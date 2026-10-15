@@ -35,6 +35,12 @@ import app.identity.models  # noqa: E402,F401
 # ``alembic check`` / autogenerate can see it.
 import app.audit.models  # noqa: E402,F401
 
+# Expense-domain models live in their own package; importing them here registers
+# expense_categories/cost_centers/expense_claims/expense_lines/
+# reimbursement_payments on Base.metadata so that ``alembic check`` /
+# autogenerate can see them.
+import app.expense.models  # noqa: E402,F401
+
 config = context.config
 
 if config.config_file_name is not None:
