@@ -18,3 +18,8 @@ dev = [
     "pytest",
     "httpx",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["app/tests"]
+pythonpath = ["."]
+addopts = "-q"
