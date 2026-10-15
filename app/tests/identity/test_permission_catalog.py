@@ -2,13 +2,15 @@
 
 Covers the acceptance criteria of task W1-3:
 
-1. counts: 7 roles, 19 permissions, 31 role-permission mappings;
+1. counts: 7 roles, 20 permissions, 32 role-permission mappings;
 2. PLAN §9 mandatory rules: ``sysadmin`` holds neither ``expense_claim/approve``
    nor ``expense_claim/finance_review``; ``auditor`` is read-only (no create /
    submit / approve / finance_review / payment);
-3. matrix spot checks (manager / employee / finance_lead);
-4. idempotency: seeding twice in one session leaves the three tables unchanged;
-5. cleanup: ``clear_permission_catalog`` empties the three seed tables without
+3. matrix spot checks (manager / employee / finance_lead), including the W1-13
+   alignment: ``finance_lead`` gains ``audit/read/company`` (PLAN §9 审计日志);
+4. count constants agree with the catalog lengths;
+5. idempotency: seeding twice in one session leaves the three tables unchanged;
+6. cleanup: ``clear_permission_catalog`` empties the three seed tables without
    touching other tables such as ``employee_channel_bindings``.
 
 Every test seeds its own data and the session fixture removes the catalog seed
@@ -44,6 +46,7 @@ from app.identity.permissions import (
     ROLES,
     ROLE_PERMISSION_NUMBERS,
     SYSADMIN_FORBIDDEN,
+    permission_by_number,
     validate_catalog,
 )
 from app.identity.seed import clear_permission_catalog, seed_permission_catalog
@@ -131,7 +134,7 @@ def test_catalog_is_self_consistent() -> None:
 
 
 def test_seed_counts(session: Session) -> None:
-    """7 roles, 19 permissions, 31 mappings land in the database."""
+    """7 roles, 20 permissions, 32 mappings land in the database."""
     _seed(session)
 
     assert _count(session, Role) == EXPECTED_ROLE_COUNT
@@ -187,6 +190,54 @@ def test_matrix_spot_checks(session: Session) -> None:
 
     finance_lead = _role_permission_keys(session, "finance_lead")
     assert ("payment", "record", "company") in finance_lead
+
+
+def test_finance_lead_gains_audit_read_company(session: Session) -> None:
+    """W1-13: PLAN §9 审计日志 grants the finance lead audit read access."""
+    _seed(session)
+
+    finance_lead = _role_permission_keys(session, "finance_lead")
+    assert ("audit", "read", "company") in finance_lead
+    # The new grant is permission number 20 and exists exactly once.
+    assert _count(session, Permission, resource="audit", action="read", scope="company") == 1
+    assert (
+        permission_by_number(20).key
+        == ("audit", "read", "company")
+    )
+
+
+def test_auditor_stays_read_only_and_catalog_valid(session: Session) -> None:
+    """The audit grant to finance_lead must not loosen the auditor's read-only rule."""
+    # The pure catalog still satisfies every PLAN §9 mandatory rule.
+    validate_catalog()
+    _seed(session)
+
+    keys = _role_permission_keys(session, "auditor")
+    for resource, action, scope in keys:
+        assert action not in AUDITOR_FORBIDDEN_ACTIONS
+        assert action == "read"
+    # The finance_lead grant did not leak into the auditor role.
+    assert ("audit", "read", "company") not in keys
+
+
+def test_sysadmin_still_lacks_approve_and_finance_review(session: Session) -> None:
+    """PLAN §9: administrators never gain approve / finance_review."""
+    _seed(session)
+
+    keys = _role_permission_keys(session, "sysadmin")
+    for resource, action in SYSADMIN_FORBIDDEN:
+        assert not any(r == resource and a == action for r, a, _ in keys)
+
+
+def test_count_constants_match_catalog_lengths() -> None:
+    """The expected counts equal the real catalog lengths (19/31 -> 20/32)."""
+    assert EXPECTED_PERMISSION_COUNT == len(PERMISSIONS) == 20
+    assert EXPECTED_ROLE_PERMISSION_COUNT == sum(
+        len(numbers) for numbers in ROLE_PERMISSION_NUMBERS.values()
+    ) == 32
+    assert [spec.number for spec in PERMISSIONS] == list(
+        range(1, EXPECTED_PERMISSION_COUNT + 1)
+    )
 
 
 def test_seed_is_idempotent(session: Session) -> None:

@@ -32,7 +32,7 @@ __all__ = ["clear_permission_catalog", "seed_permission_catalog"]
 
 
 def seed_permission_catalog(session: Session) -> dict[str, int]:
-    """幂等写入 7 角色 + 19 权限 + 31 映射，返回本次新建的行数。
+    """幂等写入 7 角色 + 20 权限 + 32 映射，返回本次新建的行数。
 
     重复调用不会产生重复行：第二次调用返回全 0 且三表行数不变。目录在写入前
     先经 ``validate_catalog()`` 自检，任何违反 PLAN §9 强制规则的编辑都会在
