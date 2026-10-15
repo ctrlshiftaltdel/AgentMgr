@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card" style="max-width:520px;margin:60px auto">
+  <h1>403 · 无权限</h1>
+  <div class="err">{{ message }}</div>
+  <p class="muted">你没有访问该页面或执行该操作的权限。此页面不会展示任何业务数据。</p>
+  <p><a class="btn secondary" href="/admin">返回仪表盘</a></p>
+</div>
+{% endblock %}

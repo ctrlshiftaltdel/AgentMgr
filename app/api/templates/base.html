@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ title }} · 报销管理后台</title>
+<style>
+  body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;margin:0;background:#f5f6f8;color:#1f2329}
+  header{background:#1f3a5f;color:#fff;padding:10px 20px;display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+  header strong{font-size:16px}
+  header nav a{color:#cfe0f5;text-decoration:none;margin-right:14px}
+  header nav a:hover{color:#fff}
+  header .who{margin-left:auto;color:#cfe0f5;font-size:13px}
+  main{max-width:1080px;margin:24px auto;padding:0 16px}
+  .card{background:#fff;border:1px solid #e3e6eb;border-radius:8px;padding:16px 20px;margin-bottom:16px}
+  h1{font-size:20px;margin:0 0 12px}
+  h2{font-size:16px;margin:0 0 10px}
+  table{border-collapse:collapse;width:100%}
+  th,td{border-bottom:1px solid #e3e6eb;padding:8px 10px;text-align:left;font-size:14px;vertical-align:top}
+  th{background:#f0f3f7}
+  .muted{color:#6b7280}
+  .btn{display:inline-block;padding:6px 12px;border-radius:6px;border:1px solid #1f3a5f;background:#1f3a5f;color:#fff;cursor:pointer;font-size:14px}
+  .btn.secondary{background:#fff;color:#1f3a5f}
+  .btn.danger{background:#a12622;border-color:#a12622}
+  form.inline{display:inline}
+  .err{background:#fdecea;border:1px solid #f5c2c0;color:#a12622;padding:10px 12px;border-radius:6px;margin-bottom:12px}
+  .ok{background:#eaf6ec;border:1px solid #bfe3c6;color:#1d6b2f;padding:10px 12px;border-radius:6px}
+  .grid{display:flex;gap:16px;flex-wrap:wrap}
+  .grid .card{flex:1 1 200px}
+  .big{font-size:28px;font-weight:600}
+  label{display:block;font-size:13px;color:#4b5563;margin:8px 0 2px}
+  input[type=text],select{padding:6px 8px;border:1px solid #cbd2da;border-radius:6px;font-size:14px}
+</style>
+</head>
+<body>
+{% if principal %}
+<header>
+  <strong>报销管理后台</strong>
+  <nav>
+    <a href="/admin">仪表盘</a>
+    <a href="/admin/claims">报销单</a>
+    {% if nav_identity %}<a href="/admin/employees">员工与角色</a>{% endif %}
+    {% if nav_bindings %}<a href="/admin/bindings">渠道绑定</a>{% endif %}
+    {% if nav_audit %}<a href="/admin/audit">审计日志</a>{% endif %}
+  </nav>
+  <span class="who">{{ employee_label }}</span>
+  <form class="inline" method="post" action="/admin/logout">
+    <button class="btn secondary" type="submit">退出</button>
+  </form>
+</header>
+{% endif %}
+<main>
+{% block content %}{% endblock %}
+</main>
+</body>
+</html>
