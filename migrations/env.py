@@ -25,6 +25,11 @@ from app.db.base import Base  # noqa: E402
 # Importing the models package registers all tables on Base.metadata.
 import app.db.models  # noqa: E402,F401
 
+# Identity/RBAC models live in their own domain package; importing them here
+# registers roles/permissions/bindings tables on Base.metadata so that
+# ``alembic check`` / autogenerate can see them.
+import app.identity.models  # noqa: E402,F401
+
 config = context.config
 
 if config.config_file_name is not None:
