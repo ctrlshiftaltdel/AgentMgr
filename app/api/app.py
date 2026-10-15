@@ -6,6 +6,8 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
+from app.api.admin import register_admin_exception_handlers
+from app.api.admin import router as admin_router
 from app.api.claims import router as claims_router
 from app.api.errors import register_exception_handlers
 from app.db.session import engine
@@ -23,6 +25,13 @@ def create_app() -> FastAPI:
 
     # Expense claim endpoints (create/list/read/transitions/payments/export).
     app.include_router(claims_router)
+
+    # Minimal server-rendered admin console (login/session, claims review,
+    # role & channel-binding management, audit log).  Every page and action
+    # re-checks permissions via ``app.identity.authorization``; the admin layer
+    # only maps those decisions to HTML pages.
+    app.include_router(admin_router)
+    register_admin_exception_handlers(app)
 
     @app.get("/health")
     def health() -> dict[str, str]:

@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>审计日志</h1>
+<div class="card">
+  {% if events %}
+  <table>
+    <thead><tr><th>#</th><th>时间</th><th>操作人</th><th>动作</th><th>资源</th><th>资源 ID</th><th>详情</th></tr></thead>
+    <tbody>
+      {% for event in events %}
+      <tr>
+        <td>{{ event.id }}</td>
+        <td>{{ event.created_at }}</td>
+        <td>{{ event.actor_id }}</td>
+        <td>{{ event.action }}</td>
+        <td>{{ event.resource_type }}</td>
+        <td>{{ event.resource_id }}</td>
+        <td>{{ event.details }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">暂无审计记录。</p>
+  {% endif %}
+</div>
+{% endblock %}
