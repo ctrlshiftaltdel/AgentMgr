@@ -8,6 +8,15 @@
 ``record_event`` 只把事件 ``add`` 到传入的 session 并 ``flush``，**绝不 commit**：
 事务边界由调用方控制，审计写入应与被审计的业务变更处于同一事务，避免出现
 「业务成功但审计丢失」或反之的偏差。
+
+**部署前提（本防护有效性的必要条件）**：应用连接数据库所用的角色**不得拥有任何
+DDL 权限**（不得是表/函数/触发器的属主，不得是超级用户，不得有 ``CREATE`` /
+``ALTER`` 权限）。数据库层只增不改的强制依赖于 ``audit_events`` 上的 BEFORE
+UPDATE OR DELETE 触发器；而拥有 DDL 权限的角色可以执行
+``ALTER TABLE audit_events DISABLE TRIGGER ...`` 或 ``DROP TRIGGER`` 直接绕过它。
+因此数据库迁移（建表、建函数、建触发器）**必须由独立的、仅迁移时使用的 DDL 角色
+执行**；运行期应用角色只被授予 ``INSERT`` / ``SELECT``（外加 ``audit_events_id_seq``
+的 ``USAGE``），不得被授予 ``UPDATE`` / ``DELETE``，更不得被授予 DDL 权限。
 """
 
 from __future__ import annotations

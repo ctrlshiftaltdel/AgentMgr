@@ -10,13 +10,32 @@ aligned with ``templates/PLAN.md`` §8/§9 and
 
 Key invariants enforced here:
 
-* ``actor_id`` references ``employees(id)`` with **ON DELETE SET NULL** -- audit
-  must outlive the person record, so ``CASCADE`` is explicitly forbidden;
+* ``actor_id`` is a plain ``BIGINT NULL`` with **no foreign key**.  Audit is an
+  independent append-only ledger: it must keep the *actual* operator's employee
+  id, so it deliberately does **not** declare ``ON DELETE SET NULL`` / ``CASCADE``
+  -- any referential action that rewrote ``actor_id`` when an employee was
+  deleted would erase the operator from the record.  Employees are soft-deleted
+  (``status = 'left'``) so the id stays resolvable in practice; on a hard delete
+  the audit row keeps its original ``actor_id`` (dangling references are allowed
+  on purpose -- audit evidence must not be lost);
 * ``resource_id`` is ``TEXT`` (resource ids are not necessarily numeric);
 * append-only is enforced at the **database layer**, not by application
   convention: a ``plpgsql`` function ``public.audit_events_reject_mutation()``
-  plus a ``BEFORE UPDATE OR DELETE`` row trigger raise an exception on any
-  row-level mutation or deletion.
+  plus a ``BEFORE UPDATE OR DELETE`` row trigger **unconditionally** raise an
+  exception (``ERRCODE = 'restrict_violation'``) on any row-level UPDATE or
+  DELETE.  There is **no** ``pg_trigger_depth()`` escape hatch and **no** column
+  shape check: an earlier revision tried to whitelist the ``ON DELETE SET NULL``
+  referential action via ``pg_trigger_depth() > 1``, which any role able to
+  create a trigger could abuse (at depth 2) to null out ``actor_id``.  Dropping
+  the FK and rejecting unconditionally closes that hole.
+
+Deployment prerequisite for this guard to hold: the application database role
+must **not** own DDL privileges (otherwise it could
+``ALTER TABLE ... DISABLE TRIGGER``); migrations run under a separate DDL role.
+See ``app/audit/service.py`` for the full statement.
+
+This revision is in its **final form** (``0004`` is not yet merged, so it is
+amended in place; no ``0005`` is added).
 
 ``downgrade`` drops, in order, the trigger, the function, the indexes and the
 table, returning cleanly to the ``0003_permission_catalog`` state.
@@ -36,34 +55,18 @@ depends_on = None
 
 # Append-only guard: any row-level UPDATE or DELETE is rejected outright.
 #
-# PostgreSQL implements a foreign key's ``ON DELETE SET NULL`` referential action
-# as an internal ``UPDATE`` on the referencing table (audit_events), which would
-# otherwise be caught by this very trigger.  That nested referential action runs
-# at trigger depth 2, whereas a direct application statement runs at depth 1, so
-# the guard allows *only* the FK action -- and only when it does nothing but null
-# ``actor_id`` while every other column is untouched.  Everything else raises.
+# No ``pg_trigger_depth()`` escape hatch and no column-shape whitelist: those
+# existed only to let the ``employees`` FK's ``ON DELETE SET NULL`` referential
+# action (which Postgres runs as an internal UPDATE at trigger depth 2) through,
+# and any role able to create a trigger could exploit the same depth-2 path to
+# null out ``actor_id``.  The FK is gone (``actor_id`` is a plain BIGINT), so the
+# guard rejects unconditionally.
 _CREATE_REJECT_FUNCTION = """
 CREATE OR REPLACE FUNCTION public.audit_events_reject_mutation()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    IF pg_trigger_depth() > 1
-       AND TG_OP = 'UPDATE'
-       AND OLD.actor_id IS NOT NULL
-       AND NEW.actor_id IS NULL
-       AND NEW.id            IS NOT DISTINCT FROM OLD.id
-       AND NEW.action        IS NOT DISTINCT FROM OLD.action
-       AND NEW.resource_type IS NOT DISTINCT FROM OLD.resource_type
-       AND NEW.resource_id   IS NOT DISTINCT FROM OLD.resource_id
-       AND NEW.request_id    IS NOT DISTINCT FROM OLD.request_id
-       AND NEW.details       IS NOT DISTINCT FROM OLD.details
-       AND NEW.created_at    IS NOT DISTINCT FROM OLD.created_at
-    THEN
-        -- Legitimate: the employees FK's ON DELETE SET NULL action.
-        RETURN NEW;
-    END IF;
-
     RAISE EXCEPTION
         'audit_events is append-only (only INSERT is permitted): % is rejected',
         TG_OP
@@ -92,6 +95,8 @@ def upgrade() -> None:
     op.create_table(
         "audit_events",
         sa.Column("id", sa.BigInteger(), autoincrement=True, nullable=False),
+        # Plain BIGINT NULL, no FK: audit keeps the actual operator's employee
+        # id and is never rewritten when an employee row is deleted.
         sa.Column("actor_id", sa.BigInteger(), nullable=True),
         sa.Column("action", sa.Text(), nullable=False),
         sa.Column("resource_type", sa.Text(), nullable=False),
@@ -104,13 +109,6 @@ def upgrade() -> None:
             sa.DateTime(timezone=True),
             server_default=sa.text("now()"),
             nullable=False,
-        ),
-        # Audit must outlive the person record: SET NULL, never CASCADE.
-        sa.ForeignKeyConstraint(
-            ["actor_id"],
-            ["employees.id"],
-            name="fk_audit_events_actor_id_employees",
-            ondelete="SET NULL",
         ),
         sa.PrimaryKeyConstraint("id", name="pk_audit_events"),
     )
