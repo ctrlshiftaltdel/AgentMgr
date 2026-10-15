@@ -30,6 +30,11 @@ import app.db.models  # noqa: E402,F401
 # ``alembic check`` / autogenerate can see them.
 import app.identity.models  # noqa: E402,F401
 
+# Audit models live in their own domain package; importing them here registers
+# the append-only ``audit_events`` table on Base.metadata so that
+# ``alembic check`` / autogenerate can see it.
+import app.audit.models  # noqa: E402,F401
+
 config = context.config
 
 if config.config_file_name is not None:
