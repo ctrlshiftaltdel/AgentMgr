@@ -46,6 +46,17 @@ import app.expense.models  # noqa: E402,F401
 # Base.metadata so that ``alembic check`` / autogenerate can see them.
 import app.workflow.models  # noqa: E402,F401
 
+# Document-domain models (source_files) live in their own package; importing them
+# here registers source_files on Base.metadata so that ``alembic check`` /
+# autogenerate can see it.  Imported before intake models because
+# extraction_drafts references source_files.
+import app.documents.models  # noqa: E402,F401
+
+# Intake-domain models (intake_jobs, extraction_drafts) live in their own package;
+# importing them here registers them on Base.metadata so that ``alembic check`` /
+# autogenerate can see them.
+import app.intake.models  # noqa: E402,F401
+
 config = context.config
 
 if config.config_file_name is not None:
