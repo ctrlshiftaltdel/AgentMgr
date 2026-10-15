@@ -37,7 +37,7 @@
 - 分支命名：`task/<ID>-<short-name>`
 - Worktree 根目录：`.worktrees/`
 - 工作目录要求：一个执行实例一个 Worktree；不共享可写工作区。
-- 并发上限：1（依据：本机 2 vCPU / 1.9 GiB 内存 / 无 swap，单个 Hermes 进程实测约 250 MB）
+- 并发上限：1（依据：本机 2 vCPU / 1.9 GiB 内存；单 Profile 网关进程实测 RSS 405–409 MB，本机可支撑约 2–3 个 Profile 常驻；本机虽配置 swap 约 3.0 GiB，但不计入常驻容量）
 - 默认审查修复上限：`3`（可通过 `.orchestration/config.json` 的 `retry_cap` 调整；只有用户显式修改此值才可改变）
 - 本地证据保留方式：`.orchestration/`；日志中需脱敏。
 - 备份策略：定期执行 `python3 scripts/orchestrator.py backup` 备份任务库；仓库与 `.orchestration/` 需另存于生产主机之外；数据库与附件备份策略待阶段 1 建立
