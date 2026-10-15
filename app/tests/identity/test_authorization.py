@@ -86,7 +86,7 @@ def _cleanup(session: Session) -> None:
 def session(engine: Engine) -> Iterator[Session]:
     with Session(engine) as sess:
         try:
-            # 权限目录是判定的事实来源，先播种 7 角色 / 19 权限 / 31 映射。
+            # 权限目录是判定的事实来源，先播种 7 角色 / 20 权限 / 32 映射。
             seed_permission_catalog(sess)
             sess.commit()
             yield sess
