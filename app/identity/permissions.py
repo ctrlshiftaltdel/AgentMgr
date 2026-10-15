@@ -18,6 +18,77 @@
     ``expense_claim/finance_review``（管理员不自动获得财务批准权）；
   - 审计人员（``auditor``）只读：不得拥有 create / submit / approve /
     finance_review / payment 类动作。
+
+PLAN §9 矩阵逐行对照（任务 W1-13）
+-----------------------------------
+
+列顺序与 PLAN §9 一致：普通员工 / 主管 / 财务经办 / 财务主管 / 仓储采购 /
+系统管理员 / 审计人员。下表把矩阵中**每一个非「否」单元格**映射到本目录的三元组；
+「否」与「默认不授予」单元格映射为空集，不单列。
+
++----------------------+------------------+----------------------------------------------+--------------------+
+| 能力                   | 角色               | 已实现三元组 / 缺失                                  | 判定                 |
++======================+==================+==============================================+====================+
+| 发起报销                 | 普通员工             | ``expense_claim/create/own`` (1)             | 一致                 |
+|                      | 主管               | ``expense_claim/create/own`` (1)             | 一致                 |
+|                      | 财务经办             | 缺失（PLAN「按授权」）                                | 按授权-占位             |
+|                      | 财务主管             | 缺失（PLAN「按授权」）                                | 按授权-占位             |
+|                      | 仓储采购             | ``expense_claim/create/own`` (1)             | 部分：仅「自己」           |
+| 查看报销                 | 普通员工             | ``expense_claim/read/own`` (2)               | 一致                 |
+|                      | 主管               | ``expense_claim/read/team`` (3)              | 一致                 |
+|                      | 财务经办             | ``expense_claim/read/company`` (4)           | 不一致-记录             |
+|                      | 财务主管             | ``expense_claim/read/company`` (4)           | 一致                 |
+|                      | 审计人员             | ``expense_claim/read/authorized`` (5)        | 一致                 |
+| 审批报销                 | 主管               | ``expense_claim/approve/team`` (8)           | 一致                 |
+|                      | 财务经办             | 缺失（PLAN「按规则限制」）                              | 按授权-占位             |
+|                      | 财务主管             | 缺失（PLAN「按授权且非本人」）                            | 按授权-占位             |
+| 发票查验/财务复核            | 主管               | 缺失（PLAN「按授权查看状态」）                            | 按授权-占位             |
+|                      | 财务经办             | ``invoice/verify/company`` (10) +            | 一致                 |
+|                      |                  | ``expense_claim/finance_review/company`` (9) |                    |
+|                      | 财务主管             | ``invoice/verify/company`` (10) +            | 一致                 |
+|                      |                  | ``expense_claim/finance_review/company`` (9) |                    |
+|                      | 审计人员             | ``invoice/read/authorized`` (12)             | 一致                 |
+| 过账/付款类操作             | 财务经办             | 缺失（PLAN「仅明确授权步骤」）                            | 按授权-占位             |
+|                      | 财务主管             | ``payment/record/company`` (13)              | 一致                 |
+| 采购/入库/出库             | 普通员工             | 缺失（PLAN「按授权申请」）                              | 按授权-占位             |
+|                      | 主管               | 缺失（PLAN「按审批职责」）                              | 按授权-占位             |
+|                      | 财务经办             | 缺失（PLAN「按需查看」）                               | 按授权-占位             |
+|                      | 财务主管             | 缺失（PLAN「按需查看」）                               | 按授权-占位             |
+|                      | 仓储采购             | ``inventory/read/company`` (14) +            | 一致                 |
+|                      |                  | ``inventory/execute/company`` (15)           |                    |
+|                      | 审计人员             | ``inventory/read/authorized`` (16)           | 一致                 |
+| 查看公司财务数据             | 主管               | 缺失（PLAN「按团队授权的汇总」）                           | 按授权-占位             |
+|                      | 财务经办/财务主管        | ``expense_claim/read/company`` (4) 仅覆盖报销     | 不一致-记录             |
+|                      | 审计人员             | 只读授权范围 (5)(12)(16)(17)                       | 一致                 |
+| 管理角色与身份绑定            | 财务主管             | 缺失（PLAN「可有限授权」）                              | 按授权-占位             |
+|                      | 系统管理员            | ``identity/manage/company`` (18) +           | 一致                 |
+|                      |                  | ``channel_binding/manage/company`` (19)      |                    |
+| 审计日志                 | 主管               | 缺失（PLAN「按授权」）                                | 按授权-占位             |
+|                      | 财务经办             | 缺失（PLAN「按授权」）                                | 按授权-占位             |
+|                      | 财务主管             | ``audit/read/company`` (20)                  | 一致（W1-13 落地）       |
+|                      | 仓储采购             | 缺失（PLAN「按授权」）                                | 按授权-占位             |
+|                      | 系统管理员            | 缺失（PLAN「受控」语义模糊）                             | 不一致-记录             |
+|                      | 审计人员             | ``audit/read/authorized`` (17)               | 一致                 |
++----------------------+------------------+----------------------------------------------+--------------------+
+
+「按授权 / 授权范围 / 按规则限制 / 可有限授权」等单元格依赖**显式授权表**，而
+``app.identity.authorization.visible_employee_ids`` 的 ``authorized`` 档位当前是
+**占位实现**（只返回自身，见该函数 docstring）。因此这些单元格**不落地为
+``authorized`` 三元组**，以免声称已支持尚未实现的语义；它们是已知限制，待显式
+授权表任务落地。若将来落成 ``authorized``，其**真实**效果等同「仅自身」，而非
+矩阵字面含义。上表标记「按授权-占位」的行即属此类：它们**没有**对应三元组，
+不得误读为已支持。
+
+已知不一致（记录，不在本期修正）：
+
+* **查看报销 / 财务经办**：PLAN 写「授权范围」（authorized），实现为
+  ``expense_claim/read/company`` (4)，范围更宽。收窄会连带影响同用 (4) 的财务主管
+  与「查看公司财务数据」语义，属产品决策，留待显式授权表任务统一处理。
+* **查看公司财务数据 / 财务经办·财务主管**：PLAN 为「业务所需范围 / 授权公司范围」，
+  实现仅有 ``expense_claim/read/company`` (4)，覆盖报销但不覆盖更广的财务数据；
+  无独立三元组。
+* **审计日志 / 系统管理员**：PLAN 为「受控」，语义模糊且与强制规则「管理员不自动
+  获得财务批准权」相区分，未落地为三元组。
 """
 
 from __future__ import annotations
@@ -59,7 +130,7 @@ ROLES: tuple[RoleSpec, ...] = (
     RoleSpec("auditor", "审计人员"),
 )
 
-#: 十九条权限目录，编号 1..19，与 PLAN §9 的能力列一一对应。
+#: 二十条权限目录，编号 1..20，与 PLAN §9 的能力列一一对应。
 PERMISSIONS: tuple[PermissionSpec, ...] = (
     PermissionSpec(1, "expense_claim", "create", "own"),
     PermissionSpec(2, "expense_claim", "read", "own"),
@@ -80,14 +151,15 @@ PERMISSIONS: tuple[PermissionSpec, ...] = (
     PermissionSpec(17, "audit", "read", "authorized"),
     PermissionSpec(18, "identity", "manage", "company"),
     PermissionSpec(19, "channel_binding", "manage", "company"),
+    PermissionSpec(20, "audit", "read", "company"),
 )
 
-#: 角色名 -> 该角色被授予的权限编号（共 31 条映射）。
+#: 角色名 -> 该角色被授予的权限编号（共 32 条映射）。
 ROLE_PERMISSION_NUMBERS: dict[str, tuple[int, ...]] = {
     "employee": (1, 2, 6, 7),
     "manager": (1, 2, 3, 6, 7, 8),
     "finance_operator": (4, 9, 10, 11),
-    "finance_lead": (4, 9, 10, 11, 13),
+    "finance_lead": (4, 9, 10, 11, 13, 20),
     "warehouse": (1, 2, 6, 7, 14, 15),
     "sysadmin": (18, 19),
     "auditor": (5, 12, 16, 17),
@@ -95,8 +167,8 @@ ROLE_PERMISSION_NUMBERS: dict[str, tuple[int, ...]] = {
 
 #: 目录规模的期望值，供 ``validate_catalog()`` 与测试共同引用。
 EXPECTED_ROLE_COUNT = 7
-EXPECTED_PERMISSION_COUNT = 19
-EXPECTED_ROLE_PERMISSION_COUNT = 31
+EXPECTED_PERMISSION_COUNT = 20
+EXPECTED_ROLE_PERMISSION_COUNT = 32
 
 #: PLAN §9 强制规则：系统管理员不得拥有的 (resource, action) 组合。
 SYSADMIN_FORBIDDEN: frozenset[tuple[str, str]] = frozenset(
