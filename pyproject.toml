@@ -1,0 +1,20 @@
+[project]
+name = "ajaimgr"
+version = "0.1.0"
+description = "中国大陆企业 Hermes Agent 原生管理系统（首期报销）"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "sqlalchemy",
+    "alembic",
+    "psycopg[binary]",
+    "pydantic",
+    "python-multipart",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "httpx",
+]
