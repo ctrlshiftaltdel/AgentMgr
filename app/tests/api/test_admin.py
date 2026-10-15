@@ -498,3 +498,128 @@ def test_dashboard_and_detail_render(
     assert "明细" in detail.text
     assert "审计轨迹" in detail.text
     assert "出差打车" in detail.text
+
+
+# --- 10. permission denials are audited (W1-18, DEFECT #4) --------------------
+
+
+def _audit_events(engine: Engine, **filters: object) -> list[AuditEvent]:
+    """Audit rows matching ``filters`` (``audit_events`` is never deleted here)."""
+    with Session(engine) as session:
+        stmt = select(AuditEvent)
+        for column, value in filters.items():
+            stmt = stmt.where(getattr(AuditEvent, column) == value)
+        return list(session.scalars(stmt.order_by(AuditEvent.id)))
+
+
+def test_admin_page_denial_is_audited(
+    admin_client: TestClient, engine: Engine, world: World
+) -> None:
+    """An ordinary employee's 403 on ``/admin/audit`` leaves an ``admin.deny`` row.
+
+    PLAN §12: a permission denial must be auditable.  The row names the subject,
+    the attempted action, the resource and the propagated ``X-Request-Id``.
+    """
+    _login(admin_client, world.claimant.employee_no)
+    response = admin_client.get(
+        "/admin/audit", headers={"X-Request-Id": "w1-18-api-deny-001"}
+    )
+    assert response.status_code == 403
+    assert "无权限" in response.text
+
+    events = _audit_events(engine, request_id="w1-18-api-deny-001")
+    assert [event.action for event in events] == ["admin.deny"]
+    event = events[0]
+    assert event.actor_id == world.claimant.id
+    assert event.resource_type == "audit"
+    assert event.resource_id is None
+    assert event.details == {
+        "attempted_action": "read",
+        "reason": "missing_permission",
+    }
+
+
+def test_login_failure_is_audited_without_credentials(
+    admin_client: TestClient, engine: Engine, world: World
+) -> None:
+    """A failed login writes ``admin.login_failed`` and never the credential."""
+    bogus = "w1-18-api-not-the-token-77c1"
+    response = admin_client.post(
+        "/admin/login",
+        data={"token": bogus, "employee_no": world.claimant.employee_no},
+        headers={"X-Request-Id": "w1-18-api-login-failed-001"},
+    )
+    assert response.status_code == 401
+
+    events = _audit_events(engine, request_id="w1-18-api-login-failed-001")
+    assert [event.action for event in events] == ["admin.login_failed"]
+    event = events[0]
+    assert event.actor_id is None
+    assert event.resource_type == "admin_session"
+    assert event.details == {"reason": "invalid_credentials"}
+    assert bogus not in str(event.details)
+    assert bogus not in response.text
+    # No business event was recorded for the attempt.
+    assert (
+        _audit_events(
+            engine, request_id="w1-18-api-login-failed-001", action="admin.login"
+        )
+        == []
+    )
+
+
+def test_invalid_session_writes_no_audit_event(
+    admin_client: TestClient, engine: Engine, world: World
+) -> None:
+    """A tampered session is redirected and writes no audit row (see admin.py)."""
+    good = create_session_token(world.claimant.id)
+    last = good[-1]
+    tampered = good[:-1] + ("A" if last != "A" else "B")
+    assert tampered != good
+
+    response = admin_client.get(
+        "/admin/audit",
+        headers={
+            "Cookie": f"{SESSION_COOKIE_NAME}={tampered}",
+            "X-Request-Id": "w1-18-api-invalid-session-001",
+        },
+    )
+    assert response.status_code in (302, 303, 307, 308)
+    assert "/admin/login" in response.headers["location"]
+    assert _audit_events(engine, request_id="w1-18-api-invalid-session-001") == []
+    assert tampered not in response.text
+
+
+def test_denial_audit_write_failure_still_returns_403(
+    api_token: str, engine: Engine, monkeypatch: pytest.MonkeyPatch, world: World
+) -> None:
+    """If writing the deny audit blows up, the request is still refused (403).
+
+    Default-deny wins: an audit-backend failure must never turn the 403 into a
+    500, and must never let the request through.
+    """
+    monkeypatch.setenv(TOKEN_ENV, api_token)
+    from app.api import admin as admin_module
+    from app.api.app import create_app
+
+    calls: list[str] = []
+
+    def _explode(*_args: object, **_kwargs: object) -> None:
+        calls.append("record_event")
+        raise RuntimeError("audit backend unavailable")
+
+    denials_before = len(_audit_events(engine, action="admin.deny"))
+    with TestClient(
+        create_app(), follow_redirects=False, raise_server_exceptions=False
+    ) as test_client:
+        cookie = _login(test_client, world.claimant.employee_no)
+        # Patch only after a successful login so the denial path is what fails.
+        monkeypatch.setattr(admin_module, "record_event", _explode)
+        response = test_client.get("/admin/audit", headers=_cookie(cookie))
+
+    assert calls, "the denial path must have attempted to write the audit"
+    assert response.status_code == 403
+    assert response.status_code not in (200, 500)
+    assert "无权限" in response.text
+    # The audit row could not be written -- but the request was still refused.
+    assert len(_audit_events(engine, action="admin.deny")) == denials_before
