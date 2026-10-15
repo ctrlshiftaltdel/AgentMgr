@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>报销单 {{ claim.claim_no }}</h1>
+<div class="card">
+  <table>
+    <tr><th>状态</th><td>{{ claim.status }}</td></tr>
+    <tr><th>归属</th><td>{{ owner_label }}</td></tr>
+    <tr><th>总额</th><td>{{ claim.total_amount }} {{ claim.currency }}</td></tr>
+    <tr><th>提交时间</th><td>{{ claim.submitted_at or "—" }}</td></tr>
+  </table>
+</div>
+
+{% if can_approve_flag or can_finance_review %}
+<div class="card">
+  <h2>审批动作</h2>
+  {% if can_approve_flag %}
+  <form class="inline" method="post" action="/admin/claims/{{ claim.id }}/approve"><button class="btn" type="submit">审批通过</button></form>
+  <form class="inline" method="post" action="/admin/claims/{{ claim.id }}/return"><button class="btn secondary" type="submit">退回补件</button></form>
+  <form class="inline" method="post" action="/admin/claims/{{ claim.id }}/reject"><button class="btn danger" type="submit">拒绝</button></form>
+  {% endif %}
+  {% if can_finance_review %}
+  <form class="inline" method="post" action="/admin/claims/{{ claim.id }}/finance-review"><button class="btn secondary" type="submit">财务复核</button></form>
+  {% endif %}
+</div>
+{% endif %}
+
+<div class="card">
+  <h2>明细</h2>
+  {% if lines %}
+  <table>
+    <thead><tr><th>日期</th><th>说明</th><th>金额</th><th>税额</th></tr></thead>
+    <tbody>
+      {% for line in lines %}
+      <tr><td>{{ line.expense_date }}</td><td>{{ line.description }}</td><td>{{ line.amount }}</td><td>{{ line.tax_amount }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">暂无明细。</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>审计轨迹</h2>
+  {% if events %}
+  <table>
+    <thead><tr><th>#</th><th>时间</th><th>操作人</th><th>动作</th><th>详情</th></tr></thead>
+    <tbody>
+      {% for event in events %}
+      <tr><td>{{ event.id }}</td><td>{{ event.created_at }}</td><td>{{ event.actor_id }}</td><td>{{ event.action }}</td><td>{{ event.details }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">暂无审计记录。</p>
+  {% endif %}
+</div>
+{% endblock %}

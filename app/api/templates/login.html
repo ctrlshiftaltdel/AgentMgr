@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card" style="max-width:420px;margin:60px auto">
+  <h1>管理后台登录</h1>
+  {% if error %}<div class="err">{{ error }}</div>{% endif %}
+  <form method="post" action="/admin/login">
+    <label for="employee_no">员工号</label>
+    <input id="employee_no" name="employee_no" type="text" autocomplete="off" required>
+    <label for="token">内部令牌</label>
+    <input id="token" name="token" type="password" autocomplete="off" required>
+    <p class="muted" style="font-size:12px">本页面为阶段 1 过渡方案：凭据由部署注入的内部令牌与本人员工号组成，生产环境应接入公司 SSO。</p>
+    <button class="btn" type="submit">登录</button>
+  </form>
+</div>
+{% endblock %}

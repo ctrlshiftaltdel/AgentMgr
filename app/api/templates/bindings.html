@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>渠道绑定</h1>
+<div class="card">
+  <h2>新增 / 激活绑定</h2>
+  <form method="post" action="/admin/bindings">
+    <input type="hidden" name="action" value="bind">
+    <label for="employee_id">员工</label>
+    <select id="employee_id" name="employee_id">
+      {% for employee in employees %}<option value="{{ employee.id }}">{{ employee.label }}</option>{% endfor %}
+    </select>
+    <label for="channel_type">渠道类型</label>
+    <input id="channel_type" name="channel_type" type="text" placeholder="weixin">
+    <label for="external_user_id">渠道用户 ID</label>
+    <input id="external_user_id" name="external_user_id" type="text">
+    <button class="btn" type="submit">绑定</button>
+  </form>
+</div>
+<div class="card">
+  <table>
+    <thead><tr><th>#</th><th>员工</th><th>渠道类型</th><th>渠道用户 ID</th><th>状态</th><th>操作</th></tr></thead>
+    <tbody>
+      {% for row in rows %}
+      <tr>
+        <td>{{ row.binding.id }}</td>
+        <td>{{ row.employee_label }}</td>
+        <td>{{ row.binding.channel_type }}</td>
+        <td>{{ row.binding.external_user_id }}</td>
+        <td>{{ row.binding.status }}</td>
+        <td>
+          <form class="inline" method="post" action="/admin/bindings">
+            <input type="hidden" name="action" value="unbind">
+            <input type="hidden" name="binding_id" value="{{ row.binding.id }}">
+            <button class="btn secondary" type="submit">解绑</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}
