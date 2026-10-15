@@ -25,16 +25,30 @@
 ``StepAlreadyDecidedError``                   409     ``step_already_decided``
 ``InvalidDecisionError``                      422     ``invalid_decision``
 ``ValidationError``（报销服务业务校验）         422     ``validation_error``
+``InputValidationError``（带边界值的输入校验）   422     ``validation_error``
 ``ClaimNotFoundError``                        404     ``not_found``
 ``WorkflowInstanceNotFoundError``             404     ``not_found``
 ``PathTraversalError`` 等文件存储闸门          400     ``bad_request``
 ``ApiError``（API 层显式错误）                  自定    自定
 请求体结构校验失败（``RequestValidationError``） 422     ``validation_error``
+数据库约束违反（``IntegrityError``：CHECK/FK）   422     ``validation_error``
+唯一约束/并发冲突（SQLSTATE 23505/40001）        409     ``conflict``
+数据类型越界（``DataError``：numeric 溢出等）    422     ``validation_error``
 其它未预期异常                                  500     ``internal_error``
 ============================================  ======  ==========================
 
 所有 ``message`` 都是**受控的静态文案**，绝不拼接异常 ``repr`` 或 ``str(exc)``，
-从而不会把堆栈、DSN 或 SQL 带出接口。
+从而不会把堆栈、DSN 或 SQL 带出接口。唯一的例外是
+``InputValidationError.message``：它由服务层用常量拼装（只含字段名与边界值，
+不含输入原文），用于把「金额上限 / 说明最大长度」这类边界告诉调用方。
+
+数据库约束违反兜底
+------------------
+
+服务层已经先行校验，但约束仍可能被绕过（并发、未来新增的写入路径、外键指向
+不存在的行等）。这类 ``IntegrityError``/``DataError`` 是**调用方输入问题**，
+不是服务端故障，因此映射为 422（唯一约束/并发冲突为 409），**绝不允许**再以
+500 形式暴露。
 """
 
 from __future__ import annotations
@@ -43,6 +57,7 @@ from typing import cast
 
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
+from sqlalchemy.exc import DataError, IntegrityError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -56,6 +71,7 @@ from app.documents.storage import (
 from app.expense.service import (
     AuthorizationDeniedError,
     ClaimNotFoundError,
+    InputValidationError,
     ValidationError,
 )
 from app.expense.state_machine import InvalidTransitionError
@@ -86,6 +102,12 @@ _MESSAGE_UNAUTHORIZED = "authentication required"
 _MESSAGE_FORBIDDEN = "access denied"
 _MESSAGE_UNAVAILABLE = "service unavailable"
 _MESSAGE_INTERNAL = "internal server error"
+_MESSAGE_CONSTRAINT = "request violates a data constraint"
+_MESSAGE_CONFLICT = "resource conflict"
+
+#: SQLSTATE codes that mean "concurrent/unique conflict" → 409 rather than 422.
+#: ``23505`` unique_violation, ``40001`` serialization_failure.
+_CONFLICT_SQLSTATES = frozenset({"23505", "40001"})
 
 
 class ApiError(Exception):
@@ -168,6 +190,17 @@ def register_exception_handlers(app: FastAPI) -> None:
         ValidationError,
         _static_handler(422, "validation_error", _MESSAGE_VALIDATION),
     )
+
+    # ``InputValidationError`` 是 ``ValidationError`` 的子类：Starlette 按异常的
+    # MRO 顺序取第一个已注册的处理器，所以这条更具体的规则会先命中，从而把
+    # 「金额上限 / 说明最大长度」这类边界值带给调用方。``message`` 由服务层用
+    # 常量拼装，不含输入原文，可以安全外传。
+    async def _input_validation(_request: Request, exc: Exception) -> JSONResponse:
+        return _json_error(
+            422, "validation_error", cast(InputValidationError, exc).message
+        )
+
+    app.add_exception_handler(InputValidationError, _input_validation)
     app.add_exception_handler(
         ClaimNotFoundError,
         _static_handler(404, "not_found", _MESSAGE_NOT_FOUND),
@@ -194,6 +227,27 @@ def register_exception_handlers(app: FastAPI) -> None:
         return _json_error(422, "validation_error", "request body failed schema validation")
 
     app.add_exception_handler(RequestValidationError, _request_validation)
+
+    # --- 数据库约束违反兜底 → 422 / 409，绝不 500 ---
+    #
+    # 服务层已经先行校验金额与说明长度，但约束仍可能被绕过（并发、外键指向
+    # 不存在的行、未来新增的写入路径等）。这类错误是调用方输入问题，不是服务端
+    # 故障：CHECK/FK 等约束违反映射为 422，唯一约束/并发冲突映射为 409。
+    # 响应只给受控文案，不回显 SQL、约束名或异常原文。
+    async def _integrity_error(_request: Request, exc: Exception) -> JSONResponse:
+        sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
+        if sqlstate in _CONFLICT_SQLSTATES:
+            return _json_error(409, "conflict", _MESSAGE_CONFLICT)
+        return _json_error(422, "validation_error", _MESSAGE_CONSTRAINT)
+
+    app.add_exception_handler(IntegrityError, _integrity_error)
+
+    # ``DataError``：数值溢出（``22003``）、字符串超长（``22001``）等——同样是
+    # 输入无法被数据库表示，映射为 422 而不是 500。
+    app.add_exception_handler(
+        DataError,
+        _static_handler(422, "validation_error", _MESSAGE_CONSTRAINT),
+    )
 
     # --- 框架级 HTTP 异常（404 路由不存在 / 405 方法不允许等） ---
     _HTTP_CODES = {
