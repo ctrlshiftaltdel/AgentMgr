@@ -10,7 +10,9 @@ Covers the acceptance points:
 6. data-scope filtering: an employee sees only their own claims, a finance lead
    sees the whole company;
 7. role grant/revoke and channel-binding changes are written to ``audit_events``;
-8. a user without the audit permission gets a 403 page on ``/admin/audit``;
+8. ``/admin/audit`` requires an ``audit/read`` scope (403 otherwise) and filters
+   events to the principal's widest ``audit/read`` scope (an ``authorized``
+   principal sees only its own events, not other employees');
 9. page responses never contain stack traces, the DSN or driver names.
 
 Every request uses ``follow_redirects=False`` so 3xx responses are observable;
@@ -30,6 +32,7 @@ from sqlalchemy.orm import Session
 
 from app.api.admin_auth import SESSION_COOKIE_NAME, create_session_token
 from app.audit.models import AuditEvent
+from app.audit.service import record_event
 from app.db.models.organization import Employee
 from app.expense.models import ExpenseClaim
 from app.identity.models import EmployeeRole, Role
@@ -368,6 +371,84 @@ def test_audit_page_visible_for_auditor(
     response = admin_client.get("/admin/audit")
     assert response.status_code == 200
     assert "审计日志" in response.text
+
+
+# --- 8b. audit page data-scope filtering (W1-12 round 1) ---------------------
+
+
+def _audit_event(engine: Engine, *, actor_id: int, action: str, marker: str) -> None:
+    """Append a committed audit event carrying a unique ``marker`` in details."""
+    with Session(engine) as session:
+        record_event(
+            session,
+            actor_id=actor_id,
+            action=action,
+            resource_type="w1-12.test",
+            details={"marker": marker},
+        )
+        session.commit()
+
+
+def test_audit_page_scoped_to_own_events_for_authorized_scope(
+    admin_client: TestClient, engine: Engine, world: World
+) -> None:
+    """An ``audit/read/authorized`` principal sees only its own events.
+
+    ``authorized`` is a placeholder scope (returns only ``{employee_id}``), so the
+    audit page must show the principal's own event and hide another employee's.
+    """
+    auditor = _employee_with_role(engine, world, "E-auditor-scope", "auditor")
+    other = _employee_with_role(engine, world, "E-auditor-other", "employee")
+
+    _audit_event(
+        engine, actor_id=auditor.id, action="w1-12.audit.own", marker="OWN-MARKER-AAA"
+    )
+    _audit_event(
+        engine,
+        actor_id=other.id,
+        action="w1-12.audit.other",
+        marker="OTHER-MARKER-BBB",
+    )
+
+    _login(admin_client, auditor.employee_no)
+    response = admin_client.get("/admin/audit")
+    assert response.status_code == 200
+    assert "审计日志" in response.text
+    # Own event is rendered ...
+    assert "OWN-MARKER-AAA" in response.text
+    # ... while the other employee's event is filtered out entirely.
+    assert "OTHER-MARKER-BBB" not in response.text
+
+
+def test_audit_page_forbidden_for_employee_without_audit_permission(
+    admin_client: TestClient, engine: Engine, world: World
+) -> None:
+    """An ordinary employee has no ``audit/read`` scope → 403 page."""
+    employee = _employee_with_role(engine, world, "E-no-audit", "employee")
+    _login(admin_client, employee.employee_no)
+    response = admin_client.get("/admin/audit")
+    assert response.status_code == 403
+    assert "无权限" in response.text
+
+
+def test_audit_page_renders_after_filtering(
+    admin_client: TestClient, engine: Engine, world: World
+) -> None:
+    """After scope filtering the page still renders 200 with audit content."""
+    auditor = _employee_with_role(engine, world, "E-auditor-render", "auditor")
+    _audit_event(
+        engine,
+        actor_id=auditor.id,
+        action="w1-12.audit.render",
+        marker="RENDER-MARKER-CCC",
+    )
+
+    _login(admin_client, auditor.employee_no)
+    response = admin_client.get("/admin/audit")
+    assert response.status_code == 200
+    assert "审计日志" in response.text
+    assert "操作人" in response.text  # table header
+    assert "RENDER-MARKER-CCC" in response.text
 
 
 # --- 9. no internal leakage ---------------------------------------------------

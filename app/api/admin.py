@@ -141,12 +141,24 @@ def _unit_of_work(session: Session) -> Iterator[None]:
         session.commit()
 
 
-def _widest_read_scope(session: Session, principal: Principal) -> str | None:
-    """返回主体在 ``expense_claim/read`` 下拥有的最宽 scope；无则 ``None``。"""
+def _widest_scope(
+    session: Session, principal: Principal, resource: str, action: str
+) -> str | None:
+    """返回主体在 ``resource/action`` 下拥有的最宽 scope；无则 ``None``。
+
+    优先级 ``company > team > authorized > own``：一旦命中更宽的 scope 即返回，
+    不再考虑更窄者。判定完全交给 ``app.identity.authorization.has_permission``
+    （默认拒绝）。
+    """
     for scope in _READ_SCOPES_WIDEST_FIRST:
-        if has_permission(session, principal, "expense_claim", "read", scope):
+        if has_permission(session, principal, resource, action, scope):
             return scope
     return None
+
+
+def _widest_read_scope(session: Session, principal: Principal) -> str | None:
+    """返回主体在 ``expense_claim/read`` 下拥有的最宽 scope；无则 ``None``。"""
+    return _widest_scope(session, principal, "expense_claim", "read")
 
 
 def _visible_read_ids(session: Session, principal: Principal) -> set[int] | None:
@@ -189,9 +201,7 @@ def _nav(session: Session, principal: Principal) -> dict[str, bool]:
         "nav_bindings": has_permission(
             session, principal, "channel_binding", "manage", "company"
         ),
-        "nav_audit": has_permission(
-            session, principal, "audit", "read", "authorized"
-        ),
+        "nav_audit": _widest_scope(session, principal, "audit", "read") is not None,
     }
 
 
@@ -825,11 +835,39 @@ def audit_list(
     session: Session = Depends(get_session),
     principal: Principal = Depends(get_admin_principal),
 ) -> HTMLResponse:
-    """审计日志查看（需 ``audit/read/authorized``）。"""
-    _require_or_forbidden(session, principal, "audit", "read", "authorized")
+    """审计日志查看：按主体在 ``audit/read`` 下**最宽的** scope 过滤事件。
 
+    过滤规则（与 ``app.api.claims`` 同模式，模块级不变量）：
+
+    * 取主体在 ``audit/read`` 下拥有的最宽 scope，优先级
+      ``company > team > authorized > own``；一旦命中更宽者即采用，不再考虑更窄者；
+    * 用 ``app.identity.authorization.visible_employee_ids(session, principal,
+      scope)`` 解析出该 scope 下可见的员工 ID 集合，只渲染
+      ``AuditEvent.actor_id`` 落在该集合内的事件（按 ``id`` 降序，最多 200 条）；
+    * 主体**没有任何** ``audit/read`` 权限时抛 ``AdminForbidden``（渲染 403 页面，
+      不返回任何事件，也不泄露存在性）。
+
+    **已知限制（必须显式声明，不得假装已支持）**：当最宽 scope 为 ``authorized``
+    时，``visible_employee_ids`` 对 ``authorized`` 是**占位实现**——显式授权表
+    （把具体资源实例显式授予某员工，如「审计人员只读特定单据」）**尚未实现**，该
+    分支当前只返回 ``{principal.employee_id}``。因此此情形下页面实际只显示
+    ``actor_id == principal.employee_id`` 的事件（即「仅自身」），**并非**「只看被
+    授权单据」的语义；这正是它比「公司范围审计查看」（``company`` scope）**更窄**
+    的原因。待显式授权表落地后，此处的 ``authorized`` 分支才会真正收窄到被授权
+    单据范围（对齐 ``app.identity.authorization.visible_employee_ids`` 的占位说明；
+    权限目录与 PLAN §9 的对齐属独立任务 W1-13）。
+    """
+    scope = _widest_scope(session, principal, "audit", "read")
+    if scope is None:
+        # 无任何 audit/read 权限：渲染 403 页面，不返回任何事件。
+        raise AdminForbidden()
+
+    visible = visible_employee_ids(session, principal, scope)
     events = session.scalars(
-        select(AuditEvent).order_by(AuditEvent.id.desc()).limit(200)
+        select(AuditEvent)
+        .where(AuditEvent.actor_id.in_(visible))
+        .order_by(AuditEvent.id.desc())
+        .limit(200)
     ).all()
     return _render(
         "audit.html",
