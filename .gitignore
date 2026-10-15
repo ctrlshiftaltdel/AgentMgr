@@ -1,0 +1,7 @@
+# Agent-Orchestration single-user machine-local state
+.orchestration/
+# Python caches from local helper scripts
+__pycache__/
+*.py[cod]
+# Task worktrees created by the orchestrator
+.worktrees/

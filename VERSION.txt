@@ -1,0 +1,3 @@
+Agent-Orchestration Starter Kit
+Edition: offline-single-user
+Format version: 1.0
