@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>报销单</h1>
+<div class="card">
+  <form method="get" action="/admin/claims">
+    <label for="status">状态</label>
+    <select id="status" name="status">
+      <option value="">全部</option>
+      {% for s in statuses %}
+      <option value="{{ s }}"{% if s == status_filter %} selected{% endif %}>{{ s }}</option>
+      {% endfor %}
+    </select>
+    <label for="employee_no">员工号</label>
+    <input id="employee_no" name="employee_no" type="text" value="{{ employee_no_filter }}">
+    <button class="btn secondary" type="submit">筛选</button>
+  </form>
+</div>
+<div class="card">
+  {% if rows %}
+  <table>
+    <thead>
+      <tr><th>编号</th><th>归属</th><th>状态</th><th>总额</th><th>币种</th></tr>
+    </thead>
+    <tbody>
+      {% for row in rows %}
+      <tr>
+        <td><a href="/admin/claims/{{ row.claim.id }}">{{ row.claim.claim_no }}</a></td>
+        <td>{{ row.owner_label }}</td>
+        <td>{{ row.claim.status }}</td>
+        <td>{{ row.claim.total_amount }}</td>
+        <td>{{ row.claim.currency }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">没有符合条件的报销单。</p>
+  {% endif %}
+</div>
+{% endblock %}

@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>员工与角色</h1>
+<div class="card">
+  <table>
+    <thead><tr><th>#</th><th>员工号</th><th>状态</th><th>角色</th><th>授予 / 撤销</th></tr></thead>
+    <tbody>
+      {% for row in rows %}
+      <tr>
+        <td>{{ row.employee.id }}</td>
+        <td>{{ row.employee.employee_no }}</td>
+        <td>{{ row.employee.status }}</td>
+        <td>{{ row.roles | join(", ") if row.roles else "—" }}</td>
+        <td>
+          <form class="inline" method="post" action="/admin/employees/{{ row.employee.id }}/roles">
+            <select name="role">
+              {% for role in all_roles %}<option value="{{ role }}">{{ role }}</option>{% endfor %}
+            </select>
+            <button class="btn" name="action" value="grant" type="submit">授予</button>
+            <button class="btn secondary" name="action" value="revoke" type="submit">撤销</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

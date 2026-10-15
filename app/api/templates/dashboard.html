@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>仪表盘</h1>
+<div class="grid">
+  <div class="card">
+    <h2>可见报销单</h2>
+    <div class="big">{{ claim_count }}</div>
+    <p class="muted">按你的数据范围过滤后的报销单总数。</p>
+  </div>
+  <div class="card">
+    <h2>待办审批</h2>
+    <div class="big">{{ pending_approvals }}</div>
+    <p class="muted">你可审批（团队范围、非本人）的待处理报销单数。</p>
+  </div>
+</div>
+<p><a class="btn" href="/admin/claims">查看报销单</a></p>
+{% endblock %}
