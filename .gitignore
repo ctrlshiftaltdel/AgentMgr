@@ -5,3 +5,4 @@ __pycache__/
 *.py[cod]
 # Task worktrees created by the orchestrator
 .worktrees/
+.venv/
