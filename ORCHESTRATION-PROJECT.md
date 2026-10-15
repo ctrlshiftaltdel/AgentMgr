@@ -4,42 +4,43 @@
 
 ## 项目身份
 
-- 项目名称：`FILL_IN`
-- 一句话目标：`FILL_IN`
-- 现有项目 / 新项目：`FILL_IN`
-- 本地主分支：`FILL_IN`（例如 `main` 或 `master`；不要假设名称）
-- 语言 / 框架 / 运行方式：`FILL_IN`
-- 重要设计 / 需求文件：`FILL_IN`（无则写“无”）
+- 项目名称：中国大陆企业 Hermes Agent 原生管理系统
+- 一句话目标：以 AI Agent 为主要工作入口的企业管理系统，首期交付报销闭环，面向 20–100 名员工，部署于中国大陆
+- 现有项目 / 新项目：新项目（仓库内已有 Agent-Orchestration 规则包，业务代码从零开始）
+- 本地主分支：`main`
+- 语言 / 框架 / 运行方式：Python 3.13；计划采用 FastAPI + PostgreSQL + Alembic（首期业务骨架尚未建立，当前仅 `app/` 下 11 个领域目录占位）；本机仅作编排与开发机，生产 Profile 主机另行准备
+- 重要设计 / 需求文件：`templates/PLAN.md`（实施方案 v2.0）、`docs/PROJECT-CHARTER.md`（项目章程 v1.0）
 
 ## 范围与安全
 
-- 允许改动路径：`FILL_IN`（按任务进一步收窄）
-- 永远禁止改动路径 / 文件：`FILL_IN`
-- 秘密与隐私文件模式：`FILL_IN`（例如 `.env*`、密钥、个人数据）
-- 破坏性操作和迁移政策：`FILL_IN`
-- 新依赖政策：`FILL_IN`
-- 需要人工批准的变化：`FILL_IN`
+- 允许改动路径：`app/`、`docs/`、`tests/`（每个任务需进一步收窄到具体文件或领域目录）
+- 永远禁止改动路径 / 文件：`AGENTS.md`、`MASTER.md`、`AGENT-BOOTSTRAP.md`、`AGENT-ORCHESTRATION.md`、`AGENT-ORCHESTRATION-ACCEPTANCE.md`、`README.md`、`VERSION.txt`、`LICENSE.txt`、`scripts/`、`prompts/`、`templates/`（除非任务明确授权）、`.orchestration/`
+- 秘密与隐私文件模式：`.env*`、`*.key`、`*.pem`、`*secret*`、`*credential*`，以及含个人数据的样例文件与运行日志
+- 破坏性操作和迁移政策：数据库迁移必须与功能代码同一任务交付且可回滚；数据删除、迁移或批量覆盖一律先进入 NEEDS_HUMAN_DECISION
+- 新依赖政策：引入第三方依赖必须在任务中声明用途与替代方案并经 Master 批准；依赖在本机的可用性必须真实探测，不得假定
+- 需要人工批准的变化：权限与安全模型变更、数据删除或迁移、凭据处理、新增外部服务、不可逆操作、重大架构取舍、产品行为存在实质歧义
 
 ## 验证命令
 
 每条命令必须在本机真实探测；未配置的检查写“待建立”，不要假定通过。
 
-- 快速测试：`FILL_IN`
-- 完整回归：`FILL_IN`
-- 静态检查 / 类型检查：`FILL_IN`（示例：`python -m py_compile <path1> <path2>` 这类零依赖语法检查；不引入第三方依赖）
-- 构建 / 打包：`FILL_IN`
-- 手工 / UI 冒烟检查：`FILL_IN`
-- 合并后必须执行：`FILL_IN`
+- 快速测试：待建立（当前无业务测试框架与依赖清单）
+- 完整回归：`python3 -m unittest discover -s tests -v`
+- 静态检查 / 类型检查：`python3 -m py_compile <path1> <path2>`（零依赖语法检查）；另包含规则包自检 `python3 scripts/validate_kit.py`
+- 构建 / 打包：待建立（尚无 pyproject.toml / requirements.txt）
+- 手工 / UI 冒烟检查：待建立（尚无服务与前端）
+- 合并后必须执行：`python3 scripts/validate_kit.py --project-ready && python3 -m unittest discover -s tests`
+- 附加说明：本机不存在 `python` 命令，必须使用 `python3`
 
 ## 本地工作流
 
 - 分支命名：`task/<ID>-<short-name>`
 - Worktree 根目录：`.worktrees/`
 - 工作目录要求：一个执行实例一个 Worktree；不共享可写工作区。
-- 并发上限：`FILL_IN`（建议从 1–3 个执行实例起步；不得超过机器、工具和锁管理能力）
+- 并发上限：1（依据：本机 2 vCPU / 1.9 GiB 内存 / 无 swap，单个 Hermes 进程实测约 250 MB）
 - 默认审查修复上限：`3`（可通过 `.orchestration/config.json` 的 `retry_cap` 调整；只有用户显式修改此值才可改变）
 - 本地证据保留方式：`.orchestration/`；日志中需脱敏。
-- 备份策略：`FILL_IN`
+- 备份策略：定期执行 `python3 scripts/orchestrator.py backup` 备份任务库；仓库与 `.orchestration/` 需另存于生产主机之外；数据库与附件备份策略待阶段 1 建立
 
 ## 新项目启动产物
 
