@@ -19,6 +19,13 @@ from decimal import ROUND_HALF_UP, Decimal
 #: 金额统一保留 2 位小数。
 MONEY_EXPONENT = Decimal("0.01")
 
+#: ``NUMERIC(18, 2)`` 能表示的最大金额（16 位整数 + 2 位小数，``10**16 - 0.01``）。
+#: 超过它的值数据库无法存储，必须在写入前拒绝。
+MAX_AMOUNT = Decimal("9999999999999999.99")
+
+#: 金额下限（数据库 CHECK ``amount >= 0`` / ``tax_amount >= 0``）。
+MIN_AMOUNT = Decimal("0.00")
+
 
 def to_decimal(value: Decimal | int | str) -> Decimal:
     """把 ``value`` 转为 ``Decimal``；``float`` 一律拒绝。
@@ -56,4 +63,11 @@ def sum_amounts(amounts: Iterable[Decimal | int | str]) -> Decimal:
     return quantize(total)
 
 
-__all__ = ["MONEY_EXPONENT", "quantize", "sum_amounts", "to_decimal"]
+__all__ = [
+    "MAX_AMOUNT",
+    "MIN_AMOUNT",
+    "MONEY_EXPONENT",
+    "quantize",
+    "sum_amounts",
+    "to_decimal",
+]
