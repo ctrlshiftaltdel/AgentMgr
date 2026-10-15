@@ -41,6 +41,11 @@ import app.audit.models  # noqa: E402,F401
 # autogenerate can see them.
 import app.expense.models  # noqa: E402,F401
 
+# Workflow-domain models live in their own package; importing them here registers
+# workflow_instances/approval_steps/outbox_events/notifications on
+# Base.metadata so that ``alembic check`` / autogenerate can see them.
+import app.workflow.models  # noqa: E402,F401
+
 config = context.config
 
 if config.config_file_name is not None:
