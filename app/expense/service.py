@@ -37,7 +37,7 @@
 from __future__ import annotations
 
 from datetime import UTC, date, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from sqlalchemy import select, text
@@ -49,14 +49,23 @@ from app.expense.models import (
     ExpenseLine,
     ReimbursementPayment,
 )
-from app.expense.money import sum_amounts, to_decimal
+from app.expense.money import (
+    MAX_AMOUNT,
+    MIN_AMOUNT,
+    quantize,
+    sum_amounts,
+    to_decimal,
+)
 from app.expense.state_machine import InvalidTransitionError, next_status
 from app.identity.authorization import Principal, can_approve, has_permission
 
 __all__ = [
+    "DESCRIPTION_MAX_LENGTH",
+    "DESCRIPTION_MIN_LENGTH",
     "AuthorizationDeniedError",
     "ClaimNotFoundError",
     "ExpenseServiceError",
+    "InputValidationError",
     "ValidationError",
     "add_line",
     "approve",
@@ -77,6 +86,13 @@ DENY_ACTION = "expense_claim.deny"
 
 #: 生成 claim_no 的序列名（由迁移 ``0006_expense_claim_no_seq`` 创建）。
 CLAIM_NO_SEQUENCE = "expense_claim_no_seq"
+
+#: 明细说明（``description``）的合法长度区间。
+#:
+#: 数据库列是 ``text``，没有长度约束；这里在服务层收紧，避免把无上限的
+#: 任意长文本写进业务表。上限值会写进错误信息，便于调用方修正输入。
+DESCRIPTION_MIN_LENGTH = 1
+DESCRIPTION_MAX_LENGTH = 500
 
 
 class ExpenseServiceError(Exception):
@@ -134,6 +150,29 @@ class ValidationError(ExpenseServiceError):
         )
 
 
+class InputValidationError(ValidationError):
+    """输入校验失败，且错误信息**必须**带出具体边界值。
+
+    ``ValidationError`` 的响应文案是固定的（``app.api.errors`` 只返回受控静态
+    文案），无法告诉调用方「金额上限是多少」「说明最多多少字符」。凡是需要把
+    边界写进 422 响应的校验（金额范围、``description`` 长度）都用这个子类，
+    ``message`` 由服务层用常量拼装，**不含任何输入原文**，因此可以安全外传。
+    """
+
+    def __init__(
+        self,
+        *,
+        attempted_action: str,
+        reason: str,
+        message: str,
+        claim_id: int | None = None,
+    ) -> None:
+        self.message = message
+        super().__init__(
+            attempted_action=attempted_action, reason=reason, claim_id=claim_id
+        )
+
+
 # --- 内部辅助 -----------------------------------------------------------------
 
 
@@ -169,6 +208,90 @@ def _record_deny(
         request_id=request_id,
         details={"attempted_action": attempted_action, "reason": reason},
     )
+
+
+def _validate_amount(
+    session: Session,
+    principal: Principal,
+    *,
+    value: Decimal | int | str,
+    field: str,
+    attempted_action: str,
+    claim_id: int,
+    request_id: str | None,
+) -> Decimal:
+    """把 ``value`` 量化为 2 位小数并校验范围，返回可直接入库的 ``Decimal``。
+
+    越界（负值、超过 ``NUMERIC(18,2)`` 上限、非有限值，或位数多到无法量化）时
+    先写一条拒绝审计事件，再抛 :class:`InputValidationError`（映射为 422），
+    因此这类输入**绝不会**落到数据库 CHECK 违反上、也就不会变成 500。
+
+    ``float``/``bool`` 仍由 ``money.to_decimal`` 以 ``TypeError`` 拒绝（在任何
+    写入之前），保持「金额必须是固定精度 decimal」的不变量。
+    """
+    try:
+        normalized: Decimal | None = quantize(to_decimal(value))
+    except InvalidOperation:  # 位数太多，无法量化到 2 位小数 → 视同越界
+        normalized = None
+    if (
+        normalized is None
+        or not normalized.is_finite()
+        or normalized < MIN_AMOUNT
+        or normalized > MAX_AMOUNT
+    ):
+        _record_deny(
+            session,
+            principal,
+            resource_id=str(claim_id),
+            attempted_action=attempted_action,
+            reason=f"{field}_out_of_range",
+            request_id=request_id,
+        )
+        raise InputValidationError(
+            attempted_action=attempted_action,
+            reason=f"{field}_out_of_range",
+            message=(
+                f"{field} must be between {MIN_AMOUNT} and {MAX_AMOUNT} "
+                "(NUMERIC(18,2))"
+            ),
+            claim_id=claim_id,
+        )
+    return normalized
+
+
+def _validate_description(
+    session: Session,
+    principal: Principal,
+    *,
+    description: str,
+    attempted_action: str,
+    claim_id: int,
+    request_id: str | None,
+) -> None:
+    """校验 ``description`` 长度落在服务层允许区间内，否则抛 422 类错误。
+
+    数据库列是 ``text``（无长度约束），因此这是唯一的长度闸门；上限写进错误
+    信息。空字符串同样被拒绝（``DESCRIPTION_MIN_LENGTH``）。
+    """
+    length = len(description)
+    if length < DESCRIPTION_MIN_LENGTH or length > DESCRIPTION_MAX_LENGTH:
+        _record_deny(
+            session,
+            principal,
+            resource_id=str(claim_id),
+            attempted_action=attempted_action,
+            reason="description_out_of_range",
+            request_id=request_id,
+        )
+        raise InputValidationError(
+            attempted_action=attempted_action,
+            reason="description_out_of_range",
+            message=(
+                "description must be between "
+                f"{DESCRIPTION_MIN_LENGTH} and {DESCRIPTION_MAX_LENGTH} characters"
+            ),
+            claim_id=claim_id,
+        )
 
 
 def _record_success(
@@ -379,7 +502,11 @@ def add_line(
 
     仅限报销人本人且仅限 ``draft``；``amount``/``tax_amount`` 必须可由
     ``Decimal`` 精确表示——``float`` 会被 ``money.to_decimal`` 以 ``TypeError``
-    拒绝，且该异常发生在任何写入之前，**不产生部分写入**。
+    拒绝；金额在写入前先量化到 2 位小数（``ROUND_HALF_UP``）并校验落在
+    ``NUMERIC(18,2)`` 的 ``[0.00, 9999999999999999.99]`` 内，``description``
+    长度落在 ``[DESCRIPTION_MIN_LENGTH, DESCRIPTION_MAX_LENGTH]`` 内。任何一项
+    不满足都在**任何写入之前**抛出 ``InputValidationError``（映射为 422），
+    **不产生部分写入**，也不会落到数据库 CHECK 违反上产生 500。
     """
     claim = _load_claim(session, claim_id)
     _require_owner(
@@ -405,9 +532,33 @@ def add_line(
             claim_id=claim.id,
         )
 
-    # 金额校验先于任何写入：float 在此被拒绝，不会留下半条明细。
-    amount_value = to_decimal(amount)
-    tax_value = to_decimal(tax_amount)
+    # 输入校验先于任何写入：越界金额 / 超长或空说明在此被拒绝，不会留下半条明细。
+    amount_value = _validate_amount(
+        session,
+        principal,
+        value=amount,
+        field="amount",
+        attempted_action="add_line",
+        claim_id=claim.id,
+        request_id=request_id,
+    )
+    tax_value = _validate_amount(
+        session,
+        principal,
+        value=tax_amount,
+        field="tax_amount",
+        attempted_action="add_line",
+        claim_id=claim.id,
+        request_id=request_id,
+    )
+    _validate_description(
+        session,
+        principal,
+        description=description,
+        attempted_action="add_line",
+        claim_id=claim.id,
+        request_id=request_id,
+    )
 
     line = ExpenseLine(
         claim_id=claim.id,
@@ -701,9 +852,18 @@ def record_payment(
         request_id=request_id,
     )
 
-    # 金额校验先于任何写入：float 在此被拒绝，不会留下半条付款记录。
-    amount_value = to_decimal(amount)
-    if amount_value <= 0:
+    # 金额校验先于任何写入：float 在此被拒绝，越界值被量化+范围校验拒绝，
+    # 不会留下半条付款记录。
+    amount_value = _validate_amount(
+        session,
+        principal,
+        value=amount,
+        field="amount",
+        attempted_action="record_payment",
+        claim_id=claim.id,
+        request_id=request_id,
+    )
+    if amount_value <= MIN_AMOUNT:
         _record_deny(
             session,
             principal,
