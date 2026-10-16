@@ -56,6 +56,13 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.db.base import Base
 from app.db.models.organization import TimestampMixin
 
+# W1-24 导入自足性：``expense_invoices.source_file_id`` 声明了指向
+# ``source_files.id`` 的外键，而 ``source_files`` 定义在 ``app.documents.models``。
+# 显式导入该模块，使本模块被单独导入时 ``source_files`` 也注册到
+# ``Base.metadata``，否则 ``configure_mappers`` / 外键解析 / Alembic autogenerate
+# 会因找不到被引用表而失败（此前依赖 migrations/env.py 与 conftest 的统一导入规避）。
+import app.documents.models  # noqa: E402,F401  (registers ``source_files``)
+
 # 发票查验七状态的**唯一来源**：报销域不得自造取值（任务 W1-23）。该集合与
 # ``invoice_verifications.status`` 的 CHECK 完全相同，因此挂账行的状态列可以
 # 逐字复制查验记录而无需另行映射。
