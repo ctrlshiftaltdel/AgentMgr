@@ -24,6 +24,12 @@
 * **默认不落在仓库内**：默认输出目录 ``~/ajaimgr-backups``；若输出路径位于
   仓库内则直接拒绝（防止把备份提交进版本库）。
 * **任务库只读**：``.orchestration/`` 下的文件只读打开，不写入、不改动。
+* **必需组成部分缺失即失败**：解析后的附件存储根（``--storage-root``，默认
+  ``<repo-root>/var/storage``）与任务库目录（``--orchestration-dir``，默认
+  ``<repo-root>/.orchestration``）必须存在且为目录；任一缺失时非零退出
+  （``ToolError`` → 退出码 2）且**不写出任何归档/旁车文件**——只有显式给出
+  ``--allow-missing-storage`` / ``--allow-missing-orchestration`` 才放行，
+  放行时 manifest 顶部 ``missing_components`` 记录缺失清单（正常情况下为空）。
 * 不引入任何新依赖：``pg_dump`` / ``psql``（PostgreSQL 客户端） + 标准库。
 """
 
@@ -102,8 +108,9 @@ def default_storage_root() -> str:
     return "var/storage"
 
 
-def default_orchestration_dir() -> Path:
-    return REPO_ROOT / ".orchestration"
+#: ``--orchestration-dir`` 的默认值：相对 ``--repo-root`` 解析（与
+#: ``--storage-root`` 一致），不再取自脚本自身位置。
+DEFAULT_ORCHESTRATION_SUBDIR = ".orchestration"
 
 
 def resolve_under(base: Path, raw: str | Path) -> Path:
@@ -294,6 +301,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="任务库目录（默认 <repo-root>/.orchestration）",
     )
     parser.add_argument(
+        "--allow-missing-storage",
+        action="store_true",
+        help="允许附件存储根缺失（默认：缺失即失败，退出码 2，不写出归档）",
+    )
+    parser.add_argument(
+        "--allow-missing-orchestration",
+        action="store_true",
+        help="允许任务库目录缺失（默认：缺失即失败，退出码 2，不写出归档）",
+    )
+    parser.add_argument(
         "--output",
         default=None,
         help=f"归档输出路径（默认 {DEFAULT_OUTPUT_DIR}/ajaimgr-backup-<UTC>.tar.gz；不得位于仓库内）",
@@ -313,9 +330,37 @@ def create_backup(args: argparse.Namespace) -> dict:
     db_url = args.db_url or default_db_url()
     target = parse_db_url(db_url)
     storage_root = resolve_under(repo_root, args.storage_root or default_storage_root())
+    # 缺陷 B 修复：任务库默认值同样按 --repo-root 解析（与 --storage-root 一致），
+    # 不再取自脚本自身位置（REPO_ROOT）。
     orchestration_dir = resolve_under(
-        repo_root, args.orchestration_dir or default_orchestration_dir()
+        repo_root, args.orchestration_dir or DEFAULT_ORCHESTRATION_SUBDIR
     )
+
+    # 缺陷 A 守卫：必需组成部分缺失时必须在**写出归档之前**失败（走 ToolError →
+    # 退出码 2），不得留下残缺归档或旁车文件；只有显式开关可以放行。
+    missing_components = [
+        name
+        for name, path in (
+            ("storage", storage_root),
+            ("orchestration", orchestration_dir),
+        )
+        if not path.is_dir()
+    ]
+    blockers: list[str] = []
+    if "storage" in missing_components and not args.allow_missing_storage:
+        blockers.append(
+            f"required component 'storage' is missing: {storage_root} "
+            "(does not exist or is not a directory); pass --allow-missing-storage "
+            "to back up without attachment storage"
+        )
+    if "orchestration" in missing_components and not args.allow_missing_orchestration:
+        blockers.append(
+            f"required component 'orchestration' is missing: {orchestration_dir} "
+            "(does not exist or is not a directory); pass --allow-missing-orchestration "
+            "to back up without the task ledger"
+        )
+    if blockers:
+        raise ToolError("\n".join(blockers))
 
     if args.output:
         archive = Path(args.output).expanduser()
@@ -373,6 +418,9 @@ def create_backup(args: argparse.Namespace) -> dict:
         manifest = {
             "format": BACKUP_FORMAT,
             "format_version": BACKUP_FORMAT_VERSION,
+            # 顶部显式记录：缺失且被 --allow-missing-* 放行的必需组成部分
+            # （正常场景为空 list）。
+            "missing_components": missing_components,
             "created_at": utc_now().isoformat(),
             "tool": "ops/backup.py",
             "label": args.label,
@@ -433,6 +481,7 @@ def create_backup(args: argparse.Namespace) -> dict:
         "archive_sha256": file_sha256(archive),
         "checksum_sidecar": str(sidecar),
         "members": len(members) + 1,
+        "missing_components": missing_components,
         "database": manifest["database"],
         "storage_file_count": manifest["storage"]["file_count"],
         "orchestration_file_count": manifest["orchestration"]["file_count"],
@@ -467,6 +516,10 @@ def main(argv: list[str] | None = None) -> int:
     ))
     print(f"  storage files    : {summary['storage_file_count']}")
     print(f"  orchestration    : {summary['orchestration_file_count']} file(s)")
+    print(
+        "  missing parts    : "
+        + (", ".join(summary["missing_components"]) or "none")
+    )
     print(
         "  excluded creds   : "
         + (", ".join(e["path"] for e in summary["excluded_credential_files"]) or "none")

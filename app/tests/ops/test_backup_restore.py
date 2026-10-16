@@ -8,7 +8,11 @@
 3. **行数不符检测**：manifest 中的行数与实际不符时报错（非零退出码）；
 4. **凭据不入归档**：待备份目录里放 ``.env`` / ``auth.json`` / ``server.key``，
    断言归档中不含它们（并被记入 manifest 的排除清单）；
-5. **归档校验和**：被篡改的归档被拒绝（``<归档>.sha256`` 旁车比对失败）。
+5. **归档校验和**：被篡改的归档被拒绝（``<归档>.sha256`` 旁车比对失败）；
+6. **缺失组成部分守卫**：必需组成部分（附件存储根 / 任务库目录）缺失且未给
+   ``--allow-missing-*`` 开关时非零退出（``ToolError`` → 2）且不写归档；
+   显式放行时 manifest 顶部 ``missing_components`` 如实记录；``--orchestration-dir``
+   的默认值按 ``--repo-root`` 解析（不再取自脚本自身位置）。
 
 测试使用**真实**数据库（``AJAIMGR_TEST_DB_URL``，即 ``ajaimgr_test``）与真实
 ``pg_dump``/``psql``；恢复目标是专用演练库 ``ajaimgr_restore_check``，每个恢复
@@ -444,6 +448,115 @@ def test_tampered_archive_checksum_is_rejected(backup_archive, restore_db_url, t
     assert "archive_checksum" in result.stdout
     # 校验和不通过时不得继续恢复：目标库不应被创建/覆盖。
     assert "db_restore" not in checks
+
+
+# --- 6. 缺失组成部分守卫（必需组成部分缺失即失败） -------------------------------
+
+
+def test_missing_storage_fails_without_allow_switch(drill, tmp_path):
+    """storage 缺失且未给开关（orchestration 给有效值以隔离）→ 退出码 2、
+    报错含开关名与解析路径、且 --output 目标文件不存在（不得留下残缺归档）。"""
+    missing_storage = tmp_path / "no-such-storage"
+    archive = tmp_path / "missing-storage.tar.gz"
+    assert not missing_storage.exists()
+
+    result = run(
+        BACKUP_PY,
+        "--db-url",
+        drill["source_db_url"],
+        "--storage-root",
+        str(missing_storage),
+        "--orchestration-dir",
+        str(drill["orchestration_dir"]),
+        "--output",
+        str(archive),
+    )
+    # ToolError 通道 → 退出码 2（非零）。
+    assert result.returncode == 2, result.stdout + result.stderr
+    combined = result.stdout + result.stderr
+    assert "--allow-missing-storage" in combined
+    assert "storage" in combined
+    assert str(missing_storage.resolve()) in combined
+    assert not archive.exists()
+    assert not archive.with_name(archive.name + ".sha256").exists()
+
+
+def test_missing_orchestration_fails_without_allow_switch(drill, tmp_path):
+    """orchestration 缺失且未给开关（storage 给有效值）→ 退出码 2 且不写归档。"""
+    missing_orch = tmp_path / "no-such-orchestration"
+    archive = tmp_path / "missing-orchestration.tar.gz"
+    assert not missing_orch.exists()
+
+    result = run(
+        BACKUP_PY,
+        "--db-url",
+        drill["source_db_url"],
+        "--storage-root",
+        str(drill["storage_root"]),
+        "--orchestration-dir",
+        str(missing_orch),
+        "--output",
+        str(archive),
+    )
+    assert result.returncode == 2, result.stdout + result.stderr
+    combined = result.stdout + result.stderr
+    assert "--allow-missing-orchestration" in combined
+    assert str(missing_orch.resolve()) in combined
+    assert not archive.exists()
+    assert not archive.with_name(archive.name + ".sha256").exists()
+
+
+def test_missing_components_with_switches_are_recorded(drill, tmp_path):
+    """两个组成部分均缺失 + 两个开关均给 → 退出码 0；``missing_components``
+    恰为 ``["storage", "orchestration"]``；归档成员只有 manifest 与数据库 dump。"""
+    archive = tmp_path / "both-missing.tar.gz"
+    result = run(
+        BACKUP_PY,
+        "--db-url",
+        drill["source_db_url"],
+        "--storage-root",
+        str(tmp_path / "no-storage"),
+        "--orchestration-dir",
+        str(tmp_path / "no-orchestration"),
+        "--output",
+        str(archive),
+        "--allow-missing-storage",
+        "--allow-missing-orchestration",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    members = archive_members(archive)
+    assert sorted(members) == ["db/database.sql", "manifest.json"]
+
+    manifest = json.loads(members["manifest.json"].decode("utf-8"))
+    assert manifest["missing_components"] == ["storage", "orchestration"]
+    # stdout 汇总同样可见。
+    assert "missing parts    : storage, orchestration" in result.stdout
+
+
+def test_orchestration_dir_default_resolves_under_repo_root(drill, tmp_path):
+    """--orchestration-dir 缺省值按 --repo-root 解析：source_dir == <fixture>/.orchestration。"""
+    fixture_repo = tmp_path / "fixture-repo"
+    fixture_orch = make_orchestration_dir(fixture_repo / ".orchestration")
+    archive = tmp_path / "default-orchestration.tar.gz"
+
+    result = run(
+        BACKUP_PY,
+        "--db-url",
+        drill["source_db_url"],
+        "--repo-root",
+        str(fixture_repo),
+        "--storage-root",
+        str(drill["storage_root"]),
+        # 故意不给 --orchestration-dir：默认值必须解析到 fixture 仓库下。
+        "--output",
+        str(archive),
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    manifest = json.loads(archive_members(archive)["manifest.json"].decode("utf-8"))
+    assert manifest["orchestration"]["source_dir"] == str(fixture_orch.resolve())
+    assert manifest["missing_components"] == []
 
 
 # --- 额外安全守卫 --------------------------------------------------------------
