@@ -10,6 +10,7 @@ from app.api.admin import register_admin_exception_handlers
 from app.api.admin import router as admin_router
 from app.api.claims import router as claims_router
 from app.api.errors import register_exception_handlers
+from app.api.invoices import router as invoices_router
 from app.db.session import engine
 
 
@@ -25,6 +26,12 @@ def create_app() -> FastAPI:
 
     # Expense claim endpoints (create/list/read/transitions/payments/export).
     app.include_router(claims_router)
+
+    # Invoice verification endpoints: manual-assisted result recording
+    # (``POST /invoice-verifications/manual``, task W1-22).  Authorization,
+    # state rules and evidence retention live in
+    # ``app.integrations.invoice_service.record_manual_verification``.
+    app.include_router(invoices_router)
 
     # Minimal server-rendered admin console (login/session, claims review,
     # role & channel-binding management, audit log).  Every page and action

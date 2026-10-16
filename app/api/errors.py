@@ -21,9 +21,12 @@
 异常                                          状态码  错误码
 ============================================  ======  ==========================
 ``AuthorizationDeniedError``                  403     ``authorization_denied``
+``ManualVerificationDeniedError``             403     ``authorization_denied``
 ``InvalidTransitionError``                    409     ``invalid_transition``
+``ManualVerificationConflictError``           409     ``invalid_transition``
 ``StepAlreadyDecidedError``                   409     ``step_already_decided``
 ``InvalidDecisionError``                      422     ``invalid_decision``
+``ManualVerificationEvidenceError``           422     ``validation_error``
 ``ValidationError``（报销服务业务校验）         422     ``validation_error``
 ``InputValidationError``（带边界值的输入校验）   422     ``validation_error``
 ``ClaimNotFoundError``                        404     ``not_found``
@@ -75,6 +78,11 @@ from app.expense.service import (
     ValidationError,
 )
 from app.expense.state_machine import InvalidTransitionError
+from app.integrations.invoice_service import (
+    ManualVerificationConflictError,
+    ManualVerificationDeniedError,
+    ManualVerificationEvidenceError,
+)
 from app.workflow.service import (
     InvalidDecisionError,
     StepAlreadyDecidedError,
@@ -208,6 +216,23 @@ def register_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(
         WorkflowInstanceNotFoundError,
         _static_handler(404, "not_found", _MESSAGE_NOT_FOUND),
+    )
+
+    # --- 发票查验人工录入（W1-22）→ 复用既有状态码/错误码/受控文案 ---
+    # 权限拒绝 403 ``authorization_denied``；缺证据/校验失败 422
+    # ``validation_error``；与既有渠道终态冲突（如「查验不通过」不可被覆盖）
+    # 409 ``invalid_transition``（与「动作不能从当前状态执行」同一语义）。
+    app.add_exception_handler(
+        ManualVerificationDeniedError,
+        _static_handler(403, "authorization_denied", _MESSAGE_AUTHORIZATION_DENIED),
+    )
+    app.add_exception_handler(
+        ManualVerificationEvidenceError,
+        _static_handler(422, "validation_error", _MESSAGE_VALIDATION),
+    )
+    app.add_exception_handler(
+        ManualVerificationConflictError,
+        _static_handler(409, "invalid_transition", _MESSAGE_INVALID_TRANSITION),
     )
 
     # --- 文件存储闸门（路径穿越 / 类型伪装 / 超大 / 散列不符）→ 400 ---
