@@ -129,11 +129,17 @@ def _count(session: Session, model: type) -> int:
     return session.scalar(select(func.count()).select_from(model))
 
 
-def _audit_events(session: Session, *, resource_id: str) -> list[AuditEvent]:
+def _audit_events(
+    session: Session, *, resource_type: str, resource_id: str
+) -> list[AuditEvent]:
+    """按资源类型 + ID 取审计事件（审计只增不改，跨测试残留，必须双条件过滤）。"""
     return list(
         session.scalars(
             select(AuditEvent)
-            .where(AuditEvent.resource_id == resource_id)
+            .where(
+                AuditEvent.resource_type == resource_type,
+                AuditEvent.resource_id == resource_id,
+            )
             .order_by(AuditEvent.id)
         )
     )
@@ -241,7 +247,9 @@ def test_low_confidence_marks_job_needs_review(session: Session) -> None:
     assert draft.review_status == "pending"
     assert job.status == "needs_review"
 
-    events = _audit_events(session, resource_id=str(draft.id))
+    events = _audit_events(
+        session, resource_type="extraction_draft", resource_id=str(draft.id)
+    )
     created = [e for e in events if e.action == "extraction_draft.created"]
     assert created, events
     assert created[0].details["low_confidence_fields"] == ["amount"]
@@ -266,7 +274,9 @@ def test_missing_key_field_marks_job_needs_review(session: Session) -> None:
 
     assert draft is not None
     assert job.status == "needs_review"
-    created = _audit_events(session, resource_id=str(draft.id))
+    created = _audit_events(
+        session, resource_type="extraction_draft", resource_id=str(draft.id)
+    )
     assert created[0].details["missing_fields"] == ["expense_date"]
 
 
@@ -299,7 +309,9 @@ def test_failed_parse_writes_no_draft_and_marks_job_failed(
     )
     assert drafts == 0
 
-    events = _audit_events(session, resource_id=str(job.id))
+    events = _audit_events(
+        session, resource_type="intake_job", resource_id=str(job.id)
+    )
     assert [e.action for e in events] == ["intake_parse.failed"]
     assert events[0].details["error"] == "provider_error"
 
@@ -333,7 +345,9 @@ def test_confirmation_records_confirmer_and_parser_version(session: Session) -> 
     assert reloaded is not None
     assert reloaded.review_status == "confirmed"
 
-    events = _audit_events(session, resource_id=str(draft.id))
+    events = _audit_events(
+        session, resource_type="extraction_draft", resource_id=str(draft.id)
+    )
     created = [e for e in events if e.action == "extraction_draft.created"]
     confirmed = [e for e in events if e.action == "extraction_draft.confirmed"]
     assert created and confirmed
@@ -360,7 +374,9 @@ def test_reject_draft_records_operator(session: Session) -> None:
     session.commit()
 
     assert draft.review_status == "rejected"
-    events = _audit_events(session, resource_id=str(draft.id))
+    events = _audit_events(
+        session, resource_type="extraction_draft", resource_id=str(draft.id)
+    )
     rejected = [e for e in events if e.action == "extraction_draft.rejected"]
     assert rejected and rejected[0].actor_id == employee.id
 
@@ -382,7 +398,9 @@ def test_audit_details_never_contain_raw_attachment_text(session: Session) -> No
     session.commit()
     assert draft is not None
 
-    events = _audit_events(session, resource_id=str(draft.id))
+    events = _audit_events(
+        session, resource_type="extraction_draft", resource_id=str(draft.id)
+    )
     rendered = " ".join(str(e.details) for e in events)
     assert RAW_ATTACHMENT_TEXT not in rendered
     assert "123.45" not in rendered
