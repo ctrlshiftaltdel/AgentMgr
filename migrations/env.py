@@ -57,6 +57,12 @@ import app.documents.models  # noqa: E402,F401
 # autogenerate can see them.
 import app.intake.models  # noqa: E402,F401
 
+# Integration-domain models (invoice_verifications) live in their own package;
+# importing them here registers the invoice verification table on Base.metadata so
+# that ``alembic check`` / autogenerate can see it.  Imported after documents
+# models because invoice_verifications references source_files.
+import app.integrations.models  # noqa: E402,F401
+
 config = context.config
 
 if config.config_file_name is not None:
