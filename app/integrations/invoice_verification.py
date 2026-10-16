@@ -6,9 +6,10 @@
 
 * ``ProviderType``：三类实现类型 ``manual_assisted`` / ``authorized_provider`` /
   ``official_api``（PLAN §7.1）。当前只有 ``manual_assisted`` 与
-  ``authorized_provider``（腾讯云 ``VatInvoiceVerifyNew``，
-  ``app.integrations.tencent_vat_verify``）有实现；``official_api`` 在取得可适用
-  的官方 API 文档与合法授权前**不实现**（W0-4 §5）。
+  ``authorized_provider`` 有实现——**首选**：百度智能云「增值税发票验真」
+  （``app.integrations.baidu_vat_verify``，所有者 2026-10-16 决策）；**备用**：
+  腾讯云 ``VatInvoiceVerifyNew``（``app.integrations.tencent_vat_verify``）；
+  ``official_api`` 在取得可适用的官方 API 文档与合法授权前**不实现**（W0-4 §5）。
 * ``VerificationStatus``：严格对应 PLAN §7.2 的**七种**状态（英文名 + 中文注释）。
 * ``InvoiceVerificationProvider``：抽象接口，含 ``provider_type`` /
   ``provider_name`` / ``verify(invoice_fields) -> VerificationResult``。上层业务只
@@ -94,7 +95,9 @@ class ProviderType(str, Enum):
     * ``MANUAL_ASSISTED``（``manual_assisted``）：人工辅助兜底——Agent/OCR 提取
       字段、去重并生成查验任务，授权财务人员经官方平台核验后录入结果；
     * ``AUTHORIZED_PROVIDER``（``authorized_provider``）：经批准的授权服务商
-      （当前首选为腾讯云 ``VatInvoiceVerifyNew``）；
+      （所有者 2026-10-16 决策：首选为百度智能云「增值税发票验真」，
+      ``app.integrations.baidu_vat_verify``；腾讯云 ``VatInvoiceVerifyNew`` 为
+      **备用实现**，``app.integrations.tencent_vat_verify``）；
     * ``OFFICIAL_API``（``official_api``）：仅在取得可适用的官方 API 文档和合法
       授权后才实现，当前**不可用**（W0-4 §5）。
 
