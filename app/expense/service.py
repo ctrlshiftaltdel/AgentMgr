@@ -604,6 +604,9 @@ def submit(
     """提交报销：``draft``/``withdrawn`` → ``submitted``。
 
     仅限本人；要求至少一条明细且 ``total_amount > 0``；写入 ``submitted_at``。
+    存在挂账发票（W1-23）时，先同步各行的查验状态（live 读
+    ``invoice_verifications``），任一行为 ``verified_fail`` 或未知状态则拒绝
+    （``ValidationError`` + 拒绝审计），状态原样保留。
     """
     claim = _load_claim(session, claim_id)
     _require_owner(
@@ -638,6 +641,17 @@ def submit(
         raise ValidationError(
             attempted_action="submit", reason="empty_claim", claim_id=claim.id
         )
+
+    # --- W1-23: 挂账发票校验（对既有流程的唯一一处修改，必须最小） ---------
+    # 先对全部挂账行做 sync（live 读 invoice_verifications），再拒绝
+    # verified_fail 或不为七状态之一的行——只写拒绝审计并抛既有 ValidationError
+    # （app/api 不在本任务允许路径内，避免将来映射为 500）。函数级导入避免
+    # service <-> invoices 模块级循环依赖。
+    from app.expense.invoices import _validate_claim_invoices_for_submit
+
+    _validate_claim_invoices_for_submit(
+        session, principal, claim, request_id=request_id
+    )
 
     claim.status = to_status
     claim.submitted_at = datetime.now(UTC)
