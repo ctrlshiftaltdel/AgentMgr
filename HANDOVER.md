@@ -1,9 +1,9 @@
 # HANDOVER — 会话交接文档
 
-- 生成时间：2026-10-16 12:10 CST（**Agent-Orchestration GitHub 版规则启用、首次推送完成、首个 PR 流程启用后**）
-- 主分支基线 head：`c4e579215901de29d74c4a5ff80e167655bcd0a3`（**本文档提交之前的 head**；本文档经 PR 合入，会出现在其之上）
-- 上一版交接：`b38cb45`（离线版暂停点）；完整历史见 git log 与 `.orchestration/` 归档
-- 任务台账：**GitHub Issues**。开放的下一阶段队列：#1 `W1-24`、#2 `W1-16`、#3 `W1-26`。离线版 45 条台账已退役归档（不再更新）。
+- 生成时间：2026-10-16 16:25 CST（**W1 冻结队列 #1/#2/#3 全部完成并 VERIFIED、开放 Issue 清空之后**）
+- 主分支基线 head：`8d6f0c92b5a9daa1ab57be58cb4c670b289eaf86`（**本文档提交之前的 head**；本文档经 PR 合入，会出现在其之上）
+- 上一版交接：`cdbcd47`（GitHub 版启用后）；更早 `b38cb45`（离线版暂停点）；完整历史见 git log
+- 任务台账：**GitHub Issues**。开放 Issue：**无**（#1 `W1-24`、#2 `W1-16`、#3 `W1-26` 已全部完成关闭；#8 为本文档刷新）。离线版 45 条台账已退役归档（不再更新）。
 - 你的角色：**Master Agent** —— 计划、派发、独立复核、**唯一合并者**、阶段收口；默认不实现产品代码。
 - 接手顺序：`AGENTS.md` → `AGENT-ORCHESTRATION.md` → `MASTER.md` → `ORCHESTRATION-PROJECT.md` → 本文档 → `prompts/START-MASTER-EXISTING-PROJECT.md`。
 
@@ -33,7 +33,7 @@
 面向中国大陆 20–100 人（后续扩到 100）企业的 Hermes Agent 原生管理系统，**首期模块：报销**。以 AI 对话/语音/图片/文件为主要工作入口；正式账务与付款留在金蝶等有正式授权的系统。
 
 - 项目章程 `docs/PROJECT-CHARTER.md`（O3 已记录「百度为首选查验渠道」）；实施方案 `templates/PLAN.md`（v2.0）；部署要求 `docs/DEPLOYMENT-REQUIREMENTS.md`；调研 `docs/research/`（W0-1/2/4/5/7 与 W1-28）
-- **当前阶段**：Wave 1 主体 + 发票查验完整链条（渠道 Provider：腾讯云 W1-20、百度 W1-28；人工辅助录入 W1-22；报销单挂账 W1-23）已完成；阶段 1 尚缺：微信消息路由、OCR/ASR 解析流水线、备份异地/跨主机恢复收口。**2026-10-16 完成规则层切换：离线版 → Agent-Orchestration GitHub 版**（仓库 `ctrlshiftaltdel/AgentMgr`，public）。
+- **当前阶段**：Wave 1 主体 + 发票查验完整链条（渠道 Provider：腾讯云 W1-20、百度 W1-28；人工辅助录入 W1-22；报销单挂账 W1-23）+ **W1 冻结队列三项（W1-24 模型导入自足性、W1-16 迁移可复现性、W1-26 受理解析流水线接口与人工兜底）** 已完成；阶段 1 尚缺：微信消息路由、OCR/ASR **真实供应商**接入（接口层已交付）、备份异地/跨主机恢复收口。**2026-10-16 完成规则层切换：离线版 → Agent-Orchestration GitHub 版**（仓库 `ctrlshiftaltdel/AgentMgr`，public）。
 
 ---
 
@@ -56,35 +56,33 @@
 
 | 项 | 值 |
 |---|---|
-| 主机 | 2 vCPU / 1.9 GiB RAM / ~3.0 GiB swap（zram+swapfile）/ 根分区 49 G（**仅编排与开发机**；生产 Profile 主机另配） |
-| 内核 / 发行版 | `6.12.111+deb13-amd64` / Debian GNU/Linux 13 (trixie) |
-| Python / uv | 3.13.5（`.python-version` = `3.13`）/ uv 0.13.1 |
-| PostgreSQL | 17.11 本地（`ajaimgr_dev` / `ajaimgr_test`，peer 认证；口令不入文件） |
-| GitHub CLI | gh 2.102.0，已登录；remote `origin` = `ctrlshiftaltdel/AgentMgr`（public） |
+| 编排+开发主机（macOS，2026-10-16 起） | 工作区 `<repo-root>`（git clone）；`gh` 2.102.0 已登录；`uv` 已装；**无 PostgreSQL、不装 psql（只开发）**；`.workbuddy/` 已入 `.git/info/exclude`；`ssh test-host` 直连可用（SSH 命令可能触发沙箱授权，放行即可） |
+| 调试/测试主机 `test-host` | Debian 13 (trixie)，内核 6.12.x，2 vCPU / 1.9 GiB（**仅编排与开发机**；生产 Profile 主机另配）；仓库 `~/ajaimgr`；uv 在 `~/.local/bin/uv`；`.venv` 与 PostgreSQL 17.11（`ajaimgr_dev` / `ajaimgr_test`，peer 认证；口令不入文件）齐备；全量测试与临时库实测在此执行 |
+| GitHub CLI | 两端均已登录；remote `origin` = `ctrlshiftaltdel/AgentMgr`（public） |
 | CI | GitHub Actions `ubuntu-latest`；`postgres:17` 服务容器（TCP+密码）；PG client 17 经 PGDG 安装并把 `/usr/lib/postgresql/17/bin` 注入 `$GITHUB_PATH`；libpq 环境变量（PGHOST/PGPORT/PGUSER/PGPASSWORD）供 socket DSN 的恢复演练使用 |
-| 出网 | 经 Privoxy 代理 `<local-proxy>`；抓取用 `curl -sS -L --compressed`（不加会拿到 gzip 字节）；个别域名（如 ai.baidu.com）须 `--noproxy '*'` 直连 |
-| venv 策略 | 所有 worktree 共享主工作树 `.venv`（`UV_PROJECT_ENVIRONMENT=~/ajaimgr/.venv`）；提高并发上限时必须改回各自独立 |
-| 并发上限 | **1**（2 vCPU / 1.9 GiB；派发前先确认没有子代理在跑） |
+| 出网（test-host） | 经 Privoxy 代理 `<local-proxy>`；本机 git fetch 偶发代理 502 / HTTP2 framing 抖动（重试或 `-c http.version=HTTP/1.1`） |
+| venv 策略 | `test-host` 上所有 worktree 共享主工作树 `.venv`（`UV_PROJECT_ENVIRONMENT=~/ajaimgr/.venv`）；本机 worktree 共享 `<repo-root>/.venv`；提高并发上限时必须改回各自独立 |
+| 并发上限 | **1**（派发前先确认没有子代理在跑） |
 
 ---
 
 ## 5 状态快照
 
-- `main` head = `c4e5792`（切换提交 `b8b4414` + CI 修复 `4d48af8`/`3ab192f`/`c4e5792`）；工作区干净；无 worktree；无运行中子代理
-- 测试：本地 `uv run pytest app/tests -q -o addopts=""` → **675 passed**；CI（run `38848166929`）**674 passed + 1 skipped**（`~/.hermes` 条件用例，CI 无该目录）+ 1 warning
-- 迁移链 `0001_org_core` → `0002_identity_rbac` → `0003_permission_catalog` → `0004_audit_events` → `0005_expense_core` → `0006_expense_claim_no_seq` → `0007_workflow_outbox` → `0008_intake_files` → `0009_perm_alignment` → `0010_invoice_verifications` → `0011_expense_invoices`
+- `main` head = `8d6f0c9`（PR #5 `83fcd95` → PR #6 `810d120` → PR #7 `8d6f0c9`）；本机与 `test-host` 均已 ff 至此；工作区干净；无 worktree 残留；无运行中子代理
+- 测试：本机 Fast（`validate_kit --project-ready` + `unittest discover`）rc=0；`test-host` 全量 `uv run pytest app/tests -q -o addopts=""` → **730 passed**；CI 最新 main run → **729 passed + 1 skipped**（`~/.hermes` 条件用例，CI 无该目录）+ 1 warning
+- 迁移链 `0001_org_core` → `0002_identity_rbac` → `0003_permission_catalog`（**冻结快照**，W1-16）→ `0004_audit_events` → `0005_expense_core` → `0006_expense_claim_no_seq` → `0007_workflow_outbox` → `0008_intake_files` → `0009_perm_alignment` → `0010_invoice_verifications` → `0011_expense_invoices`
 - 领域目录 12 个：`app/{identity,intake,expense,workflow,documents,inventory,integrations,audit,api,db,core,runtime}`
 - 规则集 `main-protection`（id 25216701）active；`python3 scripts/github_preflight.py` 通过
-- 开放 Issue：**#1 W1-24**、**#2 W1-16**、**#3 W1-26**（冻结队列，直接可派发）
-- 离线归档：`.orchestration/`（含 `archive/orchestrator.py`、最终备份 `state-20261016-114915.sqlite3`、45 条任务台账）
+- 开放 Issue：**无**（#1/#2/#3 已关闭；#8 = 本文档刷新）
+- 离线归档：`.orchestration/`（不变；含 `archive/orchestrator.py`、`state-20261016-114915.sqlite3`、45 条任务台账）
 
 ---
 
-## 6 当前操作点（队列冻结中）
+## 6 当前操作点（队列已清空）
 
-**所有者指示（2026-10-16）**：完成 GitHub 协作改造与首次上传后**暂停派发**，等所有者示意恢复。当前无任何进行中的任务。
+**队列已清空（2026-10-16 16:00）**：#1/#2/#3 冻结队列已全部完成并关闭（见 §8）。新一轮派发等待所有者指示；候选来源为 §7（BLOCKED 项与阶段 1 未开工项），部分需先做 §9.2 产品决策。当前无任何进行中的任务。
 
-**恢复后的标准循环**（对 #1/#2/#3 任意一个）：
+**恢复后的标准循环**（对任意新任务）：
 
 1. 读 Issue 全文 → 核对验收/路径/依赖（依赖须已 VERIFIED 且已合入 main）
 2. 在 Issue 写活动登记评论（`DISPATCHED`、锁定路径、mode、runner、时间）
@@ -106,18 +104,14 @@
 | 金蝶接入条件调研（原 W0-3，未建 Issue） | 金蝶产品/版本/许可/测试账套/API 文档；决定阶段 3 全部工作 |
 | 脱敏业务样例与流程盘点（原 W0-6，未建 Issue） | 脱敏后的真实 Excel/Word/PDF 样例、报销规则、库存流程 |
 
-### 冻结队列（已建 Issue，直接可派发）
+### 冻结队列——已于 2026-10-16 全部完成
 
-| Issue | 内容 | 关键点 |
-|---|---|---|
-| #1 W1-24 | 模型模块导入自足性 | 单独导入任一模型模块即可 `configure_mappers`；新增逐模块测试；不得循环导入、不得改表结构 |
-| #2 W1-16 | 迁移可复现性（`0003` 读活动代码） | 冻结快照或记录特性（写明理由）；不得改变最终目录状态；全新库 upgrade/downgrade 往返 |
-| #3 W1-26 | 受理解析流水线（OCR/ASR 接口 + 人工兜底） | 四类输入接口；草稿态带置信度/原件引用；凭据 fail closed；全桩测试不触网 |
+（#1 W1-24、#2 W1-16、#3 W1-26 已合并并 VERIFIED，Issue 已关闭；交付见 §8。）
 
 ### 阶段 1 尚未开工
 
 - **微信消息路由与统一输入格式**：依赖 W0-1 结论；真实验收需所有者授权在本机建 Profile
-- **OCR/ASR 真实供应商接入**：#3 只做接口与兜底，供应商由所有者决定
+- **OCR/ASR 真实供应商接入**：W1-26 已交付可替换接口与人工兜底（`app/intake/parsing.py`），真实供应商由所有者决定
 - **W1-25 遗留**：跨主机/异地恢复演练未做（生产验收必需项；同机 13/13 已通过；`--allow-missing-*` 误用边界见 `docs/BACKUP-RESTORE.md` §10）
 
 ---
@@ -126,6 +120,10 @@
 
 - 离线台账时期 **38 条 VERIFIED**：准备 8（骨架/章程/配置/规则包/环境等）、调研 5（W0-1/2/4/5/7）、Wave 1 主体（后端底座与迁移、身份权限、报销域与状态机、Outbox、受理与文件、导出、API、管理后台、权限目录、负面测试与修复、渠道身份、发票查验 Provider 与腾讯云/百度适配器、人工辅助录入、报销单挂账、Profile 生成器与校验器、备份与恢复工具及修复轮）。完整清单与事件流见 `.orchestration/state.sqlite3`（可用归档的 orchestrator.py 查阅）。
 - **规则层切换（2026-10-16）**：Agent-Orchestration GitHub 版规则文件替换（AGENTS/MASTER/AGENT-ORCHESTRATION/ACCEPTANCE/prompts/scripts/tests/VERSION/LICENSE）、`.github/` 模板与 CI 工作流、`ORCHESTRATION-PROJECT.md` 按项目填写、README 合并、离线专属文件退役、CI 修复至全绿、主分支规则集启用、首批 Issue #1–#3 登记。
+- **W1 冻结队列三项（2026-10-16，WorkBuddy 单会话编排；详见各 Issue 与 PR）**：
+  - W1-24 模型模块导入自足性（PR #5，`83fcd95`）：`integrations` / `intake` / `expense` 三模块补 `app.documents.models` 显式导入；新增逐模块子进程测试 `app/tests/test_model_imports.py`（修复前 3/9 失败 → 修复后 9/9；全量 DDL 零变化）。
+  - W1-16 迁移可复现性（PR #6，`810d120`）：`0003` 改**冻结快照**（7/19/31，不再读活动代码）；新文档 `docs/MIGRATION-REPRODUCIBILITY.md`；实测中间态 `7|19|31` → head `7|20|32`、往返 rc=0；`0009` 仍读活动代码为顺延项。
+  - W1-26 受理解析流水线（PR #7，`8d6f0c9`）：`app/intake/parsing.py`（`IntakeParser` / `ManualEntryParser` / `ExternalParser` / `ParserRegistry` + 裁决与脱敏）+ `app/intake/pipeline.py`（草稿写入与确认追溯；**无结构变更**）；新文档 `docs/INTAKE-PARSING-PIPELINE.md`；纯逻辑 36 + 落库 8 测试全桩。
 
 **值得知道的验收结论（累计摘要）**：越权矩阵 70 格逐格断言；主管不能审批自己的报销；状态机 49 组合穷举；Outbox `SKIP LOCKED` 并发正确；幂等（提交/审批/付款/查验限次）；7 种路径穿越全拒（含符号链接逃逸）；渠道身份零明文；W1-23 挂账探针 32/32（verified_fail 阻提交 → 翻转后放行且 live 同步）；W1-28 百度文档 sha256 逐字节比对。
 
@@ -141,7 +139,9 @@
 - 无效会话不写业务审计（安全监控落应用日志）。
 - `sniff_mime` fail-closed（偏严）；XLSX 边界一次显式 `float()`（有注释与测试锁定）；PDF 中文用内置 CID 字体。
 - `resolve_principal` 拒绝时 commit 调用方会话（调用方须视为事务边界）。
-- `0003_permission_catalog` 读活动代码（见 Issue #2）；模型模块导入不自足（见 Issue #1）。
+- 模型模块导入不自足（W1-24）与 `0003` 读活动代码（W1-16）**均已修复**（PR #5 / #6）；**`0009_perm_alignment` 仍读活动代码**，为 W1-16 顺延项（见 `docs/MIGRATION-REPRODUCIBILITY.md` §5），是否冻结待定。
+- 解析流水线（W1-26）：关键字段口径（`expense_claim` → `amount`/`expense_date`）与置信度阈值 `0.75` 为**保守默认**（产品参数，可覆盖；见 `docs/INTAKE-PARSING-PIPELINE.md` §9）。
+- 双机约定（2026-10-16 起）：本机 macOS **不装 psql**（只开发）；一切 DB 测试/实测走 `test-host`（见 §4）。
 - Outbox 用应用侧时钟；W1-8 只有 service 原语、无常驻 Worker。
 - API 身份仍是 `X-Employee-Id` 过渡方案；管理后台登录=内部令牌（生产必须接 SSO，已写 docstring）。
 - 微信通道「有条件 Go」，11 项待实测。
@@ -164,15 +164,21 @@
 8. 百度查验正式开通（账号/费用/合规确认；原 W0-4 §7 项）
 9. 生产备份必须存放于生产主机之外（章程成功标准未满足）
 10. GitHub 协作策略微调（直推 bypass？合并方式？——当前：PR + G1–G6 + strict checks）
+11. 解析流水线产品参数确认（关键字段口径、置信度阈值——当前均为保守默认）
 
 ---
 
 ## 10 操作手册（命令级）
 
+### 双机注记（2026-10-16 起）
+
+- 编排（gh / git / Issues / PR）：**本机 macOS**（`<repo-root>`）直接执行。
+- 全量测试、临时库实测、迁移往返：`ssh test-host`（SSH 命令可能触发沙箱授权，放行即可；后台任务内跑 SSH 会被沙箱拦截，需前台执行）。
+
 ### 状态恢复（每次接手先跑）
 
 ```bash
-cd ~/ajaimgr
+cd <repo-root>        # 本机（macOS）
 git fetch --prune && git log --oneline -3 && git status --short
 gh issue list --state open
 gh pr list --state open
@@ -203,10 +209,12 @@ gh run list --limit 3                # 合并后 main 的验证运行
 ### 本地验证（在运行 head 上必须真跑）
 
 ```bash
-python3 scripts/validate_kit.py --project-ready           # 规则包（快）
-python3 -m unittest discover -s tests                     # 规则包单测（快）
+python3 scripts/validate_kit.py --project-ready           # 规则包（快；本机或 test-host 均可）
+python3 -m unittest discover -s tests                     # 规则包单测（快；同上）
+
+# 全量（在 test-host 上执行；需要 PostgreSQL 17；会重置 ajaimgr_test，勿与其他实例并行）：
 export UV_PROJECT_ENVIRONMENT=~/ajaimgr/.venv
-uv run pytest app/tests -q -o addopts=""                  # 全量（需要本地 PostgreSQL；会重置 ajaimgr_test，勿与其他实例并行）
+uv run pytest app/tests -q -o addopts=""
 ```
 
 ### 其他速查
@@ -240,6 +248,11 @@ psql -d ajaimgr_test -c "\d <table>"  # 看表结构
 16. **CI 里 pg_dump 必须与服务端同主版本**：runner 自带 16 会与 17 服务「server version mismatch」；PGDG 安装 client-17 并把 `/usr/lib/postgresql/17/bin` 注入 `$GITHUB_PATH`（pg_wrapper 不会自动切）。
 17. **CI 里 socket DSN 连不上容器**：用 libpq 环境变量（PGHOST/PGPORT/PGUSER/PGPASSWORD）把 `postgresql+psycopg:///...` 与裸 `psql`/`dropdb` 指向服务容器。
 18. **规则集生效后不能直推 main**：改 main 一律走分支 + PR（首个 PR 即本文档的合入 PR）。
+19. **WorkBuddy 单会话编排（2026-10-16 起）**：派发子代理后必须核实 running（不得虚假派发）；子代理触发的沙箱授权需放行；**后台任务内跑 SSH 会被沙箱直接拦**（需前台 + escalation）。
+20. **本机 git fetch 偶发网络抖动**：代理 502 / HTTP2 framing error——重试即可；push 遇同类错误用 `git -c http.version=HTTP/1.1 push`。
+21. **陈旧锁文件**：`~/.gitconfig.lock` 残留会阻断 `gh auth setup-git`（确认无进程占用后先备份再清理；本轮已处理过一次）。
+22. **临时库名跑全量会误伤 1 例**：`test_restore_refuses_protected_database` 期望目标库为受保护名（`ajaimgr_test`）；用自定义临时库名跑全量会出现 1 failed（环境差异，非缺陷）。全量请用标准库名或在报告中说明。
+23. **子代理的「与改动无关」结论须独立核实**：用相关代码路径（如 `ops/restore.py::_guard_target` 的分支逻辑）与 CI 对照验证后才可采信（本轮已实践）。
 
 ---
 
@@ -247,7 +260,7 @@ psql -d ajaimgr_test -c "\d <table>"  # 看表结构
 
 - [ ] 读 `AGENTS.md`、`AGENT-ORCHESTRATION.md`、`MASTER.md`、`ORCHESTRATION-PROJECT.md`、`prompts/START-MASTER-EXISTING-PROJECT.md`
 - [ ] 读本文档 §3、§4、§6、§9
-- [ ] 跑 §10 的「状态恢复」五连并核对 §5 快照（head、CI 状态、开放 Issue/PR）
-- [ ] `delegate_task(action='list')` 确认没有遗留运行中的子代理
-- [ ] 如恢复派发：从 Issue #1/#2/#3 选择，先写活动登记评论再启动
+- [ ] 跑 §10 的「状态恢复」命令并核对 §5 快照（head、CI 状态、开放 Issue/PR）
+- [ ] 确认没有遗留运行中的子代理（WorkBuddy 任务列表 / `delegate_task(action='list')`）
+- [ ] 当前队列为空：新一轮任务从 §7（BLOCKED / 阶段 1 未开工）与所有者指示中选择；派发前先写活动登记评论
 - [ ] 如向所有者汇报：BLOCKED 两项 + §9.2 决策清单
