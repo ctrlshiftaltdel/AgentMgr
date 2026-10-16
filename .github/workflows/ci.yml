@@ -49,11 +49,14 @@ jobs:
           echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(. /etc/os-release && echo $VERSION_CODENAME)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
           sudo apt-get update
           sudo apt-get install -y postgresql-client-17
-          pg_dump --version | grep -E 'pg_dump.*17\.'
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
+          /usr/lib/postgresql/17/bin/pg_dump --version
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.13"
       - name: Install dependencies
         run: uv sync --frozen
       - name: Run test suite
-        run: uv run pytest app/tests -q -o addopts=""
+        run: |
+          pg_dump --version | grep -E 'pg_dump.*17\.'
+          uv run pytest app/tests -q -o addopts=""
