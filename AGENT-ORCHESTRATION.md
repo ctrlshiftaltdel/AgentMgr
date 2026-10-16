@@ -1,72 +1,95 @@
-# AGENT-ORCHESTRATION.md — Local State Machine and Safety Gates
+# AGENT-ORCHESTRATION.md — GitHub State Machine and Safety Gates
 
-本文件定义不依赖托管平台的编排契约。任务库 CLI 为 `.orchestration/state.sqlite3`；任务正文、Git 状态、当前 head 和实际验证输出为证据。若某项能力依赖运行时支持而本机并不具备，必须降级，不得假装执行。
+本文件定义 GitHub 作为跨会话事实来源时的编排方式；角色授权以 `AGENTS.md` 和项目配置为准。
 
-## 1. 任务状态机
+## 1. 生命周期
 
 ```text
-PLANNED → READY → DISPATCHED → IN_PROGRESS → REVIEW_READY → MASTER_REVIEW → APPROVED → MERGED → VERIFIED
+PLANNED → READY → DISPATCHED → PR_OPEN → MASTER_REVIEW → APPROVED → MERGED → VERIFIED
 非成功状态：BLOCKED / NEEDS_HUMAN_DECISION / FAILED / CANCELED
 ```
 
-- `PLANNED`：任务草稿已写入本地任务库，但依赖或验收可能尚未齐备。
-- `READY`：目标、路径、验收和依赖均明确；所有依赖任务为 `VERIFIED`。
-- `DISPATCHED`：先通过本地 CLI 成功获取完整文件锁，再把自包含任务包交给真实执行实例。
-- `IN_PROGRESS`：执行实例已开始；应记录分支 / Worktree。
-- `REVIEW_READY`：实现者交回 Diff、head SHA、验证命令 / 输出和剩余风险。
-- `MASTER_REVIEW`：Master 独立检查任务、变更范围、证据和风险。
-- `APPROVED`：验收全部通过；批准必须绑定精确 head SHA。
-- `MERGED`：已确认合并到项目本地主分支。远端或本地分支清理状态应单独记录，不可混为合并成功的判据。
-- `VERIFIED`：在合并后的主分支上完成必要验证，记录命令 / 退出码 / 结果。完成后释放文件锁。
-- `BLOCKED`：外部依赖、文件冲突或环境问题暂时阻止推进；记录恢复条件。
-- `NEEDS_HUMAN_DECISION`：需项目所有者选择或授权；必须记录具体问题与选项。
-- `FAILED`：执行实例失败、超时、取消或产物不可用；状态未知一律视为未完成。
-- `CANCELED`：项目所有者或 Master 明确取消；记录原因后释放锁。
+- `PLANNED`：Issue 已创建，需求或依赖尚待补齐。
+- `READY`：验收、允许 / 禁止路径、依赖及验证命令明确；依赖均已 VERIFIED；路径锁无冲突。
+- `DISPATCHED`：Issue 评论中已登记活动任务锁，执行实例真实启动（或在人启动的多会话模式下真实接手）。
+- `PR_OPEN`：Draft PR 已存在并关联 Issue。
+- `MASTER_REVIEW`：作者声明交付，已更新到最新默认分支，当前 head 有可核对验证结论。
+- `APPROVED`：Master 已通过全部验收并记录批准时的 head SHA。
+- `MERGED`：已由 Master 合入默认分支。分支清理是单独的收尾状态，不决定是否已合并。
+- `VERIFIED`：合并后验证成功，证据已记录；随后可关闭 Issue 并释放活动锁。
+- `BLOCKED`：依赖、冲突或环境暂时阻塞；需要记录恢复条件。
+- `NEEDS_HUMAN_DECISION`：需用户决定或授权的事项，必须列出问题与选项。
+- `FAILED`：实例失败、超时、取消或产物不可用；未知状态一律未完成。
+- `CANCELED`：经明确决定取消，必须记录原因和锁释放依据。
 
-状态改变由 `scripts/orchestrator.py` 记录。不要手工编辑 SQLite。任务库提供的是治理记账，不会代替运行时真正派发或运行测试。
+## 2. 活动任务登记与路径锁
 
-## 2. 派发与活动任务锁
+**不能仅靠开放 PR 建立锁表。** 执行实例可能已启动但还未开 PR，因此每次派发前必须在目标 Issue 添加标准活动登记评论。
 
-1. 任务先进入 `READY`，然后运行 `python scripts/orchestrator.py task dispatch <ID>`。CLI 使用 SQLite `BEGIN IMMEDIATE` 原子检查锁并登记 `DISPATCHED`。
-2. 锁范围由任务允许路径确定；比较采用路径相同或父子路径重叠的方式。例如 `src/` 与 `src/core.py` 冲突，`src/a.py` 与 `src/b.py` 不冲突。
-3. 只有当全部路径可锁定时才一次性取得全部锁；冲突则整个派发失败，不允许半锁状态。
-4. 任务处于活动状态时，不得修改锁定路径集合。确需扩大范围时，先阻塞任务、记录理由、检查新路径冲突并更新登记。
-5. 仅进入 `VERIFIED` 或 `CANCELED` 自动释放锁。失败、超时、未知状态、审查退回或单纯删除 Worktree 都不自动释放。异常清理需运行显式 `task unlock` 并记录理由；强制解锁可能允许冲突，应先确认原任务已停止。
-6. 每次启动或恢复 Master 时，先执行 `orchestrator.py task list`，再核对 `git status`、主分支、各任务 Worktree 和任务库事件；不要从聊天记忆重建。
+登记评论用以下固定字段，更新时编辑同一条评论或追加新记录并标记旧记录已过时：
+
+```text
+<!-- ORCH-TASK-REGISTRY v1 -->
+status: DISPATCHED
+mode: single-session | multi-session
+locked_paths:
+  - src/example.py
+branch: <branch or NONE>
+pr: <number or NONE>
+runner: <runtime + handle/instance id, or HUMAN-STARTED>
+dispatched_at: <ISO-8601 with timezone>
+updated_at: <ISO-8601 with timezone>
+<!-- /ORCH-TASK-REGISTRY -->
+```
+
+- 锁定路径来自 Issue 的允许路径；路径父子重叠也视为冲突。目录范围要尽可能具体。
+- Master 接手时遍历所有活动登记（`DISPATCHED` / `PR_OPEN` / `MASTER_REVIEW` / `APPROVED` / `MERGED` / 未解决的阻塞），并结合开放 PR 实际 Diff 重建锁表。
+- 任务尚无 PR 不意味着没有锁。执行句柄 / 状态未知时不释放锁；先确认实例已停止或恢复任务。
+- 在活动登记中更新状态、分支、PR、head SHA、阻塞原因与更新时间。PR 被关闭不等于执行实例必然停止。
+- `VERIFIED` 后记录最终状态及验证 SHA，再关闭 Issue 和释放锁。异常解锁需要明确理由和可核查记录。
 
 ## 3. 依赖与并行
 
-- 依赖应构成有向无环图。依赖必须达到 `VERIFIED`，不能仅因为代码已提交或已合并就派发下游任务。
-- 同一文件或目录前缀冲突的任务串行；不冲突且无依赖的任务可以并行。
-- 单机可以并行运行多个执行实例，但所有实例必须先通过本地任务库登记及获取锁。不要让两个实例编辑同一个 Worktree。
-- 如果运行时不能真实 spawn / wait / collect，Master 产出任务包，由同一位操作者在另一个本地会话启动执行实例；Master 不声称它已启动。
+依赖必须合入默认分支并通过合并后验证（`VERIFIED`），下游才可派发。同文件或父子路径范围冲突的任务串行；无依赖且文件集合不重叠的任务可并行。派发前执行 `gh pr list --state open` 并逐 PR 核对变更路径，同时读取未开 PR 的活动 Issue 登记。
 
-## 4. 独立审查门
+## 4. 平台能力探测与降级
 
-Master 需要审查：
+单会话自动编排必须实际具备：
 
-1. 任务验收标准是否逐条通过，哪些证据支持结论。
-2. 实际变更路径是否全部属于允许路径；有无未授权文件。
-3. `git status --short` 与 Diff 是否干净、范围是否正确；是否从最新本地主分支创建工作分支。
-4. 每个必需的测试 / lint / typecheck / build 是否真正在当前 head 上执行，结果是否通过。
-5. 当前 head SHA 是否与测试证据和批准记录一致。
-6. 是否引入新依赖、迁移、权限变化、安全风险或未实现的行为。
-7. 失败测试有无被删除、跳过或弱化；证据是否可复现。
+- C1：启动独立执行实例并返回可寻址句柄。
+- C2：传入独立任务上下文并保持隔离。
+- C3：等待并取回状态、产物与证据。
+- C4：区分成功、失败、取消和未知状态。
 
-任一验收项不通过 → 退回 `IN_PROGRESS` 或 `BLOCKED`，写明具体缺口。默认最多 3 轮修复；达到上限仍未通过 → `BLOCKED`，由项目所有者决定拆分、扩大范围或取消。
+启动前逐项探测。任一能力缺失 → 不可声称已 spawn；降级为由人启动另一会话的多会话交接，并让 Master 下次依据 GitHub 状态恢复。提示词不能创造运行时能力。
 
-## 5. 批准与合并
+## 5. Master 审查
 
-- `APPROVED` 必须带当前完整 commit SHA。工作树或提交头有任何变化，批准立即失效，需重新审查。
-- 只有 Master 执行合并（例如 `git merge --no-ff <branch>`，具体策略由项目配置决定）。执行者不能自批自合。
-- 合并前备份或确认可恢复；遇到冲突不自动覆盖他人 / 主分支内容。
-- 合并后运行 `ORCHESTRATION-PROJECT.md` 指定的验证命令，保存日志与退出码；全部通过后转 `VERIFIED`。
-- 合并成功与分支清理分开记账。清理失败不能触发重复合并。
+按任务逐条检查：
 
-## 6. 项目接入与新项目
+1. 验收标准与实际行为 / 结果。
+2. 变更文件集合完全在允许路径内。
+3. PR 与 Issue 关联正确；差异来自最新默认分支。
+4. `mergeable` 可合并；无未解决冲突。
+5. 当前 head SHA 上的必需 CI 全绿；本地必要测试已实际执行。
+6. 测试证据真实、可追溯；head 变化后重新运行。
+7. 风险、未完成项和需要用户拍板的变化已经处置。
 
-新项目的技术栈、目录与验证命令可能不存在。首次任务应是“项目初始化 / 技术方案 / 最小骨架”，而不是假设已有测试脚本。先记录产品目标、限制、假设与待人拍板问题，再通过任务库派发初始化任务。将未知验证项明确记为“待建立”，创建相应任务；不能声称尚不存在的命令已经通过。
+不通过则退回执行者，评论必须给可执行修复建议并增加轮次。默认 3 轮；达到上限仍未通过，进入 `BLOCKED` 并汇报。
+
+## 6. 合并门禁 G1–G6
+
+| 门 | 条件 |
+|---|---|
+| G1 验收 | 每一条验收标准有明确通过结论与证据 |
+| G2 范围 | 只改允许路径，没有未授权更改 |
+| G3 基线 | 基于最新默认分支，PR 可合并 |
+| G4 CI | 项目配置中所有 required checks 在当前 head SHA 上通过 |
+| G5 证据 | 真实命令、输出 / 退出码及当前 SHA 可核验 |
+| G6 风险 | 未完成项、迁移、权限、安全和公开行为变化已处置；需用户决定的已阻塞 |
+
+只有 G1–G6 全部通过，且批准时 head SHA 与待合并 head 完全一致，Master 才能合并。Execution Agent 不合并。合并后重新验证；分支删除失败要单独重试，不重复合并。
 
 ## 7. 阶段收口
 
-阶段只在必需任务达到 `VERIFIED`、相关风险已登记、阻塞与人工决策有明确去向、下一阶段任务已记录时算完成。汇报至少包含：范围与状态、已验证任务、仍阻塞事项、实际验证证据、未解决风险、下一步及需用户决定的事项。
+阶段只有在必需任务均达到 VERIFIED、required checks 通过、阻塞和需人工决策都有明确去向、下一阶段 Issue 已登记且路径依赖关系清楚时才算完成。至少汇报：阶段范围 / 任务状态、已合并及验证的 PR ↔ Issue、阻塞与恢复条件、真实检查证据、未解决风险、用户需处理事项。

@@ -194,7 +194,7 @@ uv run python ops/restore.py /path/ajaimgr-backup.tar.gz \
 3. **pg_dump 版本一致性**：本机 `pg_dump` 17.11 与服务器同主版本；生产若为其它主版本，需以同主版本客户端备份（否则可能出现 dump/restore 失败或降级）。
 4. **角色分离未落地**：应用运行期角色目前仍是表属主、有 DDL 权限，`audit_events` 的只增不改触发器可被 `ALTER TABLE ... DISABLE TRIGGER` 绕过（§2 已记录）；备份侧影响是归档不含所有权/GRANT，恢复后必须由角色/授权脚本重建。
 5. **恢复时长（RTO）未测**：本机数据量极小（本次归档 64705 B ≈ 63 KB），真实规模下的备份窗口与恢复时间未知。
-6. **保留代数与自动调度未实现**：§6 是建议值，尚无 cron/systemd timer 与失败告警；`.orchestration/backups/` 目前仍是任务库的本地副本（由 `scripts/orchestrator.py backup` 生成），不作为生产备份手段。
+6. **保留代数与自动调度未实现**：§6 是建议值，尚无 cron/systemd timer 与失败告警；`.orchestration/backups/` 是离线版规则包时期任务库的本地副本（该规则包已于 2026-10-16 切换为 GitHub 版并退役，此目录仅作历史归档），不作为生产备份手段。
 7. **内容扫描边界**：凭据排除只覆盖文件名模式与私钥头（§5），不做通用密钥熵检测。
 8. **`--no-owner` 的取舍**：为让归档可跨角色恢复而放弃所有权信息；若生产要求归档自带所有权，需要改为同角色恢复或补充授权脚本（与第 4 项一并解决）。
 9. **`--allow-missing-*` 的误用边界**：放行开关会把「残缺归档」从失败降级为成功；虽有 manifest `missing_components` 与 stdout `missing parts` 留痕，日常巡检仍应断言 `missing_components` 为空，只在部署事实（确实未启用任务库 / 确实没有附件存储）成立时才使用该开关。
