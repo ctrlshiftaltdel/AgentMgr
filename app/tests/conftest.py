@@ -49,9 +49,11 @@ from sqlalchemy.orm import Session  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-#: Every business table created by migrations ``0001``..``0009``, listed children
+#: Every business table created by migrations ``0001``..``0011``, listed children
 #: first.  ``alembic_version`` is deliberately excluded -- it must survive a reset
-#: so the schema stays at head.
+#: so the schema stays at head.  ``invoice_verifications`` (0010) is not part of
+#: this reset: the modules that create verification rows clean them up per test
+#: (``app/tests/integrations`` and ``app/tests/api``).
 BUSINESS_TABLES: tuple[str, ...] = (
     "audit_events",
     "notifications",
@@ -60,6 +62,7 @@ BUSINESS_TABLES: tuple[str, ...] = (
     "workflow_instances",
     "reimbursement_payments",
     "expense_lines",
+    "expense_invoices",
     "expense_claims",
     "cost_centers",
     "expense_categories",

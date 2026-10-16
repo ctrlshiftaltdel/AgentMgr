@@ -1,8 +1,10 @@
 """迁移 0010（``invoice_verifications``）的往返与结构测试。
 
-验证 ``alembic upgrade head`` → ``downgrade -1`` → ``upgrade head`` 干净往返，
-并断言表结构满足 PLAN §8 / §7.2 的硬性要求（金额为 numeric、``duplicate_key``
-唯一、七种状态受 CHECK 约束、证据引用列存在）。
+验证 0010 的 ``upgrade`` → ``downgrade`` 干净往返。自 0011（W1-23）起 head 不再
+等于 0010，``downgrade -1`` 只会退回 0011 的前驱（即 0010），因此本测试**显式
+指定目标 revision**（退到恰好 0010 → 退到 0009 → 升回 head），保持对 0010 本身
+的往返验证；并断言表结构满足 PLAN §8 / §7.2 的硬性要求（金额为 numeric、
+``duplicate_key`` 唯一、七种状态受 CHECK 约束、证据引用列存在）。
 """
 
 from __future__ import annotations
@@ -11,6 +13,8 @@ from collections.abc import Iterator
 
 import pytest
 from alembic import command
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import Engine
 
@@ -51,21 +55,33 @@ def _ensure_head(engine: Engine) -> None:
     command.upgrade(alembic_config(), "head")
 
 
+def _head_revision(config: Config) -> str:
+    """当前迁移脚本的 head revision（不写死，避免新增迁移后本测试过期）。"""
+    return ScriptDirectory.from_config(config).get_current_head()
+
+
 def test_migration_0010_roundtrip(engine: Engine) -> None:
-    """upgrade head → downgrade -1 → upgrade head，三步都成功且表按预期增删。"""
+    """退到恰好 0010 → 退到 0009 → 升回 head：三步都成功且表按预期增删。"""
     config = alembic_config()
+    head = _head_revision(config)
     try:
         _ensure_head(engine)
         assert TABLE in _table_names(engine)
+
+        # 退到恰好 0010（head 为更新的 revision 时，这一步先丢弃其后的迁移）。
+        command.downgrade(config, REVISION)
+        assert TABLE in _table_names(engine)
         assert _current_revision(engine) == REVISION
 
-        command.downgrade(config, "-1")
+        # 0010 自身的降级：表随迁移消失，库回到 0009。
+        command.downgrade(config, PREVIOUS)
         assert TABLE not in _table_names(engine)
         assert _current_revision(engine) == PREVIOUS
 
+        # 升回 head：0010 重新建表。
         command.upgrade(config, "head")
         assert TABLE in _table_names(engine)
-        assert _current_revision(engine) == REVISION
+        assert _current_revision(engine) == head
     finally:
         # 无论断言是否失败，都把测试库恢复到 head，避免影响后续测试。
         command.upgrade(config, "head")
