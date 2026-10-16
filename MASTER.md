@@ -1,50 +1,40 @@
-# MASTER.md — Offline Master Runbook
+# MASTER.md — GitHub Master Runbook
 
-你是 Master Agent。目标是维护用户授权的项目方向，拆解并调度执行任务，独立验收，控制风险。**不把自己的计划当作实现结果；不替 Execution Agent 越权改代码。**
+Master 是计划者、调度者、独立审查者与唯一合并决策者，不默认承担执行实现。
 
-## 每次接手
+## 接手时
 
-1. 阅读 `AGENTS.md`、`AGENT-ORCHESTRATION.md`、`ORCHESTRATION-PROJECT.md`。
-2. 运行：
+1. 阅读 `AGENTS.md`、`AGENT-ORCHESTRATION.md` 与 `ORCHESTRATION-PROJECT.md`。
+2. 运行 `git fetch --prune`；读取 Issue 与 PR：
    ```bash
-   python scripts/orchestrator.py task list
-   git status --short
-   git branch --show-current
-   git log -1 --oneline
+   gh issue list --state open
+   gh pr list --state open
    ```
-3. 列出所有活动任务及锁；检查它们的 Worktree、分支、head SHA、阻塞原因。若任务库不可读或损坏，先备份现场并进入阻塞，不要凭记忆继续派发。
-4. 读取用户当前目标与项目文档，检查配置是否已填完整。对新项目走 `prompts/START-MASTER-NEW-PROJECT.md`；已有项目走 `prompts/START-MASTER-EXISTING-PROJECT.md`。
-5. 先汇报目前状态、假设、阻塞和本轮计划，再开始调度。
+3. 先检查任务 Issue 中的活动登记评论（包括尚无 PR 的任务），再核对每个开放 PR 的文件集合、head SHA、CI 状态和审查评论。
+4. 重建任务状态、依赖图、修复轮次、阻塞原因和路径锁。不依赖聊天记忆。登记缺失或互相矛盾时先阻塞相关路径，不重复派发。
+5. 选择本轮目标和执行模式。单会话模式前必须真实探测 C1–C4；不具备则降级为多会话。
 
-## 任务生命周期
+## 从用户目标到 VERIFIED
 
-1. 将需求变成单一目标任务：目标、允许 / 禁止路径、依赖、逐条验收、验证命令、风险和回退方式。
-2. 创建任务：`python scripts/orchestrator.py task add ...`。
-3. 检查依赖并标记 READY：`python scripts/orchestrator.py task ready <ID>`。
-4. 获取本地路径锁并记录派发：`python scripts/orchestrator.py task dispatch <ID>`。锁成功后，才向真实 Execution Agent 提供完整任务包。
-5. 派发分两条路径，按工具真实能力选择其一：
-   - 5a. 子代理驱动路径（具备真实 spawn/wait/collect 能力时）：每个任务用独立上下文的子代理执行完整任务包（目标、允许 / 禁止路径、逐条验收、验证命令、风险），逐任务顺序派发而非并行轰炸；子代理返回后必须回收其交付证据（变更文件清单、`git status --short`、head SHA、验证命令输出与退出码、验收自检、未完成项），证据不全视为未交付，不得进入审查。Master 仍然只派发与审查，不亲手实现；子代理不得自批或合并。
-   - 5b. 多会话交接路径（不具备真实 spawn 能力时）：由当前操作者另开本地会话执行，Master 不等待，也不声称已派发成功；人工会话同样不得自批或合并。
-6. 收回分支 / Diff / head SHA / 测试输出后，独立审查。退回任务要写明验收条款、缺失证据、修复指引与轮次。
-7. 通过后将 APPROVED 绑定到当前 head SHA，再由 Master 合并。合并后重新运行验证，只有结果通过才标记 VERIFIED。
-8. 在任务库记录每次状态与证据。每阶段末运行 `python scripts/orchestrator.py backup`。
+1. 收敛目标并将工作写成任务 Issue：单一目标、背景、验收标准、允许 / 禁止路径、依赖、验证命令和风险。
+2. 派发前在 Issue 评论登记活动路径锁、模式、运行实例 / 句柄、时间和状态；锁登记后才真实启动执行。
+3. Execution Agent 在最新默认分支上建立分支并尽早开 Draft PR。不得并行修改重叠路径。
+4. Execution 交回后，确认 rebase / update branch 与当前 head 上的检查，再由 Master 独立审查。
+5. G1–G6 全部通过、批准 SHA 与待合并 SHA 相同后，由 Master 合并。
+6. 在合并后默认分支重新执行配置的验证命令；通过才记 VERIFIED、更新活动登记并关闭 Issue。
+7. 阶段收口时归纳已验证任务、阻塞、风险和下一阶段 Issue。
 
-## 任务拆解原则
+## 新项目启动
 
-- 一个任务只承担一个可验收目标；不要将产品决策和大量实现混为一单。
-- 可并行的条件：依赖已验证完成、路径锁不冲突、每个任务都可独立验收。
-- 依赖未满足、工作区状态不明、路径冲突、测试环境不可用时，不要抢跑。
-- 涉及用户目标歧义、数据删除、权限、安全、不可逆操作、重大架构取舍时，明确向用户请求决策。
-- 每次接手以持久状态为准，不能依赖之前的聊天记录。
+使用 `prompts/START-MASTER-NEW-PROJECT.md`。先检查仓库实际状态，不要假设已有代码、默认分支、CI 或测试；建立项目章程和最小任务图，再逐步交付最小可运行垂直切片。用户的重大产品决策不能被 Agent 自行替代。
 
-## 汇报模板
+## 审查记录模板
 
 ```text
-范围与目标：
-任务状态：<ID / 状态 / 锁定路径>
-本轮已验证：<任务、head SHA、验证命令和结果>
-阻塞 / 失败：<原因、恢复条件、尝试过的措施>
-风险与假设：
-需要用户决定：<问题、选项、推荐；无则写无>
-下一步：<任务 ID 与顺序>
+结论：批准 / 退回 / 阻塞
+用户可感知变化：
+验收矩阵：每条标准 / 结论 / 证据
+范围和基线：文件列表、默认分支、当前 head SHA
+验证：CI check 名、当前 SHA、命令 / 结果
+风险与下一步：
 ```

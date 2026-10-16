@@ -1,52 +1,45 @@
-# AGENT-ORCHESTRATION-ACCEPTANCE.md — Offline Acceptance Checklist
+# AGENT-ORCHESTRATION-ACCEPTANCE.md — GitHub Acceptance Checklist
 
-每次首次接入、变更调度器，或更换 Agent 运行时后执行。证据必须来自真实命令和当前提交；不能将空模板或历史记录当成已验收。
+## A. Configuration and recovery
+- [ ] `ORCHESTRATION-PROJECT.md` has no unresolved `FILL_IN` entries that block execution.
+- [ ] Required CI checks are identified by exact name and branch protection / ruleset is configured.
+- [ ] A new Master context can recover open tasks, active locks, PR states, reviewer rounds, head SHA, and blocked reasons from GitHub.
+- [ ] Recovery includes dispatched Issues with no PR yet, not only open PRs.
 
-## A. 配置与恢复
+## B. Dispatch and path locks
+- [ ] Before starting an Execution Agent, an active registry record is added to the Issue with locked paths and runtime identity.
+- [ ] Same path and parent/child path overlaps are treated as conflicts.
+- [ ] Two disjoint paths with no dependency can proceed in parallel.
+- [ ] The lock remains when the agent status is unknown, a PR is closed, or no PR exists.
+- [ ] Registry is updated at dispatch, PR creation, review, block/failure, merge and verification.
 
-- [ ] `ORCHESTRATION-PROJECT.md` 中不再有未处理的 `FILL_IN`。
-- [ ] 本地任务库初始化成功；备份 / 恢复路径明确。
-- [ ] 新 Master 上下文仅根据任务库、Git 状态和证据记录恢复当前任务、路径锁、修复轮次与阻塞原因。
-- [ ] 任务库损坏 / 不可读时会停止调度，而非从聊天记忆猜测。
+## C. Review and merge
+- [ ] Master independently checks issue acceptance, diff paths, current head SHA, current-head CI, and actual validation evidence.
+- [ ] Any head change invalidates previous approval and requires new CI / tests / review.
+- [ ] Only Master merges.
+- [ ] Merge and branch deletion are distinct outcomes; deletion failure cannot lead to a second merge.
+- [ ] Post-merge verification is recorded before issue closure and VERIFIED state.
 
-## B. 文件锁与并行
+## D. Controlled failure
+Use an isolated test Issue or safe branch; never land a deliberate defect in the production default branch.
+- [ ] Master catches a known acceptance defect and gives actionable review feedback.
+- [ ] Execution fixes it; new head has current CI / validation evidence and is re-reviewed.
+- [ ] Third failed review leads to BLOCKED; no fourth retry and no reduced acceptance criteria.
+- [ ] Spawn failure, timeout, cancellation, empty / ambiguous result is not treated as success.
+- [ ] Test record includes date, runtime, issue/PR, each head SHA, check results, final status and cleanup.
 
-- [ ] 两个路径完全不相交且无依赖的任务可分别取得锁。
-- [ ] 同文件冲突及父目录 / 子文件冲突都被拒绝。
-- [ ] 多路径任务若其中一条冲突，会整体拒绝；没有半套锁。
-- [ ] 活动任务未生成分支 / Worktree 之前，锁也已登记。
-- [ ] VERIFIED / CANCELED 后锁释放；FAILED / 状态未知时锁不自动释放。
-- [ ] 强制解锁必须填写原因，并在事件记录中可追溯。
-
-## C. 安全审查
-
-- [ ] Master 对照任务逐条验收，并查看实际 Diff、允许路径、测试输出、退出码、head SHA 和风险。
-- [ ] 执行者无法直接把任务标记为 APPROVED / MERGED / VERIFIED 而绕过 Master 审查（至少在运行纪律及工具使用上验证）。
-- [ ] head 变化会使先前 APPROVED 失效。
-- [ ] 合并只由 Master 操作；合并后验证未通过时不能标记 VERIFIED。
-
-## D. 可控失败演练
-
-在隔离的测试仓库或演练任务中执行，不得把故意缺陷合入真实主分支。
-
-- [ ] 制造一项可控的验收缺口，Master 能指出具体标准、证据缺失和修复要求。
-- [ ] 修复后在新的 head 上重新运行验证。
-- [ ] 默认最多 3 轮审查—修复；第 3 轮仍失败则 BLOCKED，不派发第 4 轮。
-- [ ] spawn 失败、超时、取消、结果为空或状态不可判定时，均不当作成功。
-- [ ] 演练记录含日期、运行时 / 版本、任务 ID、每轮 head SHA、命令 / 退出码、结论和清理结果。
-
-## E. 证据模板
-
+## E. Evidence record
 ```text
-日期与运行环境：
-项目 / 分支：
-测试任务 ID：
-任务库备份位置：
-调度能力实际探测：
-文件锁测试命令与结果：
-失败演练轮次与 head SHA：
-第 3 轮后是否 BLOCKED：
-合并后验证命令 / 退出码：
-已知限制与未测试项：
-最终结论：通过 / 部分通过 / 未通过
+Date / runtime version:
+Repository / default branch:
+Issue / PR:
+C1-C4 capability evidence:
+Active lock registry checked:
+Head SHA before and after repair:
+Current-head CI checks and results:
+Review rounds:
+Was BLOCKED reached at cap:
+Merge SHA / post-merge validation:
+Unverified areas:
+Final conclusion: PASS / PARTIAL / FAIL
 ```

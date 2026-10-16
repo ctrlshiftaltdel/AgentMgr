@@ -1,32 +1,17 @@
 # Project Charter
 
-## Problem and target users
-- Problem to solve:
-- Target users / scenarios:
+## Problem / users / primary scenarios
 
 ## Goals and non-goals
-- Goals:
-- Non-goals:
 
 ## Constraints and assumptions
-- Platform / runtime:
-- Data and privacy:
-- Performance / reliability:
-- Assumptions requiring validation:
 
-## Initial success criteria
-- [ ] Observable outcome 1
-- [ ] Observable outcome 2
+## Success criteria and how they will be verified
 
-## Architecture decisions and alternatives
-- Decision:
-- Alternatives:
-- Trade-offs / risks:
+## Architecture choices, alternatives and trade-offs
+
+## Data, privacy, security and dependency constraints
 
 ## Open decisions requiring owner input
-- Question / options / recommendation:
 
-## Initial milestone
-- Smallest end-to-end vertical slice:
-- Validation method:
-- Rollback / recovery:
+## First vertical slice and initial Issues

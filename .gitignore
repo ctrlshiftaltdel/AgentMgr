@@ -1,8 +1,8 @@
-# Agent-Orchestration single-user machine-local state
+# Local orchestration archive (retired offline kit; machine-local)
 .orchestration/
 # Python caches from local helper scripts
 __pycache__/
 *.py[cod]
-# Task worktrees created by the orchestrator
+# Per-task worktrees (Agent execution workspaces)
 .worktrees/
 .venv/

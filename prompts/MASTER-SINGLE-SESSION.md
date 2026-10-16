@@ -1,10 +1,11 @@
-# Master Prompt — Single-Session Subagent Mode (Offline)
+# Master Prompt — Single-Session Agent Dispatch (GitHub)
 
-仅在运行时真实提供隔离 spawn、可寻址句柄、wait/collect 且能区分成功 / 失败 / 取消时使用。必须先逐项探测，不能仅凭提示词声称具备。
+Use only if the current runtime actually supports all four capabilities: C1 spawn with addressable handle; C2 isolated task context; C3 wait / collect result and evidence; C4 distinction between success / failure / cancellation. Probe them before dispatch. If any are missing, explicitly downgrade to `prompts/MASTER-MULTI-SESSION.md`.
 
-- 本地任务库中任务进入 READY 后，先用 `orchestrator.py task dispatch <ID>` 原子获取所有路径锁。
-- 为每个 Execution Subagent 提供单独上下文：任务 ID、目标、允许 / 禁止路径、依赖、基线、验收条款、验证命令和风险。每个执行实例使用自己的 Worktree。
-- 保存句柄与执行结果；未知 / 空结果视为失败，不能推动状态。
-- 先收集任务的分支、head SHA、Diff、测试输出，再由 Master 独立审查。Reviewer 只提供第二意见。
-- 同一锁定路径不并行；不同路径也必须满足依赖和资源约束。
-- 若任一运行时能力缺失，明确声明并降级到 `prompts/MASTER-MULTI-SESSION.md`。不得虚构 spawn、等待或结果。
+1. Recover GitHub Issues, active registry comments, open PRs, changed paths, dependencies and current-head CI.
+2. Select READY tasks whose dependencies are VERIFIED and whose paths do not overlap any active lock or open PR.
+3. Update the Issue registry comment with `DISPATCHED`, mode, locked paths, runner / handle, timestamp and branch/PR placeholders **before** invoking spawn.
+4. Spawn isolated Execution Subagents with complete Issue text, permitted/forbidden paths, dependency proof, validation commands and delivery requirements. One writable worktree per task.
+5. Wait and collect actual status, artifacts and evidence. Unknown or missing result means failure / incomplete, not success.
+6. Independently review the PR. Reviewer Subagents are optional second opinions and cannot approve / merge.
+7. Merge only if current head matches approved SHA and G1–G6 pass. Verify the merged default branch, then update the registry and close the Issue.
