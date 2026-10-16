@@ -16,6 +16,7 @@
 
 - 应用运行期角色**不得拥有 DDL 权限**：审计表 audit_events 的只增不改由 BEFORE UPDATE/DELETE 触发器强制，而 ALTER TABLE ... DISABLE TRIGGER 只有表属主或超级用户可执行；若应用角色是表属主，该防护可被绕过（W1-5 审查时已实测确认）。
 - 迁移（alembic upgrade/downgrade）必须由**独立的 DDL 角色**执行，与运行期角色分离。
+- 迁移必须**可复现**：已应用的迁移不得从 `app.*` 等活动代码读取要写入的数据（目录/枚举/常量/矩阵），否则重放历史会随代码漂移、中间状态不唯一、回滚不再对称；迁移应自带写死在版本内的冻结数据。`0003_permission_catalog` 已按此约定改为冻结快照，影响评估与约定详见 [MIGRATION-REPRODUCIBILITY.md](MIGRATION-REPRODUCIBILITY.md)。
 - 认证：本地开发用 unix socket + peer 认证（角色 agents，无口令落盘）；生产必须改为口令或证书认证，且口令不得进入仓库、日志或模型提示词。
 - 应用角色最小权限：只授予所需表的 SELECT/INSERT/UPDATE/DELETE；审计表只授予 INSERT 与 SELECT。
 - 待建立：角色与授权脚本。
