@@ -40,6 +40,12 @@ jobs:
           --health-retries 20
     env:
       AJAIMGR_TEST_DB_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/ajaimgr_test
+      # 备份/恢复演练使用 socket DSN（postgresql+psycopg:///ajaimgr_restore_check）
+      # 与裸 psql/dropdb；用 libpq 默认值把它们指向服务容器（TCP + 凭据）。
+      PGHOST: 127.0.0.1
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
     steps:
       - uses: actions/checkout@v4
       - name: Install PostgreSQL 17 client (pg_dump must match the server)
