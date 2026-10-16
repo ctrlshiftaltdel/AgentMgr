@@ -39,6 +39,7 @@ orchestration/config.json      # 任务库配置
 | `orchestration.state_table_count` / `state_integrity` | 任务库表数与 `PRAGMA integrity_check` 结果 |
 | `members[]` | 除 `manifest.json` 自身外的全部成员散列（manifest 是校验根，无法自证） |
 | `excluded_credential_files[]` | 因命中凭据模式而被排除的文件（留痕，便于审计） |
+| `missing_components[]` | 缺失且被 `--allow-missing-*` 显式放行的必需组成部分（取值 `storage` / `orchestration`；正常场景为空 list，见 §3） |
 
 **校验和**：备份完成后生成 `<归档>.sha256`（`sha256sum` 格式）。恢复端默认要求该旁车存在且与归档实际 sha256 一致，否则拒绝（`--allow-missing-checksum` 才能放行）。
 
@@ -54,7 +55,17 @@ uv run python ops/backup.py \
   --output /var/backups/ajaimgr/ajaimgr-backup.tar.gz
 ```
 
-连接串解析顺序：`--db-url` → `AJAIMGR_DB_URL` → `app.core.config` 默认值；附件根：`--storage-root` → `AJAIMGR_STORAGE_ROOT` → `var/storage`（相对 `--repo-root` 解析）。
+连接串解析顺序：`--db-url` → `AJAIMGR_DB_URL` → `app.core.config` 默认值；附件根：`--storage-root` → `AJAIMGR_STORAGE_ROOT` → `var/storage`（相对 `--repo-root` 解析）；任务库目录：`--orchestration-dir` → 默认 `<repo-root>/.orchestration`（同样按 `--repo-root` 解析，不随脚本所在位置变化）。
+
+**必需组成部分缺失即失败**：解析后的附件存储根与任务库目录必须存在且为目录；任一缺失时备份直接失败（退出码 2）且**不写出归档或旁车文件**。只有显式给出放行开关才允许继续：
+
+```bash
+uv run python ops/backup.py ... \
+  --allow-missing-storage \          # 仅当部署确实没有附件存储
+  --allow-missing-orchestration      # 仅当部署确实未启用任务库
+```
+
+放行时归档照常生成，但 manifest 顶部 `missing_components` 记下缺失清单（取值 `storage` / `orchestration`；正常场景为空 list），stdout 汇总同样打印 `missing parts` 一行。已知边界：目录存在但内容为空、或缺少 `state.sqlite3` / `config.json` 的情况**不触发**该守卫，保持原行为（备份成功并记入 `warnings`）。
 
 恢复 + 校验（演练示例；`*_restore_check` 这类库名才允许 `--recreate-db`）：
 
@@ -67,7 +78,7 @@ uv run python ops/restore.py /path/ajaimgr-backup.tar.gz \
   --report /tmp/restore-report.json --verbose
 ```
 
-退出码语义：`0` 全部校验通过；`1` 有校验项不符（逐项列出差异）；`2` 用法/IO/环境错误（归档不存在、缺校验和、目标库被安全守卫拒绝等）。
+退出码语义（备份 / 恢复通用）：`0` 成功（恢复侧表示 13 项校验全部通过）；`1` 恢复时有校验项不符（逐项列出差异）；`2` 用法/IO/环境错误——恢复侧如归档不存在、缺校验和、目标库被安全守卫拒绝等，备份侧如**必需组成部分缺失且未给对应 `--allow-missing-*` 开关**、输出路径位于仓库内（退出码 2 时备份不会写出任何归档/旁车文件）。
 
 安全守卫：
 
@@ -131,31 +142,33 @@ uv run python ops/restore.py /path/ajaimgr-backup.tar.gz \
 - `AGENTS.md` §1 假设**单用户操作者**：上表角色名称是职责划分，当前可能由同一人承担；一旦引入第二个操作者，执行与验收必须分离（执行人不得自我验收）。
 - 每次演练记录：归档路径与 sha256、命令、退出码、行数比对表、附件 sha256 比对结果、失败项与处置。
 
-## 8 本机演练记录（2026-10-16，W1-25）
+## 8 本机演练记录（2026-10-16，W1-25，第 1 轮修复后重跑）
 
-环境：本机 Debian 13，PostgreSQL 17.11（peer 认证，角色 `agents` 有 CREATEDB），`pg_dump` 17.11，Python 3.13.5。
+环境：本机 Debian 13，PostgreSQL 17.11（peer 认证，角色 `agents` 有 CREATEDB），`pg_dump`/`psql` 17.11，Python 3.13.5（仓库 `.venv`）。
 
 演练数据（真实数据，非构造的空库）：
 
-- 源库 `ajaimgr_dev` 迁移到 head（`0010_invoice_verifications`，23 张表），并写入真实业务行：1 公司 / 2 员工 / 1 报销单 / 2 明细 / 1 审计事件 / 2 条 `source_files` 元数据 + 权限目录 7 角色 / 20 权限 / 32 映射；
-- 附件：3 个真实 blob 经产品代码 `app.documents.storage.store_file` 落盘（PNG 66 B / PDF 193 B / TXT 55 B，内容寻址路径 `aa/bb/<sha256>`），落盘后立即 `verify_file` 校验；
-- 待备份目录中另外放置了**假凭据文件**（`.env` / `auth.json` / `server.key`，内容为明显的占位串，非真实口令），用于验证排除策略；
-- 任务库使用仓库内真实 `.orchestration/`（只读：备份前 `state.sqlite3` 为 253952 B / mtime 08:52，备份后完全一致，且未在目录内新增 `-shm`/`-wal` 旁车文件）。
+- 源库 `ajaimgr_dev` 迁移到 head（23 张表），真实业务行：1 公司 / 2 员工 / 1 报销单 / 2 明细 / 1 审计事件 / 2 条 `source_files` 元数据 + 权限目录 7 角色 / 20 权限 / 32 映射；
+- 附件：3 个真实 blob 经产品代码 `app.documents.storage.store_file` 落盘并 `verify_file` 校验（PNG 66 B / PDF 69 B / TXT 50 B，内容寻址路径 `<aa>/<bb>/<sha256>`）；
+- 待备份目录中另放**假凭据文件**（`.env` / `auth.json` / `server.key`，明显占位串，非真实口令），验证排除策略；
+- 任务库使用仓库内真实 `.orchestration/`（只读）：备份前后 `state.sqlite3` 均为 258048 B / mtime 09:28:03，目录内无新增文件、无 `-shm`/`-wal` 旁车；演练结束复核同样干净。（经验教训：对任务库做独立只读检查必须打开**复制本**——直接对原文件 `sqlite3` 打开即使 `mode=ro` 也会在目录内生成 `-shm`/`-wal`，本工具内部正是因此先复制再打开。）
 
 结果：
 
 | 步骤 | 命令（要点） | 退出码 |
 | --- | --- | --- |
-| 备份 | `uv run python ops/backup.py --db-url postgresql+psycopg:///ajaimgr_dev --storage-root <drill>/storage --orchestration-dir .orchestration --output ~/ajaimgr-backups/w1-25-drill.tar.gz` | 0 |
-| 恢复 | `uv run python ops/restore.py ~/ajaimgr-backups/w1-25-drill.tar.gz --target-db-url postgresql+psycopg:///ajaimgr_restore_check --recreate-db --storage-target <tmp> --orchestration-target <tmp> --report <json> --verbose` | 0 |
-| 篡改归档字节（旁车未更新） | 同上，归档为被改动副本 | 1（`archive_checksum` FAIL） |
-| 篡改附件字节（旁车已刷新） | 同上 | 1（`member_hashes` / `storage_hashes` FAIL，指出具体 blob 路径） |
+| 备份 | `uv run python ops/backup.py --db-url postgresql+psycopg:///ajaimgr_dev --repo-root ~/ajaimgr --storage-root <drill>/storage --output <drill>/w1-25-drill-r2.tar.gz`（**不给** `--orchestration-dir`，验证默认值按 `--repo-root` 解析） | 0 |
+| 恢复 | `uv run python ops/restore.py <drill>/w1-25-drill-r2.tar.gz --target-db-url postgresql+psycopg:///ajaimgr_restore_check --recreate-db --storage-target <drill>/restored-storage --orchestration-target <drill>/restored-orchestration --report <drill>/restore-report.json --verbose` | 0（13/13 PASS） |
+| 负向：任务库缺失且未放行 | 同上备份，`--repo-root` 指向无 `.orchestration` 的目录 | 2（报 `required component 'orchestration' is missing: …` 并提示 `--allow-missing-orchestration`；不写归档） |
+| 负向：存储根缺失且未放行 | 同上备份，`--storage-root` 指向不存在路径 | 2（同口径提示，含解析路径与 `--allow-missing-storage`；不写归档） |
+| 篡改归档字节（旁车未更新） | 同上恢复，归档为被改动副本 | 1（`archive_checksum` FAIL） |
+| 篡改附件字节（旁车已刷新） | 同上 | 1（`member_hashes` / `storage_restore` / `storage_hashes` FAIL，指出具体 blob 路径） |
 | 篡改 manifest 行数（旁车已刷新） | 同上 | 1（`db_row_counts` FAIL，`companies: manifest=99 restored=1`） |
 
-- 归档：`w1-25-drill.tar.gz`，63463 B，sha256 `68053e0b0ca20ebc48093611ca60b7fe7b31a4b43901ee32cd96c89a20bba33e`，7 个成员，凭据扫描 0 violation。
-- 行数比对（manifest vs 恢复后库）：`companies` 1/1、`employees` 2/2、`expense_claims` 1/1、`expense_lines` 2/2、`audit_events` 1/1、`invoice_verifications` 0/0、`source_files` 2/2，全部一致。
-- 附件 sha256：3/3 与 manifest 一致，恢复目录与源目录逐字节 `diff -r` 无差异。
-- 任务库：恢复后可打开，`integrity_check=ok`，4 张表（`tasks`/`locks`/`events`/`sqlite_sequence`），43 条任务、410 条事件，与源库一致。
+- 归档：`w1-25-drill-r2.tar.gz`，64705 B，sha256 `d52b8753a7c9e7af4faac492c741ab61b37041d1984b348d3cb4bd06ba404cbd`，7 个成员（manifest + dump + 3 附件 + 任务库 2 文件），凭据扫描 0 violation；3 个假凭据全部被排除并记入 `excluded_credential_files`。
+- 行数比对（manifest vs 恢复后库；恢复侧工具与独立 `psql` 查询两条路径分别核对）：`companies` 1/1、`employees` 2/2、`expense_claims` 1/1、`expense_lines` 2/2、`audit_events` 1/1、`invoice_verifications` 0/0、`source_files` 2/2，全部一致。
+- 附件 sha256：3/3 与 manifest 一致；恢复目录与源目录 `diff -r` 除被排除的 3 个假凭据外无任何差异。
+- 任务库：恢复后可打开，`integrity_check=ok`，4 张表（`tasks`/`locks`/`events`/`sqlite_sequence`），43 条任务、414 条事件，与源库一致；恢复出的 `state.sqlite3` / `config.json` sha256 与 manifest 记录（归档内快照）一致。
 - 演练用恢复库 `ajaimgr_restore_check` 演练后删除。
 
 ## 9 本机演练与生产环境的差异（**不得混同**）
@@ -180,7 +193,9 @@ uv run python ops/restore.py /path/ajaimgr-backup.tar.gz \
 2. **未做跨主机恢复**：本次是同机演练，网络传输、目标机权限、目标机 PostgreSQL 版本差异均未验证。
 3. **pg_dump 版本一致性**：本机 `pg_dump` 17.11 与服务器同主版本；生产若为其它主版本，需以同主版本客户端备份（否则可能出现 dump/restore 失败或降级）。
 4. **角色分离未落地**：应用运行期角色目前仍是表属主、有 DDL 权限，`audit_events` 的只增不改触发器可被 `ALTER TABLE ... DISABLE TRIGGER` 绕过（§2 已记录）；备份侧影响是归档不含所有权/GRANT，恢复后必须由角色/授权脚本重建。
-5. **恢复时长（RTO）未测**：本机数据量极小（归档 63 KB），真实规模下的备份窗口与恢复时间未知。
+5. **恢复时长（RTO）未测**：本机数据量极小（本次归档 64705 B ≈ 63 KB），真实规模下的备份窗口与恢复时间未知。
 6. **保留代数与自动调度未实现**：§6 是建议值，尚无 cron/systemd timer 与失败告警；`.orchestration/backups/` 目前仍是任务库的本地副本（由 `scripts/orchestrator.py backup` 生成），不作为生产备份手段。
 7. **内容扫描边界**：凭据排除只覆盖文件名模式与私钥头（§5），不做通用密钥熵检测。
 8. **`--no-owner` 的取舍**：为让归档可跨角色恢复而放弃所有权信息；若生产要求归档自带所有权，需要改为同角色恢复或补充授权脚本（与第 4 项一并解决）。
+9. **`--allow-missing-*` 的误用边界**：放行开关会把「残缺归档」从失败降级为成功；虽有 manifest `missing_components` 与 stdout `missing parts` 留痕，日常巡检仍应断言 `missing_components` 为空，只在部署事实（确实未启用任务库 / 确实没有附件存储）成立时才使用该开关。
+10. **组成部分守卫的检查深度**：只检查「存在且为目录」——目录存在但为空、或缺少 `state.sqlite3` / `config.json` 时备份仍成功（仅记入 `warnings`）；恢复侧对缺失的任务库文件会在 `orchestration_sqlite` / `orchestration_config` 报 FAIL，但「附件存储为空目录」与「零附件」在恢复侧不可区分，生产巡检需另行核对来源清单。
