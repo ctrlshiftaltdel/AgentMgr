@@ -49,6 +49,7 @@ import hashlib
 import hmac
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import NoReturn
 
@@ -954,6 +955,11 @@ def _bind_channel(
                 EmployeeChannelBinding.external_user_id == external_user_id.strip(),
             )
         )
+        # 管理员在受权后台执行绑定本身**就是**核验行为（W0-2 §4.2 步骤 3：绑定由
+        # 系统管理员在最小管理后台维护）。因此写入 verified_at，使该绑定对
+        # app.identity.channel_routing.resolve_principal 成为「已核验」而可解析；
+        # 否则解析器会按「未验证」fail closed，后台建出的绑定将无法认证任何人。
+        verified_at = datetime.now(timezone.utc)
         if existing is None:
             session.add(
                 EmployeeChannelBinding(
@@ -961,11 +967,13 @@ def _bind_channel(
                     channel_type=channel_type.strip(),
                     external_user_id=external_user_id.strip(),
                     status="active",
+                    verified_at=verified_at,
                 )
             )
         else:
             existing.employee_id = target.id
             existing.status = "active"
+            existing.verified_at = verified_at
         record_event(
             session,
             actor_id=principal.employee_id,
@@ -977,6 +985,7 @@ def _bind_channel(
                 "channel_type": channel_type.strip(),
                 "external_user_id_hash": _external_id_hash(external_user_id.strip()),
                 "status": "active",
+                "verified_at": verified_at.isoformat(),
             },
         )
     return RedirectResponse(url="/admin/bindings", status_code=303)
