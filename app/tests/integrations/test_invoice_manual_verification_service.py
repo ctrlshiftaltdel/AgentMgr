@@ -122,8 +122,15 @@ def _seed_row_in_status(
     status: VerificationStatus,
     *,
     invoice_no: str,
+    error_code: str | None = None,
+    reason: str | None = None,
 ) -> InvoiceVerification:
-    """用既有 provider 流程把某张票的行推进到 ``status``（作为录入前状态）。"""
+    """用既有 provider 流程把某张票的行推进到 ``status``（作为录入前状态）。
+
+    ``error_code``/``reason`` 用于给行种入**真实的渠道失败信息**（如「无法查验」
+    的 ``1021``/``verify_result:1021``），以覆盖「自带 error_code 的行被录入采纳」
+    的推进路径（F1 回归）。
+    """
     fields = make_fields(invoice_no=invoice_no)
     principal = world.principal(world.finance_operator)
     if status is VerificationStatus.SUSPECTED_DUPLICATE:
@@ -150,7 +157,7 @@ def _seed_row_in_status(
         provider = ManualAssistedProvider()
     else:
         provider = StubProvider(
-            results=[make_result(status)],
+            results=[make_result(status, error_code=error_code, reason=reason)],
             _provider_type=ProviderType.AUTHORIZED_PROVIDER,
         )
     return verify_invoice(
@@ -313,15 +320,37 @@ def test_all_non_fail_statuses_reach_verified_pass(
         VerificationStatus.UNABLE_TO_VERIFY,
         VerificationStatus.SUSPECTED_DUPLICATE,
     )
+    # F1 回归：为「无法查验」行种入真实的渠道失败信息（百度渠道 ``1021``），
+    # 录入采纳后行侧「最新结果」字段必须同步——不得再挂着被取代的渠道失败信息
+    # （历史保留在 ``invoice.verify`` 审计 ``details`` 中）。
+    unable_error_code = "1021"
+    unable_reason = "verify_result:1021"
     for index, status in enumerate(statuses):
         invoice_no = f"8000000{index}"
-        row = _seed_row_in_status(session, world, status, invoice_no=invoice_no)
+        unable = status is VerificationStatus.UNABLE_TO_VERIFY
+        row = _seed_row_in_status(
+            session,
+            world,
+            status,
+            invoice_no=invoice_no,
+            error_code=unable_error_code if unable else None,
+            reason=unable_reason if unable else None,
+        )
         assert row.status == status.value, f"seed failed for {status}"
+        if unable:
+            assert row.error_code == unable_error_code
+            assert row.reason == unable_reason
 
         recorded = _record(session, world, fields=make_fields(invoice_no=invoice_no))
         assert recorded.id == row.id
         assert recorded.status == VerificationStatus.VERIFIED_PASS.value
         assert recorded.provider_type == "manual_assisted"
+        # 「最新结果」与记录的 status 一致（新建/既有行同口径）：被取代的渠道
+        # error_code/reason 不得残留在 ``verified_pass`` 行上。
+        assert recorded.error_code is None, f"stale error_code for {status}"
+        assert (
+            recorded.reason == "manual_verification_recorded"
+        ), f"stale reason for {status}"
 
     assert _row_count(session) == len(statuses)
 

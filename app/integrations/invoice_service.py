@@ -583,7 +583,10 @@ def record_manual_verification(
     5. 落库：``provider_type=provider_name='manual_assisted'``、``verified_at``
        取服务端时钟（可注入）、``verified_by`` 取操作人、证据结构化落
        ``evidence_json``（``channel``/``note``/``recorded_by``/``recorded_at``）并
-       写内容寻址的 ``evidence_ref``；``source_file_id`` 给定时在**新建**行上一并
+       写内容寻址的 ``evidence_ref``；行侧「最新结果」字段按**本次采纳结论**更新
+       （新建/既有行同口径：``error_code=None``、``reason`` 为
+       ``manual_verification_recorded``；被取代的渠道失败信息只保留在
+       ``invoice.verify`` 审计中）；``source_file_id`` 给定时在**新建**行上一并
        记录（既有行不重指原件，只按提供的新原件重算去重结论）；
     6. 写成功审计（``invoice.manual_verify``，``details`` 只含非敏感结构化值：
        ``from_status``/``to_status``/``provider_type``/``provider_name``/
@@ -686,6 +689,10 @@ def record_manual_verification(
         else:
             duplicate_result = row.duplicate_check_result
         row.status = resolved.value
+        # 「最新结果」与新建行同口径：本次采纳的是人工录入结论，被取代的渠道失败
+        # 信息不得继续挂在行上（历史保留在 ``invoice.verify`` 审计 ``details`` 中）。
+        row.error_code = None
+        row.reason = "manual_verification_recorded"
         row.provider_type = MANUAL_PROVIDER_TYPE
         row.provider_name = MANUAL_PROVIDER_NAME
         session.flush()
