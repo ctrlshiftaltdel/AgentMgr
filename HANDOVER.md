@@ -3,7 +3,7 @@
 - 生成时间：2026-10-17 20:42 CST（**财务对接方向变更 + 整合计划/章程/README/PLAN 三批文档落库之后**）
 - 主分支基线 head：`adfa7e9`（**本文档提交之前的 head**；本文档经 PR 合入，会出现在其之上）
 - 上一版交接：`2d21bfc`（HANDOVER 刷新，PR #9）；更早 `cdbcd47`（GitHub 版启用后）、`b38cb45`（离线版暂停点）；完整历史见 git log
-- 任务台账：**GitHub Issues**。开放 Issue：**#16**（Track A 差距分析，PLANNED）；#10/#12/#13 已完成关闭；#17 为本文档刷新。离线版 45 条台账已退役归档（不再更新）。
+- 任务台账：**GitHub Issues**。开放 Issue：**#16**（Track A，PLANNED，后置）；#10/#12/#13/#17 已完成关闭；#19 为本文档批次。离线版 45 条台账已退役归档（不再更新）。
 - 你的角色：**Master Agent** —— 计划、派发、独立复核、**唯一合并者**、阶段收口；默认不实现产品代码。
 - 接手顺序：`AGENTS.md` → `AGENT-ORCHESTRATION.md` → `MASTER.md` → `ORCHESTRATION-PROJECT.md` → 本文档 → `prompts/START-MASTER-EXISTING-PROJECT.md`。
 
@@ -73,14 +73,22 @@
 - 迁移链 `0001_org_core` → `0002_identity_rbac` → `0003_permission_catalog`（**冻结快照**，W1-16）→ `0004_audit_events` → `0005_expense_core` → `0006_expense_claim_no_seq` → `0007_workflow_outbox` → `0008_intake_files` → `0009_perm_alignment` → `0010_invoice_verifications` → `0011_expense_invoices`
 - 领域目录 12 个：`app/{identity,intake,expense,workflow,documents,inventory,integrations,audit,api,db,core,runtime}`
 - 规则集 `main-protection`（id 25216701）active；`python3 scripts/github_preflight.py` 通过
-- 开放 Issue：**#16**（Track A 差距分析，PLANNED，等优先级确认）；#10/#12/#13 已 VERIFIED 关闭；#17 = 本文档刷新
+- 开放 Issue：**#16**（Track A，PLANNED，后置）；#10/#12/#13/#17 已 VERIFIED 关闭；#19 = 本次决策落库
 - 离线归档：`.orchestration/`（不变；含 `archive/orchestrator.py`、`state-20261016-114915.sqlite3`、45 条任务台账）
 
 ---
 
-## 6 当前操作点（队列已清空）
+## 6 当前操作点（阶段 1 收口优先）
 
-**队列已清空（2026-10-16 16:00）**：#1/#2/#3 冻结队列已全部完成并关闭（见 §8）。新一轮派发等待所有者指示；候选来源为 §7（BLOCKED 项与阶段 1 未开工项），部分需先做 §9.2 产品决策。当前无任何进行中的任务。
+**2026-10-17 所有者决定优先级**：先收口阶段 1 剩余项；Track A（#16）后置。当前无进行中任务、无开放 PR。
+
+阶段 1 三项的实际可动性：
+
+| 项 | 状态 | 卡点 |
+|---|---|---|
+| 渠道消息入站与路由（后端侧） | 可开工 | 真实微信适配与 Profile 验收需所有者授权（`ORCHESTRATION-PROJECT.md` 禁止未经授权新建/启动 Profile） |
+| OCR/ASR 真实供应商 | 阻塞 | 需所有者选定供应商；接口与人工兜底已交付（W1-26） |
+| 跨主机/异地恢复演练 | 阻塞 | 需第二台主机或异地位；同机 13/13 已通过 |
 
 **恢复后的标准循环**（对任意新任务）：
 
@@ -108,7 +116,7 @@
 
 | Issue | 内容 | 状态 |
 |---|---|---|
-| #16 | Track A：AiNativeERP 设计映射与 Track B 范围（仅文档） | PLANNED，等所有者确认优先级后再写活动登记并派发 |
+| #16 | Track A：AiNativeERP 设计映射与 Track B 范围（仅文档） | PLANNED，后置：阶段 1 收口后再评估 |
 
 ### 冻结队列——已于 2026-10-16 全部完成
 
@@ -125,7 +133,7 @@
 ## 8 已完成（不要重做）
 
 - **财务对接方向变更与文档落库（2026-10-17，3 个 PR）**：
-  - PR #11 `4ac3141`：章程升 v1.1（取消金蝶、模板驱动导出、远期自研财务/ERP）+ 整合计划 v0.2（Track A/B/C/D、契约字段、B-1/B-2 待决策、Track D 导出机制）。
+  - PR #11 `4ac3141`：章程升 v1.1（取消金蝶、模板驱动导出、远期自研财务/ERP）+ 整合计划 v0.2（Track A/B/C/D、契约字段、B-1/B-2 决策块、Track D 导出机制）。
   - PR #14 `e100621`：`README.md` / `ORCHESTRATION-PROJECT.md` / `HANDOVER.md` 定位对齐，BLOCKED 队列移除金蝶、改为导出模板。
   - PR #15 `adfa7e9`：`templates/PLAN.md` 升 v2.1，阶段 3/4 改为「财务导出与对账」与「财务能力扩展（远期自研）」；§8 新增 `export_templates` / `export_runs`。
   - 三个 Issue #10 / #12 / #13 均已 VERIFIED 并关闭；每批均通过 `kit-validate` + `app-tests`。
@@ -175,8 +183,11 @@
 7. 生产 Profile 主机规格（需真实负载测试）
 8. 百度查验正式开通（账号/费用/合规确认；原 W0-4 §7 项）
 9. 生产备份必须存放于生产主机之外（章程成功标准未满足）
-10. 工具层 B-1：谁负责选工具（Agent 侧 / 后端路由 / 混合）——见整合计划 §5.6；建议 Agent 侧 + `needs_more_info` 一等结果
-11. 工具层 B-2：确认请求持久化（新增 `tool_confirmations` / 复用审批实例 / 不持久化）——见 §5.7；「不持久化」应否决（微信异步必丢）
+### 9.3 已决策（2026-10-17 所有者）
+
+- B-1 工具选择：Agent 侧选（Hermes 经 MCP / function calling），后端只做契约校验、权限与澄清；不建后端意图路由（章程 D8、整合计划 §5.6）。
+- B-2 确认持久化：新增 `tool_confirmations` 轻表；参数 hash + TTL 15 分钟 + 一次性消费 + 执行前复检（整合计划 §5.7）；建表放在 Track B 的确认类 Issue。
+- 优先级：先收口阶段 1 剩余项（渠道消息路由、OCR/ASR 真实供应商、跨主机恢复演练），Track A 后置。
 10. GitHub 协作策略微调（直推 bypass？合并方式？——当前：PR + G1–G6 + strict checks）
 11. 解析流水线产品参数确认（关键字段口径、置信度阈值——当前均为保守默认）
 
