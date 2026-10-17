@@ -68,7 +68,7 @@
 
 ## 5 状态快照
 
-- `main` head = `1954dfd`（PR #11 `4ac3141` → PR #14 `e100621` → PR #15 `adfa7e9` → PR #18 `3993097` → PR #20 `1954dfd`，均为文档变更）；本机与 `test-host` 均已 ff 至此；工作区干净；无 worktree 残留；无运行中子代理；**本轮未派发任何任务、无活动锁**；远端仅保留 `main`
+- `main` head = `1954dfd`（PR #11 `4ac3141` → PR #14 `e100621` → PR #15 `adfa7e9` → PR #18 `3993097` → PR #20 `1954dfd`，均为文档变更）；**本机已 ff 至此；`test-host` 本批未同步、未核对（上次记录为 `8d6f0c9`），派发前需先 `git fetch && git merge --ff-only`**；本机工作区干净；无 worktree 残留；无运行中子代理；**本轮未派发任何任务、无活动锁**；远端仅保留 `main`
 - 测试：本机 Fast（`validate_kit --project-ready` + `unittest discover -s tests`）rc=0（2026-10-18 06:0x 实测）；**本机未跑全量 pytest**（无 PostgreSQL）；各 PR 的 CI `app-tests` 均对 head 通过（`68a5e57` / `a57cc50` / `eee12f2` / `b89d4d1` / `7e0a515`）；最近一次全量基线仍为 **730 passed**（2026-10-16，`test-host`），本批为纯文档变更，未重跑
 - 迁移链 `0001_org_core` → `0002_identity_rbac` → `0003_permission_catalog`（**冻结快照**，W1-16）→ `0004_audit_events` → `0005_expense_core` → `0006_expense_claim_no_seq` → `0007_workflow_outbox` → `0008_intake_files` → `0009_perm_alignment` → `0010_invoice_verifications` → `0011_expense_invoices`
 - 领域目录 12 个：`app/{identity,intake,expense,workflow,documents,inventory,integrations,audit,api,db,core,runtime}`
