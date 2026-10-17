@@ -1,9 +1,9 @@
 # HANDOVER — 会话交接文档
 
-- 生成时间：2026-10-16 16:25 CST（**W1 冻结队列 #1/#2/#3 全部完成并 VERIFIED、开放 Issue 清空之后**）
-- 主分支基线 head：`8d6f0c92b5a9daa1ab57be58cb4c670b289eaf86`（**本文档提交之前的 head**；本文档经 PR 合入，会出现在其之上）
-- 上一版交接：`cdbcd47`（GitHub 版启用后）；更早 `b38cb45`（离线版暂停点）；完整历史见 git log
-- 任务台账：**GitHub Issues**。开放 Issue：**无**（#1 `W1-24`、#2 `W1-16`、#3 `W1-26` 已全部完成关闭；#8 为本文档刷新）。离线版 45 条台账已退役归档（不再更新）。
+- 生成时间：2026-10-17 20:42 CST（**财务对接方向变更 + 整合计划/章程/README/PLAN 三批文档落库之后**）
+- 主分支基线 head：`adfa7e9`（**本文档提交之前的 head**；本文档经 PR 合入，会出现在其之上）
+- 上一版交接：`2d21bfc`（HANDOVER 刷新，PR #9）；更早 `cdbcd47`（GitHub 版启用后）、`b38cb45`（离线版暂停点）；完整历史见 git log
+- 任务台账：**GitHub Issues**。开放 Issue：**#16**（Track A 差距分析，PLANNED）；#10/#12/#13 已完成关闭；#17 为本文档刷新。离线版 45 条台账已退役归档（不再更新）。
 - 你的角色：**Master Agent** —— 计划、派发、独立复核、**唯一合并者**、阶段收口；默认不实现产品代码。
 - 接手顺序：`AGENTS.md` → `AGENT-ORCHESTRATION.md` → `MASTER.md` → `ORCHESTRATION-PROJECT.md` → 本文档 → `prompts/START-MASTER-EXISTING-PROJECT.md`。
 
@@ -33,7 +33,7 @@
 面向中国大陆 20–100 人（后续扩到 100）企业的 Hermes Agent 原生管理系统，**首期模块：报销**。以 AI 对话/语音/图片/文件为主要工作入口；**不接入金蝶等特定第三方财务系统**，对外账务交接采用模板驱动的 Excel 导出（模板待所有者提供；远期自研财务/ERP）。
 
 - 项目章程 `docs/PROJECT-CHARTER.md`（O3 已记录「百度为首选查验渠道」）；实施方案 `templates/PLAN.md`（v2.0）；部署要求 `docs/DEPLOYMENT-REQUIREMENTS.md`；调研 `docs/research/`（W0-1/2/4/5/7 与 W1-28）
-- **当前阶段**：Wave 1 主体 + 发票查验完整链条（渠道 Provider：腾讯云 W1-20、百度 W1-28；人工辅助录入 W1-22；报销单挂账 W1-23）+ **W1 冻结队列三项（W1-24 模型导入自足性、W1-16 迁移可复现性、W1-26 受理解析流水线接口与人工兜底）** 已完成；阶段 1 尚缺：微信消息路由、OCR/ASR **真实供应商**接入（接口层已交付）、备份异地/跨主机恢复收口。**2026-10-16 完成规则层切换：离线版 → Agent-Orchestration GitHub 版**（仓库 `ctrlshiftaltdel/AgentMgr`，public）。
+- **当前阶段**：Wave 1 主体 + 发票查验完整链条（渠道 Provider：腾讯云 W1-20、百度 W1-28；人工辅助录入 W1-22；报销单挂账 W1-23）+ **W1 冻结队列三项（W1-24 模型导入自足性、W1-16 迁移可复现性、W1-26 受理解析流水线接口与人工兜底）** 已完成；阶段 1 尚缺：微信消息路由、OCR/ASR **真实供应商**接入（接口层已交付）、备份异地/跨主机恢复收口。**2026-10-16 完成规则层切换：离线版 → Agent-Orchestration GitHub 版**（仓库 `ctrlshiftaltdel/AgentMgr`，public）。**2026-10-17 财务对接方向变更**：金蝶接入取消，对外账务交接改为模板驱动 Excel 导出（模板待所有者提供），远期自研财务/ERP（章程 v1.1）；同日落库 AI 工具治理整合计划 v0.2（Track A/B/C/D，`docs/AgentMgr_AiNativeERP_Integration_Plan.md`）。
 
 ---
 
@@ -68,12 +68,12 @@
 
 ## 5 状态快照
 
-- `main` head = `8d6f0c9`（PR #5 `83fcd95` → PR #6 `810d120` → PR #7 `8d6f0c9`）；本机与 `test-host` 均已 ff 至此；工作区干净；无 worktree 残留；无运行中子代理
-- 测试：本机 Fast（`validate_kit --project-ready` + `unittest discover`）rc=0；`test-host` 全量 `uv run pytest app/tests -q -o addopts=""` → **730 passed**；CI 最新 main run → **729 passed + 1 skipped**（`~/.hermes` 条件用例，CI 无该目录）+ 1 warning
+- `main` head = `adfa7e9`（PR #11 `4ac3141` → PR #14 `e100621` → PR #15 `adfa7e9`，均为文档变更）；本机与 `test-host` 均已 ff 至此；工作区干净；无 worktree 残留；无运行中子代理；远端仅保留 `main`
+- 测试：本机 Fast（`validate_kit --project-ready` + `unittest discover -s tests`）rc=0（2026-10-17 20:33 实测）；**本机未跑全量 pytest**（无 PostgreSQL）；各 PR 的 CI `app-tests` 均对 head 通过（`68a5e57` / `a57cc50` / `eee12f2`）；最近一次全量基线仍为 **730 passed**（2026-10-16，`test-host`），本批为纯文档变更，未重跑
 - 迁移链 `0001_org_core` → `0002_identity_rbac` → `0003_permission_catalog`（**冻结快照**，W1-16）→ `0004_audit_events` → `0005_expense_core` → `0006_expense_claim_no_seq` → `0007_workflow_outbox` → `0008_intake_files` → `0009_perm_alignment` → `0010_invoice_verifications` → `0011_expense_invoices`
 - 领域目录 12 个：`app/{identity,intake,expense,workflow,documents,inventory,integrations,audit,api,db,core,runtime}`
 - 规则集 `main-protection`（id 25216701）active；`python3 scripts/github_preflight.py` 通过
-- 开放 Issue：**无**（#1/#2/#3 已关闭；#8 = 本文档刷新）
+- 开放 Issue：**#16**（Track A 差距分析，PLANNED，等优先级确认）；#10/#12/#13 已 VERIFIED 关闭；#17 = 本文档刷新
 - 离线归档：`.orchestration/`（不变；含 `archive/orchestrator.py`、`state-20261016-114915.sqlite3`、45 条任务台账）
 
 ---
@@ -104,6 +104,12 @@
 | 导出模板与字段口径（原金蝶 W0-3 位置，未建 Issue） | 首个 Excel 模板文件、期间/币种/单据号口径、目标财务系统的导入要求 |
 | 脱敏业务样例与流程盘点（原 W0-6，未建 Issue） | 脱敏后的真实 Excel/Word/PDF 样例、报销规则、库存流程 |
 
+### 待派发（PLANNED）
+
+| Issue | 内容 | 状态 |
+|---|---|---|
+| #16 | Track A：AiNativeERP 设计映射与 Track B 范围（仅文档） | PLANNED，等所有者确认优先级后再写活动登记并派发 |
+
 ### 冻结队列——已于 2026-10-16 全部完成
 
 （#1 W1-24、#2 W1-16、#3 W1-26 已合并并 VERIFIED，Issue 已关闭；交付见 §8。）
@@ -117,6 +123,12 @@
 ---
 
 ## 8 已完成（不要重做）
+
+- **财务对接方向变更与文档落库（2026-10-17，3 个 PR）**：
+  - PR #11 `4ac3141`：章程升 v1.1（取消金蝶、模板驱动导出、远期自研财务/ERP）+ 整合计划 v0.2（Track A/B/C/D、契约字段、B-1/B-2 待决策、Track D 导出机制）。
+  - PR #14 `e100621`：`README.md` / `ORCHESTRATION-PROJECT.md` / `HANDOVER.md` 定位对齐，BLOCKED 队列移除金蝶、改为导出模板。
+  - PR #15 `adfa7e9`：`templates/PLAN.md` 升 v2.1，阶段 3/4 改为「财务导出与对账」与「财务能力扩展（远期自研）」；§8 新增 `export_templates` / `export_runs`。
+  - 三个 Issue #10 / #12 / #13 均已 VERIFIED 并关闭；每批均通过 `kit-validate` + `app-tests`。
 
 - 离线台账时期 **38 条 VERIFIED**：准备 8（骨架/章程/配置/规则包/环境等）、调研 5（W0-1/2/4/5/7）、Wave 1 主体（后端底座与迁移、身份权限、报销域与状态机、Outbox、受理与文件、导出、API、管理后台、权限目录、负面测试与修复、渠道身份、发票查验 Provider 与腾讯云/百度适配器、人工辅助录入、报销单挂账、Profile 生成器与校验器、备份与恢复工具及修复轮）。完整清单与事件流见 `.orchestration/state.sqlite3`（可用归档的 orchestrator.py 查阅）。
 - **规则层切换（2026-10-16）**：Agent-Orchestration GitHub 版规则文件替换（AGENTS/MASTER/AGENT-ORCHESTRATION/ACCEPTANCE/prompts/scripts/tests/VERSION/LICENSE）、`.github/` 模板与 CI 工作流、`ORCHESTRATION-PROJECT.md` 按项目填写、README 合并、离线专属文件退役、CI 修复至全绿、主分支规则集启用、首批 Issue #1–#3 登记。
@@ -163,6 +175,8 @@
 7. 生产 Profile 主机规格（需真实负载测试）
 8. 百度查验正式开通（账号/费用/合规确认；原 W0-4 §7 项）
 9. 生产备份必须存放于生产主机之外（章程成功标准未满足）
+10. 工具层 B-1：谁负责选工具（Agent 侧 / 后端路由 / 混合）——见整合计划 §5.6；建议 Agent 侧 + `needs_more_info` 一等结果
+11. 工具层 B-2：确认请求持久化（新增 `tool_confirmations` / 复用审批实例 / 不持久化）——见 §5.7；「不持久化」应否决（微信异步必丢）
 10. GitHub 协作策略微调（直推 bypass？合并方式？——当前：PR + G1–G6 + strict checks）
 11. 解析流水线产品参数确认（关键字段口径、置信度阈值——当前均为保守默认）
 
@@ -262,5 +276,5 @@ psql -d ajaimgr_test -c "\d <table>"  # 看表结构
 - [ ] 读本文档 §3、§4、§6、§9
 - [ ] 跑 §10 的「状态恢复」命令并核对 §5 快照（head、CI 状态、开放 Issue/PR）
 - [ ] 确认没有遗留运行中的子代理（WorkBuddy 任务列表 / `delegate_task(action='list')`）
-- [ ] 当前队列为空：新一轮任务从 §7（BLOCKED / 阶段 1 未开工）与所有者指示中选择；派发前先写活动登记评论
+- [ ] 开放 Issue 仅 #16（Track A，PLANNED）：派发前先确认优先级并写活动登记评论；其余任务从 §7（BLOCKED / 阶段 1 未开工）与所有者指示中选择
 - [ ] 如向所有者汇报：BLOCKED 两项 + §9.2 决策清单
