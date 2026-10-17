@@ -6,7 +6,7 @@
 
 - Repository: `ctrlshiftaltdel/AgentMgr`（https://github.com/ctrlshiftaltdel/AgentMgr ，public）
 - Default branch: `main`
-- Product goal / one-sentence summary: 面向中国大陆 20–100 人企业的 Hermes Agent 原生管理系统，首期交付报销闭环；以 AI 对话/语音/图片/文件为主要工作入口，正式账务与付款留在金蝶等有正式授权的系统。
+- Product goal / one-sentence summary: 面向中国大陆 20–100 人企业的 Hermes Agent 原生管理系统，首期交付报销闭环；以 AI 对话/语音/图片/文件为主要工作入口，不接入金蝶等特定第三方财务系统，对外账务交接采用模板驱动的 Excel 导出（远期自研财务/ERP）。
 - Existing repository / new repository: 已有仓库（含完整开发历史；起源于单机离线版规则包，2026-10-16 切换为 GitHub 版规则并首次推送）。
 - Primary design/spec files: `docs/PROJECT-CHARTER.md`（项目章程）、`templates/PLAN.md`（实施方案 v2.0）、`docs/DEPLOYMENT-REQUIREMENTS.md`（部署要求）、`docs/research/`（W0-1/W0-2/W0-4/W0-5/W0-7 调研报告）。
 
