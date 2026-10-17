@@ -157,7 +157,7 @@ uv run python ops/restore.py /path/ajaimgr-backup.tar.gz \
 
 | 步骤 | 命令（要点） | 退出码 |
 | --- | --- | --- |
-| 备份 | `uv run python ops/backup.py --db-url postgresql+psycopg:///ajaimgr_dev --repo-root ~/ajaimgr --storage-root <drill>/storage --output <drill>/w1-25-drill-r2.tar.gz`（**不给** `--orchestration-dir`，验证默认值按 `--repo-root` 解析） | 0 |
+| 备份 | `uv run python ops/backup.py --db-url postgresql+psycopg:///ajaimgr_dev --repo-root <repo-root> --storage-root <drill>/storage --output <drill>/w1-25-drill-r2.tar.gz`（**不给** `--orchestration-dir`，验证默认值按 `--repo-root` 解析） | 0 |
 | 恢复 | `uv run python ops/restore.py <drill>/w1-25-drill-r2.tar.gz --target-db-url postgresql+psycopg:///ajaimgr_restore_check --recreate-db --storage-target <drill>/restored-storage --orchestration-target <drill>/restored-orchestration --report <drill>/restore-report.json --verbose` | 0（13/13 PASS） |
 | 负向：任务库缺失且未放行 | 同上备份，`--repo-root` 指向无 `.orchestration` 的目录 | 2（报 `required component 'orchestration' is missing: …` 并提示 `--allow-missing-orchestration`；不写归档） |
 | 负向：存储根缺失且未放行 | 同上备份，`--storage-root` 指向不存在路径 | 2（同口径提示，含解析路径与 `--allow-missing-storage`；不写归档） |

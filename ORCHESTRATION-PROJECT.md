@@ -36,7 +36,7 @@
 ## Local validation
 
 - Fast test command: `python3 scripts/validate_kit.py --project-ready && python3 -m unittest discover -s tests`
-- Full test command: `export UV_PROJECT_ENVIRONMENT=~/ajaimgr/.venv && uv run pytest app/tests -q -o addopts=""`（需要本机 PostgreSQL 17；会重置测试库 `ajaimgr_test`，不得与其他执行实例并行运行）
+- Full test command: `export UV_PROJECT_ENVIRONMENT=<test-host-venv> && uv run pytest app/tests -q -o addopts=""`（需要 PostgreSQL 17；会重置测试库 `ajaimgr_test`，不得与其他执行实例并行运行；实际路径见本地 `local_info.md`）
 - Lint / typecheck: 未配置独立 linter/typechecker；语法探测用 `python3 -m py_compile <files>`
 - Build / package: 待建立（尚无打包需求）
 - Post-merge verification: Fast + Full 全部在默认分支上重跑并记录真实输出与退出码
@@ -52,9 +52,11 @@
 
 ## Agent workspace / local machine notes（编排机约定）
 
+- 开发机可为 Windows / Linux / macOS；具体路径、SSH 别名与连接参数见本地 `local_info.md`（不入库）。
+
 - 不新建、不启动、不停止任何真实 Hermes Profile；不写入 `~/.hermes/` 下任何文件（W0-7 一次性实验授权已过期，不得顺延）。
 - 不读取、不打印任何真实凭据值；仓库、日志与报告中一律使用占位符；不向所有者索要凭据。
-- 所有 worktree 共享主工作树 `.venv`（`UV_PROJECT_ENVIRONMENT=~/ajaimgr/.venv`）；不在 worktree 内生成独立 `.venv`。
+- 所有 worktree 共享主工作树 `.venv`（`UV_PROJECT_ENVIRONMENT` 指向该 `.venv`，实际路径见本地 `local_info.md`）；不在 worktree 内生成独立 `.venv`。
 - TMPDIR 指向仓库外且不在 `~/.hermes` 下。
 - 提交作者：仓库级占位 `Agent Orchestration <agent@localhost>`（所有者已明确不更换）。
 - 本机为编排与开发机；生产 Profile 主机另行准备（规格待真实负载测试）。

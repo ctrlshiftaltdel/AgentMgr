@@ -6,3 +6,5 @@ __pycache__/
 # Per-task worktrees (Agent execution workspaces)
 .worktrees/
 .venv/
+# Local-only machine/environment info (never commit)
+local_info.md

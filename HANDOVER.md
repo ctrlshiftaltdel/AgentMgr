@@ -1,7 +1,8 @@
 # HANDOVER — 会话交接文档
 
 - 生成时间：2026-10-18 06:05 CST（**下一轮队列 #21/#22/#23 已建、本轮未派发任何任务之后**）
-- 主分支基线 head：`1954dfd`（**本文档提交之前的 head**；本文档经 PR 合入，会出现在其之上）
+- 主分支基线 head：`3d9a193`（**历史重写后的基线；本文档提交之前的 head**）
+- **2026-10-18 历史重写说明**：为清除公开内容中的本机/个人标识，全部提交已重写；本文档中 2026-10-18 之前记录的所有 commit SHA 均已失效，PR / Issue 编号仍然有效。环境细节统一放在本地 `local_info.md`（不入库）。
 - 上一版交接：`3993097`（HANDOVER 刷新，PR #18）；更早 `adfa7e9`（PR #15）、`2d21bfc`（PR #9）、`cdbcd47`（GitHub 版启用后）、`b38cb45`（离线版暂停点）；完整历史见 git log
 - 任务台账：**GitHub Issues**。开放 Issue：**#16**（Track A，后置）、**#21**、**#22**、**#23**（下一轮队列）；#10/#12/#13/#17/#19 已 VERIFIED 关闭；#24 为本次交接刷新。离线版 45 条台账已退役归档（不再更新）。
 - 你的角色：**Master Agent** —— 计划、派发、独立复核、**唯一合并者**、阶段收口；默认不实现产品代码。
@@ -41,7 +42,7 @@
 
 1. **严禁读取、复制或索要凭据值**（token/cookie/真实账号标识/口令）：仓库、日志、报告一律占位符。不要在聊天中接收凭据。
 2. 不新建、不启动、不停止任何 Hermes Profile；不写入 `~/.hermes/` 下任何文件。
-3. 不用 pip；统一 uv（`~/.local/bin/uv`）；解释器由 `.python-version` 固定 3.13（生产同为 3.13）。
+3. 不用 pip；统一 uv（在 PATH 中）；解释器由 `.python-version` 固定 3.13（生产同为 3.13）。
 4. **不新增第三方依赖**，除非在任务 Issue 中声明理由与替代方案并获批准。当前 10 个直接依赖：fastapi、uvicorn[standard]、sqlalchemy、alembic、psycopg[binary]、pydantic、python-multipart、openpyxl、reportlab、jinja2。
 5. DSN 默认走本地 unix socket peer 认证；任何文件不得写入口令。
 6. 不得为让测试通过而修改、删除或跳过既有断言（行为变化可修正并留证据）。
@@ -56,19 +57,19 @@
 
 | 项 | 值 |
 |---|---|
-| 编排+开发主机（macOS，2026-10-16 起） | 工作区 `<repo-root>`（git clone）；`gh` 2.102.0 已登录；`uv` 已装；**无 PostgreSQL、不装 psql（只开发）**；`.workbuddy/` 已入 `.git/info/exclude`；`ssh test-host` 直连可用（SSH 命令可能触发沙箱授权，放行即可） |
-| 调试/测试主机 `test-host` | Debian 13 (trixie)，内核 6.12.x，2 vCPU / 1.9 GiB（**仅编排与开发机**；生产 Profile 主机另配）；仓库 `~/ajaimgr`；uv 在 `~/.local/bin/uv`；`.venv` 与 PostgreSQL 17.11（`ajaimgr_dev` / `ajaimgr_test`，peer 认证；口令不入文件）齐备；全量测试与临时库实测在此执行 |
-| GitHub CLI | 两端均已登录；remote `origin` = `ctrlshiftaltdel/AgentMgr`（public） |
+| 编排/开发机（多机：Windows / Linux / macOS） | 工作区路径各机自定（见本地 `local_info.md`，不入库）；`gh` 按需登录；`uv` 已装；编排机可不装 PostgreSQL（只开发）；`.workbuddy/` 与 `local_info.md` 已入各机 `.git/info/exclude` |
+| 测试主机 | Debian 13 (trixie)，2 vCPU / 1.9 GiB（**仅编排与开发机**；生产 Profile 主机另配）；仓库、uv、`.venv` 与 PostgreSQL 17.11（`ajaimgr_dev` / `ajaimgr_test`，peer 认证；口令不入文件）齐备；具体路径与 SSH 别名见本地 `local_info.md`；全量测试与临时库实测在此执行 |
+| GitHub CLI | 各编排机按需登录；remote `origin` = `ctrlshiftaltdel/AgentMgr`（public） |
 | CI | GitHub Actions `ubuntu-latest`；`postgres:17` 服务容器（TCP+密码）；PG client 17 经 PGDG 安装并把 `/usr/lib/postgresql/17/bin` 注入 `$GITHUB_PATH`；libpq 环境变量（PGHOST/PGPORT/PGUSER/PGPASSWORD）供 socket DSN 的恢复演练使用 |
-| 出网（test-host） | 经 Privoxy 代理 `<local-proxy>`；本机 git fetch 偶发代理 502 / HTTP2 framing 抖动（重试或 `-c http.version=HTTP/1.1`） |
-| venv 策略 | `test-host` 上所有 worktree 共享主工作树 `.venv`（`UV_PROJECT_ENVIRONMENT=~/ajaimgr/.venv`）；本机 worktree 共享 `<repo-root>/.venv`；提高并发上限时必须改回各自独立 |
+| 出网 | 默认直连 GitHub；如所在网络需要代理，按机器本地配置（见 `local_info.md`），不得写入仓库。直连偶发抖动时重试，或 `git -c http.version=HTTP/1.1 fetch` |
+| venv 策略 | 测试主机所有 worktree 共享主工作树 `.venv`（`UV_PROJECT_ENVIRONMENT` 指向该 `.venv`，实际路径见 `local_info.md`）；编排机 worktree 共享各自主工作树 `.venv`；提高并发上限时必须改回各自独立 |
 | 并发上限 | **1**（派发前先确认没有子代理在跑） |
 
 ---
 
 ## 5 状态快照
 
-- `main` head = `1954dfd`（PR #11 `4ac3141` → PR #14 `e100621` → PR #15 `adfa7e9` → PR #18 `3993097` → PR #20 `1954dfd`，均为文档变更）；**本机已 ff 至此；`test-host` 本批未同步、未核对（上次记录为 `8d6f0c9`），派发前需先 `git fetch && git merge --ff-only`**；本机工作区干净；无 worktree 残留；无运行中子代理；**本轮未派发任何任务、无活动锁**；远端仅保留 `main`
+- `main` head = `3d9a193`（历史重写后的基线；此前 PR #11 → #14 → #15 → #18 → #20 均为文档变更，旧 SHA 已失效）；工作区干净；无 worktree 残留；无运行中子代理；**本轮未派发任何任务、无活动锁**；远端仅保留 `main`；测试主机同步状态以派发前实测为准（`git fetch && git merge --ff-only`）
 - 测试：本机 Fast（`validate_kit --project-ready` + `unittest discover -s tests`）rc=0（2026-10-18 06:0x 实测）；**本机未跑全量 pytest**（无 PostgreSQL）；各 PR 的 CI `app-tests` 均对 head 通过（`68a5e57` / `a57cc50` / `eee12f2` / `b89d4d1` / `7e0a515`）；最近一次全量基线仍为 **730 passed**（2026-10-16，`test-host`），本批为纯文档变更，未重跑
 - 迁移链 `0001_org_core` → `0002_identity_rbac` → `0003_permission_catalog`（**冻结快照**，W1-16）→ `0004_audit_events` → `0005_expense_core` → `0006_expense_claim_no_seq` → `0007_workflow_outbox` → `0008_intake_files` → `0009_perm_alignment` → `0010_invoice_verifications` → `0011_expense_invoices`
 - 领域目录 12 个：`app/{identity,intake,expense,workflow,documents,inventory,integrations,audit,api,db,core,runtime}`
@@ -179,7 +180,7 @@
 - `resolve_principal` 拒绝时 commit 调用方会话（调用方须视为事务边界）。
 - 模型模块导入不自足（W1-24）与 `0003` 读活动代码（W1-16）**均已修复**（PR #5 / #6）；**`0009_perm_alignment` 仍读活动代码**，为 W1-16 顺延项（见 `docs/MIGRATION-REPRODUCIBILITY.md` §5），是否冻结待定。
 - 解析流水线（W1-26）：关键字段口径（`expense_claim` → `amount`/`expense_date`）与置信度阈值 `0.75` 为**保守默认**（产品参数，可覆盖；见 `docs/INTAKE-PARSING-PIPELINE.md` §9）。
-- 双机约定（2026-10-16 起）：本机 macOS **不装 psql**（只开发）；一切 DB 测试/实测走 `test-host`（见 §4）。
+- 多机约定：编排机可不装 psql（只开发）；一切 DB 测试/实测走测试主机（见 §4 与本地 `local_info.md`）。
 - Outbox 用应用侧时钟；W1-8 只有 service 原语、无常驻 Worker。
 - API 身份仍是 `X-Employee-Id` 过渡方案；管理后台登录=内部令牌（生产必须接 SSO，已写 docstring）。
 - 微信通道「有条件 Go」，11 项待实测。
@@ -213,15 +214,15 @@
 
 ## 10 操作手册（命令级）
 
-### 双机注记（2026-10-16 起）
+### 多机注记（2026-10-18 起）
 
-- 编排（gh / git / Issues / PR）：**本机 macOS**（`<repo-root>`）直接执行。
-- 全量测试、临时库实测、迁移往返：`ssh test-host`（SSH 命令可能触发沙箱授权，放行即可；后台任务内跑 SSH 会被沙箱拦截，需前台执行）。
+- 编排（gh / git / Issues / PR）：在任一编排机（Windows / Linux / macOS）执行；工作区路径见本地 `local_info.md`（不入库）。
+- 全量测试、临时库实测、迁移往返：`ssh <test-host>`（别名与连接参数见本地 `local_info.md`；后台任务内跑 SSH 可能被沙箱拦截，需前台执行）。
 
 ### 状态恢复（每次接手先跑）
 
 ```bash
-cd <repo-root>        # 本机（macOS）
+cd <repo-root>        # 各机路径见本地 local_info.md
 git fetch --prune && git log --oneline -3 && git status --short
 gh issue list --state open
 gh pr list --state open
@@ -252,11 +253,11 @@ gh run list --limit 3                # 合并后 main 的验证运行
 ### 本地验证（在运行 head 上必须真跑）
 
 ```bash
-python3 scripts/validate_kit.py --project-ready           # 规则包（快；本机或 test-host 均可）
+python3 scripts/validate_kit.py --project-ready           # 规则包（快；编排机或测试主机均可）
 python3 -m unittest discover -s tests                     # 规则包单测（快；同上）
 
-# 全量（在 test-host 上执行；需要 PostgreSQL 17；会重置 ajaimgr_test，勿与其他实例并行）：
-export UV_PROJECT_ENVIRONMENT=~/ajaimgr/.venv
+# 全量（在测试主机上执行；需要 PostgreSQL 17；会重置 ajaimgr_test，勿与其他实例并行）：
+export UV_PROJECT_ENVIRONMENT=<test-host-venv>   # 实际路径见 local_info.md
 uv run pytest app/tests -q -o addopts=""
 ```
 
@@ -278,7 +279,7 @@ psql -d ajaimgr_test -c "\d <table>"  # 看表结构
 3. **验证脚本会往共享测试库写残留**，破坏后续 teardown；自己的临时脚本自己清（结束时复核残留=0）；演练库用完 drop。
 4. **测试库角色/权限目录会被 pytest 清掉**：临时脚本建员工前先 `seed_permission_catalog(session)`。
 5. **TMPDIR**：默认在 `~/.hermes/cache/scratch`；受约束场景显式改到仓库外且不在 `~/.hermes` 下。
-6. **worktree 里 `uv run` 会生成 126 MB `.venv`**：显式 `export UV_PROJECT_ENVIRONMENT=~/ajaimgr/.venv`；出现即删。
+6. **worktree 里 `uv run` 会生成 126 MB `.venv`**：显式 `export UV_PROJECT_ENVIRONMENT=<test-host-venv>`（见 `local_info.md`）；出现即删。
 7. **管道吃退出码**：`cmd | head` 的 `$?` 是 `head` 的；要真退出码就重定向到文件再读。
 8. **规则集语义**：head 一变，旧批准与旧 CI 证据失效；strict 模式要求 PR 与 main 同步后才能合并。
 9. **并发上限 1 是资源约束**：路径不冲突也不要并跑两个执行实例；派发前先看有没有在跑的。

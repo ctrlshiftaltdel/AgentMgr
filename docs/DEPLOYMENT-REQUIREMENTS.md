@@ -32,7 +32,7 @@
 
 - 解释器由仓库根 `.python-version` 固定为 3.13；不得用系统 python3 直接跑业务代码。
 - 依赖由 uv 管理（pyproject.toml + uv.lock），**不得使用 pip**。
-- 当前本地开发做法：所有 Worktree 共享主工作树的 `.venv`（环境变量 UV_PROJECT_ENVIRONMENT=~/ajaimgr/.venv），以避免在 1.9 GiB 的机器上重复安装依赖。
+- 当前本地开发做法：所有 Worktree 共享主工作树的 `.venv`（环境变量 `UV_PROJECT_ENVIRONMENT=<test-host-venv>`，实际路径见本地 `local_info.md`），以避免在 1.9 GiB 的机器上重复安装依赖。
 - **切换要求**：一旦把 ORCHESTRATION-PROJECT.md 的并发上限从 1 提高（允许两个执行实例同时运行），必须改回“每个 Worktree 各自生成 .venv”，否则一个 Worktree 的 uv sync 会就地改写另一个正在使用的环境。
 - 生产同样固定 3.13 并用 uv sync 安装锁定版本。
 
