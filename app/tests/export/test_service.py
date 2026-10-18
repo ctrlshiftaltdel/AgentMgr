@@ -335,9 +335,14 @@ def test_export_is_idempotent(session: Session, world, tmp_path: Path) -> None:
     assert strip_volatile(first.manifest) == strip_volatile(second.manifest)
     assert first.file_sha256 == second.file_sha256
     assert first.file_storage_key == second.file_storage_key
-    # 内容寻址：相同内容只落一份 blob（两次导出 + manifest = 2 个物理文件）。
-    blobs = [p for p in root.rglob("*") if p.is_file()]
-    assert len(blobs) == 2
+    # 内容寻址：导出文件字节可复现 → 两次导出共享**同一份** xlsx blob；
+    # manifest 因 export_id/exported_at 不同而内容不同 → 各落一份（共 2 份）。
+    blobs = sorted(p for p in root.rglob("*") if p.is_file())
+    assert len(blobs) == 3
+    assert (root / first.file_storage_key).is_file()
+    assert first.manifest_storage_key != second.manifest_storage_key
+    assert (root / first.manifest_storage_key).is_file()
+    assert (root / second.manifest_storage_key).is_file()
 
 
 # --- 拒绝路径 ----------------------------------------------------------------
