@@ -2,12 +2,16 @@
 
 覆盖 Issue #35 的验收项：
 
-* 凭据缺失 → 构造即 ``MissingCredentialError``，信息只含变量名；
+* 凭据缺失 → 构造即 ``MissingCredentialError``，信息只含变量名；``BDOCR_*`` 优先，
+  兼容旧名 ``AJAIMGR_BAIDU_*``（两者都在时用新名）；
 * token 缓存（同一实例多次识别只取一次）、过期重取、401/110 刷新一次；
 * 请求体形态（``image`` / ``pdf_file`` / ``ofd_file`` + base64 + ``probability=true``
   + 页码参数）与 ``Content-Type``；
 * 成功映射（中文日期、金额取价税合计而非不含税、购方/销方、税额）；
-* 置信度：字段项自带 ``probability``（两种形态、0–100 归一化）与缺失回退 0.5；
+* ``taxi_online_ticket`` 用 snake_case 字段（``total_fare``/``application_date``/
+  ``service_provider``），``taxi_receipt`` 不受影响；
+* 置信度：真实响应 ``{"average": ..., "min": ...}`` 优先取 ``min``、回退 ``average``
+  （0–100 归一化、负数/非有限值丢弃），缺失回退 0.5；
 * 4 类只分类不识别、空结果、多票取金额最大者；
 * 预检：非 clean / 不支持 MIME / 超 4M / 像素越界 / 图片带页码 → 发请求前拒绝；
 * 传输异常 → ``provider_error``，不泄漏异常原文与凭据；
@@ -34,6 +38,8 @@ from app.integrations.baidu_invoice_ocr import (
     BAIDU_OCR_ENDPOINT,
     BAIDU_OCR_PARSER_NAME,
     BAIDU_TOKEN_ENDPOINT,
+    LEGACY_API_KEY_ENV,
+    LEGACY_SECRET_KEY_ENV,
     SECRET_KEY_ENV,
     BaiduInvoiceOcrParser,
     HttpResponse,
@@ -241,6 +247,16 @@ class AssertionsMixin(unittest.TestCase):
 
 
 class TestCredentials(AssertionsMixin):
+    def _token_query(self, transport: RecordingTransport) -> dict[str, list[str]]:
+        """取第 1 次（token）请求的查询参数，用于核对实际使用的凭据。"""
+        token_calls = [
+            call
+            for call in transport.calls
+            if call["url"].startswith(BAIDU_TOKEN_ENDPOINT)
+        ]
+        self.assertTrue(token_calls)
+        return parse_qs(urlsplit(token_calls[0]["url"]).query)
+
     def test_missing_both_credentials_fails_closed(self) -> None:
         with self.assertRaises(MissingCredentialError) as caught:
             BaiduInvoiceOcrParser(
@@ -260,6 +276,72 @@ class TestCredentials(AssertionsMixin):
             )
         self.assertIn(SECRET_KEY_ENV, str(caught.exception))
         self.assertNotIn(API_KEY, str(caught.exception))
+
+    def test_primary_credential_names_are_used(self) -> None:
+        parser, transport, _ = _parser(
+            [
+                _token_response(),
+                _ocr_response([_entry("vat_invoice", VAT_RESULT)]),
+            ],
+            env={API_KEY_ENV: API_KEY, SECRET_KEY_ENV: SECRET_KEY},
+        )
+        self.assertTrue(parser.parse(_request()).ok)
+        query = self._token_query(transport)
+        self.assertEqual(query["client_id"], [API_KEY])
+        self.assertEqual(query["client_secret"], [SECRET_KEY])
+
+    def test_legacy_credential_names_are_supported(self) -> None:
+        # 旧部署只有 AJAIMGR_BAIDU_* 时仍可构造并取 token。
+        parser, transport, _ = _parser(
+            [
+                _token_response(),
+                _ocr_response([_entry("vat_invoice", VAT_RESULT)]),
+            ],
+            env={LEGACY_API_KEY_ENV: API_KEY, LEGACY_SECRET_KEY_ENV: SECRET_KEY},
+        )
+        self.assertTrue(parser.credentials_configured)
+        self.assertTrue(parser.parse(_request()).ok)
+        query = self._token_query(transport)
+        self.assertEqual(query["client_id"], [API_KEY])
+        self.assertEqual(query["client_secret"], [SECRET_KEY])
+
+    def test_primary_credential_names_win_over_legacy(self) -> None:
+        primary_key = "example-primary-key-0002"
+        primary_secret = "example-primary-secret-0002"
+        parser, transport, _ = _parser(
+            [
+                _token_response(),
+                _ocr_response([_entry("vat_invoice", VAT_RESULT)]),
+            ],
+            env={
+                API_KEY_ENV: primary_key,
+                SECRET_KEY_ENV: primary_secret,
+                LEGACY_API_KEY_ENV: API_KEY,
+                LEGACY_SECRET_KEY_ENV: SECRET_KEY,
+            },
+        )
+        self.assertTrue(parser.parse(_request()).ok)
+        query = self._token_query(transport)
+        self.assertEqual(query["client_id"], [primary_key])
+        self.assertEqual(query["client_secret"], [primary_secret])
+
+    def test_blank_primary_falls_back_to_legacy(self) -> None:
+        # 新名存在但为空白 → 视为未配置，回退旧名（仍 fail closed 的补集）。
+        parser, transport, _ = _parser(
+            [
+                _token_response(),
+                _ocr_response([_entry("vat_invoice", VAT_RESULT)]),
+            ],
+            env={
+                API_KEY_ENV: "   ",
+                SECRET_KEY_ENV: "",
+                LEGACY_API_KEY_ENV: API_KEY,
+                LEGACY_SECRET_KEY_ENV: SECRET_KEY,
+            },
+        )
+        self.assertTrue(parser.parse(_request()).ok)
+        query = self._token_query(transport)
+        self.assertEqual(query["client_id"], [API_KEY])
 
     def test_parser_identity_and_supported_inputs(self) -> None:
         parser, _, _ = _parser([_token_response()])
@@ -592,6 +674,43 @@ class TestFieldMapping(AssertionsMixin):
         self.assertEqual(result.fields["invoice_no"], "00012345")
         self.assertNotIn("unkeyed value is ignored", set(result.fields.values()))
 
+    def test_taxi_online_ticket_uses_snake_case_fields(self) -> None:
+        # 真实响应：taxi_online_ticket 的 result 是 snake_case，不能复用 taxi_receipt 的表。
+        result = self._parse_one_entry(
+            _entry(
+                "taxi_online_ticket",
+                {
+                    "total_fare": "123.45",
+                    "application_date": "2026-01-02",
+                    "service_provider": "示例出行科技有限公司",
+                },
+            )
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.fields["invoice_type"], "taxi_online_ticket")
+        self.assertEqual(result.fields["amount"], "123.45")
+        self.assertEqual(result.fields["invoice_date"], "2026-01-02")
+        self.assertEqual(result.fields["seller_name"], "示例出行科技有限公司")
+
+    def test_taxi_online_ticket_falls_back_to_pascal_case(self) -> None:
+        result = self._parse_one_entry(
+            _entry("taxi_online_ticket", {"TotalFare": "23.50", "date": "2026-01-02"})
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.fields["amount"], "23.50")
+        self.assertEqual(result.fields["invoice_date"], "2026-01-02")
+
+    def test_taxi_receipt_keeps_its_own_alias_table(self) -> None:
+        # 回归：taxi_receipt 仍用 PascalCase，且不会误取 snake_case 字段。
+        result = self._parse_one_entry(
+            _entry(
+                "taxi_receipt",
+                {"TotalFare": "23.50", "date": "2026-01-02", "total_fare": "999.99"},
+            )
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.fields["amount"], "23.50")
+
     def test_classification_only_types_return_only_invoice_type(self) -> None:
         for invoice_type in (
             "limit_invoice",
@@ -683,6 +802,94 @@ class TestFieldMapping(AssertionsMixin):
         parser, _, _ = _parser([_token_response(), HttpResponse(200, b"not-json")])
         result = parser.parse(_request())
         self.assert_provider_error(result)
+
+
+class TestFieldConfidence(AssertionsMixin):
+    """字段置信度：真实响应为 ``{"average": ..., "min": ...}``（已核实）。"""
+
+    def _amount_confidence(self, probability: object) -> float:
+        parser, _, _ = _parser(
+            [
+                _token_response(),
+                _ocr_response(
+                    [
+                        _entry(
+                            "vat_invoice",
+                            {
+                                "AmountInFiguers": {
+                                    "word": "123.45",
+                                    "probability": probability,
+                                }
+                            },
+                        )
+                    ]
+                ),
+            ]
+        )
+        result = parser.parse(_request())
+        self.assertTrue(result.ok)
+        self.assertEqual(result.fields["amount"], "123.45")
+        return result.field_confidence["amount"]
+
+    def test_mapping_confidence_prefers_min(self) -> None:
+        self.assertAlmostEqual(
+            self._amount_confidence({"average": 0.975, "min": 0.42}), 0.42
+        )
+
+    def test_mapping_confidence_falls_back_to_average(self) -> None:
+        self.assertAlmostEqual(self._amount_confidence({"average": 0.86}), 0.86)
+
+    def test_mapping_confidence_ignores_null_min(self) -> None:
+        self.assertAlmostEqual(
+            self._amount_confidence({"average": 0.86, "min": None}), 0.86
+        )
+
+    def test_mapping_confidence_supports_percentage_scale(self) -> None:
+        self.assertAlmostEqual(
+            self._amount_confidence({"average": 92.2, "min": 80}), 0.8
+        )
+
+    def test_mapping_confidence_drops_negative_min(self) -> None:
+        self.assertAlmostEqual(
+            self._amount_confidence({"average": 0.7, "min": -0.3}), 0.7
+        )
+
+    def test_non_finite_and_negative_scalars_fall_back(self) -> None:
+        self.assertEqual(self._amount_confidence(float("nan")), 0.5)
+        self.assertEqual(self._amount_confidence(float("inf")), 0.5)
+        self.assertEqual(self._amount_confidence(-0.4), 0.5)
+        self.assertEqual(
+            self._amount_confidence({"average": float("nan"), "min": None}), 0.5
+        )
+
+    def test_real_response_single_element_array_is_unwrapped(self) -> None:
+        parser, _, _ = _parser(
+            [
+                _token_response(),
+                _ocr_response(
+                    [
+                        _entry(
+                            "taxi_online_ticket",
+                            {
+                                "total_fare": [
+                                    {
+                                        "word": "123.45",
+                                        "probability": {
+                                            "average": 0.92,
+                                            "min": 0.81,
+                                        },
+                                    }
+                                ]
+                            },
+                        )
+                    ]
+                ),
+            ]
+        )
+        result = parser.parse(_request())
+        self.assertTrue(result.ok)
+        self.assertEqual(result.fields["amount"], "123.45")
+        self.assertAlmostEqual(result.field_confidence["amount"], 0.81)
 
 
 class TestNoNetwork(AssertionsMixin):
