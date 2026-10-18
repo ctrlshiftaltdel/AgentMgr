@@ -73,6 +73,14 @@
   本模块同时容忍映射直给标量、数组形态（元素带 ``key``/``name`` 等标识键）。
 * ``taxi_online_ticket`` 的 ``result`` 用 snake_case 字段名。
 
+共享口径（Issue #52）：本模块同时是百度 OCR 的**通用件**所在地——OAuth 客户端
+（``BaiduInvoiceOcrClient``）、原件预检（``precheck_source_document``）、凭据解析
+（``resolve_credential_env``）与字段清洗/归一化（``clean_field_text`` /
+``normalize_amount`` / ``normalize_invoice_date``）。专用端点适配器
+（``app.integrations.baidu_dedicated_ocr``：``vat_invoice`` /
+``online_taxi_itinerary``）复用这些公开口径，使**同一供应商的请求形态、预检顺序与
+字段格式在所有端点之间不漂移**；共享件本身的行为未变。
+
 网络出口通过可注入的 ``transport`` 完成：生产默认 ``httpx``（**惰性导入**，仅真实
 请求时加载）；测试一律注入桩，**绝不调用真实百度接口、不使用真实 Key**。本模块只
 依赖标准库与项目既有模块。
@@ -132,6 +140,12 @@ __all__ = [
     "Transport",
     "TransportError",
     "TransportTimeout",
+    # 共享口径（Issue #52：专用端点适配器复用同一供应商约定）。
+    "clean_field_text",
+    "normalize_amount",
+    "normalize_invoice_date",
+    "precheck_source_document",
+    "resolve_credential_env",
 ]
 
 _LOGGER = logging.getLogger(__name__)
@@ -825,11 +839,17 @@ def _resolve_credential_env(env: Mapping[str, str] | None) -> dict[str, str]:
 
 
 class BaiduInvoiceOcrClient:
-    """百度 ``multiple_invoice`` 客户端：OAuth token 缓存 + 单次识别请求。
+    """百度 OCR 客户端：OAuth token 缓存 + 单次识别请求（**所有 OCR 端点共用**）。
 
     * ``api_key`` / ``secret_key`` 默认从环境变量读取（``BDOCR_*`` 优先，兼容旧名
       ``AJAIMGR_BAIDU_*``）；缺失即 ``MissingCredentialError``（fail closed），错误
       信息只提环境变量名；
+    * ``endpoint`` 决定打到哪个 OCR 端点（默认 ``multiple_invoice``；专用端点由
+      Issue #52 的适配器传入），鉴权、表单编码与失败收敛口径三端点一致；
+    * ``probability`` 决定是否随请求发送 ``probability=true``（默认 ``True``，即
+      ``multiple_invoice`` 的现状）。专用端点**不发送**该参数：``vat_invoice`` 已由
+      真实探针确认会**静默忽略**它（W2-37 §7 D4①），``online_taxi_itinerary`` 文档
+      未列该开关——不臆造参数；
     * token 按 ``expires_in`` 缓存，剩余寿命不足 60 秒即重新获取；同一实例内用锁
       串行化 token 获取（避免并发重复取 token，不做 token 预热）；
     * 401 或 ``error_code`` ∈ {110, 111} → 失效缓存并**刷新一次**后重试一次；
@@ -845,6 +865,7 @@ class BaiduInvoiceOcrClient:
         transport: Transport | None = None,
         clock: Callable[[], datetime] | None = None,
         endpoint: str = BAIDU_OCR_ENDPOINT,
+        probability: bool = True,
         token_endpoint: str = BAIDU_TOKEN_ENDPOINT,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
@@ -873,6 +894,7 @@ class BaiduInvoiceOcrClient:
             clock if clock is not None else (lambda: datetime.now(UTC))
         )
         self._endpoint = endpoint
+        self._probability = bool(probability)
         self._token_endpoint = token_endpoint
         self._timeout = timeout
         self._token_lock = threading.Lock()
@@ -947,11 +969,12 @@ class BaiduInvoiceOcrClient:
     def recognize(
         self, content: bytes, mime_type: str, *, page: int | None = None
     ) -> dict[str, Any]:
-        """调用一次 ``multiple_invoice``，返回原始响应 dict。
+        """调用一次 OCR 端点，返回原始响应 dict。
 
         ``image``/``pdf_file``/``ofd_file`` 一律 base64 → urlencode；``probability``
-        固定为 ``true``（请求字段置信度）。PDF/OFD 可传 ``page``（默认第 1 页）；
-        图片传 ``page`` 直接拒绝。失败抛 ``OcrProviderError``。
+        按构造参数决定（``multiple_invoice`` 传 ``true``，专用端点不传）。PDF/OFD 可
+        传 ``page``（默认第 1 页）；图片传 ``page`` 直接拒绝。失败抛
+        ``OcrProviderError``。
         """
         if not content:
             raise OcrProviderError("empty_content")
@@ -973,7 +996,9 @@ class BaiduInvoiceOcrClient:
         if len(urlencode({field_name: encoded})) > MAX_ENCODED_BYTES:
             raise OcrProviderError("payload_too_large")
 
-        params: dict[str, str] = {field_name: encoded, "probability": "true"}
+        params: dict[str, str] = {field_name: encoded}
+        if self._probability:
+            params["probability"] = "true"
         if page_number is not None:
             page_field = "pdf_file_num" if carrier == "pdf" else "ofd_file_num"
             params[page_field] = str(page_number)
@@ -997,7 +1022,10 @@ class BaiduInvoiceOcrClient:
                 raise OcrProviderError("provider_http_error")
             if code is not None:
                 raise OcrProviderError(_ERROR_REASONS.get(code, PROVIDER_ERROR))
-            if not isinstance(data.get("words_result"), list):
+            # ``words_result`` 的载体随端点而异：``multiple_invoice`` 是**数组**
+            # （一页多票），专用端点（Issue #52）是**对象**（单票/单份）。两者都
+            # 只表示「响应形态可识别」，字段级解析由各适配器负责。
+            if not isinstance(data.get("words_result"), (list, Mapping)):
                 raise OcrProviderError("invalid_response")
             return data
 
@@ -1142,3 +1170,38 @@ class BaiduInvoiceOcrParser(ExternalParser):
             field_confidence=confidence,
             source_file_id=request.source_file_id,
         )
+
+
+# --- 共享口径（Issue #52：专用端点适配器复用） --------------------------------
+#
+# 下列函数是**同一供应商约定**的公开入口。OAuth 客户端
+# （``BaiduInvoiceOcrClient``）与预检/字段清洗口径必须在 ``multiple_invoice``、
+# ``vat_invoice``、``online_taxi_itinerary`` 三个端点之间完全一致——否则同一张票
+# 在不同路由模式下会得到不同格式的字段值（例如日期是否 ISO、金额是否两位小数），
+# 下游的写回与核对就会出现模式相关的分支。它们只是对模块内既有实现的**公开别名**：
+# 行为未变，既有调用方与测试不受影响。
+
+
+def resolve_credential_env(env: Mapping[str, str] | None) -> dict[str, str]:
+    """公开别名：按「新名优先、旧名回退」解析百度 OCR 凭据（只搬运，不记录）。"""
+    return _resolve_credential_env(env)
+
+
+def precheck_source_document(document: SourceDocument, page: Any) -> str | None:
+    """公开别名：发请求前的本地预检（返回稳定拒绝原因；通过返回 ``None``）。"""
+    return _precheck(document, page)
+
+
+def clean_field_text(value: Any) -> str | None:
+    """公开别名：字段值清洗（``None`` / 布尔值 / **容器**一律视为无值）。"""
+    return _clean_str(value)
+
+
+def normalize_amount(raw: str) -> str:
+    """公开别名：金额 → 2 位小数字符串（无法解析时保留原值交给人工复核）。"""
+    return _normalize_amount(raw)
+
+
+def normalize_invoice_date(raw: str) -> str:
+    """公开别名：日期 → ISO ``YYYY-MM-DD``（无法解析时保留原值交给人工复核）。"""
+    return _normalize_invoice_date(raw)

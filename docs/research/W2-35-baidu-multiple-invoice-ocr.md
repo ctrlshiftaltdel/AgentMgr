@@ -8,6 +8,12 @@
 > 本文记录的是**从真实响应中学到的事实**、与选型报告不一致之处、以及仍未验证项。
 >
 > - 关联 Issue：#35（接入）、#37（按真实响应修正）、#39（本文）
+> - 后续状态（2026-10-18，**Issue #52**）：本端点已由 #45 接入默认装配点
+>   （`app/intake/assembly.py::build_default_parser_registry`），并由 #52 成为**可配置
+>   路由**下的 `smart` 默认路径（`[ocr].routing = "smart"`，**生产行为不变**）；`routed`
+>   模式下票据改走专用端点 `vat_invoice`（处置口径见
+>   [W2-37](W2-37-ocr-endpoint-comparison.md) §7.1）。本模块为专用端点适配器新增了
+>   「共享口径」公开别名（预检 / 凭据解析 / 字段清洗与归一化），既有行为未变。
 > - 代码：`app/integrations/baidu_invoice_ocr.py`（`BaiduInvoiceOcrClient` / `BaiduInvoiceOcrParser`）
 > - 上游：选型报告 [W2-ocr-asr-vendor-selection.md](W2-ocr-asr-vendor-selection.md)、
 >   契约 [../INTAKE-PARSING-PIPELINE.md](../INTAKE-PARSING-PIPELINE.md)
@@ -218,8 +224,12 @@
    §9 第 1 项**未验证**，这是合规阻塞项，不是技术项。
 4. **配额与计费未验证**：免费额度、超额度后的行为、PDF 多页是否重复计费，均未实测。
 5. **OFD 只见过增值税发票**：OFD 承载其他票种时的表现未知。
-6. **未注册进 `ParserRegistry`**：当前适配器可用但未接入自动路由，端到端「解析 → 草稿 →
-   人工确认」链路尚未打通（后续 Issue）。
+6. ~~**未注册进 `ParserRegistry`**~~ **→ 已解决（2026-10-18）**：`#45`（PR #51）
+   补齐了默认装配点 `build_default_parser_registry` 与生产级 `SourceReader`，
+   `#52` 又把它变成**可配置路由**下的 `smart` 默认路径（`[ocr].routing`，见
+   [W2-37](W2-37-ocr-endpoint-comparison.md) §7.1）；`#56`（PR #66）打通了「确认后
+   写回」。端到端「解析 → 草稿 → 人工确认 → 写回」由桩测试覆盖（真实票据的端到端
+   联调见 §8）。**仍未做**：`routed` 模式的真实联调（须所有者单独授权）。
 7. **一页多票拆分未实现**（见 §4）。
 
 ---
