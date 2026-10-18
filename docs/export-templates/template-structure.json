@@ -1,0 +1,1961 @@
+{
+  "template": {
+    "path_placeholder": "<template-file>",
+    "sha256": "1a235166285ee31255c899ce57e09eedd1e7f6641cd6fd3b5e931471ecb2718c",
+    "size_bytes": 161974,
+    "worksheet_count": 14,
+    "shared_strings": 989,
+    "defined_names": [
+      {
+        "name": "_xlnm._FilterDatabase",
+        "local_sheet_id": "4",
+        "refers_to": "横向自定义!#REF!"
+      },
+      {
+        "name": "_xlnm._FilterDatabase",
+        "local_sheet_id": "8",
+        "refers_to": "录入数据!$A$1:$AE$8"
+      }
+    ]
+  },
+  "extraction": {
+    "tool": "python3 (stdlib zipfile + xml.etree)",
+    "script": "embedded heredoc, docs/TRACK-D-EXPORT-TEMPLATE-MAPPING.md Sec.8",
+    "header_row_policy": "default 1; explicit overrides for non-tabular first rows",
+    "header_row_overrides": {
+      "使用说明": null,
+      "横向自定义": null,
+      "发票多行式": 3
+    },
+    "header_text_normalization": "_x000D_ / CR / LF / TAB -> single space",
+    "optional_hint": "textual hint from the header text; not authoritative"
+  },
+  "worksheets": [
+    {
+      "order": 1,
+      "name": "使用说明",
+      "extent": "A1:V34",
+      "non_empty_rows": 24,
+      "first_row": 1,
+      "last_row": 34,
+      "first_three_rows": [
+        {
+          "row": 1,
+          "non_empty_cells": 1,
+          "numeric_cells": 0
+        },
+        {
+          "row": 2,
+          "non_empty_cells": 2,
+          "numeric_cells": 0
+        },
+        {
+          "row": 3,
+          "non_empty_cells": 1,
+          "numeric_cells": 0
+        }
+      ],
+      "header_row": null,
+      "header_row_is_override": true,
+      "data_start_row": null,
+      "first_data_row": null,
+      "column_count": 0,
+      "formula_cells": 0,
+      "merged_cells": [
+        "A26:M26",
+        "A28:M28",
+        "A15:M15",
+        "A16:M16",
+        "A17:M17",
+        "N2:V2",
+        "A21:M21",
+        "A18:M18",
+        "A22:M22",
+        "A24:M24"
+      ],
+      "data_validations": [],
+      "columns": []
+    },
+    {
+      "order": 2,
+      "name": "简易日记账",
+      "extent": "A1:O5",
+      "non_empty_rows": 3,
+      "first_row": 1,
+      "last_row": 3,
+      "first_three_rows": [
+        {
+          "row": 1,
+          "non_empty_cells": 15,
+          "numeric_cells": 0
+        },
+        {
+          "row": 2,
+          "non_empty_cells": 11,
+          "numeric_cells": 3
+        },
+        {
+          "row": 3,
+          "non_empty_cells": 11,
+          "numeric_cells": 3
+        }
+      ],
+      "header_row": 1,
+      "header_row_is_override": false,
+      "data_start_row": 2,
+      "first_data_row": {
+        "row": 2,
+        "populated_columns": [
+          "A",
+          "B",
+          "C",
+          "D",
+          "F",
+          "G",
+          "H",
+          "J",
+          "K",
+          "N",
+          "O"
+        ]
+      },
+      "column_count": 15,
+      "formula_cells": 0,
+      "merged_cells": [],
+      "data_validations": [],
+      "columns": [
+        {
+          "column": "A",
+          "header": "凭证字 (非必录)",
+          "optional_hint": true
+        },
+        {
+          "column": "B",
+          "header": "序号",
+          "optional_hint": false
+        },
+        {
+          "column": "C",
+          "header": "凭证日期 交易日期",
+          "optional_hint": false
+        },
+        {
+          "column": "D",
+          "header": "摘 要",
+          "optional_hint": false
+        },
+        {
+          "column": "E",
+          "header": "借方(收款金额）",
+          "optional_hint": false
+        },
+        {
+          "column": "F",
+          "header": "贷方（付款金额）",
+          "optional_hint": false
+        },
+        {
+          "column": "G",
+          "header": "资金科目代码 (与金额方向相同)",
+          "optional_hint": false
+        },
+        {
+          "column": "H",
+          "header": "资金科目名称 (非必填）",
+          "optional_hint": true
+        },
+        {
+          "column": "I",
+          "header": "辅助核算名称A 跟随资金科目(非必填）",
+          "optional_hint": true
+        },
+        {
+          "column": "J",
+          "header": "对方科目代码 (与金额方向相反)",
+          "optional_hint": false
+        },
+        {
+          "column": "K",
+          "header": "对方科目名称 (非必填）",
+          "optional_hint": true
+        },
+        {
+          "column": "L",
+          "header": "辅助核算名称B 跟随对方科目(非必填）",
+          "optional_hint": true
+        },
+        {
+          "column": "M",
+          "header": "数据检测情况",
+          "optional_hint": false
+        },
+        {
+          "column": "N",
+          "header": "匹配模板编号",
+          "optional_hint": false
+        },
+        {
+          "column": "O",
+          "header": "匹配模板名称",
+          "optional_hint": false
+        }
+      ]
+    },
+    {
+      "order": 3,
+      "name": "日记账",
+      "extent": "A1:AC21",
+      "non_empty_rows": 5,
+      "first_row": 1,
+      "last_row": 5,
+      "first_three_rows": [
+        {
+          "row": 1,
+          "non_empty_cells": 29,
+          "numeric_cells": 0
+        },
+        {
+          "row": 2,
+          "non_empty_cells": 13,
+          "numeric_cells": 6
+        },
+        {
+          "row": 3,
+          "non_empty_cells": 13,
+          "numeric_cells": 5
+        }
+      ],
+      "header_row": 1,
+      "header_row_is_override": false,
+      "data_start_row": 2,
+      "first_data_row": {
+        "row": 2,
+        "populated_columns": [
+          "A",
+          "B",
+          "C",
+          "D",
+          "E",
+          "F",
+          "H",
+          "K",
+          "L",
+          "M",
+          "O",
+          "P",
+          "X"
+        ]
+      },
+      "column_count": 29,
+      "formula_cells": 0,
+      "merged_cells": [],
+      "data_validations": [
+        {
+          "sqref": "G2:G4",
+          "type": "list"
+        },
+        {
+          "sqref": "Y1:Y4",
+          "type": "whole"
+        }
+      ],
+      "columns": [
+        {
+          "column": "A",
+          "header": "凭证字 (非必录)",
+          "optional_hint": true
+        },
+        {
+          "column": "B",
+          "header": "序号",
+          "optional_hint": false
+        },
+        {
+          "column": "C",
+          "header": "凭证日期 交易日期",
+          "optional_hint": false
+        },
+        {
+          "column": "D",
+          "header": "摘要",
+          "optional_hint": false
+        },
+        {
+          "column": "E",
+          "header": "借方金额",
+          "optional_hint": false
+        },
+        {
+          "column": "F",
+          "header": "贷方金额",
+          "optional_hint": false
+        },
+        {
+          "column": "G",
+          "header": "数量跟随位置",
+          "optional_hint": false
+        },
+        {
+          "column": "H",
+          "header": "数量",
+          "optional_hint": false
+        },
+        {
+          "column": "I",
+          "header": "数量单位",
+          "optional_hint": false
+        },
+        {
+          "column": "J",
+          "header": "单价",
+          "optional_hint": false
+        },
+        {
+          "column": "K",
+          "header": "资金科目代码 (与金额方向相同)",
+          "optional_hint": false
+        },
+        {
+          "column": "L",
+          "header": "资金科目名称A (非必填）",
+          "optional_hint": true
+        },
+        {
+          "column": "M",
+          "header": "辅助核算名称A1 （非必须）",
+          "optional_hint": true
+        },
+        {
+          "column": "N",
+          "header": "辅助核算名称A2 （非必须）",
+          "optional_hint": true
+        },
+        {
+          "column": "O",
+          "header": "对方科目代码 (与金额方向相反)",
+          "optional_hint": false
+        },
+        {
+          "column": "P",
+          "header": "对方科目名称B (非必填）",
+          "optional_hint": true
+        },
+        {
+          "column": "Q",
+          "header": "辅助核算名称B1 （非必须）",
+          "optional_hint": true
+        },
+        {
+          "column": "R",
+          "header": "辅助核算名称B2 （非必须）",
+          "optional_hint": true
+        },
+        {
+          "column": "S",
+          "header": "外币跟随位置",
+          "optional_hint": false
+        },
+        {
+          "column": "T",
+          "header": "币别代码",
+          "optional_hint": false
+        },
+        {
+          "column": "U",
+          "header": "币别名称",
+          "optional_hint": false
+        },
+        {
+          "column": "V",
+          "header": "外币原值",
+          "optional_hint": false
+        },
+        {
+          "column": "W",
+          "header": "汇率",
+          "optional_hint": false
+        },
+        {
+          "column": "X",
+          "header": "附件数",
+          "optional_hint": false
+        },
+        {
+          "column": "Y",
+          "header": "业务编号位置",
+          "optional_hint": false
+        },
+        {
+          "column": "Z",
+          "header": "业务编号",
+          "optional_hint": false
+        },
+        {
+          "column": "AA",
+          "header": "数据检测情况",
+          "optional_hint": false
+        },
+        {
+          "column": "AB",
+          "header": "匹配模板编号",
+          "optional_hint": false
+        },
+        {
+          "column": "AC",
+          "header": "匹配模板名称",
+          "optional_hint": false
+        }
+      ]
+    },
+    {
+      "order": 4,
+      "name": "发票记录",
+      "extent": "A1:AF31",
+      "non_empty_rows": 4,
+      "first_row": 1,
+      "last_row": 4,
+      "first_three_rows": [
+        {
+          "row": 1,
+          "non_empty_cells": 32,
+          "numeric_cells": 0
+        },
+        {
+          "row": 2,
+          "non_empty_cells": 16,
+          "numeric_cells": 8
+        },
+        {
+          "row": 3,
+          "non_empty_cells": 15,
+          "numeric_cells": 9
+        }
+      ],
+      "header_row": 1,
+      "header_row_is_override": false,
+      "data_start_row": 2,
+      "first_data_row": {
+        "row": 2,
+        "populated_columns": [
+          "A",
+          "B",
+          "C",
+          "D",
+          "G",
+          "H",
+          "I",
+          "J",
+          "K",
+          "L",
+          "M",
+          "P",
+          "Q",
+          "R",
+          "S",
+          "AA"
+        ]
+      },
+      "column_count": 32,
+      "formula_cells": 0,
+      "merged_cells": [],
+      "data_validations": [
+        {
+          "sqref": "E2:E31 AC2:AC31",
+          "type": "list"
+        },
+        {
+          "sqref": "AB1:AB12",
+          "type": "whole"
+        }
+      ],
+      "columns": [
+        {
+          "column": "A",
+          "header": "凭证字 (非必录)",
+          "optional_hint": true
+        },
+        {
+          "column": "B",
+          "header": "凭证号",
+          "optional_hint": false
+        },
+        {
+          "column": "C",
+          "header": "凭证日期",
+          "optional_hint": false
+        },
+        {
+          "column": "D",
+          "header": "摘 要",
+          "optional_hint": false
+        },
+        {
+          "column": "E",
+          "header": "数量跟随位置",
+          "optional_hint": false
+        },
+        {
+          "column": "F",
+          "header": "数量单位 (非必填）",
+          "optional_hint": true
+        },
+        {
+          "column": "G",
+          "header": "数量 (非必填）",
+          "optional_hint": true
+        },
+        {
+          "column": "H",
+          "header": "单价 (非必填）",
+          "optional_hint": true
+        },
+        {
+          "column": "I",
+          "header": "不含税金额",
+          "optional_hint": false
+        },
+        {
+          "column": "J",
+          "header": "税额",
+          "optional_hint": false
+        },
+        {
+          "column": "K",
+          "header": "价税合计",
+          "optional_hint": false
+        },
+        {
+          "column": "L",
+          "header": "借方 科目代码A",
+          "optional_hint": false
+        },
+        {
+          "column": "M",
+          "header": "借方 科目名称A (非必填）",
+          "optional_hint": true
+        },
+        {
+          "column": "N",
+          "header": "辅助核算名称A1 (非必填）",
+          "optional_hint": true
+        },
+        {
+          "column": "O",
+          "header": "辅助核算名称A2 (非必填）",
+          "optional_hint": true
+        },
+        {
+          "column": "P",
+          "header": "税费 科目代码B",
+          "optional_hint": false
+        },
+        {
+          "column": "Q",
+          "header": "税费科 目名称B",
+          "optional_hint": false
+        },
+        {
+          "column": "R",
+          "header": "贷方 科目代码C",
+          "optional_hint": false
+        },
+        {
+          "column": "S",
+          "header": "贷方 科目名称C (非必填）",
+          "optional_hint": true
+        },
+        {
+          "column": "T",
+          "header": "辅助核算名称C1 (非必填）",
+          "optional_hint": true
+        },
+        {
+          "column": "U",
+          "header": "辅助核算名称C2 (非必填）",
+          "optional_hint": true
+        },
+        {
+          "column": "V",
+          "header": "外币跟随位置",
+          "optional_hint": false
+        },
+        {
+          "column": "W",
+          "header": "币别代码",
+          "optional_hint": false
+        },
+        {
+          "column": "X",
+          "header": "币别名称",
+          "optional_hint": false
+        },
+        {
+          "column": "Y",
+          "header": "外币原值",
+          "optional_hint": false
+        },
+        {
+          "column": "Z",
+          "header": "汇率",
+          "optional_hint": false
+        },
+        {
+          "column": "AA",
+          "header": "附件数",
+          "optional_hint": false
+        },
+        {
+          "column": "AB",
+          "header": "业务编号位置",
+          "optional_hint": false
+        },
+        {
+          "column": "AC",
+          "header": "业务编号",
+          "optional_hint": false
+        },
+        {
+          "column": "AD",
+          "header": "数据检测情况",
+          "optional_hint": false
+        },
+        {
+          "column": "AE",
+          "header": "模板号（无需手填）",
+          "optional_hint": true
+        },
+        {
+          "column": "AF",
+          "header": "模板名称（无需手填）",
+          "optional_hint": true
+        }
+      ]
+    },
+    {
+      "order": 5,
+      "name": "横向自定义",
+      "extent": "A1:H29984",
+      "non_empty_rows": 11,
+      "first_row": 1,
+      "last_row": 11,
+      "first_three_rows": [
+        {
+          "row": 1,
+          "non_empty_cells": 5,
+          "numeric_cells": 0
+        },
+        {
+          "row": 2,
+          "non_empty_cells": 5,
+          "numeric_cells": 0
+        },
+        {
+          "row": 3,
+          "non_empty_cells": 5,
+          "numeric_cells": 0
+        }
+      ],
+      "header_row": null,
+      "header_row_is_override": true,
+      "data_start_row": null,
+      "first_data_row": null,
+      "column_count": 0,
+      "formula_cells": 0,
+      "merged_cells": [],
+      "data_validations": [
+        {
+          "sqref": "E6:H6",
+          "type": "list"
+        }
+      ],
+      "columns": []
+    },
+    {
+      "order": 6,
+      "name": "发票多行式",
+      "extent": "A1:Q33",
+      "non_empty_rows": 6,
+      "first_row": 1,
+      "last_row": 6,
+      "first_three_rows": [
+        {
+          "row": 1,
+          "non_empty_cells": 7,
+          "numeric_cells": 0
+        },
+        {
+          "row": 2,
+          "non_empty_cells": 5,
+          "numeric_cells": 1
+        },
+        {
+          "row": 3,
+          "non_empty_cells": 16,
+          "numeric_cells": 0
+        }
+      ],
+      "header_row": 3,
+      "header_row_is_override": true,
+      "data_start_row": 4,
+      "first_data_row": {
+        "row": 4,
+        "populated_columns": [
+          "B",
+          "D",
+          "F",
+          "G",
+          "H",
+          "I",
+          "J",
+          "K",
+          "L",
+          "M"
+        ]
+      },
+      "column_count": 16,
+      "formula_cells": 0,
+      "merged_cells": [],
+      "data_validations": [
+        {
+          "sqref": "A2",
+          "type": "list"
+        }
+      ],
+      "columns": [
+        {
+          "column": "A",
+          "header": "发票代码",
+          "optional_hint": false
+        },
+        {
+          "column": "B",
+          "header": "发票号码",
+          "optional_hint": false
+        },
+        {
+          "column": "C",
+          "header": "全电号码",
+          "optional_hint": false
+        },
+        {
+          "column": "D",
+          "header": "对方公司名称",
+          "optional_hint": false
+        },
+        {
+          "column": "E",
+          "header": "单位 (非必填）",
+          "optional_hint": true
+        },
+        {
+          "column": "F",
+          "header": "数量 (非必填）",
+          "optional_hint": true
+        },
+        {
+          "column": "G",
+          "header": "单价 (非必填）",
+          "optional_hint": true
+        },
+        {
+          "column": "H",
+          "header": "不含税金额",
+          "optional_hint": false
+        },
+        {
+          "column": "I",
+          "header": "税额",
+          "optional_hint": false
+        },
+        {
+          "column": "J",
+          "header": "价税合计",
+          "optional_hint": false
+        },
+        {
+          "column": "K",
+          "header": "摘要",
+          "optional_hint": false
+        },
+        {
+          "column": "L",
+          "header": "科目代码A",
+          "optional_hint": false
+        },
+        {
+          "column": "M",
+          "header": "科目名称A (非必填）",
+          "optional_hint": true
+        },
+        {
+          "column": "N",
+          "header": "辅助核算名称A1 (非必填）",
+          "optional_hint": true
+        },
+        {
+          "column": "O",
+          "header": "辅助核算名称A2 (非必填）",
+          "optional_hint": true
+        },
+        {
+          "column": "P",
+          "header": "数据检测情况",
+          "optional_hint": false
+        }
+      ]
+    },
+    {
+      "order": 7,
+      "name": "发票多行式二",
+      "extent": "A1:V31",
+      "non_empty_rows": 7,
+      "first_row": 1,
+      "last_row": 7,
+      "first_three_rows": [
+        {
+          "row": 1,
+          "non_empty_cells": 20,
+          "numeric_cells": 0
+        },
+        {
+          "row": 2,
+          "non_empty_cells": 14,
+          "numeric_cells": 5
+        },
+        {
+          "row": 3,
+          "non_empty_cells": 14,
+          "numeric_cells": 5
+        }
+      ],
+      "header_row": 1,
+      "header_row_is_override": false,
+      "data_start_row": 2,
+      "first_data_row": {
+        "row": 2,
+        "populated_columns": [
+          "A",
+          "B",
+          "D",
+          "F",
+          "G",
+          "H",
+          "I",
+          "J",
+          "K",
+          "L",
+          "N",
+          "O",
+          "Q",
+          "R"
+        ]
+      },
+      "column_count": 20,
+      "formula_cells": 0,
+      "merged_cells": [],
+      "data_validations": [],
+      "columns": [
+        {
+          "column": "A",
+          "header": "发票代码",
+          "optional_hint": false
+        },
+        {
+          "column": "B",
+          "header": "发票号码",
+          "optional_hint": false
+        },
+        {
+          "column": "C",
+          "header": "全量发票号码",
+          "optional_hint": false
+        },
+        {
+          "column": "D",
+          "header": "摘 要",
+          "optional_hint": false
+        },
+        {
+          "column": "E",
+          "header": "数量单位 (非必填）",
+          "optional_hint": true
+        },
+        {
+          "column": "F",
+          "header": "数量 (非必填）",
+          "optional_hint": true
+        },
+        {
+          "column": "G",
+          "header": "单价 (非必填）",
+          "optional_hint": true
+        },
+        {
+          "column": "H",
+          "header": "不含税金额",
+          "optional_hint": false
+        },
+        {
+          "column": "I",
+          "header": "税额",
+          "optional_hint": false
+        },
+        {
+          "column": "J",
+          "header": "价税合计",
+          "optional_hint": false
+        },
+        {
+          "column": "K",
+          "header": "借方跟随明细 科目代码A",
+          "optional_hint": false
+        },
+        {
+          "column": "L",
+          "header": "借方跟随明细 科目名称A (非必填）",
+          "optional_hint": true
+        },
+        {
+          "column": "M",
+          "header": "跟随明细辅助核算名称A (非必填）",
+          "optional_hint": true
+        },
+        {
+          "column": "N",
+          "header": "税费 科目代码B",
+          "optional_hint": false
+        },
+        {
+          "column": "O",
+          "header": "税费科 目名称B",
+          "optional_hint": false
+        },
+        {
+          "column": "P",
+          "header": "税费科目核算名称B (非必填）",
+          "optional_hint": true
+        },
+        {
+          "column": "Q",
+          "header": "贷方应付 科目代码C",
+          "optional_hint": false
+        },
+        {
+          "column": "R",
+          "header": "贷方应付 科目名称C (非必填）",
+          "optional_hint": true
+        },
+        {
+          "column": "S",
+          "header": "辅助核算名称C1 (非必填）",
+          "optional_hint": true
+        },
+        {
+          "column": "T",
+          "header": "数据检测情况",
+          "optional_hint": false
+        }
+      ]
+    },
+    {
+      "order": 8,
+      "name": "先借后贷",
+      "extent": "A1:T31",
+      "non_empty_rows": 7,
+      "first_row": 1,
+      "last_row": 7,
+      "first_three_rows": [
+        {
+          "row": 1,
+          "non_empty_cells": 13,
+          "numeric_cells": 0
+        },
+        {
+          "row": 2,
+          "non_empty_cells": 9,
+          "numeric_cells": 3
+        },
+        {
+          "row": 3,
+          "non_empty_cells": 9,
+          "numeric_cells": 3
+        }
+      ],
+      "header_row": 1,
+      "header_row_is_override": false,
+      "data_start_row": 2,
+      "first_data_row": {
+        "row": 2,
+        "populated_columns": [
+          "A",
+          "B",
+          "C",
+          "D",
+          "E",
+          "F",
+          "G",
+          "I",
+          "J"
+        ]
+      },
+      "column_count": 13,
+      "formula_cells": 0,
+      "merged_cells": [],
+      "data_validations": [],
+      "columns": [
+        {
+          "column": "A",
+          "header": "凭证字",
+          "optional_hint": false
+        },
+        {
+          "column": "B",
+          "header": "凭证号",
+          "optional_hint": false
+        },
+        {
+          "column": "C",
+          "header": "凭证日期",
+          "optional_hint": false
+        },
+        {
+          "column": "D",
+          "header": "摘 要",
+          "optional_hint": false
+        },
+        {
+          "column": "E",
+          "header": "金额",
+          "optional_hint": false
+        },
+        {
+          "column": "F",
+          "header": "借方跟随明细 科目代码A",
+          "optional_hint": false
+        },
+        {
+          "column": "G",
+          "header": "借方跟随明细 科目名称A (非必填）",
+          "optional_hint": true
+        },
+        {
+          "column": "H",
+          "header": "跟随明细辅助核算名称A (非必填）",
+          "optional_hint": true
+        },
+        {
+          "column": "I",
+          "header": "贷方 科目代码B",
+          "optional_hint": false
+        },
+        {
+          "column": "J",
+          "header": "贷方 科目名称B (非必填）",
+          "optional_hint": true
+        },
+        {
+          "column": "K",
+          "header": "辅助核算名称B (非必填）",
+          "optional_hint": true
+        },
+        {
+          "column": "L",
+          "header": "数据检测情况",
+          "optional_hint": false
+        },
+        {
+          "column": "T",
+          "header": "数据检测情况",
+          "optional_hint": false
+        }
+      ]
+    },
+    {
+      "order": 9,
+      "name": "录入数据",
+      "extent": "A1:AE18",
+      "non_empty_rows": 7,
+      "first_row": 1,
+      "last_row": 7,
+      "first_three_rows": [
+        {
+          "row": 1,
+          "non_empty_cells": 31,
+          "numeric_cells": 0
+        },
+        {
+          "row": 2,
+          "non_empty_cells": 14,
+          "numeric_cells": 7
+        },
+        {
+          "row": 3,
+          "non_empty_cells": 13,
+          "numeric_cells": 7
+        }
+      ],
+      "header_row": 1,
+      "header_row_is_override": false,
+      "data_start_row": 2,
+      "first_data_row": {
+        "row": 2,
+        "populated_columns": [
+          "A",
+          "B",
+          "C",
+          "D",
+          "E",
+          "F",
+          "H",
+          "I",
+          "J",
+          "K",
+          "L",
+          "M",
+          "N",
+          "S"
+        ]
+      },
+      "column_count": 31,
+      "formula_cells": 0,
+      "merged_cells": [],
+      "data_validations": [],
+      "columns": [
+        {
+          "column": "A",
+          "header": "凭证字",
+          "optional_hint": false
+        },
+        {
+          "column": "B",
+          "header": "凭证号",
+          "optional_hint": false
+        },
+        {
+          "column": "C",
+          "header": "凭证日期",
+          "optional_hint": false
+        },
+        {
+          "column": "D",
+          "header": "凭证摘要",
+          "optional_hint": false
+        },
+        {
+          "column": "E",
+          "header": "科目代码",
+          "optional_hint": false
+        },
+        {
+          "column": "F",
+          "header": "科目名称",
+          "optional_hint": false
+        },
+        {
+          "column": "G",
+          "header": "余额方向 D/C(自动补充)",
+          "optional_hint": false
+        },
+        {
+          "column": "H",
+          "header": "币别代码",
+          "optional_hint": false
+        },
+        {
+          "column": "I",
+          "header": "币别名称",
+          "optional_hint": false
+        },
+        {
+          "column": "J",
+          "header": "原币金额",
+          "optional_hint": false
+        },
+        {
+          "column": "K",
+          "header": "汇率",
+          "optional_hint": false
+        },
+        {
+          "column": "L",
+          "header": "数量",
+          "optional_hint": false
+        },
+        {
+          "column": "M",
+          "header": "单价",
+          "optional_hint": false
+        },
+        {
+          "column": "N",
+          "header": "借方金额",
+          "optional_hint": false
+        },
+        {
+          "column": "O",
+          "header": "贷方金额",
+          "optional_hint": false
+        },
+        {
+          "column": "P",
+          "header": "制单人",
+          "optional_hint": false
+        },
+        {
+          "column": "Q",
+          "header": "辅助核算类别A",
+          "optional_hint": false
+        },
+        {
+          "column": "R",
+          "header": "项目代码A",
+          "optional_hint": false
+        },
+        {
+          "column": "S",
+          "header": "核算项目名称A",
+          "optional_hint": false
+        },
+        {
+          "column": "T",
+          "header": "辅助核算类别B",
+          "optional_hint": false
+        },
+        {
+          "column": "U",
+          "header": "项目代码B",
+          "optional_hint": false
+        },
+        {
+          "column": "V",
+          "header": "核算项目名称B",
+          "optional_hint": false
+        },
+        {
+          "column": "W",
+          "header": "辅助核算类别C",
+          "optional_hint": false
+        },
+        {
+          "column": "X",
+          "header": "项目代码C",
+          "optional_hint": false
+        },
+        {
+          "column": "Y",
+          "header": "核算项目名称C",
+          "optional_hint": false
+        },
+        {
+          "column": "Z",
+          "header": "辅助核算类别D",
+          "optional_hint": false
+        },
+        {
+          "column": "AA",
+          "header": "项目代码D",
+          "optional_hint": false
+        },
+        {
+          "column": "AB",
+          "header": "核算项目名称D",
+          "optional_hint": false
+        },
+        {
+          "column": "AC",
+          "header": "业务编号",
+          "optional_hint": false
+        },
+        {
+          "column": "AD",
+          "header": "附件数",
+          "optional_hint": false
+        },
+        {
+          "column": "AE",
+          "header": "检测错误情况",
+          "optional_hint": false
+        }
+      ]
+    },
+    {
+      "order": 10,
+      "name": "PZ",
+      "extent": "A1:AR19",
+      "non_empty_rows": 19,
+      "first_row": 1,
+      "last_row": 19,
+      "first_three_rows": [
+        {
+          "row": 1,
+          "non_empty_cells": 44,
+          "numeric_cells": 0
+        },
+        {
+          "row": 2,
+          "non_empty_cells": 19,
+          "numeric_cells": 11
+        },
+        {
+          "row": 3,
+          "non_empty_cells": 19,
+          "numeric_cells": 11
+        }
+      ],
+      "header_row": 1,
+      "header_row_is_override": false,
+      "data_start_row": 2,
+      "first_data_row": {
+        "row": 2,
+        "populated_columns": [
+          "A",
+          "B",
+          "C",
+          "D",
+          "E",
+          "F",
+          "G",
+          "U",
+          "V",
+          "W",
+          "X",
+          "Y",
+          "Z",
+          "AA",
+          "AB",
+          "AE",
+          "AJ",
+          "AK",
+          "AM"
+        ]
+      },
+      "column_count": 44,
+      "formula_cells": 0,
+      "merged_cells": [],
+      "data_validations": [],
+      "columns": [
+        {
+          "column": "A",
+          "header": "FDATE",
+          "optional_hint": false
+        },
+        {
+          "column": "B",
+          "header": "FPERIOD",
+          "optional_hint": false
+        },
+        {
+          "column": "C",
+          "header": "FGROUP",
+          "optional_hint": false
+        },
+        {
+          "column": "D",
+          "header": "FNUM",
+          "optional_hint": false
+        },
+        {
+          "column": "E",
+          "header": "FENTRYID",
+          "optional_hint": false
+        },
+        {
+          "column": "F",
+          "header": "FEXP",
+          "optional_hint": false
+        },
+        {
+          "column": "G",
+          "header": "FACCTID",
+          "optional_hint": false
+        },
+        {
+          "column": "H",
+          "header": "FCLSNAME1",
+          "optional_hint": false
+        },
+        {
+          "column": "I",
+          "header": "FOBJID1",
+          "optional_hint": false
+        },
+        {
+          "column": "J",
+          "header": "FOBJNAME1",
+          "optional_hint": false
+        },
+        {
+          "column": "K",
+          "header": "FCLSNAME2",
+          "optional_hint": false
+        },
+        {
+          "column": "L",
+          "header": "FOBJID2",
+          "optional_hint": false
+        },
+        {
+          "column": "M",
+          "header": "FOBJNAME2",
+          "optional_hint": false
+        },
+        {
+          "column": "N",
+          "header": "FCLSNAME3",
+          "optional_hint": false
+        },
+        {
+          "column": "O",
+          "header": "FOBJID3",
+          "optional_hint": false
+        },
+        {
+          "column": "P",
+          "header": "FOBJNAME3",
+          "optional_hint": false
+        },
+        {
+          "column": "Q",
+          "header": "FCLSNAME4",
+          "optional_hint": false
+        },
+        {
+          "column": "R",
+          "header": "FOBJID4",
+          "optional_hint": false
+        },
+        {
+          "column": "S",
+          "header": "FOBJNAME4",
+          "optional_hint": false
+        },
+        {
+          "column": "T",
+          "header": "FTRANSID",
+          "optional_hint": false
+        },
+        {
+          "column": "U",
+          "header": "FCYID",
+          "optional_hint": false
+        },
+        {
+          "column": "V",
+          "header": "FEXCHRATE",
+          "optional_hint": false
+        },
+        {
+          "column": "W",
+          "header": "FDC",
+          "optional_hint": false
+        },
+        {
+          "column": "X",
+          "header": "FFCYAMT",
+          "optional_hint": false
+        },
+        {
+          "column": "Y",
+          "header": "FQTY",
+          "optional_hint": false
+        },
+        {
+          "column": "Z",
+          "header": "FPRICE",
+          "optional_hint": false
+        },
+        {
+          "column": "AA",
+          "header": "FDEBIT",
+          "optional_hint": false
+        },
+        {
+          "column": "AB",
+          "header": "FCREDIT",
+          "optional_hint": false
+        },
+        {
+          "column": "AC",
+          "header": "FSETTLCODE",
+          "optional_hint": false
+        },
+        {
+          "column": "AD",
+          "header": "FSETTLENO",
+          "optional_hint": false
+        },
+        {
+          "column": "AE",
+          "header": "FPREPARE",
+          "optional_hint": false
+        },
+        {
+          "column": "AF",
+          "header": "FPAY",
+          "optional_hint": false
+        },
+        {
+          "column": "AG",
+          "header": "FCASH",
+          "optional_hint": false
+        },
+        {
+          "column": "AH",
+          "header": "FPOSTER",
+          "optional_hint": false
+        },
+        {
+          "column": "AI",
+          "header": "FCHECKER",
+          "optional_hint": false
+        },
+        {
+          "column": "AJ",
+          "header": "FATTCHMENT",
+          "optional_hint": false
+        },
+        {
+          "column": "AK",
+          "header": "FPOSTED",
+          "optional_hint": false
+        },
+        {
+          "column": "AL",
+          "header": "FMODULE",
+          "optional_hint": false
+        },
+        {
+          "column": "AM",
+          "header": "FDELETED",
+          "optional_hint": false
+        },
+        {
+          "column": "AN",
+          "header": "FSERIALNO",
+          "optional_hint": false
+        },
+        {
+          "column": "AO",
+          "header": "FTRANSDATE",
+          "optional_hint": false
+        },
+        {
+          "column": "AP",
+          "header": "FCASHFLOW",
+          "optional_hint": false
+        },
+        {
+          "column": "AQ",
+          "header": "FUNITNAME",
+          "optional_hint": false
+        },
+        {
+          "column": "AR",
+          "header": "FREFERENCE",
+          "optional_hint": false
+        }
+      ]
+    },
+    {
+      "order": 11,
+      "name": "科目数据",
+      "extent": "A1:O202",
+      "non_empty_rows": 202,
+      "first_row": 1,
+      "last_row": 202,
+      "first_three_rows": [
+        {
+          "row": 1,
+          "non_empty_cells": 15,
+          "numeric_cells": 0
+        },
+        {
+          "row": 2,
+          "non_empty_cells": 4,
+          "numeric_cells": 0
+        },
+        {
+          "row": 3,
+          "non_empty_cells": 4,
+          "numeric_cells": 0
+        }
+      ],
+      "header_row": 1,
+      "header_row_is_override": false,
+      "data_start_row": 2,
+      "first_data_row": {
+        "row": 2,
+        "populated_columns": [
+          "A",
+          "B",
+          "C",
+          "F"
+        ]
+      },
+      "column_count": 15,
+      "formula_cells": 0,
+      "merged_cells": [],
+      "data_validations": [],
+      "columns": [
+        {
+          "column": "A",
+          "header": "科目代码",
+          "optional_hint": false
+        },
+        {
+          "column": "B",
+          "header": "科目名称",
+          "optional_hint": false
+        },
+        {
+          "column": "C",
+          "header": "助记码",
+          "optional_hint": false
+        },
+        {
+          "column": "D",
+          "header": "科目类别",
+          "optional_hint": false
+        },
+        {
+          "column": "E",
+          "header": "是否存货科目",
+          "optional_hint": false
+        },
+        {
+          "column": "F",
+          "header": "余额方向",
+          "optional_hint": false
+        },
+        {
+          "column": "G",
+          "header": "外币核算",
+          "optional_hint": false
+        },
+        {
+          "column": "H",
+          "header": "期末调汇",
+          "optional_hint": false
+        },
+        {
+          "column": "I",
+          "header": "往来单位核算",
+          "optional_hint": false
+        },
+        {
+          "column": "J",
+          "header": "部门核算",
+          "optional_hint": false
+        },
+        {
+          "column": "K",
+          "header": "职员核算",
+          "optional_hint": false
+        },
+        {
+          "column": "L",
+          "header": "其他核算项目",
+          "optional_hint": false
+        },
+        {
+          "column": "M",
+          "header": "往来业务核算",
+          "optional_hint": false
+        },
+        {
+          "column": "N",
+          "header": "数量金额核算",
+          "optional_hint": false
+        },
+        {
+          "column": "O",
+          "header": "数量单位",
+          "optional_hint": false
+        }
+      ]
+    },
+    {
+      "order": 12,
+      "name": "核算项目",
+      "extent": "A1:J76",
+      "non_empty_rows": 16,
+      "first_row": 1,
+      "last_row": 16,
+      "first_three_rows": [
+        {
+          "row": 1,
+          "non_empty_cells": 9,
+          "numeric_cells": 0
+        },
+        {
+          "row": 2,
+          "non_empty_cells": 4,
+          "numeric_cells": 0
+        },
+        {
+          "row": 3,
+          "non_empty_cells": 4,
+          "numeric_cells": 0
+        }
+      ],
+      "header_row": 1,
+      "header_row_is_override": false,
+      "data_start_row": 2,
+      "first_data_row": {
+        "row": 2,
+        "populated_columns": [
+          "A",
+          "B",
+          "C",
+          "J"
+        ]
+      },
+      "column_count": 9,
+      "formula_cells": 0,
+      "merged_cells": [],
+      "data_validations": [],
+      "columns": [
+        {
+          "column": "A",
+          "header": "核算分类",
+          "optional_hint": false
+        },
+        {
+          "column": "B",
+          "header": "代码",
+          "optional_hint": false
+        },
+        {
+          "column": "C",
+          "header": "核算名称",
+          "optional_hint": false
+        },
+        {
+          "column": "D",
+          "header": "费用、成本科目代码-A",
+          "optional_hint": false
+        },
+        {
+          "column": "E",
+          "header": "费用、成本科目名称-A",
+          "optional_hint": false
+        },
+        {
+          "column": "F",
+          "header": "费用、成本科目代码-B",
+          "optional_hint": false
+        },
+        {
+          "column": "G",
+          "header": "费用、成本科目名称-B",
+          "optional_hint": false
+        },
+        {
+          "column": "H",
+          "header": "费用、成本科目代码-C",
+          "optional_hint": false
+        },
+        {
+          "column": "I",
+          "header": "费用、成本科目名称-C",
+          "optional_hint": false
+        }
+      ]
+    },
+    {
+      "order": 13,
+      "name": "模式凭证",
+      "extent": "A1:Q19",
+      "non_empty_rows": 19,
+      "first_row": 1,
+      "last_row": 19,
+      "first_three_rows": [
+        {
+          "row": 1,
+          "non_empty_cells": 17,
+          "numeric_cells": 0
+        },
+        {
+          "row": 2,
+          "non_empty_cells": 9,
+          "numeric_cells": 3
+        },
+        {
+          "row": 3,
+          "non_empty_cells": 6,
+          "numeric_cells": 2
+        }
+      ],
+      "header_row": 1,
+      "header_row_is_override": false,
+      "data_start_row": 2,
+      "first_data_row": {
+        "row": 2,
+        "populated_columns": [
+          "A",
+          "C",
+          "F",
+          "G",
+          "H",
+          "I",
+          "K",
+          "M",
+          "O"
+        ]
+      },
+      "column_count": 17,
+      "formula_cells": 18,
+      "merged_cells": [],
+      "data_validations": [],
+      "columns": [
+        {
+          "column": "A",
+          "header": "顺序号",
+          "optional_hint": false
+        },
+        {
+          "column": "B",
+          "header": "摘要等于条件",
+          "optional_hint": false
+        },
+        {
+          "column": "C",
+          "header": "摘要包含条件",
+          "optional_hint": false
+        },
+        {
+          "column": "D",
+          "header": "摘要不包含条件",
+          "optional_hint": false
+        },
+        {
+          "column": "E",
+          "header": "备用",
+          "optional_hint": false
+        },
+        {
+          "column": "F",
+          "header": "模板编号",
+          "optional_hint": false
+        },
+        {
+          "column": "G",
+          "header": "模板名称",
+          "optional_hint": false
+        },
+        {
+          "column": "H",
+          "header": "科目代码",
+          "optional_hint": false
+        },
+        {
+          "column": "I",
+          "header": "科目名称",
+          "optional_hint": false
+        },
+        {
+          "column": "J",
+          "header": "辅助核算明细名称",
+          "optional_hint": false
+        },
+        {
+          "column": "K",
+          "header": "借方金额比例",
+          "optional_hint": false
+        },
+        {
+          "column": "L",
+          "header": "贷方金额比例",
+          "optional_hint": false
+        },
+        {
+          "column": "M",
+          "header": "借方金额",
+          "optional_hint": false
+        },
+        {
+          "column": "N",
+          "header": "贷方金额",
+          "optional_hint": false
+        },
+        {
+          "column": "O",
+          "header": "匹配新摘要（非必须）",
+          "optional_hint": true
+        },
+        {
+          "column": "P",
+          "header": "匹配币别代码",
+          "optional_hint": false
+        },
+        {
+          "column": "Q",
+          "header": "匹配汇率",
+          "optional_hint": false
+        }
+      ]
+    },
+    {
+      "order": 14,
+      "name": "核算分类",
+      "extent": "A1:D6",
+      "non_empty_rows": 6,
+      "first_row": 1,
+      "last_row": 6,
+      "first_three_rows": [
+        {
+          "row": 1,
+          "non_empty_cells": 4,
+          "numeric_cells": 0
+        },
+        {
+          "row": 2,
+          "non_empty_cells": 3,
+          "numeric_cells": 1
+        },
+        {
+          "row": 3,
+          "non_empty_cells": 3,
+          "numeric_cells": 1
+        }
+      ],
+      "header_row": 1,
+      "header_row_is_override": false,
+      "data_start_row": 2,
+      "first_data_row": {
+        "row": 2,
+        "populated_columns": [
+          "A",
+          "B",
+          "C"
+        ]
+      },
+      "column_count": 4,
+      "formula_cells": 0,
+      "merged_cells": [],
+      "data_validations": [],
+      "columns": [
+        {
+          "column": "A",
+          "header": "FClsID",
+          "optional_hint": false
+        },
+        {
+          "column": "B",
+          "header": "FClsName",
+          "optional_hint": false
+        },
+        {
+          "column": "C",
+          "header": "FQtyAux",
+          "optional_hint": false
+        },
+        {
+          "column": "D",
+          "header": "FObjTableName",
+          "optional_hint": false
+        }
+      ]
+    }
+  ]
+}
