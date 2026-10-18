@@ -118,6 +118,12 @@ OCR/ASR 供应商尚未决定：本任务**不接任何真实供应商**，只�
 3. 未登记类型的输入自动回退到 `ManualEntryParser`；
 4. 无需改动裁决、草稿写入与追溯逻辑——它们只依赖 `ParseResult`。
 
+### 8.1 供应商选型（调研结论，未接入）
+
+OCR/ASR 候选评估与接入设计见 [`research/W2-ocr-asr-vendor-selection.md`](research/W2-ocr-asr-vendor-selection.md)。
+该报告只做选型与设计，**未接入任何供应商、未调用任何真实接口**；其中「主选/备选」为决策建议，
+在合规审查（DPA/PIPIA）与字段口径确认前不得据此发起真实调用。本节不改变上述扩展点与既有契约。
+
 ## 9. 未决事项与风险
 
 - **关键字段口径**（`BUSINESS_REQUIRED_FIELDS`）与**置信度阈值**是保守默认，最终
