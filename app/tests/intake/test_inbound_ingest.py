@@ -242,14 +242,6 @@ def _message(
     )
 
 
-def _hermes_snapshot() -> tuple[bool, tuple[str, ...]]:
-    """``~/.hermes`` 的存在性 + 文件清单快照（用于断言无文件系统副作用）。"""
-    root = Path.home() / ".hermes"
-    if not root.exists():
-        return (False, ())
-    return (True, tuple(sorted(str(p.relative_to(root)) for p in root.rglob("*"))))
-
-
 def _assert_rejected(
     session: Session,
     result: IngestResult,
@@ -269,23 +261,32 @@ def _assert_rejected(
 
 
 def test_accepted_creates_job_and_anchor(
-    session: Session, engine: Engine, org: Org
+    session: Session,
+    engine: Engine,
+    org: Org,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """首次受理：建作业 + 写锚点 + 返回由 employee 记录算出的 Profile 名。"""
+    # 把家目录指到空临时目录：POSIX 的 ``Path.home()`` 读 HOME、Windows 读
+    # USERPROFILE，两个都改才能让「无副作用」断言与宿主机真实 ``~/.hermes`` 解耦。
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    assert Path.home() == tmp_path  # 隔离确实生效，否则下面的断言没有意义
+
     _add_binding(engine, employee_id=org.active_employee.id, external_user_id="wx-in-1")
 
-    before_hermes = _hermes_snapshot()
     result = ingest_inbound_message(
         session, _message(external_message_id="msg-ok-1", external_user_id="wx-in-1")
     )
-    after_hermes = _hermes_snapshot()
 
     assert result.status == INGEST_ACCEPTED
     assert result.intake_job_id is not None
     assert result.profile_name == profile_name_for(org.active_employee)
     assert result.profile_name is not None and result.profile_name.startswith("emp-")
-    # 只算名字：不创建目录、不写 ~/.hermes、不启动进程。
-    assert after_hermes == before_hermes
+    # 只算名字：不创建目录、不写 ~/.hermes、不启动进程——临时家目录必须仍是空的。
+    assert list(tmp_path.rglob("*")) == []
+    assert not (tmp_path / ".hermes").exists()
 
     job = session.get(IntakeJob, result.intake_job_id)
     assert job is not None
