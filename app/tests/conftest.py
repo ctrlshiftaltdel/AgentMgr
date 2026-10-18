@@ -67,6 +67,7 @@ BUSINESS_TABLES: tuple[str, ...] = (
     "cost_centers",
     "expense_categories",
     "extraction_drafts",
+    "inbound_messages",
     "source_files",
     "intake_jobs",
     "employee_channel_bindings",
