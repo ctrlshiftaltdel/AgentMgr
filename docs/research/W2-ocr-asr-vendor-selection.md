@@ -10,6 +10,13 @@
 > - 既有设计：[../INTAKE-PARSING-PIPELINE.md](../INTAKE-PARSING-PIPELINE.md)
 > - 同生态既有调研：[W1-28-baidu-invoice-verification.md](W1-28-baidu-invoice-verification.md)（发票验真，与本报告相互独立）
 > - **查阅日期：2026-10-18**（本文全部外部来源，见 §10）
+>
+> **2026-10-18 后续（必读）**：所有者已拍板**百度智能财务票据识别 `multiple_invoice` 为 OCR
+> 主用**，适配器已随 #35 / #37 合入 `main`，并用真实凭据完成端到端联调。真实响应**推翻了
+> 本文 §4.2「百度 `multiple_invoice` 未提供逐字段置信度」的判断**（开 `probability=true`
+> 后字段项确实带置信度，形态为 dict `{average, min}`）。认知与修正已落库
+> [W2-35-baidu-multiple-invoice-ocr.md](W2-35-baidu-multiple-invoice-ocr.md)。
+> 本文作为**选型过程记录**保留；**§0.1 的推荐排序不再作为执行依据**。
 
 ## 0. 一页结论
 
@@ -19,13 +26,18 @@
 |---|---|---|---|---|
 | **OCR 主** | 腾讯云 | 通用票据识别（高级版）`RecognizeGeneralInvoice` | 单接口覆盖 14 大类标准报销票据，支持一页多票混贴、PDF 最多 30 页；业务错误码在文档中逐条列出；默认 5 次/秒对小团队足够 | **不返回逐字段置信度**（页面未提及），需要固定置信度 + 强制人工复核 |
 | **OCR 备** | 阿里云 | `RecognizeInvoice`（增值税发票）+ `RecognizeMixedInvoices`（混贴）+ 各票种专用接口 | 唯一在官方文档中明确给出**逐字段置信度**（`keyProb` / `valueProb`）的候选，最贴合 `ParseResult.field_confidence` 契约；默认 10 QPS | 按票种拆多个接口，接入与路由成本最高；增值税发票单价 0.225 元/次起（月≤1 万次档） |
-| **OCR 第三 / 私有化选项** | 百度智能云 | 智能财务票据识别 `multiple_invoice` / 增值税发票识别 `vat_invoice` | 企业认证免费额度最高（增值税发票 2,000 次/月），智能财务票据阶梯价 0.100 元/次起；官方提供私有化部署 | 图片上限 4M / 最长边 4096px（更紧）；`probability` 是**整票分类置信度**，不是逐字段置信度 |
+| **OCR 主用（所有者 2026-10-18 拍板；原列第三 / 私有化选项）** | 百度智能云 | 智能财务票据识别 `multiple_invoice` / 增值税发票识别 `vat_invoice` | 企业认证免费额度最高（增值税发票 2,000 次/月），智能财务票据阶梯价 0.100 元/次起；官方提供私有化部署 | 图片上限 4M / 最长边 4096px（更紧）；`probability` 是**整票分类置信度**，不是逐字段置信度 |
 | **ASR 主** | 腾讯云 | 一句话识别（≤60s）+ 录音文件识别（≤5h） | 短音频 23 种方言、词级时间戳；长音频最多 5 小时、支持句级分段（`ResTextFormat=3`） | 长音频为异步任务，需轮询/回调与 24 小时结果有效期管理 |
 | **ASR 备** | 阿里云 | 录音文件识别极速版（≤2h） | 同步返回、句/词级时间戳、100MB；接入简单 | 仅商用版，不支持试用；>2h 需换普通版（未评估） |
 
 **一句话**：OCR 先用**腾讯云单接口**把「能不能用」验证掉，再用**阿里云**补「逐字段置信度」；
 若「数据不出内网」是硬约束，直接评估**百度私有化**，不要走公网 API。
 ASR 与 OCR 同选腾讯云可复用一套签名与凭据管理。
+
+> **2026-10-18 更新（覆盖上面这段话）**：所有者已拍板**百度 `multiple_invoice` 为 OCR 主用**
+> （依据：既有账号与免费额度），适配器已合入 `main` 并完成真实联调；腾讯云 / 阿里云退为备选。
+> 上面这段**保留为选型过程记录，不再作为执行依据**。认知与证据见
+> [W2-35-baidu-multiple-invoice-ocr.md](W2-35-baidu-multiple-invoice-ocr.md)。
 
 ### 0.2 继续只用人工兜底（`ManualEntryParser`）的适用条件
 
@@ -43,7 +55,9 @@ ASR 与 OCR 同选腾讯云可复用一套签名与凭据管理。
 
 ### 0.3 本报告**没有**做的事
 
-- 未注册/未登录任何云账号，未申请 API Key，未调用任何 OCR/ASR 接口；
+- 未注册/未登录任何云账号，未申请 API Key，未调用任何 OCR/ASR 接口（**指本报告成文时**；
+  百度的真实联调是后续 #35 / #37 完成的，见
+  [W2-35-baidu-multiple-invoice-ocr.md](W2-35-baidu-multiple-invoice-ocr.md)）；
 - 未验证任何厂商的**实际识别效果**、**真实账单**、**SLA 赔付条款**、**数据处理协议正文**；
 - 未新增依赖、未修改 `app/`、未新增迁移；
 - 未对「腾讯云 / 阿里云 / 百度智能云」做商务询价。
@@ -149,14 +163,17 @@ ASR 与 OCR 同选腾讯云可复用一套签名与凭据管理。
 |---|---|---|---|---|
 | 顶层结构 | `log_id` / `words_result_num` / `words_result` | `log_id` / `words_result_num` / `words_result[]` | `MixedInvoiceItems[]` / `TotalPDFCount` / `RequestId` | `data`（结构化对象）+ 图像元信息 |
 | 字段形态 | `words_result` 为**扁平 key-value**（`InvoiceCode`、`TotalAmount`…）；商品明细为 `Commodity*` 数组，元素含 `row`/`word` | 每张票一个对象：`probability`、`left/top/width/height`、`type`、`result{...}` | 每张票按**票种分组**：`SingleInvoiceInfos.VatSpecialInvoice{...}`、`.TaxiTicket{...}`；未命中票种为 `null` | `data` 下扁平字段（`invoiceCode`、`totalAmount`、`sellerTaxNumber`…）+ `invoiceDetails[]` |
-| 逐字段置信度 | **未提供**（页面未提及） | **未提供**；`probability` 是**单张票据分类置信度**，不是字段置信度 | **未提供**（页面未提及） | **提供**：`prism_keyValueInfo[]` 含 `keyProb` / `valueProb`（页面标注为「字段名称置信度」「字段名称对应值的置信度」） |
+| 逐字段置信度 | **未提供**（页面未提及） | **提供**（已由真实响应核实，2026-10-18）：开 `probability=true` 后 `result.<Field>[0].probability` 存在，形态是 **dict** `{"average": float, "min": float}`（0–1）；整票 `probability` 仍是**单张票据分类置信度**，不是字段置信度 | **未提供**（页面未提及） | **提供**：`prism_keyValueInfo[]` 含 `keyProb` / `valueProb`（页面标注为「字段名称置信度」「字段名称对应值的置信度」） |
 | 字段坐标 | 未提供（页面未提及） | `left/top/width/height`（需 `location=true`） | `ItemPolygon`（需 `EnableItemPolygon=true`） | `prism_keyValueInfo` 含坐标信息 |
-| 对 `field_confidence` 的可行映射 | 只能给固定值（如 0.5）或按票种/字段规则赋值 | 同左；可用 `probability` 作为**整票上限** | 同左（无置信度） | 可直接归一化 `keyProb`/`valueProb`；**但取值域未验证**（页面只写 int，未写 0–100 还是 0–1） |
+| 对 `field_confidence` 的可行映射 | 只能给固定值（如 0.5）或按票种/字段规则赋值 | **可直接归一化**：`probability.min` 优先、缺失回退 `average`、都没有才回退 0.5；整票 `probability` **只能**映射到 `invoice_type` 这一个键 | 同左（无置信度） | 可直接归一化 `keyProb`/`valueProb`；**但取值域未验证**（页面只写 int，未写 0–100 还是 0–1） |
 
 **关键提醒（易踩坑）**：
 
-- 百度 `multiple_invoice` 的 `probability` 是「单张票据分类的置信度」[S2]，**不能**当作「金额字段的置信度」；
-  若强行复用，会让「票种识别对了」被误读为「金额可信」。
+- 百度 `multiple_invoice` 的**整票** `probability` 是「单张票据分类的置信度」[S2]，**不能**当作
+  「金额字段的置信度」；若强行复用，会让「票种识别对了」被误读为「金额可信」。
+  字段级置信度要用 `result.<Field>[0].probability`，它是 **dict** `{average, min}`，取 `min`
+  ——**本节表格原先写的「未提供」已被真实响应推翻**（2026-10-18 核实），详见
+  [W2-35-baidu-multiple-invoice-ocr.md](W2-35-baidu-multiple-invoice-ocr.md) §2.1。
 - 阿里 `keyProb`/`valueProb` 的类型是 `int`，页面**未给出取值范围与含义**（是否 0–100、是否概率）→
   接入前必须用真实响应确认，否则归一化会写错（见 §9 第 6 项）。
 - 腾讯云与百度的 `vat_invoice` 都没有逐字段置信度 → 若选它们，`field_confidence` 只能：
@@ -600,7 +617,11 @@ class TencentGeneralInvoiceParser(ExternalParser):
 11. **阿里 OCR 错误码清单**：错误中心正文未阅读（§4.7）。
 12. **ASR 结果留存**：阿里极速版未载明；百度未载明（§5）。
 13. **方言名单（阿里）**：页面指向另一页，本文未核实（§5）。
-14. **真实识别效果**：本文未调用任何接口，所有准确率均为厂商自述（§4.3）。
+14. **真实识别效果**：本文成文时未调用任何接口，所有准确率均为厂商自述（§4.3）。
+    **部分关闭（2026-10-18）**：百度 `multiple_invoice` 已用 20 份自有真实票据完成**端到端
+    联调**（20/20 跑通，见 [W2-35-baidu-multiple-invoice-ocr.md](W2-35-baidu-multiple-invoice-ocr.md)
+    §8）；但这是**「跑通」不等于「准」**——样本无标注真值、仅覆盖增值税发票与网约车票，
+    **字段级 exact-match 准确率仍未验证**。腾讯 / 阿里**仍未验证**。
 15. **SLA / 赔付**：三家的 OCR/ASR SLA 条款均未阅读（§7.5）。
 
 ---
