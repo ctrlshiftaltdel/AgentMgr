@@ -9,6 +9,7 @@ from sqlalchemy import text
 from app.api.admin import register_admin_exception_handlers
 from app.api.admin import router as admin_router
 from app.api.claims import router as claims_router
+from app.api.documents import router as documents_router
 from app.api.errors import register_exception_handlers
 from app.api.invoices import router as invoices_router
 from app.db.session import engine
@@ -24,8 +25,14 @@ def create_app() -> FastAPI:
     # never leak stack traces, DSNs or SQL.
     register_exception_handlers(app)
 
-    # Expense claim endpoints (create/list/read/transitions/payments/export).
+    # Expense claim endpoints (create/list/read/transitions/payments/export,
+    # plus invoice attach/list under ``/claims/{claim_id}/invoices``).  Service
+    # semantics for attaching live in ``app.expense.invoices``.
     app.include_router(claims_router)
+
+    # Document endpoints: original-file upload (``POST /documents``).  Type,
+    # size, path-safety and hash gates live in ``app.documents.storage``.
+    app.include_router(documents_router)
 
     # Invoice verification endpoints: manual-assisted result recording
     # (``POST /invoice-verifications/manual``, task W1-22).  Authorization,
