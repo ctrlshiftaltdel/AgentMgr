@@ -40,10 +40,16 @@
    ``YYYY-MM-DD``，支持 ``2019年08月28日``）/ ``amount``（价税合计）/
    ``tax_amount`` / ``buyer_name`` / ``buyer_tax_id`` / ``seller_name`` /
    ``seller_tax_id``。金额统一为 2 位小数字符串（避免浮点与 JSON 序列化问题）。
-4. **置信度**：``words_result[].probability`` 是**票种分类置信度**，只允许用于
-   ``invoice_type`` 这一个字段；其余字段若字段项自带 ``probability``（取值 >1 视为
-   0–100）则归一化使用，没有就回退 ``0.5``（低于默认阈值 0.75 → 必然人工复核）。
-   **绝不**把分类置信度当金额/税号等字段置信度。
+   票种字段名按真实响应区分：VAT 为 PascalCase；``taxi_online_ticket`` 为
+   **snake_case**（``total_fare`` / ``application_date`` / ``service_provider``），
+   **不能**复用 ``taxi_receipt`` 的 ``TotalFare``/``Fare``/``date``。
+4. **置信度**（**已由真实响应核实，2026-10-18 联调**）：``words_result[].probability``
+   是**票种分类置信度**，只允许用于 ``invoice_type`` 这一个字段。字段项
+   ``result.<Field>[0].probability`` 是 **dict**：``{"average": float, "min": float}``，
+   取值 0–1；本模块**优先取 ``min``**（保守），缺失/不可用时回退 ``average``。标量
+   形态仍兼容（``>1`` 视为 0–100）；非有限值与负数丢弃。没有可用置信度则回退
+   ``0.5``（低于默认阈值 0.75 → 必然人工复核）。**绝不**把分类置信度当金额/税号等
+   字段置信度。
 5. **失败收敛**：预检失败、传输异常、4xx、业务错误码、响应形态异常，统一产出
    ``error='provider_error'`` 的失败结果；异常原文、凭据、响应体**不进结果、不进
    日志**。``log_id`` 只写 debug 日志（定位用），**不进** ``ParseResult.fields``。
@@ -55,16 +61,17 @@
 
 待真实响应核实（**未验证**）：
 
-* ``result`` 的确切形态。Issue #35 描述为「字段数组，元素形如 ``{"word": "..."}``」，
-  研究文档写作 ``result{...}``。本模块**同时容忍** ``result`` 为映射（``{"TotalAmount":
-  "100.00"}``）与数组（``{"key": "TotalAmount", "word": "100.00"}`` 或
-  ``{"TotalAmount": {"word": "100.00", "probability": 0.9}}``）；无键名的裸
-  ``{"word": ...}`` 无法安全映射，直接忽略。
-* 字段置信度的实际返回形态与取值域（0–1 还是 0–100）。
 * ``4M`` 的服务端真实上限（官方只写 4M、未说明进制；本地预检已保守取十进制
-  4,000,000 字节）、``probability=true`` 是否对
-  ``multiple_invoice`` 生效、各票种字段名。
+  4,000,000 字节）。
 * 错误码表的完整性（文档未给全表）。
+
+已核实（2026-10-18 联调，据此实现）：
+
+* ``probability=true`` 确实生效，字段置信度形态为 ``{"average": float, "min": float}``
+  （0–1）。
+* ``result`` 为**映射**：``{"<字段名>": [{"word": "...", "probability": {...}}]}``；
+  本模块同时容忍映射直给标量、数组形态（元素带 ``key``/``name`` 等标识键）。
+* ``taxi_online_ticket`` 的 ``result`` 用 snake_case 字段名。
 
 网络出口通过可注入的 ``transport`` 完成：生产默认 ``httpx``（**惰性导入**，仅真实
 请求时加载）；测试一律注入桩，**绝不调用真实百度接口、不使用真实 Key**。本模块只
@@ -105,6 +112,8 @@ __all__ = [
     "CLASSIFICATION_ONLY_TYPES",
     "DEFAULT_FIELD_CONFIDENCE",
     "DEFAULT_TIMEOUT_SECONDS",
+    "LEGACY_API_KEY_ENV",
+    "LEGACY_SECRET_KEY_ENV",
     "MAX_ENCODED_BYTES",
     "MAX_IMAGE_SIDE",
     "MIN_IMAGE_SIDE",
@@ -135,8 +144,19 @@ BAIDU_OCR_PARSER_NAME = "baidu_cloud/multiple_invoice"
 BAIDU_OCR_PARSER_VERSION = "1"
 
 #: 凭据环境变量名（**只从环境变量读取**，不落仓库、不落日志）。
-API_KEY_ENV = "AJAIMGR_BAIDU_API_KEY"
-SECRET_KEY_ENV = "AJAIMGR_BAIDU_SECRET_KEY"
+#: 与真实部署一致的名字优先；旧名仅作兼容回退（见 ``_resolve_credential_env``）。
+API_KEY_ENV = "BDOCR_API_KEY"
+SECRET_KEY_ENV = "BDOCR_SECRET_KEY"
+
+#: 兼容旧部署的变量名（仅当新名缺失时才读取）。
+LEGACY_API_KEY_ENV = "AJAIMGR_BAIDU_API_KEY"
+LEGACY_SECRET_KEY_ENV = "AJAIMGR_BAIDU_SECRET_KEY"
+
+#: (优先名, 回退名)：逐个解析，优先名有非空值时不看回退名。
+_CREDENTIAL_FALLBACKS: tuple[tuple[str, str], ...] = (
+    (API_KEY_ENV, LEGACY_API_KEY_ENV),
+    (SECRET_KEY_ENV, LEGACY_SECRET_KEY_ENV),
+)
 
 #: 默认请求超时（秒）。超时即 ``provider_error``，不自动重发。
 DEFAULT_TIMEOUT_SECONDS = 10.0
@@ -213,6 +233,14 @@ _TAXI_ALIASES = _ID_ALIASES + (
     ("amount", ("TotalFare", "Fare", "fare")),
 )
 
+#: 网约车电子发票：``result`` 用 **snake_case**（已由真实响应核实），与
+#: ``taxi_receipt`` 的 PascalCase 完全不同；同时保留 PascalCase 回退以防供应商改版。
+_TAXI_ONLINE_ALIASES = _ID_ALIASES + (
+    ("invoice_date", ("application_date", "start_time", "date", "Date", "InvoiceDate")),
+    ("amount", ("total_fare", "TotalFare", "Fare", "fare")),
+    ("seller_name", ("service_provider",)),
+)
+
 _TRAIN_ALIASES = _ID_ALIASES + (
     ("invoice_date", ("date", "Date", "StartDate", "start_date", "InvoiceDate")),
     ("amount", ("TotalAmount", "total_amount", "amount", "Fare", "fare")),
@@ -254,7 +282,7 @@ _GENERIC_ALIASES = _ID_ALIASES + (
 _TYPE_ALIASES: Mapping[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
     "vat_invoice": _VAT_ALIASES,
     "taxi_receipt": _TAXI_ALIASES,
-    "taxi_online_ticket": _TAXI_ALIASES,
+    "taxi_online_ticket": _TAXI_ONLINE_ALIASES,
     "train_ticket": _TRAIN_ALIASES,
     "air_ticket": _AIR_ALIASES,
     "quota_invoice": _QUOTA_ALIASES,
@@ -368,9 +396,19 @@ def _coerce_page(page: Any) -> int | None:
 def _normalize_confidence(value: Any) -> float | None:
     """把渠道置信度归一化到 ``[0, 1]``；无法解析返回 ``None``。
 
-    取值 >1 视为 0–100 制（如 ``92`` → ``0.92``）；非有限值/负数丢弃。文档未给出
-    字段置信度取值域，此规则**待真实响应核实**。
+    返回形态**已由真实响应核实**（2026-10-18 联调）：字段项
+    ``result.<Field>[0].probability`` 是 ``{"average": float, "min": float}``（0–1）。
+    映射优先取 ``min``（保守），``min`` 缺失或不可用时回退 ``average``；标量形态
+    仍兼容（取值 >1 视为 0–100 制，如 ``92`` → ``0.92``）。非有限值/负数丢弃。
     """
+    if isinstance(value, Mapping):
+        for key in ("min", "average"):
+            if key not in value:
+                continue
+            normalized = _normalize_confidence(value[key])
+            if normalized is not None:
+                return normalized
+        return None
     if value is None or isinstance(value, bool):
         return None
     try:
@@ -584,8 +622,14 @@ _FIELD_META_KEYS: frozenset[str] = frozenset(
 
 
 def _unwrap_field(value: Any, item_confidence: Any) -> tuple[Any, Any]:
-    """展开字段值（``{"word": ..., "probability": ...}``）并取出置信度。"""
+    """展开字段值（``{"word": ..., "probability": ...}``）并取出置信度。
+
+    真实响应中 ``result.<Field>`` 是**单元素数组**（``[{"word": ..., "probability":
+    {...}}]``）：此时取首元素继续展开，置信度随之带出。
+    """
     confidence = item_confidence
+    if isinstance(value, list) and value and isinstance(value[0], Mapping):
+        value = value[0]
     if isinstance(value, Mapping):
         if "probability" in value:
             confidence = value["probability"]
@@ -599,15 +643,17 @@ def _unwrap_field(value: Any, item_confidence: Any) -> tuple[Any, Any]:
 
 
 def _collect_named_fields(result: Any) -> dict[str, tuple[Any, Any]]:
-    """把 ``result`` 摊平成 ``字段名 → (值, 置信度)``（**容忍两种返回形态**）。
+    """把 ``result`` 摊平成 ``字段名 → (值, 置信度)``（**容忍多种返回形态**）。
 
+    * 真实形态：``{"total_fare": [{"word": "123.45", "probability": {"average": ...,
+      "min": ...}}]}``（单元素数组，置信度为 dict）；
     * 映射形态：``{"TotalAmount": "100.00"}`` 或
       ``{"TotalAmount": {"word": "100.00", "probability": 0.9}}``；
     * 数组形态：元素带标识键（``key``/``name``/``field``/``title``）+ ``word``；
       或元素直接以业务字段名为键；
     * 无标识键的裸 ``{"word": ...}`` 无法安全映射 → 忽略（不臆造）。
 
-    同一字段名重复出现时保留首次出现的值。形态**待真实响应核实**。
+    同一字段名重复出现时保留首次出现的值。
     """
     collected: dict[str, tuple[Any, Any]] = {}
     if isinstance(result, Mapping):
@@ -741,14 +787,36 @@ def _normalize_response(
     return best_fields, best_confidence
 
 
+# --- 凭据 ---------------------------------------------------------------------
+
+
+def _resolve_credential_env(env: Mapping[str, str] | None) -> dict[str, str]:
+    """按「新名优先、旧名回退」解析凭据，返回**仅含所需变量**的映射。
+
+    新名（``BDOCR_*``）有非空值时优先；仅当新名缺失/空白时才回退旧名
+    （``AJAIMGR_BAIDU_*``）。两者都缺失时不放该键，交由基类 fail closed。
+    **只搬运变量名对应的值，不记录、不外传。**
+    """
+    source = os.environ if env is None else env
+    resolved: dict[str, str] = {}
+    for primary, legacy in _CREDENTIAL_FALLBACKS:
+        value = source.get(primary)
+        if value is None or not str(value).strip():
+            value = source.get(legacy)
+        if value is not None and str(value).strip():
+            resolved[primary] = str(value).strip()
+    return resolved
+
+
 # --- 客户端（OAuth + 识别） ---------------------------------------------------
 
 
 class BaiduInvoiceOcrClient:
     """百度 ``multiple_invoice`` 客户端：OAuth token 缓存 + 单次识别请求。
 
-    * ``api_key`` / ``secret_key`` 默认从环境变量读取；缺失即 ``MissingCredentialError``
-      （fail closed），错误信息只提环境变量名；
+    * ``api_key`` / ``secret_key`` 默认从环境变量读取（``BDOCR_*`` 优先，兼容旧名
+      ``AJAIMGR_BAIDU_*``）；缺失即 ``MissingCredentialError``（fail closed），错误
+      信息只提环境变量名；
     * token 按 ``expires_in`` 缓存，剩余寿命不足 60 秒即重新获取；同一实例内用锁
       串行化 token 获取（避免并发重复取 token，不做 token 预热）；
     * 401 或 ``error_code`` ∈ {110, 111} → 失效缓存并**刷新一次**后重试一次；
@@ -767,11 +835,10 @@ class BaiduInvoiceOcrClient:
         token_endpoint: str = BAIDU_TOKEN_ENDPOINT,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
-        resolved_key = (
-            api_key if api_key is not None else os.environ.get(API_KEY_ENV)
-        )
+        env = _resolve_credential_env(None)
+        resolved_key = api_key if api_key is not None else env.get(API_KEY_ENV)
         resolved_secret = (
-            secret_key if secret_key is not None else os.environ.get(SECRET_KEY_ENV)
+            secret_key if secret_key is not None else env.get(SECRET_KEY_ENV)
         )
         if not resolved_key or not str(resolved_key).strip():
             raise MissingCredentialError(
@@ -959,7 +1026,8 @@ class BaiduInvoiceOcrParser(ExternalParser):
 
     构造时注入只读 ``source_reader``（协议见 ``SourceReader``），**不修改**
     ``ParseRequest``。凭据由 ``ExternalParser`` 从环境变量读取并 fail closed；构造
-    成功即意味着 ``AJAIMGR_BAIDU_API_KEY`` / ``AJAIMGR_BAIDU_SECRET_KEY`` 均已配置。
+    成功即意味着 ``BDOCR_API_KEY`` / ``BDOCR_SECRET_KEY``（或兼容旧名
+    ``AJAIMGR_BAIDU_API_KEY`` / ``AJAIMGR_BAIDU_SECRET_KEY``）均已配置。
 
     支持的输入类型：``image`` 与 ``document``（PDF/OFD）；其它类型由基类抛
     ``UnsupportedInputError``。所有预检/供应商失败统一返回
@@ -979,7 +1047,7 @@ class BaiduInvoiceOcrParser(ExternalParser):
         token_endpoint: str = BAIDU_TOKEN_ENDPOINT,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
-        super().__init__(env=env)
+        super().__init__(env=_resolve_credential_env(env))
         self._source_reader = source_reader
         self._client = BaiduInvoiceOcrClient(
             api_key=self._credentials[API_KEY_ENV],
