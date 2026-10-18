@@ -1,0 +1,26 @@
+name: Privacy Audit
+
+on:
+  schedule:
+    # Every Monday at 02:00 UTC.
+    - cron: "0 2 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  github-text:
+    name: github-text
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan tracked files, history and GitHub text
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/check_privacy.py --ci --github --repo "$GITHUB_REPOSITORY"

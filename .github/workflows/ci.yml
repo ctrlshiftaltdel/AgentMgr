@@ -20,6 +20,17 @@ jobs:
       - name: Kit unit tests
         run: python3 -m unittest discover -s tests -v
 
+  privacy-scan:
+    name: privacy-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan repository content and history
+        run: python3 scripts/check_privacy.py --ci
+
   app-tests:
     name: app-tests
     runs-on: ubuntu-latest

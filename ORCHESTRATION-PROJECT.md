@@ -16,6 +16,7 @@
 - Who may merge? Master only；人类所有者始终可指定运行模式、缩小授权或要求暂停。
 - Human decision triggers: 新增第三方依赖；权限/安全模型变更；凭据处理；数据删除/迁移；新增外部服务；不可逆操作；重大架构取舍；公开行为变化；产品行为实质歧义。以上一律进入 `NEEDS_HUMAN_DECISION`。
 - Protected paths / sensitive data patterns: 受保护路径为 `AGENTS.md`、`MASTER.md`、`AGENT-*.md`、`ORCHESTRATION-PROJECT.md`、`README.md`、`VERSION.txt`、`LICENSE.txt`、`HANDOVER.md`、`.github/`、`scripts/`、`tests/`、`prompts/`、`templates/`、`.orchestration/`、`.env*`（任务确需修改时必须在 Issue 中显式列出并说明）。敏感模式：密钥/令牌/cookie/真实账号标识/凭据值；含个人数据的样例文件与运行日志；`.env*`、`*secret*`、`*credential*`、`*.key`、`*.pem`。
+- Privacy / local machine data policy: 公开内容（仓库文件、提交消息、Issue、PR、评论、CI 日志）不得包含个人用户名、主机名 / SSH 别名、绝对家目录、内网或公网 IP、本地代理地址、凭据或真实账号标识。环境细节写入**本地** `local_info.md`（`.gitignore` + `.git/info/exclude`，不得提交）；仓库内使用 `<repo-root>`、`<test-host>`、`<test-host-venv>`、`<local-proxy>` 等占位符；允许 `~`、`127.0.0.1`（仅测试）、RFC 5737 文档网段与 `example.com`。CI `privacy-scan` 阻断；`privacy-audit` 每周/手动扫描 Issue/PR 文本。泄漏处置：立即轮换凭据、按需经所有者批准重写历史，并在 Issue 记录处置结果。
 - Dependency policy: 现有 10 个直接依赖（fastapi、uvicorn[standard]、sqlalchemy、alembic、psycopg[binary]、pydantic、python-multipart、openpyxl、reportlab、jinja2）。新增依赖必须在 Issue 中声明用途与替代方案并经所有者批准；环境与依赖一律用 uv 管理（禁止 pip）；解释器由仓库根 `.python-version` 固定 3.13。
 
 ## Allowed change policy
@@ -31,11 +32,13 @@
 
 - Required check 1: `kit-validate`（workflow `CI`：`validate_kit.py --project-ready` + 规则包单元测试）
 - Required check 2: `app-tests`（workflow `CI`：PostgreSQL 17 服务容器 + 全量 `pytest app/tests`）
-- Additional required checks: 无。
+- Required check 3: `privacy-scan`（workflow `CI`：`scripts/check_privacy.py --ci`，扫描文件、提交消息与历史）
+- Additional required checks: 无。`privacy-audit`（workflow `Privacy Audit`）为每周/手动审计，不作为 PR 门禁。
 
 ## Local validation
 
-- Fast test command: `python3 scripts/validate_kit.py --project-ready && python3 -m unittest discover -s tests`
+- Fast test command: `python3 scripts/validate_kit.py --project-ready && python3 -m unittest discover -s tests && python3 scripts/check_privacy.py --ci`
+- Privacy check: `python3 scripts/check_privacy.py --ci`（仓库文件 + 提交消息 + 全部历史；`--github` 额外扫描 Issue/PR 文本）
 - Full test command: `export UV_PROJECT_ENVIRONMENT=<test-host-venv> && uv run pytest app/tests -q -o addopts=""`（需要 PostgreSQL 17；会重置测试库 `ajaimgr_test`，不得与其他执行实例并行运行；实际路径见本地 `local_info.md`）
 - Lint / typecheck: 未配置独立 linter/typechecker；语法探测用 `python3 -m py_compile <files>`
 - Build / package: 待建立（尚无打包需求）
@@ -53,7 +56,7 @@
 ## Agent workspace / local machine notes（编排机约定）
 
 - 开发机可为 Windows / Linux / macOS；具体路径、SSH 别名与连接参数见本地 `local_info.md`（不入库）。
-
+- `local_info.md` 只存在于各机本地，已被 `.gitignore` 与 `.git/info/exclude` 忽略；不得提交、粘贴到 Issue/PR 或作为 CI 产物。
 - 不新建、不启动、不停止任何真实 Hermes Profile；不写入 `~/.hermes/` 下任何文件（W0-7 一次性实验授权已过期，不得顺延）。
 - 不读取、不打印任何真实凭据值；仓库、日志与报告中一律使用占位符；不向所有者索要凭据。
 - 所有 worktree 共享主工作树 `.venv`（`UV_PROJECT_ENVIRONMENT` 指向该 `.venv`，实际路径见本地 `local_info.md`）；不在 worktree 内生成独立 `.venv`。
