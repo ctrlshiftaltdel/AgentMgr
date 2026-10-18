@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import base64
 import json
-import logging
 import struct
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
@@ -58,7 +57,10 @@ from app.integrations.baidu_invoice_ocr import (
     HttpResponse,
     TransportError,
 )
-from app.intake.assembly import build_default_parser_registry
+from app.intake.assembly import (
+    MISSING_CREDENTIAL,
+    build_default_parser_registry,
+)
 from app.intake.models import ExtractionDraft, IntakeJob
 from app.intake.parsing import InputKind, ManualEntryParser, ParseRequest
 from app.intake.pipeline import confirm_draft, record_parse_draft
@@ -70,7 +72,6 @@ API_KEY = "example-bd-ocr-api-key-0001"
 SECRET_KEY = "example-bd-ocr-secret-key-9999"
 ENV = {API_KEY_ENV: API_KEY, SECRET_KEY_ENV: SECRET_KEY}
 TOKEN = "24.example-token.2592000.1763000000.282335-00000001"
-ASSEMBLY_LOGGER = "app.intake.assembly"
 
 FORMAL_BUSINESS_MODELS = (ExpenseClaim, ExpenseLine)
 
@@ -481,28 +482,25 @@ def test_provider_failure_is_machine_readable_and_writes_no_draft(
 
 
 def test_missing_credentials_falls_back_to_manual_entry(
-    session: Session, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    session: Session, tmp_path: Path
 ) -> None:
-    """无凭据：不注册外部解析器，回退人工录入后草稿仍可确认。"""
+    """无凭据：不注册外部解析器（返回值带非敏感说明），回退人工录入后草稿仍可确认。"""
     employee = _make_employee(session, suffix="nokey")
     job = _make_job(session, employee)
     source = _stored_source(session, employee, tmp_path=tmp_path)
 
     transport = StubTransport(ocr_results=[_vat_response()])
-    with caplog.at_level(logging.WARNING, logger=ASSEMBLY_LOGGER):
-        registry = _registry(session, tmp_path, transport, env={})
+    registry = _registry(session, tmp_path, transport, env={})
 
     assert registry.registered_kinds == frozenset()
+    assert registry.degraded is True
+    assert registry.skipped_parsers == (BAIDU_OCR_PARSER_NAME,)
+    note = registry.notes[0]
+    assert note.reason == MISSING_CREDENTIAL
+    assert note.env_vars == (API_KEY_ENV, SECRET_KEY_ENV)  # 只有变量名
+    assert API_KEY not in note.detail
     assert registry.resolve(InputKind.IMAGE) is None
     assert transport.calls == []  # 未注册 → 不发任何请求
-
-    warnings = [
-        record.getMessage()
-        for record in caplog.records
-        if record.name == ASSEMBLY_LOGGER and record.levelno >= logging.WARNING
-    ]
-    assert warnings
-    assert any(BAIDU_OCR_PARSER_NAME in message for message in warnings)
 
     manual = ManualEntryParser(
         values={"amount": "88.00", "expense_date": "2026-10-01"}

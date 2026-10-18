@@ -129,9 +129,9 @@ OCR/ASR 供应商尚未决定：本任务**不接任何真实供应商**，只�
 |---|---|---|
 | `BaiduInvoiceOcrParser` | `../app/integrations/baidu_invoice_ocr.py` | 百度智能云「智能财务票据识别」（`multiple_invoice`）的 `ExternalParser` 实现；支持 `image` 与 `document`（PDF/OFD）输入；凭据 `BDOCR_API_KEY` / `BDOCR_SECRET_KEY`（兼容旧名 `AJAIMGR_BAIDU_*`）只从环境变量读取、缺失即构造失败 |
 | `SourceFileReader` | `../app/intake/source_reader.py` | **生产级 `SourceReader`**：`source_file_id` → `source_files` 行 → `app.documents.storage.read_file` → sha256 校验 → `SourceDocument`（`content` / `mime_type` / `size_bytes` / `scan_status`）；只读、不 commit；失败 fail closed 且分类稳定——`missing_file` / `hash_mismatch` / `storage_error`，错误消息**不含存储路径与文件内容**（底层异常链被抑制） |
-| `build_default_parser_registry` | `../app/intake/assembly.py` | **默认装配点**：凭据齐全即注册百度解析器；凭据缺失时**不注册、不抛给调用方**——仍返回可用的 `ParserRegistry`（未注册类型 `resolve` 返回 `None`，回退语义不变），并写一条只含解析器标识与缺失环境变量名的 warning 日志（**不含凭据值**）；其它构造异常不吞 |
+| `build_default_parser_registry` | `../app/intake/assembly.py` | **默认装配点**：凭据齐全即注册百度解析器；凭据缺失时**不注册、不抛给调用方**——仍返回可用的 `DefaultParserRegistry`（`ParserRegistry` 子类，未注册类型 `resolve` 返回 `None`，回退语义不变），并通过 `notes` / `skipped_parsers` / `degraded` **在返回值上**给出非敏感装配说明，同时写一条 warning 日志；说明与日志都只含解析器标识、原因码与环境变量名（**不含凭据值**）；其它构造异常不吞 |
 
-装配函数需注入只读 `SourceReader`（生产用 `SourceFileReader(session=..., root=...)`，测试注入桩），其余参数（`env` / `transport` / `clock` / `endpoint` / `timeout`）仅用于测试与联调注入。装配阶段不做任何网络调用（默认传输惰性导入 `httpx`，只在真实解析时加载），也不读写数据库。返回的 `ParserRegistry` 可被调用方长期复用（解析器实例持有 token 缓存与传输客户端）。
+装配函数需注入只读 `SourceReader`（生产用 `SourceFileReader(session=..., root=...)`，测试注入桩），其余参数（`env` / `transport` / `clock` / `endpoint` / `timeout`）仅用于测试与联调注入。装配阶段不做任何网络调用（默认传输惰性导入 `httpx`，只在真实解析时加载），也不读写数据库。返回的 registry 可被调用方长期复用（解析器实例持有 token 缓存与传输客户端）；`ParserRegistry` 的既有语义不变，`DefaultParserRegistry` 只是额外携带装配说明。
 
 ### 8.3 端到端链路与测试口径
 

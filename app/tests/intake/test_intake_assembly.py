@@ -4,8 +4,10 @@
 
 * 凭据齐全 → 注册百度票据解析器（``image`` / ``document``），未注册类型
   ``resolve`` 仍返回 ``None``（回退 ``ManualEntryParser`` 的语义不变）；
-* 凭据缺失 → **不注册、不抛给调用方**，装配结果仍可用，且原件读取不被触碰；
-* 降级**可观测**且日志**不含凭据值**（只含解析器标识与环境变量名）；
+* 凭据缺失 → **不注册、不抛给调用方**，装配结果仍可用（返回值带非敏感说明），且
+  原件读取不被触碰；
+* 降级**可观测**：返回值 ``notes`` / ``skipped_parsers`` / ``degraded`` 与 warning
+  日志都不含凭据值（只含解析器标识与环境变量名）；
 * 非凭据类构造失败**不被吞掉**（真实缺陷必须显式失败）；
 * 装配本身不触网（默认传输惰性导入，只在真实解析时加载）。
 """
@@ -15,7 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import socket
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import patch
@@ -31,12 +33,12 @@ from app.integrations.baidu_invoice_ocr import (
     SourceDocument,
 )
 from app.intake import assembly
-from app.intake.parsing import (
-    InputKind,
-    ManualEntryParser,
-    ParseRequest,
-    ParserRegistry,
+from app.intake.assembly import (
+    MISSING_CREDENTIAL,
+    DefaultParserRegistry,
+    ParserAssemblyNote,
 )
+from app.intake.parsing import InputKind, ManualEntryParser, ParseRequest
 
 API_KEY = "example-bd-ocr-api-key-0001"
 SECRET_KEY = "example-bd-ocr-secret-key-9999"
@@ -124,13 +126,42 @@ def _request(source_file_id: int = 7) -> ParseRequest:
     )
 
 
-def _build(**kwargs: Any) -> tuple[ParserRegistry, StubReader, StubTransport]:
+def _build(**kwargs: Any) -> tuple[DefaultParserRegistry, StubReader, StubTransport]:
     reader = StubReader()
     transport = StubTransport(ocr_results=[_ocr_response()])
     registry = assembly.build_default_parser_registry(
         source_reader=reader, transport=transport, **kwargs
     )
     return registry, reader, transport
+
+
+@pytest.fixture()
+def assembly_log_records() -> Iterator[list[logging.LogRecord]]:
+    """收集 ``app.intake.assembly`` 的日志记录。
+
+    测试会话的 alembic 迁移会调用 ``fileConfig``（``migrations/env.py``），其默认
+    ``disable_existing_loggers=True`` 把**导入期**创建的 logger 置为 ``disabled``，
+    因此本文件断言「日志可观测」时显式恢复该 logger 并在用后还原（``app/tests/
+    conftest.py`` 不在本任务允许路径内，故不修改它）。
+    """
+    logger = logging.getLogger(LOGGER_NAME)
+    records: list[logging.LogRecord] = []
+
+    class _Collector(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Collector()
+    previous_disabled, previous_level = logger.disabled, logger.level
+    logger.addHandler(handler)
+    logger.disabled = False
+    logger.setLevel(logging.DEBUG)
+    try:
+        yield records
+    finally:
+        logger.setLevel(previous_level)
+        logger.disabled = previous_disabled
+        logger.removeHandler(handler)
 
 
 # --- 注册路径 -----------------------------------------------------------------
@@ -190,6 +221,7 @@ def test_missing_credentials_degrades_without_raising() -> None:
     registry, reader, transport = _build(env={})
 
     assert registry.registered_kinds == frozenset()
+    assert registry.degraded is True
     assert registry.resolve(InputKind.IMAGE) is None
     assert registry.resolve(InputKind.DOCUMENT) is None
     # 未注册时不触碰原件，也不发任何请求。
@@ -207,22 +239,28 @@ def test_partial_credentials_also_degrade() -> None:
     registry, _, _ = _build(env={API_KEY_ENV: API_KEY})
 
     assert registry.registered_kinds == frozenset()
+    assert registry.degraded is True
+    assert registry.skipped_parsers == (BAIDU_OCR_PARSER_NAME,)
 
 
-def test_degradation_is_observable_without_credential_values(
-    caplog: pytest.LogCaptureFixture,
+def test_degradation_is_observable_in_band_without_credential_values(
+    assembly_log_records: list[logging.LogRecord],
 ) -> None:
-    """降级写 warning：含解析器标识与缺失变量名，**不含凭据值**。"""
-    with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
-        registry, _, _ = _build(env={API_KEY_ENV: API_KEY})
+    """降级可观测：返回值说明 + warning 日志，两者都**不含凭据值**。"""
+    registry, _, _ = _build(env={API_KEY_ENV: API_KEY})
 
-    messages = [
-        record.getMessage()
-        for record in caplog.records
-        if record.name == LOGGER_NAME and record.levelno >= logging.WARNING
-    ]
-    assert messages, caplog.records
-    rendered = "\n".join(messages)
+    assert registry.degraded is True
+    assert registry.skipped_parsers == (BAIDU_OCR_PARSER_NAME,)
+    assert len(registry.notes) == 1
+    note = registry.notes[0]
+    assert isinstance(note, ParserAssemblyNote)
+    assert note.parser_name == BAIDU_OCR_PARSER_NAME
+    assert note.reason == MISSING_CREDENTIAL
+    assert note.env_vars == (API_KEY_ENV, SECRET_KEY_ENV)  # 只有变量名
+    assert SECRET_KEY_ENV in note.detail  # 只提缺失的变量名
+    assert API_KEY not in note.detail  # 绝不含凭据值
+
+    rendered = "\n".join(record.getMessage() for record in assembly_log_records)
     assert BAIDU_OCR_PARSER_NAME in rendered
     assert SECRET_KEY_ENV in rendered
     assert API_KEY not in rendered
@@ -230,21 +268,19 @@ def test_degradation_is_observable_without_credential_values(
 
 
 def test_registration_is_logged_on_success(
-    caplog: pytest.LogCaptureFixture,
+    assembly_log_records: list[logging.LogRecord],
 ) -> None:
-    """成功注册同样可观测，且日志不含凭据值。"""
-    with caplog.at_level(logging.INFO, logger=LOGGER_NAME):
-        registry, _, _ = _build(env=ENV)
+    """成功注册同样可观测（无降级说明），且日志不含凭据值。"""
+    registry, _, _ = _build(env=ENV)
 
-    messages = [
-        record.getMessage()
-        for record in caplog.records
-        if record.name == LOGGER_NAME
-    ]
-    rendered = "\n".join(messages)
+    rendered = "\n".join(record.getMessage() for record in assembly_log_records)
     assert BAIDU_OCR_PARSER_NAME in rendered
     assert API_KEY not in rendered
     assert SECRET_KEY not in rendered
+
+    assert registry.degraded is False
+    assert registry.notes == ()
+    assert registry.skipped_parsers == ()
     assert registry.registered_kinds == frozenset(
         {InputKind.IMAGE, InputKind.DOCUMENT}
     )
