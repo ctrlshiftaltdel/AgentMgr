@@ -13,6 +13,7 @@
 - 归档**排除凭据类文件**（`.env` / `auth.json` / `*.key` / `*.pem` / `credentials*` 等），排除项记入 manifest，归档完成后再次扫描成员名与私钥头；命中即删除归档并非零退出。
 - 已在**本机真实数据**上完成一次完整恢复演练：备份退出码 0，恢复到专用库 `ajaimgr_restore_check` 退出码 0，13 项校验全部 PASS（见 §8）。
 - **尚未满足生产验收**：本次演练为**同机**演练，备份未离开生产主机之外，也未做跨主机恢复；生产数据库角色分离（§2）与口令/证书认证（§2）尚未建立。详见 §7、§9。
+- Issue #22 新增跨主机/异地恢复的 Runbook 与自动化封装（§11）：`ops/offsite_restore.py` 提供 `preflight`（只读预检）与 `rehearse`（单机 dry-run）。它**不建立任何网络连接**，数据库恢复步骤在 dry-run 中明确记为 `NOT_EXECUTED`；**真实跨主机/异地恢复演练仍未执行**（§11.8）。
 
 ## 2 归档格式
 
@@ -190,7 +191,7 @@ uv run python ops/restore.py /path/ajaimgr-backup.tar.gz \
 ## 10 已知风险与未完成项
 
 1. **未在生产主机外存储**：`~/ajaimgr-backups/` 与源库同机，主机损毁即同时失去两份；需建立异地/他机副本与传输校验（并保持大陆可控环境）。
-2. **未做跨主机恢复**：本次是同机演练，网络传输、目标机权限、目标机 PostgreSQL 版本差异均未验证。
+2. **未做跨主机恢复**：本次是同机演练，网络传输、目标机权限、目标机 PostgreSQL 版本差异均未验证。Runbook 与预检 / dry-run 封装见 §11；截至 2026-10-18 仍**没有**真实跨主机演练记录。
 3. **pg_dump 版本一致性**：本机 `pg_dump` 17.11 与服务器同主版本；生产若为其它主版本，需以同主版本客户端备份（否则可能出现 dump/restore 失败或降级）。
 4. **角色分离未落地**：应用运行期角色目前仍是表属主、有 DDL 权限，`audit_events` 的只增不改触发器可被 `ALTER TABLE ... DISABLE TRIGGER` 绕过（§2 已记录）；备份侧影响是归档不含所有权/GRANT，恢复后必须由角色/授权脚本重建。
 5. **恢复时长（RTO）未测**：本机数据量极小（本次归档 64705 B ≈ 63 KB），真实规模下的备份窗口与恢复时间未知。
@@ -199,3 +200,240 @@ uv run python ops/restore.py /path/ajaimgr-backup.tar.gz \
 8. **`--no-owner` 的取舍**：为让归档可跨角色恢复而放弃所有权信息；若生产要求归档自带所有权，需要改为同角色恢复或补充授权脚本（与第 4 项一并解决）。
 9. **`--allow-missing-*` 的误用边界**：放行开关会把「残缺归档」从失败降级为成功；虽有 manifest `missing_components` 与 stdout `missing parts` 留痕，日常巡检仍应断言 `missing_components` 为空，只在部署事实（确实未启用任务库 / 确实没有附件存储）成立时才使用该开关。
 10. **组成部分守卫的检查深度**：只检查「存在且为目录」——目录存在但为空、或缺少 `state.sqlite3` / `config.json` 时备份仍成功（仅记入 `warnings`）；恢复侧对缺失的任务库文件会在 `orchestration_sqlite` / `orchestration_config` 报 FAIL，但「附件存储为空目录」与「零附件」在恢复侧不可区分，生产巡检需另行核对来源清单。
+11. **跨主机 Runbook 已就绪但未演练**：§11 的步骤、预检与 dry-run 封装都只在单机验证过；网络传输、目标机权限、目标机 PostgreSQL 版本、真实恢复时长均**未实测**，不能把 dry-run 结果当作生产验收结论（§11.8）。
+
+## 11 跨主机/异地恢复 Runbook 与自动化（dry-run）
+
+- 日期：2026-10-18
+- 任务：Issue #22「跨主机/异地恢复 Runbook 与自动化（dry-run，不含真实异地执行）」
+- 工具：`ops/offsite_restore.py`（`preflight` 预检 / `rehearse` 本机 dry-run）；恢复本体仍是 `ops/restore.py`（§3、§4 的 13 项校验）
+- 测试：`app/tests/ops/test_offsite_restore.py`
+- **结论先说**：本节交付的是**可复用 Runbook + 单机 dry-run 封装**；**没有执行任何真实跨主机/异地恢复**（§11.8）。生产验收仍需要一次真实的跨主机演练（§7）。
+
+### 11.1 前置条件
+
+1. **完整归档 + 校验和旁车**：`ops/backup.py` 产物（`<archive>` 与 `<archive>.sha256`），且已离开生产主机（3-2-1 原则，§6）。
+2. **归档必须是完整的**：`manifest.missing_components` 必须为空。用 `--allow-missing-storage` / `--allow-missing-orchestration` 生成的归档、以及缺少 `.sha256` 旁车（只能靠 `--allow-missing-checksum` 放行）的归档，**不得用于生产验收**（§10 第 9 项）。`preflight` 会把 `missing_components` 非空直接判 FAIL。
+3. **归档先放在 staging 目录（中转），不要放进目标目录**：`<staging-dir>` 是仓库之外、执行账户可读的目录（可与 `<target-dir>` 同级，例如 `/srv/ajaimgr-restore-staging`）。`preflight` 与 `rehearse` **只从 `<staging-dir>` 读归档**（`--archive <staging-dir>/<archive>`）；`<target-dir>` 在这两步执行期间必须**保持为空**。
+   - 这是工具的硬性守卫：`--target-dir` 非空即 `rc=2`，报 `--target-dir must be empty: ... holds N entry(ies)`；把归档放进 `<target-dir>/incoming/` 再跑 `preflight` 会**必然失败**。
+4. **目标机可登录、可传输**：账户与传输通道（如 `rsync` over 受控网络）由 DBA 提供；本 Issue 不涉及凭据分发与网络配置。
+5. **目标库是新的演练库**：建议命名 `<app>_restore_check`；目标库名不得是 `postgres` / `template*` / `ajaimgr_dev` / `ajaimgr_test` / `ajaimgr_prod` 等受保护或生产名。
+6. **目标目录已存在且为空**：`<target-dir>` 由 DBA 创建（属主为执行账户，建议 `0700`），本工具**不会自动创建**，也不会覆盖已有文件。它只承载**恢复产物**：`preflight` 不写它；`rehearse`（可选，步骤 0.3）会写入 `incoming/`、`work/`、`restored-storage/`、`restored-orchestration/`、`evidence/`；真实传输（步骤 1）与恢复（步骤 4）随后写入 `incoming/`、`run/`、`evidence/`。因此 `preflight` / `rehearse` 必须在**传输之前、目录仍为空**时执行（顺序见 §11.3）：
+   - 执行过 `rehearse` 之后该目录已非空，**不能**再对它跑 `preflight` / `rehearse`；重试要么换一个新的空目录（推荐，如 `<target-dir>-r2`），要么在**保留证据、确认失败原因已修复**后清理该目录再跑（不得用清理掩盖失败）。
+7. **连接参数只放环境变量**：执行账户的 shell 里设置 `PGHOST` / `PGUSER`（口令由 libpq 经 `PGPASSWORD`、`PGPASSFILE` 或客户端证书读取）。本工具只检查"是否设置"，**不读取、不回显、不落盘其值**；命令行不接受 DSN，也不接受任何口令参数。
+8. **演练窗口**：冻结写入（或对只读快照操作），并预留回滚时间（§11.5）。
+
+### 11.2 目标机要求
+
+| 项目 | 要求 | 校验方式 |
+| --- | --- | --- |
+| PostgreSQL 服务器主版本 | **≥ 归档 `pg_dump` 主版本**（`manifest.pg_dump_version`，如 17）；更旧的服务器无法加载较新 `pg_dump` 的输出 | `preflight` 的 `pg_target_major` 检查（`--target-pg-major` 显式声明） |
+| 客户端工具 | `psql` / `pg_dump` 与**目标服务器同主版本**（`psql --version`） | 目标机人工执行；本工具在证据里记录本机客户端版本 |
+| 目录 | **`<staging-dir>`（归档中转，仓库外）**：存放 `<archive>` 与 `<archive>.sha256`，供 `preflight` / `rehearse` 读取；<br>**`<target-dir>`（恢复目标）** 存在、为空、属主为执行账户、建议 `0700`；`incoming/` 放（真实传输的）归档，`restored-storage/` 放附件，`restored-orchestration/` 放任务库，`work/` 放解包产物，`run/` 放 `restore.py` 产物，`evidence/` 放证据 | `preflight` 检查 `<target-dir>` 存在/**为空**/可写（非空即 `rc=2`）；上述子目录由 `rehearse` 与步骤 1/4/7 创建，`preflight` 不写任何文件 |
+| 磁盘 | `<target-dir>` 所在分区 ≥ 归档体积 ×3（`incoming/` 副本 + `work/` 解包 + `run/` 与 `restored-*/` 恢复产物）；`<staging-dir>` 另需 1 份归档体积（与 `<target-dir>` 同盘时合计 ×4） | 目标机 `df -h <staging-dir> <target-dir>` 人工确认 |
+| 数据库 | 目标实例可连、执行账户有 `CREATEDB`（或由 DBA 预建空库） | `sudo -u postgres createdb -O <app-role> <target-db>` 或 DBA 预建 |
+| 角色 | 恢复后由角色/授权脚本重建所有权与 `GRANT`（归档是 `--no-owner`，§9） | 见 §9「所有权与授权」行 |
+| 时钟 | NTP 同步（库内 `timestamptz` 存 UTC） | 目标机 `timedatectl` 人工确认 |
+| 服务账户 | 应用以独立 UID 运行，`<target-dir>` 与 `AJAIMGR_STORAGE_ROOT` 均为该账户可写 | 部署清单（§3 of `DEPLOYMENT-REQUIREMENTS.md`） |
+
+### 11.3 分步命令
+
+> 占位符约定：`<archive>`、`<staging-dir>`、`<target-host>`、`<target-dir>`、`<target-db>`、`<account>`、`<app-role>` 全部由操作者替换；仓库与文档中**不得**出现真实主机名、IP、账号或口令。
+> **执行顺序（务必自上而下）**：`0.1 → 0.2 → 0.3（可选）→ 1 → 2 → 3 → 4 → 5 → 6 → 7`。
+> 关键约束：`0.2` / `0.3` 都要求 `<target-dir>` **为空**，且两者都从 `<staging-dir>` 读归档；归档**不得**提前放进 `<target-dir>/incoming/`（否则 `preflight` 直接 `rc=2` 报 `must be empty`）。真实传输（步骤 1）在预检/演练之后执行，之后的写盘都在同一个 `<target-dir>` 内，互不冲突（步骤 1 只是把 `incoming/` 里的 dry-run 副本换成真实传输件）。
+> `ops/offsite_restore.py` 输出的 `plan` 与下面**步骤 1–7 一一对应**，工具只渲染命令、**不执行**。
+
+**步骤 0（准备 + 预检，在目标机执行）**
+
+```bash
+# 0.0 归档只放在 staging（仓库外），目标目录随后保持为空
+ls -l <staging-dir>/<archive> <staging-dir>/<archive>.sha256
+
+# 0.1 目标机自检：客户端/服务器主版本、磁盘、目录属性
+psql --version
+df -h <target-dir>
+ls -ld <staging-dir> <target-dir>
+test -z "$(ls -A <target-dir>)" && echo "target-dir is empty"
+
+# 0.2 只读预检：参数、归档完整性、目标目录、PG 主版本（不写目标目录）
+#     注意 --archive 指向 staging，--target-dir 仍是空目录
+PGHOST=<target-host> PGUSER=<account> \
+uv run python ops/offsite_restore.py preflight \
+  --archive <staging-dir>/<archive> \
+  --target-host <target-host> \
+  --target-db <target-db> \
+  --target-dir <target-dir> \
+  --target-pg-major 17
+```
+
+**步骤 0.3（可选，本机 dry-run；必须在步骤 1 之前、`<target-dir>` 仍为空时执行）** —— 复现目标机的落盘路径，**不执行数据库恢复**：
+
+```bash
+PGHOST=<target-host> PGUSER=<account> \
+uv run python ops/offsite_restore.py rehearse \
+  --archive <staging-dir>/<archive> \
+  --target-host <target-host> \
+  --target-db <target-db> \
+  --target-dir <target-dir> \
+  --target-pg-major 17 \
+  --evidence <target-dir>/evidence/offsite-restore.json --verbose
+```
+
+- `rehearse` 会**真实写入** `<target-dir>` 的子目录：`incoming/`（归档副本 + 旁车）、`work/extracted/`（解包）、`restored-storage/`（附件）、`restored-orchestration/`（任务库）、`evidence/`（证据）。这正是它要验证的落盘路径。
+- 因此它**只能在空目录上跑一次**：跑完 `<target-dir>` 已非空，再跑 `preflight` / `rehearse` 会报 `must be empty`。重试要么换新的空目录（推荐，如 `<target-dir>-r2`），要么在保留证据、确认原因已修复后清理该目录再跑。
+- 因为它在传输之前执行，**不冲突**：步骤 1 的 `rsync` 会把同名的真实传输件写进已存在的 `incoming/`（`--checksum` 下内容一致则跳过），步骤 2 再独立复核旁车；步骤 4 的 `restore.py` 只写 `run/`，与 `restored-*` 不重名。
+- 若不需要 dry-run，可**跳过 0.3**，直接进入步骤 1；此时 `incoming/` 由 `rsync` 创建。
+
+**步骤 1（传输）** —— 归档与旁车**必须一起**传输：
+
+```bash
+rsync -a --checksum <staging-dir>/<archive> <staging-dir>/<archive>.sha256 \
+  <account>@<target-host>:<target-dir>/incoming/
+```
+
+**步骤 2（传输校验，在目标机执行）**：
+
+```bash
+cd <target-dir>/incoming && sha256sum -c <archive>.sha256
+```
+
+`preflight` 本身不校验传输副本；`rehearse` 的 `transfer_checksum` 项在 dry-run 中复现同一判定（源归档 → `<target-dir>/incoming/` 的副本字节散列必须等于源归档）。真实传输的判定以本步骤的 `sha256sum -c` 为准。从步骤 1 起 `<target-dir>` 不再为空，`0.2` / `0.3` 不可重跑。
+
+**步骤 3（建库；先确认目标库不存在）**：
+
+```bash
+# 本工具不执行 DROP、不提供 --recreate-db 等价开关
+psql -d postgres -Atc "SELECT 1 FROM pg_database WHERE datname = '<target-db>'"
+sudo -u postgres createdb -O <app-role> <target-db>
+```
+
+**步骤 4（恢复 + 逐项校验，由 `ops/restore.py` 执行）**：
+
+```bash
+PGHOST=<target-host> PGUSER=<account> \
+uv run python ops/restore.py <target-dir>/incoming/<archive> \
+  --target-db-url postgresql+psycopg:///<target-db> \
+  --storage-target <target-dir>/run/storage \
+  --orchestration-target <target-dir>/run/orchestration \
+  --report <target-dir>/evidence/restore-report.json --verbose
+```
+
+- **禁止**追加 `--allow-missing-checksum` / `--allow-missing-storage` / `--allow-missing-orchestration`（这三个开关仅供本地演练，**禁止用于生产验收**，§10 第 9 项）；`ops/offsite_restore.py` 会直接拒绝这三个参数。
+- **禁止**追加 `--recreate-db`：目标必须是新建的演练库，不能对既有库执行 `DROP`。
+- 退出码语义同 §3：`0` = 13 项全 PASS，`1` = 有校验项不符，`2` = 用法/IO/环境错误。
+
+**步骤 5（校验）**：按 §11.4 清单逐条核对，任一项不满足即按 §11.5 回滚。
+
+**步骤 6（切换服务）**：
+
+```bash
+# 1) 先备份现网配置（含 DB_URL / STORAGE_ROOT，口令不写进配置文件明文）
+# 2) 停服务 → 修改 AJAIMGR_DB_URL / AJAIMGR_STORAGE_ROOT 指向新库/新目录 → 启动
+# 3) 先跑健康检查，再开放写入
+```
+
+**步骤 7（证据留存）**：把 `offsite-restore.json`、`restore-report.json` 与命令输出归档到 `<target-dir>/evidence/`，复制一份到受控存储（§11.6）。
+
+### 11.4 校验清单
+
+逐条勾选，**不得以 SKIP 项充当通过**：
+
+| # | 校验项 | 判定 | 证据来源 |
+| --- | --- | --- | --- |
+| 1 | 归档 sha256 与旁车一致 | 一致 | `preflight` / `rehearse` 的 `archive_checksum` |
+| 2 | 归档成员安全（无绝对路径 / `..` / 链接 / 设备文件） | 无危险成员 | `archive_members` |
+| 3 | manifest 格式与版本可识别、成员清单非空 | `ajaimgr-backup` / `1` | `manifest` |
+| 3.1 | `manifest.missing_components` 为空（归档完整） | 空 list | `manifest_completeness`（非空即 FAIL：该归档来自 `--allow-missing-*`，禁止用于验收） |
+| 4 | 逐成员 sha256 + 字节数与 manifest 一致 | 全部一致 | `member_hashes` |
+| 5 | 目标机 PG 主版本 ≥ 归档 `pg_dump` 主版本 | 成立 | `pg_target_major` |
+| 6 | 传输副本与源归档字节一致 | 一致 | `rehearse`（步骤 0.3）的 `transfer_checksum`；真实传输用步骤 2 的 `sha256sum -c`（`preflight` 不做传输校验） |
+| 7 | 目标目录内解包成功 | 成功 | `rehearsal_extract`（步骤 0.3） |
+| 8 | 附件逐个落盘且 sha256/字节数一致 | 全部一致 | `storage_restore` / `storage_hashes` |
+| 9 | 内容寻址 blob 文件名等于其内容 sha256 | 成立 | `storage_content_address` |
+| 10 | 任务库文件落盘 | 全部落盘 | `orchestration_restore` |
+| 11 | `state.sqlite3` 可打开、`integrity_check=ok`、表数一致 | 成立 | `orchestration_sqlite` |
+| 12 | `config.json` 可解析 | 成立 | `orchestration_config` |
+| 13 | **数据库恢复 13 项校验（§4）** | 全 PASS | `restore-report.json`（步骤 4） |
+| 14 | 关键表行数与 manifest 一致 | 7 张关键表全部一致 | 报告 `db_row_counts` + 独立 `psql count(*)` 复核 |
+| 15 | 恢复目录与源目录一致（排除凭据文件） | 无差异 | `diff -r` 人工复核 |
+| 16 | 目标库、目标目录没有**清单外**的遗留文件 | 演练库按需删除；目录内容仅为下述已知产物 | `dropdb <target-db>` + `ls -A <target-dir>` |
+| 17 | 证据文件齐全（含 `dry_run_only` / `database_step` 字段） | 齐全 | §11.6 |
+
+第 13–15 项需要数据库，**只能在目标机执行**；`rehearse` 的 `db_restore` 会显示 `SKIP / NOT EXECUTED`，这不是通过。
+
+`<target-dir>` 的**已知产物**（不属于第 16 项的"遗留"）：`incoming/`（步骤 0.3 的 dry-run 副本 + 步骤 1 的真实传输件）、`work/`（步骤 0.3 解包）、`restored-storage/` / `restored-orchestration/`（步骤 0.3 落盘）、`run/`（步骤 4 恢复产物）、`evidence/`（步骤 0.3 / 4 / 7 证据）。除此之外的未知文件（例如上一次演练的残留、误放进来的归档）一律视为遗留，验收前清掉；演练库 `dropdb` 后按需整体清理 `<target-dir>`。
+
+### 11.5 失败回滚
+
+| 失败点 | 处置 | 注意 |
+| --- | --- | --- |
+| 步骤 0 预检失败（缺参、受保护库名、目录不存在/非空、主版本不兼容） | 修正参数或环境后重跑；目标目录保持原样 | 本工具在预检失败时**不写目标目录**。若报 `--target-dir must be empty: ... holds 1 entry(ies) (incoming)`，说明归档被放进了 `<target-dir>/incoming/`（或上一次 `rehearse` 已写入）：把归档移回 `<staging-dir>`，换一个新的空目录作为 `<target-dir>` 重跑，不要就地删除未知文件 |
+| 步骤 0.3 dry-run 失败 | 保留证据；`<target-dir>` 里可能已有部分产物（`incoming/` 等） | 该目录已非空，重试必须换新的空目录（如 `<target-dir>-r2`）；不要用"清空后重跑"掩盖真实失败 |
+| 步骤 1–2 传输失败/校验和不符 | 删除 `<target-dir>/incoming` 下的残片，重新传输；必要时重新生成归档 | 生产库未受影响（尚未建库）。执行过 0.3 时 `incoming/` 已有 dry-run 副本，`rsync --checksum` 会覆盖为真实传输件，步骤 2 仍独立复核算真 |
+| 步骤 4 恢复失败（退出码 1/2） | 保留 `restore-report.json`；确认目标库是**演练库**后 `dropdb <target-db>`，清空 `<target-dir>/run` 重来 | 严禁对生产库执行 `dropdb` / `--recreate-db` |
+| 步骤 6 切换后发现问题 | 停服务 → 把 `AJAIMGR_DB_URL` / `AJAIMGR_STORAGE_ROOT` 指回原库/原目录 → 启动 → 复跑健康检查 | 原库在切换窗口内必须保持可写或已有快照；回滚配置在切换前必须备份 |
+| 任意阶段判定"不可继续" | 停在这里并记录证据；**不得**用 `--allow-missing-*` 把失败降级为成功 | 见 §10 第 9 项 |
+
+回滚后必须重新执行 §11.4 全量校验；"进程能起来"不等于恢复通过。
+
+### 11.6 证据留存格式
+
+- 文件名：`<target-dir>/evidence/offsite-restore-<UTC 时间戳>.json`（`preflight` 默认不写文件，需显式 `--evidence`）。
+  - 预检（步骤 0.2）若要留证据，写到 `<staging-dir>/evidence/` 或目标目录之外的路径：`preflight` 若把 `evidence/` 建在 `<target-dir>` 内，目录立即非空，紧接着的 `rehearse`（步骤 0.3）会报 `must be empty`。
+  - `rehearse`（步骤 0.3）的 `evidence/` 写在 `<target-dir>` 内属于预期产物，与上述限制不冲突（它本身就是最后一步写盘）。
+- 存放：**目标机本地 + 受控存储**各一份；**不得提交进仓库**（工具会拒绝把 `--evidence` 指向仓库内）。
+- 关键字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `tool` / `mode` / `scope` / `dry_run_only` | 工具名、`preflight`/`rehearse`、`dry-run/local`、恒为 `true` |
+| `started_at` / `finished_at` | UTC 时间（取证用） |
+| `result` | `PASS` / `FAIL`（**SKIP 不等于 PASS**，见 `database_step`） |
+| `archive.path` / `.sha256` / `.size_bytes` / `.sidecar` | 归档身份与校验和 |
+| `target.host_label` / `.database` / `.directory` / `.pg_major_declared` | 操作者声明的目标环境（主机只是标签，不解析、不连接） |
+| `environment.required_keys` / `present_keys` / `values_recorded` | 只记录键名与"是否设置"，`values_recorded` 恒为 `false` |
+| `database_step` | `PLANNED`（preflight）/ `NOT_EXECUTED`（rehearse）；真实演练应在 `restore-report.json` 看到 13 项 PASS |
+| `checks[]` | 逐项 `name` / `status`（PASS/FAIL/SKIP）/ `detail` / `diffs` |
+| `storage.files[]` | 恢复后逐个附件的 `path` / `sha256` / `size_bytes` / `ok` |
+| `orchestration.state_table_count` / `.state_integrity` | 任务库表数与完整性 |
+| `artifacts` | 传输副本、附件目录、任务库目录的实际落盘位置 |
+| `plan[]` | 目标机 7 步命令（本工具只渲染，不执行） |
+| `warnings[]` / `notes[]` | 告警与边界声明（含"未执行真实跨主机恢复""禁止 `--allow-missing-*`"） |
+
+### 11.7 与 `ops/restore.py` 的关系（不改恢复语义）
+
+`ops/offsite_restore.py` 只是一层**声明校验 + 单机演练**封装：
+
+- 归档校验和、成员安全、manifest、逐成员散列、附件/任务库落盘与散列复核，全部**调用** `ops/restore.py` 里既有的函数（`check_checksum` / `extract_archive` / `check_manifest` / `check_member_hashes` / `restore_storage` / `restore_orchestration`），没有第二套实现；
+- 数据库恢复仍由 `ops/restore.py` 执行，本工具不连接任何数据库、不改 `restore.py` 的恢复语义；
+- 差异只在**入口守卫**：目标库名、目标目录、PG 主版本、`PG*` 环境变量、`--allow-missing-*` 一律在这里先 fail closed（`ops/restore.py` 保留 `--force-target` 逃生口，本工具**没有**）。
+
+### 11.8 本 Issue 的边界（**未做的事**）
+
+1. **未执行真实跨主机/异地恢复**：本文与工具只覆盖"单机 dry-run"，没有任何网络连接、`ssh`/`scp` 调用或异地数据库连接。
+2. **数据库恢复步骤未执行**：`rehearse` 的 `db_restore` 恒为 `SKIP / NOT_EXECUTED`；真正的恢复要在目标机跑 `ops/restore.py`（步骤 4）。
+3. **网络与权限未验证**：传输带宽/中断恢复、目标机账户权限、防火墙、目标机 PostgreSQL 版本与扩展差异均未实测。
+4. **§8 的 13/13 仍是同机记录**：那次演练在**同一台主机**上用真实数据完成（Debian + PG 17.11），不等于跨主机验收。
+5. **保留/调度未变**：仍按 §6 的建议值，无自动调度与失败告警。
+6. 因此：`PROJECT-CHARTER.md` 的「可在生产主机之外恢复」**仍未满足**，需按 §7 每季度做一次真实跨主机演练并留存 §11.6 证据。
+
+### 11.9 本机 dry-run 实测记录（2026-10-18）
+
+环境：Windows 10 + Python 3.13.14，**本机无 PostgreSQL、无 `psql`/`pg_dump`**；归档为测试夹具（`app/tests/ops/test_offsite_restore.py` 用 `tarfile` 构造，结构与 `ops/backup.py` 产物一致，`db/database.sql` 为占位内容且从未被 `psql` 消费）。
+
+| 步骤 | 命令（要点） | 退出码 |
+| --- | --- | --- |
+| 预检 | `python ops/offsite_restore.py preflight --archive <fixture>.tar.gz --target-host target-host --target-db ajaimgr_restore_check --target-dir <tmp>/target --target-pg-major 17` | 0（6 项 PASS） |
+| dry-run | 同上改 `rehearse --evidence <tmp>/evidence.json --verbose` | 0（14 项 PASS + `db_restore` SKIP，共 15 条） |
+| 缺参 | `preflight`（只给 `--archive`） | 2（一次性列出 5 个缺失参数 + 缺 `PGHOST`/`PGUSER`） |
+| 受保护库名 | `--target-db postgres` | 2（`refusing protected database name`，并说明本工具无 `--force-target`） |
+| 目标目录不存在 | `--target-dir <不存在路径>` | 2（含解析后的绝对路径与"本工具不自动创建"） |
+| 主版本不匹配 | `manifest pg_dump 17` + `--target-pg-major 13` | 1（`pg_target_major` FAIL，说明"不能被更旧的主版本加载"） |
+| 拒绝放行开关 | 追加 `--allow-missing-checksum` | 2（`禁止用于生产验收`） |
+| 篡改归档 | 改一个 blob 字节并刷新旁车 | 1（`member_hashes` FAIL，目标目录保持为空） |
+| 目录约束（正向）：归档在目标目录之外 | `<fixture>/x.tar.gz` + `--target-dir <tmp>/target`（空目录） | 0（`preflight` 不写目标目录，故同一空目录可连续跑 `preflight` → `rehearse`；这是 §11.3 的 staging 约定） |
+| 目录约束（反向）：归档被放进目标目录 | `--archive <tmp>/target/incoming/x.tar.gz` + `--target-dir <tmp>/target` | 2（`--target-dir must be empty: ... holds 1 entry(ies) (incoming)`；§11.3 已据此改为从 `<staging-dir>` 读取） |
+
+边界：以上全部是**单机夹具**演练，**不是**真实数据、不是真实异地主机、**不是**生产验收。
+
+补充（第 1 轮 master 复核）：`rehearse` 跑完后 `<target-dir>` 不再为空，此时再跑 `preflight` / `rehearse` 一律 `rc=2`（`must be empty`）。§11.3 因此把 `rehearse` 前移到步骤 0.3（传输之前、目录仍空时执行一次），并要求归档只放在 `<staging-dir>`。
