@@ -73,6 +73,33 @@
 
 > **诚实标注**：①本次抓取页面**未列出币种字段**，也未列出与腾讯云 `ElectronicType` 对应的「电子类型」代码字段；②文档示例中 `log_id` 出现两种位置：成功示例把 `log_id`/`words_result_num` 嵌在 `words_result` 内，字段表与失败示例则放在**顶层**——适配器两处都取（顶层优先）；③失败返回示例为顶层 `{"log_id", "error_code": 282162, "error_msg": "Unexpected query result exception", "VerifyResult": "0005", ...}`，即**失败响应可能同时带顶层 `error_code`（文档未给出该代码的映射表，属待确认）**。以上未列/歧义之处均按「不臆造」处理（见 §4）。
 
+#### 2.3.1 真实响应层级修正（2026-10-18，**#57 实测 / #58 修复**）
+
+> **真实证据（#57 跑批，8/8 一致）**：渠道把**结论/身份字段**放在响应**顶层**
+> （`VerifyResult` / `InvalidSign` / `InvoiceCode` / `InvoiceNum` / `InvoiceDate` /
+> `InvoiceType` / `CheckCode` / `MachineCode` / `VerifyFrequency` / `VerifyMessage`），
+> `words_result` 只承载**票面明细**（`SellerName` / `SellerRegisterNum` /
+> `PurchaserName` / `PurchaserRegisterNum` / `TotalAmount` / `TotalTax` /
+> `AmountInFiguers` / `Commodity*` 等）。这与上文「返回参数」表把结论字段列在
+> `words_result` 内的排布**不一致**——上表按**文档**照录，本节按**实测**修正。
+
+- **缺陷（#57 发现，#58 修复）**：适配器此前只从 `words_result` 取结论字段，故把
+  8/8 的真实「查验通过」（顶层 `VerifyResult=0001` + `InvalidSign=N`）误判为
+  「无法查验」（`InvalidResponse` / `provider_invalid_response`），影响**所有票种**
+  （挂账状态、提交校验、导出异常票口径）。
+- **修复口径（#58）**：对**结论/身份字段**（`VerifyResult`、`InvalidSign`、
+  `InvoiceCode`、`InvoiceNum`、`InvoiceDate`）改为「**顶层优先、`words_result`
+  回退**」（适配器内 `_layered`）；**票面明细**（购销方税号、`TotalAmount` /
+  `TotalTax` / `AmountInFiguers`）仍从 `words_result` 提取。两种结构均兼容；
+  两处都缺时维持 fail closed（`InvalidResponse`）。
+- **未提取字段**（`VerifyMessage` / `VerifyFrequency` / `InvoiceType` / `CheckCode` /
+  `MachineCode`）：契约层无对应槽位，原始响应（含顶层与 `words_result` 两处）全量
+  保留在 `evidence`，故不存在层级丢失。
+- **桩测试**：`app/tests/integrations/test_baidu_vat_verify.py` 新增「真实结构」
+  用例（顶层结论 + `words_result` 明细 → 正确状态；顶层优先于 `words_result`；
+  两处都缺 → fail closed），并保留旧结构（结论嵌 `words_result`）兼容用例。
+- **待办（单独授权）**：#57 批次的重跑刷新（会再消耗查验额度）不在 #58 范围内。
+
 ### 2.4 结果码（页内「查验结果码释义表」14 个，逐字核对 + 本项目映射）
 
 | VerifyResult | 查验结果信息（VerifyMessage） | 描述 | **是否计费** | 本项目状态映射 |
@@ -150,9 +177,10 @@ PLAN §7.2 要求保存的字段，在本渠道下的来源（「本项目记录
 - **凭据**：环境变量 `AJAIMGR_BAIDU_API_KEY` / `AJAIMGR_BAIDU_SECRET_KEY`（env-only）；缺失/空白即抛 `MissingCredentialError`（fail closed），错误信息只含变量名。
 - **传输**：可注入 `transport`（`(url, headers, body, timeout) -> HttpResponse`）；生产默认 `httpx`（**惰性导入**，仅真实调用时加载；httpx 为既有传递依赖，未新增依赖）；测试一律注入桩，绝不触网。
 - **请求**：POST 表单；`access_token` 在 URL；六参数按 §2.2 策略；金额定点；单次尝试（超时/失败不自动重发）。
+- **响应层级**（§2.3.1）：结论/身份字段「顶层优先、`words_result` 回退」（`_layered`），票面明细仍从 `words_result` 提取；两种结构兼容，两处都缺 → fail closed。
 - **结果处理**：`RESULT_CODE_TABLE`（14 码，含「是否计费」`billed` 标记与文档 `VerifyMessage` 原文）+ `map_result_code` / `is_result_code_billed`；未知码 fail closed；`0001` 分支仍执行 `InvalidSign` 与票面一致性校验。
 - **错误码约定**（与腾讯云适配器一致）：渠道判定成功但业务否决（作废/红冲/票面不一致）时 `error_code=None`、缘由记入 `reason`；渠道结果码（如 `0006`）与本地失败码（`Timeout`/`TransportError`/`InvalidResponse`/`HTTP500` 等）写入 `error_code`。
-- **桩测试**：`app/tests/integrations/test_baidu_vat_verify.py` 共 **54** 个用例，覆盖：入参裁剪不臆造、请求线路格式（表单/Token URL）、成功解析与票面映射、票面/金额不一致、`InvalidSign` 四类否决与未知取值 fail closed、14 码映射与计费标记、未知码 fail closed、token 获取/缓存/过期重取/失败映射、超时只尝试一次、凭据缺失 fail closed（错误信息不含凭据值）。
+- **桩测试**：`app/tests/integrations/test_baidu_vat_verify.py` 共 **65** 个用例，覆盖：入参裁剪不臆造、请求线路格式（表单/Token URL）、成功解析与票面映射、**真实响应层级（顶层结论 + `words_result` 明细，顶层优先、两处都缺 fail closed，见 §2.3.1）**、票面/金额不一致、`InvalidSign` 四类否决与未知取值 fail closed、14 码映射与计费标记、未知码 fail closed、token 获取/缓存/过期重取/失败映射、超时只尝试一次、凭据缺失 fail closed（错误信息不含凭据值）。
 - **不新增渠道选择配置项/环境开关**（所有者决策）；腾讯云适配器除文首注释外行为不变；`manual_assisted` 兜底保留。
 
 ## 5. 待确认项（不阻塞本次交付；接入启用前逐项确认）

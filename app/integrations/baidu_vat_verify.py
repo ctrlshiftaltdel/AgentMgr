@@ -22,11 +22,17 @@
   传递，未提供的条件字段以空串表达（文档原文允许「此参数可为空」），**不臆造取值**；
   ``invoice_type`` 为渠道必选且无「可为空」例外，缺失时本地 fail closed（不发起必然
   失败的请求）。金额一律定点格式（不出现科学计数法）。
-* **响应解析**按 W1-28 §2.3 提取 ``words_result`` 字段，**不臆造**未列出的字段
-  （币种与「电子类型」代码字段文档未列 → 保持 ``None``）；``VerifyResult`` 驱动
-  状态映射、``InvalidSign`` 驱动作废/红冲否决；``VerifyMessage``/``VerifyFrequency``
+* **响应解析**按 W1-28 §2.3 提取字段，**不臆造**未列出的字段（币种与「电子类型」
+  代码字段文档未列 → 保持 ``None``）；``VerifyResult`` 驱动状态映射、
+  ``InvalidSign`` 驱动作废/红冲否决；``VerifyMessage``/``VerifyFrequency``
   与其余票面字段原样保留在 ``evidence``（契约层无对应槽位）；``provider_ref`` 用
   ``log_id``；``evidence`` 放原始响应（脱敏由服务层 ``sanitize_evidence`` 负责）。
+* **响应层级**（2026-10-18 真实调用修正，见 #57/#58）：W1-28 §2.3 的字段表把结论与
+  身份字段列在 ``words_result`` 内，但**真实响应把结论/身份字段放在顶层**
+  （``VerifyResult``/``InvalidSign``/``InvoiceCode``/``InvoiceNum``/``InvoiceDate``
+  等），``words_result`` 只承载票面明细（购销方名称/税号、合计金额/税额/价税合计、
+  货物明细等）。适配器对**结论/身份字段**采用「**顶层优先、``words_result`` 回退**」
+  （``_layered``），对**票面明细**仍从 ``words_result`` 提取——两种结构都兼容。
 * **结果码映射**按 W1-28 §2.4 的 14 个逐字码表（含「是否计费」列）：``0001`` 且
   ``InvalidSign=N`` → 查验通过候选（仍须票面一致性比对）；``0006`` 与
   ``InvalidSign ∈ {Y, H, BH, QH}`` → 查验不通过；其余（``0002``/``0005``/``0009``/
@@ -268,6 +274,21 @@ def _optional_str(value: Any) -> str | None:
     return text or None
 
 
+def _layered(top: Mapping[str, Any], words: Mapping[str, Any], key: str) -> Any:
+    """按**真实响应层级**取字段值：顶层优先、``words_result`` 回退。
+
+    2026-10-18 的真实调用（#57）证明：渠道把**结论/身份字段**
+    （``VerifyResult``/``InvalidSign``/``InvoiceCode``/``InvoiceNum``/
+    ``InvoiceDate``/``InvoiceType``/``CheckCode``/``MachineCode``/
+    ``VerifyFrequency``/``VerifyMessage``）放在响应**顶层**，``words_result`` 只放
+    票面明细；而 W1-28 §2.3 的字段表与既有桩测试把结论字段嵌在 ``words_result``
+    内。为兼容两种结构而两处都取：**顶层优先**，顶层缺失（含空值）时回退
+    ``words_result``——与 ``log_id`` 的既有取法（``data.get(...) or words.get(...)``）
+    同一约定，**不臆造**未出现的取值。
+    """
+    return top.get(key) or words.get(key)
+
+
 def _parse_decimal(value: Any) -> Decimal | None:
     """把渠道金额字符串解析为 2 位小数 ``Decimal``；无法解析返回 ``None``。"""
     if value is None or value == "":
@@ -278,8 +299,14 @@ def _parse_decimal(value: Any) -> Decimal | None:
         return None
 
 
-def _parse_face(words: Mapping[str, Any]) -> InvoiceFace:
-    """按 W1-28 §2.3 从 ``words_result`` 提取票面要素（不臆造未列字段）。
+def _parse_face(top: Mapping[str, Any], words: Mapping[str, Any]) -> InvoiceFace:
+    """提取票面要素（不臆造未列字段）。
+
+    取值层级（#57 真实结构）：**结论/身份字段**（``InvalidSign``/``InvoiceCode``/
+    ``InvoiceNum``/``InvoiceDate``）**顶层优先、``words_result`` 回退**；**票面明细**
+    （``SellerRegisterNum``/``PurchaserRegisterNum``/``TotalAmount``/``TotalTax``/
+    ``AmountInFiguers``）按真实结构只在 ``words_result``，故仍从 ``words_result``
+    提取。
 
     映射（逐项对齐文档「返回参数」表）：
 
@@ -298,11 +325,13 @@ def _parse_face(words: Mapping[str, Any]) -> InvoiceFace:
     ``TotalCarPrice``/``total_tax`` 等）语义按票种分节、与通用槽位无一一对应，
     **不并入**（避免臆造），保留在 ``evidence`` 原文。
     """
-    invalid_sign = _optional_str(words.get("InvalidSign"))
+    invalid_sign = _optional_str(_layered(top, words, "InvalidSign"))
     return InvoiceFace(
-        invoice_code=_optional_str(words.get("InvoiceCode")),
-        invoice_no=_optional_str(words.get("InvoiceNum")),
-        invoice_date=parse_invoice_date(_optional_str(words.get("InvoiceDate"))),
+        invoice_code=_optional_str(_layered(top, words, "InvoiceCode")),
+        invoice_no=_optional_str(_layered(top, words, "InvoiceNum")),
+        invoice_date=parse_invoice_date(
+            _optional_str(_layered(top, words, "InvoiceDate"))
+        ),
         seller_tax_code=_optional_str(words.get("SellerRegisterNum")),
         buyer_tax_code=_optional_str(words.get("PurchaserRegisterNum")),
         amount_without_tax=_parse_decimal(words.get("TotalAmount")),
@@ -605,7 +634,12 @@ class BaiduVatInvoiceVerifyProvider(InvoiceVerificationProvider):
     def _parse(
         self, response: HttpResponse, fields: InvoiceFields
     ) -> VerificationResult:
-        """解析渠道响应：结果码映射 / 票面提取 / 票面一致性判定。"""
+        """解析渠道响应：结果码映射 / 票面提取 / 票面一致性判定。
+
+        结论/身份字段（``VerifyResult``/``InvalidSign`` 及票面身份字段）按 #57 真实
+        结构「**顶层优先、``words_result`` 回退**」读取（``_layered``）；票面明细仍
+        从 ``words_result`` 提取（见 ``_parse_face``）。
+        """
         try:
             data = json.loads(response.body.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
@@ -625,7 +659,7 @@ class BaiduVatInvoiceVerifyProvider(InvoiceVerificationProvider):
         words = words if isinstance(words, dict) else {}
         # 文档示例中 ``log_id`` 出现在顶层，个别示例嵌套在 ``words_result`` 内；
         # 两处都取（顶层优先），用于 provider_ref 定位问题。
-        log_id = _optional_str(data.get("log_id") or words.get("log_id"))
+        log_id = _optional_str(_layered(data, words, "log_id"))
 
         if response.status_code >= 400:
             return VerificationResult(
@@ -636,7 +670,7 @@ class BaiduVatInvoiceVerifyProvider(InvoiceVerificationProvider):
                 reason="provider_http_error",
             )
 
-        code = _optional_str(words.get("VerifyResult"))
+        code = _optional_str(_layered(data, words, "VerifyResult"))
         if code is None:
             # 失败返回示例可能只有顶层 ``error_code``（文档未给出该代码的映射表，
             # 属「待确认」，一律 fail closed）。
@@ -658,8 +692,8 @@ class BaiduVatInvoiceVerifyProvider(InvoiceVerificationProvider):
             )
 
         status = map_result_code(code)
-        invalid_sign = _optional_str(words.get("InvalidSign"))
-        face = _parse_face(words)
+        invalid_sign = _optional_str(_layered(data, words, "InvalidSign"))
+        face = _parse_face(data, words)
 
         if status is VerificationStatus.VERIFIED_PASS:
             # ``0001`` 仅是「查验通过**候选**」：仍须 InvalidSign 非否决态，
