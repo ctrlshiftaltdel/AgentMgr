@@ -12,7 +12,7 @@
 
 ## Permissions
 
-- May Master autonomously dispatch Execution Subagents? yes —— 本机具备 C1–C4（delegate_task 可启动独立实例、隔离上下文、等待并取回结果、区分成功/失败/取消，已多轮实测）。并发上限 1；派发前必须先在目标 Issue 写活动任务登记评论。
+- May Master autonomously dispatch Execution Subagents? yes —— 本机具备 C1–C4（delegate_task 可启动独立实例、隔离上下文、等待并取回结果、区分成功/失败/取消，已多轮实测）。并发上限 4 或按负载动态（CPU / 内存有空余即可派发；路径两两不重叠为硬前提，详见 §Execution policy 的 `Parallelism cap`）；派发前必须先在目标 Issue 写活动任务登记评论。
 - Who may merge? Master only；人类所有者始终可指定运行模式、缩小授权或要求暂停。
 - Human decision triggers: 新增第三方依赖；权限/安全模型变更；凭据处理；数据删除/迁移；新增外部服务；不可逆操作；重大架构取舍；公开行为变化；产品行为实质歧义。以上一律进入 `NEEDS_HUMAN_DECISION`。
 - Protected paths / sensitive data patterns: 受保护路径为 `AGENTS.md`、`MASTER.md`、`AGENT-*.md`、`ORCHESTRATION-PROJECT.md`、`README.md`、`VERSION.txt`、`LICENSE.txt`、`HANDOVER.md`、`.github/`、`scripts/`、`tests/`、`prompts/`、`templates/`、`.orchestration/`、`.env*`（任务确需修改时必须在 Issue 中显式列出并说明）。敏感模式：密钥/令牌/cookie/真实账号标识/凭据值；含个人数据的样例文件与运行日志；`.env*`、`*secret*`、`*credential*`、`*.key`、`*.pem`。
@@ -39,7 +39,7 @@
 
 - Fast test command: `python3 scripts/validate_kit.py --project-ready && python3 -m unittest discover -s tests && python3 scripts/check_privacy.py --ci`
 - Privacy check: `python3 scripts/check_privacy.py --ci`（仓库文件 + 提交消息 + 全部历史；`--github` 额外扫描 Issue/PR 文本）
-- Full test command: `export UV_PROJECT_ENVIRONMENT=<test-host-venv> && uv run pytest app/tests -q -o addopts=""`（需要 PostgreSQL 17；会重置测试库 `ajaimgr_test`，不得与其他执行实例并行运行；实际路径见本地 `local_info.md`）
+- Full test command: `flock /tmp/ajaimgr-fulltest.lock bash -c 'export UV_PROJECT_ENVIRONMENT=<test-host-venv> && uv run --no-sync pytest app/tests -q -o addopts=""'`（需要 PostgreSQL 17；会重置测试库 `ajaimgr_test`，故经 flock 串行排队执行；`--no-sync` 见 §Agent workspace 的 venv 并行策略；实际路径见本地 `local_info.md`）
 - Lint / typecheck: 未配置独立 linter/typechecker；语法探测用 `python3 -m py_compile <files>`
 - Build / package: 待建立（尚无打包需求）
 - Post-merge verification: Fast + Full 全部在默认分支上重跑并记录真实输出与退出码
@@ -49,7 +49,7 @@
 - Branch naming: `feat/<issue>-<short>` / `fix/<issue>-<short>` / `chore/<issue>-<short>`
 - Draft PR expected early: yes（尽早开 Draft PR；确有理由时在 PR 中注明）
 - Review-fix cap: 3 rounds by default.
-- Parallelism cap: 2（依据：编排开发机已升级为 4 vCPU / 7.7 GiB，原「2 vCPU / 1.9 GiB」的资源瓶颈不再成立；测试主机全量测试改由 `flock /tmp/ajaimgr-fulltest.lock` 串行化，不再需要全局并发 1）。并行前提（缺一不可）：(a) 同批次各任务的允许路径集合两两不重叠（含文档文件）；(b) 测试主机全量测试一律经 `flock /tmp/ajaimgr-fulltest.lock` 包裹串行执行；(c) 派发前仍须完成活动任务登记与依赖检查（不变）。
+- Parallelism cap: 4 或按负载动态（有空余即派发：CPU / 内存尚有余量即可派发下一个执行实例）。条件：(a) 同批次各任务的允许路径集合两两不重叠（含文档文件）；(b) 测试主机全量测试必须经 `flock /tmp/ajaimgr-fulltest.lock` 串行；(c) 派发前仍须完成活动任务登记与依赖检查（不变）。依据：编排开发机已升级为 4 vCPU / 7.7 GiB，原「2 vCPU / 1.9 GiB」的资源瓶颈不再成立；测试主机全量测试改由 `flock /tmp/ajaimgr-fulltest.lock` 串行化，不再需要全局并发上限。
 - Active task registry: required Issue comment（见 `AGENT-ORCHESTRATION.md` §2 与 `templates/ACTIVE-TASK-REGISTRY.md`）。
 - Issue closure timing: after post-merge verification；关闭前在登记评论记录最终 SHA 与验证结果。（不使用 `Closes #N` 自动关闭；PR 正文用 `Refs #N`。）
 
@@ -59,7 +59,7 @@
 - `local_info.md` 只存在于各机本地，已被 `.gitignore` 与 `.git/info/exclude` 忽略；不得提交、粘贴到 Issue/PR 或作为 CI 产物。
 - 不新建、不启动、不停止任何真实 Hermes Profile；不写入 `~/.hermes/` 下任何文件（W0-7 一次性实验授权已过期，不得顺延）。
 - 不读取、不打印任何真实凭据值；仓库、日志与报告中一律使用占位符；不向所有者索要凭据。
-- 所有 worktree 共享主工作树 `.venv`（`UV_PROJECT_ENVIRONMENT` 指向该 `.venv`，实际路径见本地 `local_info.md`）；不在 worktree 内生成独立 `.venv`。
+- 并行模式下继续共享主工作树 `.venv`（`UV_PROJECT_ENVIRONMENT` 指向该 `.venv`，实际路径见本地 `local_info.md`）；不在 worktree 内生成独立 `.venv`。并行执行必须使用 `uv run --no-sync`（禁止并发 `uv sync` 就地改写环境）；任何会改动 `pyproject.toml` / `uv.lock` 的任务必须独占派发（不与其它执行实例并行）。
 - TMPDIR 指向仓库外且不在 `~/.hermes` 下。
 - 提交作者：仓库级占位 `Agent Orchestration <agent@localhost>`（所有者已明确不更换）。
 - 本机为编排与开发机；生产 Profile 主机另行准备（规格待真实负载测试）。
