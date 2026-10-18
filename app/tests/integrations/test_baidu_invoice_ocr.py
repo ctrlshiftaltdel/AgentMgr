@@ -9,7 +9,7 @@
 * 成功映射（中文日期、金额取价税合计而非不含税、购方/销方、税额）；
 * 置信度：字段项自带 ``probability``（两种形态、0–100 归一化）与缺失回退 0.5；
 * 4 类只分类不识别、空结果、多票取金额最大者；
-* 预检：非 clean / 不支持 MIME / 超 4MiB / 像素越界 / 图片带页码 → 发请求前拒绝；
+* 预检：非 clean / 不支持 MIME / 超 4M / 像素越界 / 图片带页码 → 发请求前拒绝；
 * 传输异常 → ``provider_error``，不泄漏异常原文与凭据；
 * 零网络：``socket.socket`` 与 ``socket.create_connection`` 被替换为抛错桩。
 
@@ -476,7 +476,7 @@ class TestPrecheck(AssertionsMixin):
         self._assert_rejected(_document(b"", mime_type="image/png"))
 
     def test_encoded_size_over_limit_is_rejected(self) -> None:
-        # base64 后约 4.4MiB，超过 4MiB 上限；在像素检查前拒绝。
+        # base64 后约 4.4M，超过 4M 上限；在像素检查前拒绝。
         oversized = b"\x00" * 3_300_000
         self._assert_rejected(_document(oversized, mime_type="image/png"))
 

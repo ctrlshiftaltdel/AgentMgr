@@ -31,7 +31,8 @@
    ``expires_in`` 提前 60 秒过期、同一实例内加锁避免并发重复取 token）与一次识别
    请求；``BaiduInvoiceOcrParser`` 负责预检、字段归一化与失败收敛。
 2. **预检 fail closed（发请求前）**：``scan_status != 'clean'``、MIME 不在允许列表、
-   空内容、base64+urlencode 后超过 4MiB、图片像素越界、图片却指定页码——一律拒绝，
+   空内容、base64+urlencode 后超过 4M（取十进制下界 4,000,000 字节）、图片像素越界、
+   图片却指定页码——一律拒绝，
    **连 token 都不取**。图片尺寸用标准库解析 PNG/JPEG/BMP 头；解析不了就跳过像素
    检查并记一条 warning 日志（不阻断，best-effort）。
 3. **字段归一化**（只映射确实出现的字段，键集合与 ``field_confidence`` 严格一致）：
@@ -60,7 +61,8 @@
   ``{"TotalAmount": {"word": "100.00", "probability": 0.9}}``）；无键名的裸
   ``{"word": ...}`` 无法安全映射，直接忽略。
 * 字段置信度的实际返回形态与取值域（0–1 还是 0–100）。
-* 4M 的精确口径（十进制 4,000,000 还是 4MiB）、``probability=true`` 是否对
+* ``4M`` 的服务端真实上限（官方只写 4M、未说明进制；本地预检已保守取十进制
+  4,000,000 字节）、``probability=true`` 是否对
   ``multiple_invoice`` 生效、各票种字段名。
 * 错误码表的完整性（文档未给全表）。
 
@@ -142,8 +144,9 @@ DEFAULT_TIMEOUT_SECONDS = 10.0
 #: token 过期提前量（秒）：剩余寿命不足该值即视为过期、重新获取。
 TOKEN_EXPIRY_MARGIN_SECONDS = 60
 
-#: base64+urlencode 后的请求体上限。文档写「4M」，按二进制 MiB 取严。
-MAX_ENCODED_BYTES = 4 * 1024 * 1024
+#: base64+urlencode 后的请求体上限。文档只写「4M」，未说明进制；取十进制下界
+#: 4,000,000 字节，确保不越过服务端限制（宁可本地早拒，也不放行后被 ``216631`` 拒）。
+MAX_ENCODED_BYTES = 4_000_000
 
 #: 图片像素约束（文档：最短边 ≥15px、最长边 ≤4096px）。
 MIN_IMAGE_SIDE = 15
