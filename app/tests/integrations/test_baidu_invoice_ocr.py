@@ -12,6 +12,8 @@
   ``service_provider``），``taxi_receipt`` 不受影响；
 * 置信度：真实响应 ``{"average": ..., "min": ...}`` 优先取 ``min``、回退 ``average``
   （0–100 归一化、负数/非有限值丢弃），缺失回退 0.5；
+* 空容器字段（``[]`` / ``{}`` / 仅含空白元素的容器）按**无值**处理——不产出键、不
+  产出 ``"[]"`` 之类脏值；非空单元素数组照常取值带置信度（Issue #49 / W2-36 §7 D1）；
 * 4 类只分类不识别、空结果、多票取金额最大者；
 * 预检：非 clean / 不支持 MIME / 超 4M / 像素越界 / 图片带页码 → 发请求前拒绝；
 * 传输异常 → ``provider_error``，不泄漏异常原文与凭据；
@@ -47,7 +49,13 @@ from app.integrations.baidu_invoice_ocr import (
     SourceDocument,
     TransportError,
 )
-from app.intake.parsing import InputKind, ParseRequest
+from app.intake.parsing import (
+    InputKind,
+    ParseRequest,
+    build_draft_payload,
+    decide_draft,
+    required_fields_for,
+)
 
 API_KEY = "example-api-key-do-not-log-0001"
 SECRET_KEY = "example-secret-key-do-not-log-9999"
@@ -783,6 +791,136 @@ class TestFieldMapping(AssertionsMixin):
             _entry("vat_invoice", {"AmountInFiguers": "￥1,234.5"})
         )
         self.assertEqual(result.fields["amount"], "1234.50")
+
+    # --- 空容器字段（Issue #49 / W2-36 §7 D1）---------------------------------
+
+    def test_empty_array_field_is_treated_as_missing(self) -> None:
+        # 数电票形态：百度对 ``InvoiceCode`` 返回空数组 → 视为无值、不产出键
+        # （修复前 ``str([]) == "[]"`` 会被写成脏值、置信度回退 0.5）。
+        result = self._parse_one_entry(
+            _entry(
+                "vat_invoice",
+                {
+                    "InvoiceCode": [],
+                    "InvoiceNum": "12345678",
+                    "AmountInFiguers": "106.00",
+                },
+            )
+        )
+        self.assertTrue(result.ok)
+        self.assertNotIn("invoice_code", result.fields)
+        self.assertNotIn("invoice_code", result.field_confidence)
+        self.assertNotIn("[]", set(result.fields.values()))
+        # 键集合仍严格一致（逐字段带置信度的契约）。
+        self.assertEqual(set(result.fields), set(result.field_confidence))
+        self.assertEqual(result.fields["invoice_no"], "12345678")
+        self.assertEqual(result.fields["amount"], "106.00")
+
+    def test_non_empty_single_element_array_still_yields_value_and_confidence(
+        self,
+    ) -> None:
+        # 回归：真实响应的单元素数组形态（``[{"word": ..., "probability": {...}}]``）
+        # 取值与置信度照常，空容器规则不得误伤。
+        result = self._parse_one_entry(
+            _entry(
+                "vat_invoice",
+                {
+                    "InvoiceCode": [
+                        {
+                            "word": "011002100311",
+                            "probability": {"average": 0.92, "min": 0.81},
+                        }
+                    ],
+                    "AmountInFiguers": [
+                        {"word": "106.00", "probability": {"min": 0.77}}
+                    ],
+                },
+            )
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.fields["invoice_code"], "011002100311")
+        self.assertAlmostEqual(result.field_confidence["invoice_code"], 0.81)
+        self.assertEqual(result.fields["amount"], "106.00")
+        self.assertAlmostEqual(result.field_confidence["amount"], 0.77)
+
+    def test_empty_mapping_field_is_treated_as_missing(self) -> None:
+        result = self._parse_one_entry(
+            _entry(
+                "vat_invoice",
+                {
+                    "InvoiceCode": {},
+                    "TotalTax": [{}],
+                    "AmountInFiguers": "106.00",
+                },
+            )
+        )
+        self.assertTrue(result.ok)
+        self.assertNotIn("invoice_code", result.fields)
+        self.assertNotIn("tax_amount", result.fields)
+        self.assertEqual(set(result.fields), set(result.field_confidence))
+        self.assertEqual(result.fields["amount"], "106.00")
+
+    def test_whitespace_only_container_field_is_treated_as_missing(self) -> None:
+        result = self._parse_one_entry(
+            _entry(
+                "vat_invoice",
+                {
+                    "InvoiceCode": [{"word": "   "}],
+                    "SellerName": ["  "],
+                    "PurchaserName": [{}, None],
+                    "AmountInFiguers": "106.00",
+                },
+            )
+        )
+        self.assertTrue(result.ok)
+        for name in ("invoice_code", "seller_name", "buyer_name"):
+            with self.subTest(name=name):
+                self.assertNotIn(name, result.fields)
+                self.assertNotIn(name, result.field_confidence)
+        self.assertEqual(set(result.fields), set(result.field_confidence))
+        self.assertEqual(result.fields["amount"], "106.00")
+
+    def test_empty_container_does_not_mask_alias_fallback(self) -> None:
+        # 空容器与 ``None``/空白同处理：跳过该候选继续找同义字段，而不是吞掉整组别名。
+        result = self._parse_one_entry(
+            _entry(
+                "vat_invoice",
+                {"InvoiceCode": [], "invoice_code": "011002100311"},
+            )
+        )
+        self.assertEqual(result.fields["invoice_code"], "011002100311")
+
+    def test_empty_container_field_keeps_draft_decision_unchanged(self) -> None:
+        # 行为边界（验收第 5 条）：本批默认必填为 ``("amount", "expense_date")``，
+        # 不含 ``invoice_code``——缺失集合不因本修复变化；脏值/回退置信度带来的
+        # 低置信度噪音消失，草稿载荷键集合仍一致。
+        result = self._parse_one_entry(
+            _entry(
+                "vat_invoice",
+                {
+                    "InvoiceCode": [],
+                    "AmountInFiguers": [
+                        {"word": "106.00", "probability": {"min": 0.9}}
+                    ],
+                },
+            )
+        )
+        decision = decide_draft(
+            result, required_fields=required_fields_for("expense_claim")
+        )
+        self.assertEqual(decision.missing_fields, ("expense_date",))
+        # 修复前 ``invoice_code == "[]"`` 且置信度回退 0.5 → 这里会多一条低置信度噪音。
+        self.assertNotIn("invoice_code", decision.low_confidence_fields)
+        self.assertEqual(decision.low_confidence_fields, ())
+        self.assertTrue(decision.requires_human_review)
+        payload = build_draft_payload(
+            intake_job_id=1, business_type="expense_claim", result=result
+        )
+        self.assertEqual(payload["extracted_json"], dict(result.fields))
+        self.assertNotIn("invoice_code", payload["extracted_json"])
+        self.assertEqual(
+            set(payload["extracted_json"]), set(payload["confidence_json"])
+        )
 
     def test_response_http_error_is_provider_error(self) -> None:
         parser, _, _ = _parser(

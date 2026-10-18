@@ -369,9 +369,22 @@ class SourceReader(Protocol):
 # --- 小工具 -------------------------------------------------------------------
 
 
+#: 容器类型：数组/映射在展开层已被处理，走到清洗层仍剩容器说明它不是标量字段值。
+_CONTAINER_TYPES: tuple[type, ...] = (Mapping, list, tuple, set, frozenset)
+
+
 def _clean_str(value: Any) -> str | None:
-    """去空白后的非空字符串；``None`` / 空白 / 布尔值一律视为无值。"""
+    """去空白后的非空字符串；``None`` / 布尔值 / **容器**一律视为无值。
+
+    容器（数组/映射）**不是**标量字段值：``str([]) == "[]"``、``str({}) == "{}"`` 只会
+    把「提供商没有该字段」写成 repr 脏值，并让该字段置信度回退 ``0.5``。因此空容器、
+    仅含空白或 ``None`` 元素的容器（``["  "]`` / ``[{}]``）以及展开层无法识别的容器
+    一律按无值处理——**不产出键**（与 ``None``/空白同处理），不是为单个字段打补丁。
+    非空单元素数组等**有值**形态已在 ``_unwrap_field`` 展开为标量，不受影响。
+    """
     if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, _CONTAINER_TYPES):
         return None
     text = str(value).strip()
     return text or None
