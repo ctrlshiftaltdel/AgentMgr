@@ -18,6 +18,8 @@
    抛 ``FileTooLargeError``，不写任何文件。
 3. **真实魔数类型校验**（``sniff_mime``）：只依据**内容字节的魔数**判断类型，
    **不依赖扩展名**；声明的扩展名与真实魔数不符时抛 ``FileTypeMismatchError``。
+   ZIP 系容器进一步按**容器结构**区分：含根级 ``OFD.xml`` 的是 OFD 电子发票
+   容器（``application/ofd``），其余按声明的 Office 扩展名区分 docx/xlsx。
 4. **散列校验**（``verify_file``）：读取后重算 sha256，不符抛 ``HashMismatchError``。
 
 存储布局为内容寻址 ``f"{sha[:2]}/{sha[2:4]}/{sha}"``：相同内容共享同一个物理
@@ -33,8 +35,10 @@ blob（去重发生在存储层），因此不同员工上传相同内容时数�
 from __future__ import annotations
 
 import hashlib
+import io
 import os
 import tempfile
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote
@@ -95,6 +99,7 @@ PDF_MIME = "application/pdf"
 PNG_MIME = "image/png"
 JPEG_MIME = "image/jpeg"
 ZIP_MIME = "application/zip"
+OFD_MIME = "application/ofd"
 DOCX_MIME = (
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 )
@@ -110,15 +115,25 @@ PNG_SIG = b"\x89PNG\r\n\x1a\n"
 JPEG_SIG = b"\xff\xd8\xff"
 ZIP_SIG = b"PK\x03\x04"
 
+#: Root-level entry that identifies an OFD container (GB/T 33190 / 电子发票标准).
+#: OFD is a ZIP container, so the marker entry — not the extension alone — is what
+#: separates a real OFD from an arbitrary ZIP (fail closed).
+OFD_MARKER = "OFD.xml"
+
 #: Extensions we treat as "binary container" declarations.  A text/unknown-binary
 #: payload declared with one of these is treated as a mismatch (fail closed).
 KNOWN_BINARY_EXTS = frozenset(
-    {".pdf", ".png", ".jpg", ".jpeg", ".docx", ".xlsx", ".zip"}
+    {".pdf", ".png", ".jpg", ".jpeg", ".docx", ".xlsx", ".zip", ".ofd"}
 )
 
 #: Office Open XML formats are ZIP containers, distinguished by the *declared*
 #: extension (PLAN §8 / W0-5 §4.3: docx/xlsx are both ZIP).
 ZIP_ALLOWED_EXTS = frozenset({".docx", ".xlsx", ".zip"})
+
+#: Declarations accepted for a ZIP container that *structurally* is an OFD
+#: (root-level ``OFD.xml``).  ``.zip`` stays accepted because OFD genuinely is a
+#: ZIP container, so a ``.zip`` declaration on OFD bytes is not a spoof.
+OFD_ALLOWED_EXTS = frozenset({".ofd", ".zip"})
 
 
 @dataclass(frozen=True)
@@ -233,6 +248,28 @@ def _looks_like_text(content: bytes) -> bool:
     return True
 
 
+def _is_ofd_container(content: bytes) -> bool:
+    """Return ``True`` when the ZIP bytes hold a root-level ``OFD.xml`` entry.
+
+    OFD (电子发票标准容器, GB/T 33190) is a ZIP container whose root directory
+    carries ``OFD.xml``.  Only the central directory is read — no member is ever
+    decompressed — so a malicious payload cannot expand here.  Malformed ZIP
+    bytes are simply *not* OFD (fail closed: the caller then treats them as a
+    generic ZIP, whose declared extensions are validated as before).
+    """
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            names = archive.namelist()
+    except (zipfile.BadZipFile, OSError, ValueError):
+        return False
+    for name in names:
+        # Normalize the "./" prefix some producers emit; compare exactly, so a
+        # nested "Doc_0/OFD.xml" does not count as the root marker.
+        if (name[2:] if name.startswith("./") else name) == OFD_MARKER:
+            return True
+    return False
+
+
 def _detect_by_magic(content: bytes) -> tuple[str, frozenset[str] | None]:
     """Return ``(mime_type, allowed_declared_exts)`` from the real bytes.
 
@@ -246,8 +283,11 @@ def _detect_by_magic(content: bytes) -> tuple[str, frozenset[str] | None]:
     if content.startswith(PDF_SIG):
         return PDF_MIME, frozenset({".pdf"})
     if content.startswith(ZIP_SIG):
-        # Office Open XML formats are ZIP containers, distinguished by the
-        # declared extension (handled by ``sniff_mime``).
+        # ZIP family.  A root-level OFD.xml makes it an OFD container (structure,
+        # not the extension); otherwise it is Office Open XML or a plain archive,
+        # distinguished by the declared extension (handled by ``sniff_mime``).
+        if _is_ofd_container(content):
+            return OFD_MIME, OFD_ALLOWED_EXTS
         return ZIP_MIME, ZIP_ALLOWED_EXTS
     if _looks_like_text(content):
         return TEXT_MIME, None
@@ -257,9 +297,11 @@ def _detect_by_magic(content: bytes) -> tuple[str, frozenset[str] | None]:
 def sniff_mime(content: bytes, declared_name: str | None = None) -> str:
     """Determine the MIME type from the **real magic number**, not the name.
 
-    Supports PDF, PNG, JPEG and ZIP (docx/xlsx are ZIP containers, distinguished
-    by the declared office extension), with a plain-text fallback.  When the
-    declared extension contradicts the detected magic, ``FileTypeMismatchError``
+    Supports PDF, PNG, JPEG and ZIP: OFD containers are recognized by their
+    root-level ``OFD.xml`` structure, docx/xlsx by the declared office extension,
+    everything else as a plain archive — with a plain-text fallback.  When the
+    declared extension contradicts the detected magic (including a ``.ofd``
+    declaration whose bytes are not an OFD container), ``FileTypeMismatchError``
     is raised (fail closed, per W0-5 §4.3).
     """
     if not isinstance(content, (bytes, bytearray, memoryview)):
@@ -284,6 +326,7 @@ def sniff_mime(content: bytes, declared_name: str | None = None) -> str:
             )
 
     # Refine the generic ZIP mime for Office Open XML by declared extension.
+    # (OFD was already resolved from the container structure above.)
     if mime == ZIP_MIME and ext == ".docx":
         mime = DOCX_MIME
     elif mime == ZIP_MIME and ext == ".xlsx":
