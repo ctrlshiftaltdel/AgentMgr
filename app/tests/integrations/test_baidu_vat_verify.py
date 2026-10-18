@@ -137,6 +137,64 @@ def _matching_words(**overrides: object) -> dict[str, object]:
     return words
 
 
+def _real_top(**overrides: object) -> dict[str, object]:
+    """#57 实测**真实结构**的顶层结论/身份字段（可覆盖任意字段）。
+
+    #57 跑批的 8/8 渠道响应把 ``VerifyResult``/``InvalidSign``/``InvoiceCode``/
+    ``InvoiceNum``/``InvoiceDate``/``InvoiceType``/``CheckCode``/``MachineCode``/
+    ``VerifyFrequency``/``VerifyMessage`` 放在**顶层**。此处只用合成占位值
+    （**非真实业务值**）。
+    """
+    top: dict[str, object] = {
+        "VerifyResult": "0001",
+        "VerifyMessage": "查验成功发票一致",
+        "VerifyFrequency": "1",
+        "InvalidSign": "N",
+        "InvoiceCode": "011002000211",
+        "InvoiceNum": "12345678",
+        "InvoiceDate": "20261016",
+        "InvoiceType": "增值税普通发票（电子）",
+        "CheckCode": "654321",
+        "MachineCode": "661603113416",
+    }
+    top.update(overrides)
+    return top
+
+
+def _real_words(**overrides: object) -> dict[str, object]:
+    """#57 实测**真实结构**的 ``words_result`` 票面明细（合成占位值）。"""
+    words: dict[str, object] = {
+        "SellerName": "示例销售方",
+        "SellerRegisterNum": "91310000MA1FL0XXXX",
+        "PurchaserName": "示例购买方",
+        "PurchaserRegisterNum": "91320000MA1FL0YYYY",
+        "TotalAmount": "100.00",
+        "TotalTax": "13.00",
+        "AmountInFiguers": "113.00",
+    }
+    words.update(overrides)
+    return words
+
+
+def _real_verify_response(
+    *,
+    top: Mapping[str, object] | None = None,
+    words: Mapping[str, object] | None = None,
+    log_id: str | None = LOG_ID,
+    status_code: int = 200,
+) -> HttpResponse:
+    """构造 #57 实测**真实响应结构**：结论/身份字段在顶层、票面明细在 ``words_result``。"""
+    body: dict[str, object] = {
+        "words_result_num": len(words or {}),
+        "words_result": dict(words or {}),
+    }
+    if top:
+        body.update(top)
+    if log_id is not None:
+        body["log_id"] = log_id
+    return HttpResponse(status_code, json.dumps(body).encode("utf-8"))
+
+
 def _provider(transport: RecordingTransport) -> BaiduVatInvoiceVerifyProvider:
     return BaiduVatInvoiceVerifyProvider(
         api_key=API_KEY,
@@ -292,6 +350,145 @@ def test_log_id_nested_in_words_result_is_used() -> None:
     result = _provider(transport).verify(make_fields(invoice_kind="normal_invoice"))
     assert result.status is VerificationStatus.VERIFIED_PASS
     assert result.provider_ref == "2077691831063187864"
+
+
+# --- 真实响应层级（#57 实测结构 → #58 修正） ----------------------------------
+
+
+def test_real_structure_top_level_conclusion_is_verified_pass() -> None:
+    """#57 真实结构（结论/身份在顶层、票面明细在 words_result）→ 查验通过。"""
+    transport = RecordingTransport(
+        results=[
+            _token_response(),
+            _real_verify_response(top=_real_top(), words=_real_words()),
+        ]
+    )
+    result = _provider(transport).verify(make_fields(invoice_kind="normal_invoice"))
+    assert result.status is VerificationStatus.VERIFIED_PASS
+    assert result.provider_ref == LOG_ID
+    assert result.error_code is None
+    assert result.reason is None
+    face = result.face
+    # 身份字段取自顶层。
+    assert face.invoice_code == "011002000211"
+    assert face.invoice_no == "12345678"
+    assert face.invoice_date is not None
+    assert face.invoice_date.isoformat() == "2026-10-16"
+    # 票面明细取自 words_result。
+    assert face.seller_tax_code == "91310000MA1FL0XXXX"
+    assert face.buyer_tax_code == "91320000MA1FL0YYYY"
+    assert str(face.amount_without_tax) == "100.00"
+    assert str(face.tax_amount) == "13.00"
+    assert str(face.amount_with_tax) == "113.00"
+    assert face.is_abandoned is False
+    assert face.is_red_letter is False
+    # 顶层结论字段（VerifyMessage / VerifyFrequency 等）原样保留在 evidence。
+    assert result.evidence is not None
+    assert result.evidence["VerifyMessage"] == "查验成功发票一致"
+    assert result.evidence["VerifyFrequency"] == "1"
+
+
+def test_real_structure_top_level_identity_drives_face_mismatch() -> None:
+    """顶层 ``InvoiceNum`` 与提交要素不符 → 查验不通过（身份字段确实参与比对）。"""
+    transport = RecordingTransport(
+        results=[
+            _token_response(),
+            _real_verify_response(
+                top=_real_top(InvoiceNum="99999999"), words=_real_words()
+            ),
+        ]
+    )
+    result = _provider(transport).verify(make_fields(invoice_kind="normal_invoice"))
+    assert result.status is VerificationStatus.VERIFIED_FAIL
+    assert result.reason == "face_mismatch:invoice_no"
+    assert result.error_code is None
+
+
+@pytest.mark.parametrize("sign", ["Y", "H", "BH", "QH"])
+def test_real_structure_top_level_invalid_sign_vetoes(sign: str) -> None:
+    """顶层 ``InvalidSign`` 的作废/红冲取值同样触发查验不通过。"""
+    transport = RecordingTransport(
+        results=[
+            _token_response(),
+            _real_verify_response(
+                top=_real_top(InvalidSign=sign), words=_real_words()
+            ),
+        ]
+    )
+    result = _provider(transport).verify(make_fields(invoice_kind="normal_invoice"))
+    assert result.status is VerificationStatus.VERIFIED_FAIL
+    assert result.reason == f"invalid_sign:{sign}"
+    if sign == "Y":
+        assert result.face.is_abandoned is True
+    else:
+        assert result.face.is_red_letter is True
+
+
+def test_top_level_value_takes_precedence_over_words_result() -> None:
+    """顶层与 ``words_result`` 同时给出时以**顶层**为准（顶层优先）。"""
+    transport = RecordingTransport(
+        results=[
+            _token_response(),
+            _real_verify_response(
+                top=_real_top(VerifyResult="0006", InvalidSign="Y"),
+                words=_real_words(VerifyResult="0001", InvalidSign="N"),
+            ),
+        ]
+    )
+    result = _provider(transport).verify(make_fields(invoice_kind="normal_invoice"))
+    # 顶层 ``0006``（发票信息不一致）胜出，而非 words_result 内的 ``0001``。
+    assert result.status is VerificationStatus.VERIFIED_FAIL
+    assert result.reason == "invoice_info_mismatch"
+    assert result.error_code == "0006"
+
+
+def test_real_structure_missing_invalid_sign_fails_closed() -> None:
+    """真实结构下 ``InvalidSign`` 两处都缺 → 维持 fail closed（不臆断为正常）。"""
+    top = _real_top()
+    top.pop("InvalidSign")
+    transport = RecordingTransport(
+        results=[_token_response(), _real_verify_response(top=top, words=_real_words())]
+    )
+    result = _provider(transport).verify(make_fields(invoice_kind="normal_invoice"))
+    assert result.status is VerificationStatus.UNABLE_TO_VERIFY
+    assert result.reason == "invalid_sign_unknown"
+
+
+def test_real_structure_without_words_result_uses_top_level_conclusion() -> None:
+    """真实失败响应可能只有顶层字段（无 ``words_result``）→ 仍按顶层结论映射。"""
+    transport = RecordingTransport(
+        results=[
+            _token_response(),
+            _real_verify_response(top=_real_top(VerifyResult="0005"), words=None),
+        ]
+    )
+    result = _provider(transport).verify(make_fields(invoice_kind="normal_invoice"))
+    assert result.status is VerificationStatus.UNABLE_TO_VERIFY
+    assert result.error_code == "0005"
+    assert result.reason == "verify_result:0005"
+
+
+def test_missing_verify_result_in_both_layers_fails_closed() -> None:
+    """顶层与 ``words_result`` 都缺 ``VerifyResult`` 且无顶层 ``error_code`` → fail closed。"""
+    top = _real_top()
+    top.pop("VerifyResult")
+    transport = RecordingTransport(
+        results=[_token_response(), _real_verify_response(top=top, words=_real_words())]
+    )
+    result = _provider(transport).verify(make_fields(invoice_kind="normal_invoice"))
+    assert result.status is VerificationStatus.UNABLE_TO_VERIFY
+    assert result.error_code == "InvalidResponse"
+    assert result.reason == "provider_invalid_response"
+
+
+def test_words_result_nested_conclusion_remains_supported() -> None:
+    """旧结构（结论嵌在 ``words_result`` 内）保持兼容。"""
+    transport = RecordingTransport(
+        results=[_token_response(), _verify_response(_matching_words())]
+    )
+    result = _provider(transport).verify(make_fields(invoice_kind="normal_invoice"))
+    assert result.status is VerificationStatus.VERIFIED_PASS
+    assert result.face.invoice_no == "12345678"
 
 
 # --- 票面一致性 ---------------------------------------------------------------
