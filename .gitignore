@@ -8,3 +8,7 @@ __pycache__/
 .venv/
 # Local-only machine/environment info (never commit)
 local_info.md
+# Credentials (never commit; owner-provided real keys live in .env)
+.env
+.env.*
+!.env.example
