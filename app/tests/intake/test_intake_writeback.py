@@ -505,9 +505,12 @@ def test_low_confidence_fields_are_marked_in_audit(
     assert result.low_confidence_fields == ("amount",)
     details = _events(session, draft.id, WRITEBACK_ACTION)[0].details
     assert details["low_confidence_fields"] == ["amount"]
+    # 草稿**字段取值**不进审计（字段名可以出现）；票号/主体名明文同样不得出现。
     rendered = str(details)
-    assert "示例供应商" not in rendered  # 取值不进审计
-    assert "123.45" not in rendered  # 金额取值不进审计
+    assert "示例供应商" not in rendered
+    assert "12345678" not in rendered
+    assert "011002000211" not in rendered
+    assert "seller_name" in rendered  # 字段名可以出现（用于追溯哪些字段被提取）
 
 
 # --- 幂等 ---------------------------------------------------------------------

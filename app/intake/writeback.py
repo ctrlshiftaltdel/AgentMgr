@@ -495,13 +495,14 @@ def write_back_confirmed_draft(
     """
     draft = session.get(ExtractionDraft, draft_id, with_for_update=True)
     if draft is None:
-        _deny_and_raise(
+        _record_deny(
             session,
             principal,
             draft_id=draft_id,
             reason="draft_not_found",
             request_id=request_id,
         )
+        raise DraftNotFoundError(draft_id)
 
     job = session.get(IntakeJob, draft.intake_job_id)
     if job is None:
