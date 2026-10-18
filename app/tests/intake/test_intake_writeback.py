@@ -229,16 +229,23 @@ def _make_draft(
     business_type: str = "expense_claim",
     confirm: bool = True,
 ) -> ExtractionDraft:
-    """造一条草稿（默认已人工确认），返回它。"""
+    """造一条草稿（默认已人工确认），返回它。
+
+    有原件引用时用 ``image`` 输入，否则用 ``text`` 输入——``ParseRequest`` 对非文字
+    输入强制要求 ``source_file_id``（fail closed），测试不绕过该约束。
+    """
+    input_kind = InputKind.TEXT if source_file_id is None else InputKind.IMAGE
     job = IntakeJob(
-        submitted_by=employee.id, channel_type="weixin", input_type="image"
+        submitted_by=employee.id,
+        channel_type="weixin",
+        input_type="image" if input_kind is InputKind.IMAGE else "text",
     )
     session.add(job)
     session.flush()
 
     parser = ManualEntryParser(values=values, field_confidence=confidence)
     request = ParseRequest(
-        input_kind=InputKind.IMAGE,
+        input_kind=input_kind,
         business_type=business_type,
         source_file_id=source_file_id,
     )
