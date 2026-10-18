@@ -5,6 +5,8 @@ __pycache__/
 *.py[cod]
 # Per-task worktrees (Agent execution workspaces)
 .worktrees/
+# Track D runtime export config (never commit; config/ajaimgr.example.toml stays tracked)
+config/ajaimgr.toml
 .venv/
 # Local-only machine/environment info (never commit)
 local_info.md
