@@ -214,11 +214,14 @@ uv run python ops/restore.py /path/ajaimgr-backup.tar.gz \
 
 1. **完整归档 + 校验和旁车**：`ops/backup.py` 产物（`<archive>` 与 `<archive>.sha256`），且已离开生产主机（3-2-1 原则，§6）。
 2. **归档必须是完整的**：`manifest.missing_components` 必须为空。用 `--allow-missing-storage` / `--allow-missing-orchestration` 生成的归档、以及缺少 `.sha256` 旁车（只能靠 `--allow-missing-checksum` 放行）的归档，**不得用于生产验收**（§10 第 9 项）。`preflight` 会把 `missing_components` 非空直接判 FAIL。
-3. **目标机可登录、可传输**：账户与传输通道（如 `rsync` over 受控网络）由 DBA 提供；本 Issue 不涉及凭据分发与网络配置。
-4. **目标库是新的演练库**：建议命名 `<app>_restore_check`；目标库名不得是 `postgres` / `template*` / `ajaimgr_dev` / `ajaimgr_test` / `ajaimgr_prod` 等受保护或生产名。
-5. **目标目录已存在且为空**：`<target-dir>` 由 DBA 创建（属主为执行账户，建议 `0700`），本工具**不会自动创建**，也不会覆盖已有文件。
-6. **连接参数只放环境变量**：执行账户的 shell 里设置 `PGHOST` / `PGUSER`（口令由 libpq 经 `PGPASSWORD`、`PGPASSFILE` 或客户端证书读取）。本工具只检查"是否设置"，**不读取、不回显、不落盘其值**；命令行不接受 DSN，也不接受任何口令参数。
-7. **演练窗口**：冻结写入（或对只读快照操作），并预留回滚时间（§11.5）。
+3. **归档先放在 staging 目录（中转），不要放进目标目录**：`<staging-dir>` 是仓库之外、执行账户可读的目录（可与 `<target-dir>` 同级，例如 `/srv/ajaimgr-restore-staging`）。`preflight` 与 `rehearse` **只从 `<staging-dir>` 读归档**（`--archive <staging-dir>/<archive>`）；`<target-dir>` 在这两步执行期间必须**保持为空**。
+   - 这是工具的硬性守卫：`--target-dir` 非空即 `rc=2`，报 `--target-dir must be empty: ... holds N entry(ies)`；把归档放进 `<target-dir>/incoming/` 再跑 `preflight` 会**必然失败**。
+4. **目标机可登录、可传输**：账户与传输通道（如 `rsync` over 受控网络）由 DBA 提供；本 Issue 不涉及凭据分发与网络配置。
+5. **目标库是新的演练库**：建议命名 `<app>_restore_check`；目标库名不得是 `postgres` / `template*` / `ajaimgr_dev` / `ajaimgr_test` / `ajaimgr_prod` 等受保护或生产名。
+6. **目标目录已存在且为空**：`<target-dir>` 由 DBA 创建（属主为执行账户，建议 `0700`），本工具**不会自动创建**，也不会覆盖已有文件。它只承载**恢复产物**：`preflight` 不写它；`rehearse`（可选，步骤 0.3）会写入 `incoming/`、`work/`、`restored-storage/`、`restored-orchestration/`、`evidence/`；真实传输（步骤 1）与恢复（步骤 4）随后写入 `incoming/`、`run/`、`evidence/`。因此 `preflight` / `rehearse` 必须在**传输之前、目录仍为空**时执行（顺序见 §11.3）：
+   - 执行过 `rehearse` 之后该目录已非空，**不能**再对它跑 `preflight` / `rehearse`；重试要么换一个新的空目录（推荐，如 `<target-dir>-r2`），要么在**保留证据、确认失败原因已修复**后清理该目录再跑（不得用清理掩盖失败）。
+7. **连接参数只放环境变量**：执行账户的 shell 里设置 `PGHOST` / `PGUSER`（口令由 libpq 经 `PGPASSWORD`、`PGPASSFILE` 或客户端证书读取）。本工具只检查"是否设置"，**不读取、不回显、不落盘其值**；命令行不接受 DSN，也不接受任何口令参数。
+8. **演练窗口**：冻结写入（或对只读快照操作），并预留回滚时间（§11.5）。
 
 ### 11.2 目标机要求
 
@@ -226,8 +229,8 @@ uv run python ops/restore.py /path/ajaimgr-backup.tar.gz \
 | --- | --- | --- |
 | PostgreSQL 服务器主版本 | **≥ 归档 `pg_dump` 主版本**（`manifest.pg_dump_version`，如 17）；更旧的服务器无法加载较新 `pg_dump` 的输出 | `preflight` 的 `pg_target_major` 检查（`--target-pg-major` 显式声明） |
 | 客户端工具 | `psql` / `pg_dump` 与**目标服务器同主版本**（`psql --version`） | 目标机人工执行；本工具在证据里记录本机客户端版本 |
-| 目录 | `<target-dir>` 存在、为空、属主为执行账户、建议 `0700`；<br>`incoming/` 放归档，`restored-storage/` 放附件，`restored-orchestration/` 放任务库，`run/` 放 `restore.py` 产物，`evidence/` 放证据 | `preflight` 检查存在/为空/可写；`rehearse` 只会写入这些子目录 |
-| 磁盘 | ≥ 归档体积 ×3（归档 + 解包 + 恢复产物） | 目标机 `df -h <target-dir>` 人工确认 |
+| 目录 | **`<staging-dir>`（归档中转，仓库外）**：存放 `<archive>` 与 `<archive>.sha256`，供 `preflight` / `rehearse` 读取；<br>**`<target-dir>`（恢复目标）** 存在、为空、属主为执行账户、建议 `0700`；`incoming/` 放（真实传输的）归档，`restored-storage/` 放附件，`restored-orchestration/` 放任务库，`work/` 放解包产物，`run/` 放 `restore.py` 产物，`evidence/` 放证据 | `preflight` 检查 `<target-dir>` 存在/**为空**/可写（非空即 `rc=2`）；上述子目录由 `rehearse` 与步骤 1/4/7 创建，`preflight` 不写任何文件 |
+| 磁盘 | `<target-dir>` 所在分区 ≥ 归档体积 ×3（`incoming/` 副本 + `work/` 解包 + `run/` 与 `restored-*/` 恢复产物）；`<staging-dir>` 另需 1 份归档体积（与 `<target-dir>` 同盘时合计 ×4） | 目标机 `df -h <staging-dir> <target-dir>` 人工确认 |
 | 数据库 | 目标实例可连、执行账户有 `CREATEDB`（或由 DBA 预建空库） | `sudo -u postgres createdb -O <app-role> <target-db>` 或 DBA 预建 |
 | 角色 | 恢复后由角色/授权脚本重建所有权与 `GRANT`（归档是 `--no-owner`，§9） | 见 §9「所有权与授权」行 |
 | 时钟 | NTP 同步（库内 `timestamptz` 存 UTC） | 目标机 `timedatectl` 人工确认 |
@@ -235,31 +238,57 @@ uv run python ops/restore.py /path/ajaimgr-backup.tar.gz \
 
 ### 11.3 分步命令
 
-> 占位符约定：`<archive>`、`<target-host>`、`<target-dir>`、`<target-db>`、`<account>`、`<app-role>` 全部由操作者替换；仓库与文档中**不得**出现真实主机名、IP、账号或口令。
+> 占位符约定：`<archive>`、`<staging-dir>`、`<target-host>`、`<target-dir>`、`<target-db>`、`<account>`、`<app-role>` 全部由操作者替换；仓库与文档中**不得**出现真实主机名、IP、账号或口令。
+> **执行顺序（务必自上而下）**：`0.1 → 0.2 → 0.3（可选）→ 1 → 2 → 3 → 4 → 5 → 6 → 7`。
+> 关键约束：`0.2` / `0.3` 都要求 `<target-dir>` **为空**，且两者都从 `<staging-dir>` 读归档；归档**不得**提前放进 `<target-dir>/incoming/`（否则 `preflight` 直接 `rc=2` 报 `must be empty`）。真实传输（步骤 1）在预检/演练之后执行，之后的写盘都在同一个 `<target-dir>` 内，互不冲突（步骤 1 只是把 `incoming/` 里的 dry-run 副本换成真实传输件）。
 > `ops/offsite_restore.py` 输出的 `plan` 与下面**步骤 1–7 一一对应**，工具只渲染命令、**不执行**。
 
 **步骤 0（准备 + 预检，在目标机执行）**
 
 ```bash
+# 0.0 归档只放在 staging（仓库外），目标目录随后保持为空
+ls -l <staging-dir>/<archive> <staging-dir>/<archive>.sha256
+
 # 0.1 目标机自检：客户端/服务器主版本、磁盘、目录属性
 psql --version
 df -h <target-dir>
-ls -ld <target-dir>
+ls -ld <staging-dir> <target-dir>
+test -z "$(ls -A <target-dir>)" && echo "target-dir is empty"
 
 # 0.2 只读预检：参数、归档完整性、目标目录、PG 主版本（不写目标目录）
+#     注意 --archive 指向 staging，--target-dir 仍是空目录
 PGHOST=<target-host> PGUSER=<account> \
 uv run python ops/offsite_restore.py preflight \
-  --archive <target-dir>/incoming/<archive> \
+  --archive <staging-dir>/<archive> \
   --target-host <target-host> \
   --target-db <target-db> \
   --target-dir <target-dir> \
   --target-pg-major 17
 ```
 
+**步骤 0.3（可选，本机 dry-run；必须在步骤 1 之前、`<target-dir>` 仍为空时执行）** —— 复现目标机的落盘路径，**不执行数据库恢复**：
+
+```bash
+PGHOST=<target-host> PGUSER=<account> \
+uv run python ops/offsite_restore.py rehearse \
+  --archive <staging-dir>/<archive> \
+  --target-host <target-host> \
+  --target-db <target-db> \
+  --target-dir <target-dir> \
+  --target-pg-major 17 \
+  --evidence <target-dir>/evidence/offsite-restore.json --verbose
+```
+
+- `rehearse` 会**真实写入** `<target-dir>` 的子目录：`incoming/`（归档副本 + 旁车）、`work/extracted/`（解包）、`restored-storage/`（附件）、`restored-orchestration/`（任务库）、`evidence/`（证据）。这正是它要验证的落盘路径。
+- 因此它**只能在空目录上跑一次**：跑完 `<target-dir>` 已非空，再跑 `preflight` / `rehearse` 会报 `must be empty`。重试要么换新的空目录（推荐，如 `<target-dir>-r2`），要么在保留证据、确认原因已修复后清理该目录再跑。
+- 因为它在传输之前执行，**不冲突**：步骤 1 的 `rsync` 会把同名的真实传输件写进已存在的 `incoming/`（`--checksum` 下内容一致则跳过），步骤 2 再独立复核旁车；步骤 4 的 `restore.py` 只写 `run/`，与 `restored-*` 不重名。
+- 若不需要 dry-run，可**跳过 0.3**，直接进入步骤 1；此时 `incoming/` 由 `rsync` 创建。
+
 **步骤 1（传输）** —— 归档与旁车**必须一起**传输：
 
 ```bash
-rsync -a --checksum <archive> <archive>.sha256 <account>@<target-host>:<target-dir>/incoming/
+rsync -a --checksum <staging-dir>/<archive> <staging-dir>/<archive>.sha256 \
+  <account>@<target-host>:<target-dir>/incoming/
 ```
 
 **步骤 2（传输校验，在目标机执行）**：
@@ -268,20 +297,7 @@ rsync -a --checksum <archive> <archive>.sha256 <account>@<target-host>:<target-d
 cd <target-dir>/incoming && sha256sum -c <archive>.sha256
 ```
 
-`preflight` 的 `transfer_checksum` 项在 dry-run 中复现同一判定：复制后的字节散列必须等于源归档。
-
-**步骤 2.5（可选，本机 dry-run）** —— 在目标机（或任意单机）用临时目录演练落盘路径，**不执行数据库恢复**：
-
-```bash
-PGHOST=<target-host> PGUSER=<account> \
-uv run python ops/offsite_restore.py rehearse \
-  --archive <target-dir>/incoming/<archive> \
-  --target-host <target-host> \
-  --target-db <target-db> \
-  --target-dir <target-dir> \
-  --target-pg-major 17 \
-  --evidence <target-dir>/evidence/offsite-restore.json --verbose
-```
+`preflight` 本身不校验传输副本；`rehearse` 的 `transfer_checksum` 项在 dry-run 中复现同一判定（源归档 → `<target-dir>/incoming/` 的副本字节散列必须等于源归档）。真实传输的判定以本步骤的 `sha256sum -c` 为准。从步骤 1 起 `<target-dir>` 不再为空，`0.2` / `0.3` 不可重跑。
 
 **步骤 3（建库；先确认目标库不存在）**：
 
@@ -330,8 +346,8 @@ uv run python ops/restore.py <target-dir>/incoming/<archive> \
 | 3.1 | `manifest.missing_components` 为空（归档完整） | 空 list | `manifest_completeness`（非空即 FAIL：该归档来自 `--allow-missing-*`，禁止用于验收） |
 | 4 | 逐成员 sha256 + 字节数与 manifest 一致 | 全部一致 | `member_hashes` |
 | 5 | 目标机 PG 主版本 ≥ 归档 `pg_dump` 主版本 | 成立 | `pg_target_major` |
-| 6 | 传输副本与源归档字节一致 | 一致 | `transfer_checksum` |
-| 7 | 目标目录内解包成功 | 成功 | `rehearsal_extract` |
+| 6 | 传输副本与源归档字节一致 | 一致 | `rehearse`（步骤 0.3）的 `transfer_checksum`；真实传输用步骤 2 的 `sha256sum -c`（`preflight` 不做传输校验） |
+| 7 | 目标目录内解包成功 | 成功 | `rehearsal_extract`（步骤 0.3） |
 | 8 | 附件逐个落盘且 sha256/字节数一致 | 全部一致 | `storage_restore` / `storage_hashes` |
 | 9 | 内容寻址 blob 文件名等于其内容 sha256 | 成立 | `storage_content_address` |
 | 10 | 任务库文件落盘 | 全部落盘 | `orchestration_restore` |
@@ -340,17 +356,20 @@ uv run python ops/restore.py <target-dir>/incoming/<archive> \
 | 13 | **数据库恢复 13 项校验（§4）** | 全 PASS | `restore-report.json`（步骤 4） |
 | 14 | 关键表行数与 manifest 一致 | 7 张关键表全部一致 | 报告 `db_row_counts` + 独立 `psql count(*)` 复核 |
 | 15 | 恢复目录与源目录一致（排除凭据文件） | 无差异 | `diff -r` 人工复核 |
-| 16 | 目标库、目标目录没有遗留演练产物 | 演练库按需删除 | `dropdb <target-db>` + 目录清单 |
+| 16 | 目标库、目标目录没有**清单外**的遗留文件 | 演练库按需删除；目录内容仅为下述已知产物 | `dropdb <target-db>` + `ls -A <target-dir>` |
 | 17 | 证据文件齐全（含 `dry_run_only` / `database_step` 字段） | 齐全 | §11.6 |
 
 第 13–15 项需要数据库，**只能在目标机执行**；`rehearse` 的 `db_restore` 会显示 `SKIP / NOT EXECUTED`，这不是通过。
+
+`<target-dir>` 的**已知产物**（不属于第 16 项的"遗留"）：`incoming/`（步骤 0.3 的 dry-run 副本 + 步骤 1 的真实传输件）、`work/`（步骤 0.3 解包）、`restored-storage/` / `restored-orchestration/`（步骤 0.3 落盘）、`run/`（步骤 4 恢复产物）、`evidence/`（步骤 0.3 / 4 / 7 证据）。除此之外的未知文件（例如上一次演练的残留、误放进来的归档）一律视为遗留，验收前清掉；演练库 `dropdb` 后按需整体清理 `<target-dir>`。
 
 ### 11.5 失败回滚
 
 | 失败点 | 处置 | 注意 |
 | --- | --- | --- |
-| 步骤 0 预检失败（缺参、受保护库名、目录不存在/非空、主版本不兼容） | 修正参数或环境后重跑；目标目录保持原样 | 本工具在预检失败时**不写目标目录** |
-| 步骤 1–2 传输失败/校验和不符 | 删除 `<target-dir>/incoming` 下的残片，重新传输；必要时重新生成归档 | 生产库未受影响（尚未建库） |
+| 步骤 0 预检失败（缺参、受保护库名、目录不存在/非空、主版本不兼容） | 修正参数或环境后重跑；目标目录保持原样 | 本工具在预检失败时**不写目标目录**。若报 `--target-dir must be empty: ... holds 1 entry(ies) (incoming)`，说明归档被放进了 `<target-dir>/incoming/`（或上一次 `rehearse` 已写入）：把归档移回 `<staging-dir>`，换一个新的空目录作为 `<target-dir>` 重跑，不要就地删除未知文件 |
+| 步骤 0.3 dry-run 失败 | 保留证据；`<target-dir>` 里可能已有部分产物（`incoming/` 等） | 该目录已非空，重试必须换新的空目录（如 `<target-dir>-r2`）；不要用"清空后重跑"掩盖真实失败 |
+| 步骤 1–2 传输失败/校验和不符 | 删除 `<target-dir>/incoming` 下的残片，重新传输；必要时重新生成归档 | 生产库未受影响（尚未建库）。执行过 0.3 时 `incoming/` 已有 dry-run 副本，`rsync --checksum` 会覆盖为真实传输件，步骤 2 仍独立复核算真 |
 | 步骤 4 恢复失败（退出码 1/2） | 保留 `restore-report.json`；确认目标库是**演练库**后 `dropdb <target-db>`，清空 `<target-dir>/run` 重来 | 严禁对生产库执行 `dropdb` / `--recreate-db` |
 | 步骤 6 切换后发现问题 | 停服务 → 把 `AJAIMGR_DB_URL` / `AJAIMGR_STORAGE_ROOT` 指回原库/原目录 → 启动 → 复跑健康检查 | 原库在切换窗口内必须保持可写或已有快照；回滚配置在切换前必须备份 |
 | 任意阶段判定"不可继续" | 停在这里并记录证据；**不得**用 `--allow-missing-*` 把失败降级为成功 | 见 §10 第 9 项 |
@@ -360,6 +379,8 @@ uv run python ops/restore.py <target-dir>/incoming/<archive> \
 ### 11.6 证据留存格式
 
 - 文件名：`<target-dir>/evidence/offsite-restore-<UTC 时间戳>.json`（`preflight` 默认不写文件，需显式 `--evidence`）。
+  - 预检（步骤 0.2）若要留证据，写到 `<staging-dir>/evidence/` 或目标目录之外的路径：`preflight` 若把 `evidence/` 建在 `<target-dir>` 内，目录立即非空，紧接着的 `rehearse`（步骤 0.3）会报 `must be empty`。
+  - `rehearse`（步骤 0.3）的 `evidence/` 写在 `<target-dir>` 内属于预期产物，与上述限制不冲突（它本身就是最后一步写盘）。
 - 存放：**目标机本地 + 受控存储**各一份；**不得提交进仓库**（工具会拒绝把 `--evidence` 指向仓库内）。
 - 关键字段：
 
@@ -410,6 +431,9 @@ uv run python ops/restore.py <target-dir>/incoming/<archive> \
 | 主版本不匹配 | `manifest pg_dump 17` + `--target-pg-major 13` | 1（`pg_target_major` FAIL，说明"不能被更旧的主版本加载"） |
 | 拒绝放行开关 | 追加 `--allow-missing-checksum` | 2（`禁止用于生产验收`） |
 | 篡改归档 | 改一个 blob 字节并刷新旁车 | 1（`member_hashes` FAIL，目标目录保持为空） |
+| 目录约束（正向）：归档在目标目录之外 | `<fixture>/x.tar.gz` + `--target-dir <tmp>/target`（空目录） | 0（`preflight` 不写目标目录，故同一空目录可连续跑 `preflight` → `rehearse`；这是 §11.3 的 staging 约定） |
+| 目录约束（反向）：归档被放进目标目录 | `--archive <tmp>/target/incoming/x.tar.gz` + `--target-dir <tmp>/target` | 2（`--target-dir must be empty: ... holds 1 entry(ies) (incoming)`；§11.3 已据此改为从 `<staging-dir>` 读取） |
 
 边界：以上全部是**单机夹具**演练，**不是**真实数据、不是真实异地主机、**不是**生产验收。
 
+补充（第 1 轮 master 复核）：`rehearse` 跑完后 `<target-dir>` 不再为空，此时再跑 `preflight` / `rehearse` 一律 `rc=2`（`must be empty`）。§11.3 因此把 `rehearse` 前移到步骤 0.3（传输之前、目录仍空时执行一次），并要求归档只放在 `<staging-dir>`。
