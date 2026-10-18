@@ -1,9 +1,12 @@
 # 受理解析流水线：可替换接口与人工录入兜底（W1-26）
 
-> 关联 Issue：W1-26（受理解析流水线）。实现依据：`../templates/PLAN.md` §4.1/§4.2、
-> `PROJECT-CHARTER.md`、`research/W0-5-security-compliance.md` §3/§4.3、
+> 关联 Issue：W1-26（受理解析流水线）、#45（百度票据 OCR 装配与端到端）。
+> 实现依据：`../templates/PLAN.md` §4.1/§4.2、`PROJECT-CHARTER.md`、
+> `research/W0-5-security-compliance.md` §3/§4.3、
 > `research/W0-1-weixin-ilink.md` §6.3。
-> 代码：`../app/intake/parsing.py`（纯逻辑）、`../app/intake/pipeline.py`（落库）。
+> 代码：`../app/intake/parsing.py`（纯逻辑）、`../app/intake/pipeline.py`（落库）、
+> `../app/intake/assembly.py`（默认装配点）、`../app/intake/source_reader.py`
+> （生产级 `SourceReader`）、`../app/integrations/baidu_invoice_ocr.py`（百度票据解析器）。
 
 ## 1. 目标与范围
 
@@ -111,14 +114,50 @@ OCR/ASR 供应商尚未决定：本任务**不接任何真实供应商**，只�
 - `parse_provenance(result)`：可写审计的非敏感追溯信息，只含字段名与标识；
 - 结论：**附件原文与识别全文不进日志、不进审计**（对齐 W0-5 §3.1/§3.2）。
 
-## 8. 未来接入 OCR/ASR 的扩展点
+## 8. 接入 OCR/ASR 的扩展点与现状
+
+### 8.1 扩展步骤
 
 1. 新增 `ExternalParser` 子类：声明 `credential_env_vars`、实现 `_parse`；
-2. 在 `ParserRegistry` 登记（同一类型后登记者覆盖，显式替换）；
+2. 在默认装配点注册（同一类型后登记者覆盖，显式替换）；
 3. 未登记类型的输入自动回退到 `ManualEntryParser`；
 4. 无需改动裁决、草稿写入与追溯逻辑——它们只依赖 `ParseResult`。
 
-### 8.1 供应商选型（调研结论，未接入）
+### 8.2 已接入的产品实现
+
+| 组件 | 位置 | 说明 |
+|---|---|---|
+| `BaiduInvoiceOcrParser` | `../app/integrations/baidu_invoice_ocr.py` | 百度智能云「智能财务票据识别」（`multiple_invoice`）的 `ExternalParser` 实现；支持 `image` 与 `document`（PDF/OFD）输入；凭据 `BDOCR_API_KEY` / `BDOCR_SECRET_KEY`（兼容旧名 `AJAIMGR_BAIDU_*`）只从环境变量读取、缺失即构造失败 |
+| `SourceFileReader` | `../app/intake/source_reader.py` | **生产级 `SourceReader`**：`source_file_id` → `source_files` 行 → `app.documents.storage.read_file` → sha256 校验 → `SourceDocument`（`content` / `mime_type` / `size_bytes` / `scan_status`）；只读、不 commit；失败 fail closed 且分类稳定——`missing_file` / `hash_mismatch` / `storage_error`，错误消息**不含存储路径与文件内容**（底层异常链被抑制） |
+| `build_default_parser_registry` | `../app/intake/assembly.py` | **默认装配点**：凭据齐全即注册百度解析器；凭据缺失时**不注册、不抛给调用方**——仍返回可用的 `DefaultParserRegistry`（`ParserRegistry` 子类，未注册类型 `resolve` 返回 `None`，回退语义不变），并通过 `notes` / `skipped_parsers` / `degraded` **在返回值上**给出非敏感装配说明，同时写一条 warning 日志；说明与日志都只含解析器标识、原因码与环境变量名（**不含凭据值**）；其它构造异常不吞 |
+
+装配函数需注入只读 `SourceReader`（生产用 `SourceFileReader(session=..., root=...)`，测试注入桩），其余参数（`env` / `transport` / `clock` / `endpoint` / `timeout`）仅用于测试与联调注入。装配阶段不做任何网络调用（默认传输惰性导入 `httpx`，只在真实解析时加载），也不读写数据库。返回的 registry 可被调用方长期复用（解析器实例持有 token 缓存与传输客户端）；`ParserRegistry` 的既有语义不变，`DefaultParserRegistry` 只是额外携带装配说明。
+
+### 8.3 端到端链路与测试口径
+
+链路：已存源文件（存储 blob + `source_files` 行）→ `ParserRegistry.resolve` → 解析器（注入桩传输）→ `ParseResult` → `record_parse_draft`（草稿区）→ `confirm_draft`（记录确认人）。
+
+`../app/tests/intake/test_baidu_registry_e2e.py` 以**全桩传输、零真实网络、零真实凭据**锁定四类语义：
+
+| 场景 | 断言 |
+|---|---|
+| 解析成功且字段置信度达标 | `IntakeJob.status='parsed'`、草稿 `pending` → `confirmed`；送往供应商的请求体确为存储字节 |
+| 低置信度字段 | `'needs_review'`（草稿仍 `pending`，人工确认仍可完成） |
+| 供应商失败（业务错误码 / 传输异常） | 机器可读 `error='provider_error'`、`'failed'`、**不建草稿**；响应体与异常原文不进审计 |
+| 凭据缺失 | 不注册解析器、回退 `ManualEntryParser`，链路仍可完成 |
+
+另含两条 fail-closed 断言：生产 `SourceReader` 读取失败（blob 缺失）被收敛为失败结果而非异常；`scan_status != 'clean'` 的原件在**取 token 之前**即被拒绝。
+
+纯逻辑测试（无需 PostgreSQL）：`../app/tests/intake/test_intake_assembly.py`（装配与降级、不触网）、`test_intake_source_reader.py`（读取、只读性与错误分类）。测试不依赖真实凭据，也不读写 `~/.hermes`。
+
+### 8.4 尚未覆盖
+
+* **字段名映射**不在本层：百度适配器产出的开票日期键是 `invoice_date`，而
+  `BUSINESS_REQUIRED_FIELDS['expense_claim']` 登记的是 `expense_date`；因此端到端测试在需要「成功」裁决时显式传入 `required_fields`。该映射口径属产品决策，属后续任务。
+* **真实供应商联调冒烟**（真实票据、真实凭据）不在本任务范围，需所有者授权后单独执行。
+* 「确认草稿 → 正式报销记录」的写入路径仍未实现（见 §9）。
+
+### 8.5 供应商选型（调研结论，未接入）
 
 OCR/ASR 候选评估与接入设计见 [`research/W2-ocr-asr-vendor-selection.md`](research/W2-ocr-asr-vendor-selection.md)。
 该报告只做选型与设计，**未接入任何供应商、未调用任何真实接口**；其中「主选/备选」为决策建议，
@@ -127,8 +166,10 @@ OCR/ASR 候选评估与接入设计见 [`research/W2-ocr-asr-vendor-selection.md
 ## 9. 未决事项与风险
 
 - **关键字段口径**（`BUSINESS_REQUIRED_FIELDS`）与**置信度阈值**是保守默认，最终
-  取值属产品决策，需在后续任务中确认；
-- 真实 OCR/ASR 供应商未接入，`ExternalParser` 尚无产品实现；供应商确定后需按其
-  响应结构实现 `_parse` 并补齐测试；
+  取值属产品决策，需在后续任务中确认；百度适配器产出的字段名（如 `invoice_date`）
+  与业务关键字段（如 `expense_date`）之间的映射同样待定（见 §8.4）；
+- 百度票据解析器已实现（#35/#37）并在默认装配点接入（#45），但**真实供应商联调
+  冒烟**（真实票据、真实凭据）与其余 OCR/ASR 供应商尚未接入；新增供应商按其响应
+  结构实现 `_parse` 并补齐测试；
 - 本层只到「草稿 + 确认状态」，**正式业务记录的写入路径不在本任务范围**（后续
   Issue），且必须经后端校验与授权。
