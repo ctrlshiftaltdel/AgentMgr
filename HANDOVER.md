@@ -50,6 +50,7 @@
 8. 子代理不得自批、自合并、自我验收；Master 不得虚假派发或把阻塞当完成。
 9. **跨会话证据必须已推到远端**；本地提交、本地日志不算数。
 10. 未被 Issue 列出的路径默认禁止；扩大范围须记录授权。受保护路径另见 `ORCHESTRATION-PROJECT.md`（含 `AGENTS.md`、`MASTER.md`、`AGENT-*.md`、`.github/`、`scripts/`、`tests/`、`prompts/`、`templates/`、`HANDOVER.md`、`.orchestration/`、`.env*`）。
+11. **不得提交可识别本机/个人的信息**（用户名、主机名/SSH 别名、绝对家目录、IP、代理地址、凭据）；环境细节只放本地 `local_info.md`（不入库），仓库内用 `<repo-root>`、`<test-host>` 等占位符。提交消息、Issue、PR 与评论同样适用；CI `privacy-scan` 必须通过。
 
 ---
 
@@ -255,6 +256,7 @@ gh run list --limit 3                # 合并后 main 的验证运行
 ```bash
 python3 scripts/validate_kit.py --project-ready           # 规则包（快；编排机或测试主机均可）
 python3 -m unittest discover -s tests                     # 规则包单测（快；同上）
+python3 scripts/check_privacy.py --ci                     # 隐私/凭据扫描（文件 + 提交消息 + 历史）
 
 # 全量（在测试主机上执行；需要 PostgreSQL 17；会重置 ajaimgr_test，勿与其他实例并行）：
 export UV_PROJECT_ENVIRONMENT=<test-host-venv>   # 实际路径见 local_info.md

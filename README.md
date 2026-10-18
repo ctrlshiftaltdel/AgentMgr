@@ -41,9 +41,14 @@ docs/       文档与调研报告
 python3 scripts/validate_kit.py                 # 规则包静态检查
 python3 scripts/validate_kit.py --project-ready # 项目配置已填写
 python3 scripts/github_preflight.py             # git/gh 只读预检
+python3 scripts/check_privacy.py --ci           # 隐私/凭据扫描
 python3 -m unittest discover -s tests -v        # 规则包单元测试
 uv run pytest app/tests -q -o addopts=""        # 全量测试（需要本地 PostgreSQL 17）
 ```
+
+## 隐私与本地信息
+
+公开仓库不保存任何可识别本机或个人的信息（用户名、主机名 / SSH 别名、绝对家目录、内网或公网 IP、代理地址、凭据、真实账号标识）。环境细节写入本地 `local_info.md`（已忽略，不入库）；仓库内一律使用 `<repo-root>`、`<test-host>`、`<test-host-venv>` 等占位符。CI 的 `privacy-scan` 会扫描文件、提交消息与历史；`Privacy Audit` 工作流每周及手动审计 Issue / PR 文本。
 
 ## 许可
 
