@@ -1,10 +1,10 @@
 # HANDOVER — 会话交接文档
 
-- 生成时间：2026-10-18 10:55 CST（**第 3 轮收口：#21/#22/#23 均已合并并 VERIFIED；无活动锁、无开放 PR**）
-- 主分支基线 head：`ec4b6c1`（PR #31 合并后；**本文档提交之前的 head**）
+- 生成时间：2026-10-18 15:45 CST（**第 4/5 轮收口：#32/#34/#35/#37/#39 均已合并并 VERIFIED；无活动锁、无开放 PR**）
+- 主分支基线 head：`8c8c3d8`（PR #40 合并后；**本文档提交之前的 head**）
 - **2026-10-18 历史重写说明**：为清除公开内容中的本机/个人标识，全部提交已重写；更早文档中记录的旧 SHA 已失效，PR / Issue 编号仍然有效。环境细节统一放在本地 `local_info.md`（不入库）。
-- 上一版交接：`3d9a193`（PR #25，队列 #21/#22/#23 建 Issue）；更早 `aab3531`（PR #28，隐私 CI 落地）、`af1c27b`（多机口径）；完整历史见 git log
-- 任务台账：**GitHub Issues**。开放 Issue：**#16**（Track A，后置）、**#32**（本次交接刷新）；#21/#22/#23 已 VERIFIED 关闭（PR #29/#30/#31）；#10/#12/#13/#17/#19/#24/#26/#27 此前已关闭。离线版 45 条台账已退役归档（不再更新）。
+- 上一版交接：`69d3f90`（PR #33，第 3 轮收口 #21/#22/#23）；更早 `3d9a193`（PR #25）、`aab3531`（PR #28，隐私 CI 落地）、`af1c27b`（多机口径）；完整历史见 git log
+- 任务台账：**GitHub Issues**。开放 Issue：**#16**（Track A，后置）、**#41**（本次交接刷新）；#21/#22/#23 已 VERIFIED 关闭（PR #29/#30/#31），**第 4/5 轮的 #32/#34/#35/#37/#39 已 VERIFIED 关闭**（PR #33 / 无仓库变更 / #36 / #38 / #40）；#10/#12/#13/#17/#19/#24/#26/#27 此前已关闭。离线版 45 条台账已退役归档（不再更新）。
 - 你的角色：**Master Agent** —— 计划、派发、独立复核、**唯一合并者**、阶段收口；默认不实现产品代码。
 - 接手顺序：`AGENTS.md` → `AGENT-ORCHESTRATION.md` → `MASTER.md` → `ORCHESTRATION-PROJECT.md` → 本文档 → `prompts/START-MASTER-EXISTING-PROJECT.md`。
 
@@ -33,7 +33,7 @@
 
 面向中国大陆 20–100 人（后续扩到 100）企业的 Hermes Agent 原生管理系统，**首期模块：报销**。以 AI 对话/语音/图片/文件为主要工作入口；**不接入金蝶等特定第三方财务系统**，对外账务交接采用模板驱动的 Excel 导出（模板待所有者提供；远期自研财务/ERP）。
 
-- 项目章程 `docs/PROJECT-CHARTER.md`（O3 已记录「百度为首选查验渠道」）；实施方案 `templates/PLAN.md`（v2.0）；部署要求 `docs/DEPLOYMENT-REQUIREMENTS.md`；调研 `docs/research/`（W0-1/2/4/5/7 与 W1-28）
+- 项目章程 `docs/PROJECT-CHARTER.md`（O3 已记录「百度为首选查验渠道」）；实施方案 `templates/PLAN.md`（v2.0）；部署要求 `docs/DEPLOYMENT-REQUIREMENTS.md`；调研 `docs/research/`（W0-1/2/4/5/7、W1-28 发票验真、W2 OCR/ASR 选型、W2-35 百度联调认知）
 - **当前阶段**：Wave 1 主体 + 发票查验完整链条（渠道 Provider：腾讯云 W1-20、百度 W1-28；人工辅助录入 W1-22；报销单挂账 W1-23）+ **W1 冻结队列三项（W1-24 模型导入自足性、W1-16 迁移可复现性、W1-26 受理解析流水线接口与人工兜底）** 已完成；**2026-10-18 第 3 轮收口三项**：渠道消息入站与路由后端服务层（#21）、跨主机/异地恢复 Runbook 与 dry-run（#22）、OCR/ASR 供应商选型报告（#23）已完成。阶段 1 剩余均为**所有者阻塞**：真实微信适配与 Profile 验收（需授权）、OCR/ASR 真实接入（需拍板供应商并关闭报告 §9 的 11 项未验证）、真实异地恢复演练（需第二台主机/异地位）。**2026-10-16 完成规则层切换：离线版 → Agent-Orchestration GitHub 版**（仓库 `ctrlshiftaltdel/AgentMgr`，public）。**2026-10-17 财务对接方向变更**：金蝶接入取消，对外账务交接改为模板驱动 Excel 导出（模板待所有者提供），远期自研财务/ERP（章程 v1.1）；同日落库 AI 工具治理整合计划 v0.2（Track A/B/C/D，`docs/AgentMgr_AiNativeERP_Integration_Plan.md`）。
 
 ---
@@ -70,29 +70,40 @@
 
 ## 5 状态快照
 
-- `main` head = `ec4b6c1`（PR #31 合并后；#21 → `7022f67`、#22 → `6046679`、#23 → `ec4b6c1`）；工作区干净；无 worktree 残留；无运行中子代理；**无活动锁、无开放 PR**；远端仅保留 `main`；测试主机已同步到 `ec4b6c1`
-- 测试：**全量基线 786 passed**（2026-10-18，`test-host`，`main` 上实测；基线 760 + #22 新增 26）；本机 Fast（`validate_kit --project-ready` + `unittest discover -s tests` + `check_privacy --ci`）rc=0；三个 PR 的 CI `app-tests` / `kit-validate` / `privacy-scan` 均对 head 通过（`b04492c` / `fd7ff25` / `ec92fef`），`main` push CI `ec4b6c1` 亦 success
+- `main` head = `8c8c3d8`（PR #40 合并后；#21 → `7022f67`、#22 → `6046679`、#23 → `ec4b6c1`、#32 → `69d3f90`、#35 → `40b099f`、#37 → `fd4d197`、#39 → `8c8c3d8`；#34 无仓库变更）；工作区干净；无运行中子代理；**无活动锁、无开放 PR**；远端仅保留 `main`；测试主机已同步到 `8c8c3d8`
+- 测试：**全量基线 840 passed**（2026-10-18，测试主机，`main` `8c8c3d8` 上实测 65.89s；构成：786 + #35 的 40 例 + #37 的 14 例）；本机 Fast（`validate_kit --project-ready` + `unittest discover -s tests` + `check_privacy --ci`）rc=0；PR #36 / #38 / #40 的 CI `app-tests` / `kit-validate` / `privacy-scan` 均对 head 通过，`main` push CI `8c8c3d8` 亦 success
 - 迁移链 `0001_org_core` → `0002_identity_rbac` → `0003_permission_catalog`（**冻结快照**，W1-16）→ `0004_audit_events` → `0005_expense_core` → `0006_expense_claim_no_seq` → `0007_workflow_outbox` → `0008_intake_files` → `0009_perm_alignment` → `0010_invoice_verifications` → `0011_expense_invoices` → **`0012_inbound_messages`**（#21，可回滚）
 - 领域目录 12 个：`app/{identity,intake,expense,workflow,documents,inventory,integrations,audit,api,db,core,runtime}`
 - 规则集 `main-protection`（id 25216701）active；`python3 scripts/github_preflight.py` 通过
-- 开放 Issue：**#16**（Track A，后置）、**#32**（本次交接刷新）；#21/#22/#23 已 VERIFIED 关闭
+- 开放 Issue：**#16**（Track A，后置）、**#41**（本次交接刷新）；#21/#22/#23/#32/#34/#35/#37/#39 已 VERIFIED 关闭
 - 离线归档：`.orchestration/`（不变；含 `archive/orchestrator.py`、`state-20261016-114915.sqlite3`、45 条任务台账）
 
 ---
 
 ## 6 当前操作点（队列已清空，等所有者输入）
 
-**第 3 轮队列 #21/#22/#23 已全部合并并 VERIFIED（PR #29 / #30 / #31）。** 当前无进行中任务、无活动锁、无 worktree、无开放 PR；并发上限 1 不变。
+**第 4/5 轮队列 #34 / #35 / #37 / #39 已全部合并并 VERIFIED（PR #36 / #38 / #40；#34 无仓库变更），#32 交接刷新亦已合并（PR #33）。** 当前无进行中任务、无活动锁（交接期间仅有 `.worktrees/41-handover`）、无开放 PR；并发上限 1 不变。
 
-阶段 1 剩余三项的卡点（全部需要所有者输入，**未建实现 Issue**）：
+### 第 4/5 轮交付（详见 §8）
+
+| 项 | 交付 | 结果 |
+|---|---|---|
+| #34 员工账号 + Profile（dev） | `ajaimgr_dev` 新增 `mlxzlas` / `tester` 两名员工（employee 角色）；Hermes Profile `emp-mlxzlas` / `emp-tester` 已生成（0700/0600） | **无仓库变更**，已 VERIFIED |
+| #35 百度 OCR 适配器 | `app/integrations/baidu_invoice_ocr.py`（`multiple_invoice`；Client/Parser 分离、预检 fail closed、桩传输、40 例测试） | PR #36 → `40b099f` |
+| #37 真实响应修正 | 置信度是 dict `{average,min}`、网约车票 snake_case、`result.<Field>` 单元素数组、凭据变量名（+14 例） | PR #38 → `fd4d197` |
+| #39 认知落库与报告修正 | `docs/research/W2-35-baidu-multiple-invoice-ocr.md`、选型报告 §4.2 等修正、`.gitignore` 防凭据误提交 | PR #40 → `8c8c3d8` |
+
+### 阶段 1 卡点（仍需所有者输入）
 
 | 项 | 已交付 | 仍需所有者 |
 |---|---|---|
-| 渠道消息入站与路由（后端侧） | #21：服务层 + 桩适配器 + 迁移 `0012`（PR #29） | 真实微信适配与 Profile 端到端验收的**授权**（`ORCHESTRATION-PROJECT.md` 禁止未经授权新建/启动 Profile） |
-| OCR/ASR 真实供应商 | #23：选型报告与接入设计（PR #31，推荐腾讯云主 / 阿里云备）+ W1-26 接口与人工兜底 | **拍板供应商**；关闭报告 §9 的 11 项「未验证」（DPA/PIPIA、单价、Region 矩阵、置信度取值域等）后才能开实现 Issue |
-| 跨主机/异地恢复演练 | #22：Runbook + `ops/offsite_restore.py` dry-run（PR #30）；真实归档 preflight 6/6、rehearse 15/15 | **第二台主机或异地位**，用于真实跨主机演练与证据 |
+| OCR/ASR 真实接入 | **供应商已拍板**：百度智能财务票据识别 `multiple_invoice`；适配器已合入 `main`，并在 `fd4d197` 上用真实票据**端到端 20/20 跑通**（证据见 `docs/research/W2-35-baidu-multiple-invoice-ocr.md` §8） | ①关闭合规项（DPA / PIPIA / 留存与是否用于训练）；②提供**带标注的**脱敏样本集做准确率验收（现有 20 份无真值，只证「跑通」不证「准确」）；③确认配额与计费 |
+| 渠道消息入站与路由（后端侧） | #21：服务层 + 桩适配器 + 迁移 `0012` | 真实微信适配与 Profile 端到端验收的**授权**（`ORCHESTRATION-PROJECT.md` 禁止未经授权新建/启动 Profile） |
+| 跨主机/异地恢复演练 | #22：Runbook + `ops/offsite_restore.py` dry-run（真实归档 preflight 6/6、rehearse 15/15） | **第二台主机或异地位**，用于真实跨主机演练与证据 |
+| 导出模板与字段口径 | 模板文件已收到（`导入凭证模板_普通模板.xlsx`） | **结构解析受阻**：本机安全策略阻止直接读取该 xlsx（编辑器会话 `No workbook open`、直接解析被拒）→ 需所有者在编辑器中打开并给出 `file_id`，或直接贴表头列名，或提供无中文名副本 |
+| 脱敏业务样例与流程盘点 | — | 脱敏后的真实 Excel/Word/PDF 样例、报销规则、库存流程 |
 
-**可选下一批（所有者确认后才建 Issue）**：导出模板与字段口径（需模板文件）、脱敏业务样例与流程盘点（需样例）、真实 OCR/ASR 接入（报告 §8 已拆 9 个 Issue）、微信真实适配（需授权）、真实异地演练。
+**可选下一批（所有者确认后才建 Issue）**：把 `BaiduInvoiceOcrParser` 注册进 `ParserRegistry` 并打通「解析 → 草稿 → 人工确认」端到端、一页多票拆分、导出映射（需模板结构）、真实异地演练。
 
 **恢复后的标准循环**（对任意新任务）：
 
@@ -111,22 +122,21 @@
 
 ### BLOCKED（等所有者输入）
 
-| 项 | 需要什么 |
-|---|---|
-| 导出模板与字段口径（原金蝶 W0-3 位置，未建 Issue） | 首个 Excel 模板文件、期间/币种/单据号口径、目标财务系统的导入要求 |
-| 脱敏业务样例与流程盘点（原 W0-6，未建 Issue） | 脱敏后的真实 Excel/Word/PDF 样例、报销规则、库存流程 |
-| 微信接入授权（未建 Issue） | 是否允许在本机/指定主机创建 Profile 做真实路由与消息验收 |
-| OCR/ASR 供应商选择（#23 给建议，未建实现 Issue） | 从主/备候选中拍板；拍板后才能开真实接入 Issue |
-| 第二台主机或异地位（未建 Issue） | 用于跨主机/异地恢复的真实演练与证据 |
+| 项 | 需要什么 | 状态 |
+|---|---|---|
+| 导出模板与字段口径（未建 Issue） | 模板结构：工作表清单、表头行、列顺序、示例行、合并单元格 | 模板文件**已收到**（`导入凭证模板_普通模板.xlsx`），但**结构解析受阻**：本机安全策略阻止直接读取（编辑器会话 `No workbook open`、直接解析被拒）→ 需所有者给出 `file_id` / 直接贴表头 / 提供无中文名副本 |
+| 脱敏业务样例与流程盘点（原 W0-6，未建 Issue） | 脱敏后的真实 Excel/Word/PDF 样例、报销规则、库存流程 | 仍阻塞（收集材料中） |
+| 微信接入授权（未建 Issue） | 是否允许在指定主机创建 Profile 做真实路由与消息验收 | 仍阻塞；#34 已建 dev 员工账号与 Profile，但**渠道绑定与真实验收未授权** |
+| 第二台主机或异地位（未建 Issue） | 用于跨主机/异地恢复的真实演练与证据 | 仍阻塞（收集材料中） |
 
 ### 待派发（PLANNED）
 
 | Issue | 内容 | 状态 / 注意 |
 |---|---|---|
 | #16 | Track A：AiNativeERP 设计映射与 Track B 范围（仅文档） | PLANNED，后置：阶段 1 收口后再评估 |
-| #32 | HANDOVER 刷新（第 3 轮收口） | 本次交接 PR；合并后关闭 |
+| #41 | HANDOVER 刷新（第 4/5 轮收口） | 本次交接 PR；合并后关闭 |
 
-（#21/#22/#23 已合并并 VERIFIED，见 §8。）
+（#21/#22/#23 与第 4/5 轮的 #32/#34/#35/#37/#39 均已合并并 VERIFIED，见 §8。）
 
 ### 冻结队列——已于 2026-10-16 全部完成
 
@@ -135,13 +145,19 @@
 ### 阶段 1 剩余项（全部为所有者阻塞）
 
 - **微信真实适配与 Profile 端到端验收**：#21 已交付服务层 + 桩适配器（迁移 `0012`）；真实适配需所有者授权建 Profile（依赖 W0-1 结论）。
-- **OCR/ASR 真实接入**：#23 已交付选型报告与接入设计（推荐腾讯云主 / 阿里云备）；需所有者拍板并关闭报告 §9 的 11 项未验证，之后按 §8 的 9 个建议 Issue 开实现。
+- **OCR/ASR 真实接入**：**供应商已拍板百度 `multiple_invoice`**（见 §9.3，报告 §0.1 的腾讯云主 / 阿里云备**不再作为执行依据**）；#35 / #37 已交付适配器，并在 `fd4d197` 上用真实票据**端到端 20/20 跑通**，认知已落库 `docs/research/W2-35-baidu-multiple-invoice-ocr.md`。剩余阻塞：合规条款（DPA / PIPIA / 留存与是否用于训练）、**带标注**的脱敏样本集做准确率验收、配额与计费确认；之后可开「注册进 `ParserRegistry` + 解析→草稿→人工确认端到端」的实现 Issue。
 - **真实跨主机/异地恢复演练**：#22 已交付 Runbook + dry-run（真实归档 preflight 6/6、rehearse 15/15）；真实执行需第二台主机或异地位。`--allow-missing-*` 误用边界见 `docs/BACKUP-RESTORE.md` §10 第 9 项。
 
 ---
 
 ## 8 已完成（不要重做）
 
+- **第 4/5 轮队列（2026-10-18 下午；PR #36 / #38 / #40，#34 无仓库变更）**：
+  - **#34 员工账号与 Profile（dev，无仓库变更）**：`ajaimgr_dev` 新增 employees id=3 `mlxzlas`、id=4 `tester`（均 `employee` 角色，最小权限）；Hermes Profile `emp-mlxzlas` / `emp-tester` 已生成（目录 0700、配置 0600），由现有 multiplexed gateway 托管（**未单独启动**）；生产布局的 Profile 计划包在测试主机上留存供参考。**未做**：渠道绑定（缺微信 `external_user_id`）、生产 systemd 账户。
+  - **#35 百度 `multiple_invoice` 适配器（PR #36，merge `40b099f`）**：`app/integrations/baidu_invoice_ocr.py` —— `BaiduInvoiceOcrClient`（token 缓存、提前 60 秒过期、`110/111` 刷新一次后重试）+ `BaiduInvoiceOcrParser`（`ExternalParser` 实现，注入 `SourceReader`，预检 fail closed，输出只进草稿）；40 例全桩测试。**未接真实服务、未加依赖、未注册进 `ParserRegistry`。**
+  - **#37 按真实响应修正（PR #38，merge `fd4d197`）**：①字段置信度实为 **dict** `{average, min}`（原按标量解析会全量静默回退 0.5）→ 改为优先取 `min`、回退 `average`、再回退 0.5；②`taxi_online_ticket` 用 **snake_case**（`total_fare` / `application_date` / `service_provider`），不能复用 `taxi_receipt` 的 PascalCase 别名；③`result.<Field>` 是**单元素数组**，需解包再取 `word`；④凭据名以 `BDOCR_API_KEY` / `BDOCR_SECRET_KEY` 为准（旧名仅作回退）。新增 14 例测试。
+  - **#39 认知落库与报告修正（PR #40，merge `8c8c3d8`）**：新增 `docs/research/W2-35-baidu-multiple-invoice-ocr.md`（接口事实、三处偏差、字段与金额口径、票种能力矩阵、置信度真实分布、预检清单、隐私边界、未验证项）；修正 `docs/research/W2-ocr-asr-vendor-selection.md`（§4.2「百度无逐字段置信度」**已被真实响应推翻**、§0/§0.1/§0.3 标注百度已拍板为主用、§9 第 14 项部分关闭）；`.gitignore` 增加 `.env` / `.env.*`（保留 `!.env.example`）。
+  - **真实联调证据（`fd4d197`，聚合口径）**：20 份真实票据（14 PDF + 6 OFD）经 `BaiduInvoiceOcrParser` **20/20 成功**；票种 `vat_invoice` 14 / `taxi_online_ticket` 6；每票字段数 min 4（网约车只有票种/金额/日期/销方）／中位 10（VAT 全字段）；164 个归一化字段、144 个非票种置信度 min 0.29／中位 0.912／max 0.973，其中 28 个（19.4%）低于默认阈值 0.75；契约不变量（键集合一致、值域、金额两位小数、日期 ISO）**0 违规**。**这是「跑通」证据，不是准确率证据**（样本无标注真值）。
 - **第 3 轮队列（2026-10-18，PR #29 / #30 / #31）**：
   - **#21 渠道消息入站与路由（PR #29，merge `7022f67`）**：`app/intake/inbound.py`（`ingest_inbound_message`、`InboundChannelAdapter` 协议、`IngestResult`）、`InboundMessage` 模型 + 迁移 `0012`（唯一键 `(channel_type, external_message_id)`）、`app/tests/intake/test_inbound_ingest.py` 30 例。语义：结构校验 → 身份解析 → profile 名计算 → 幂等去重 → 建作业 + 锚点 + 受理审计（同事务）；拒绝不落库；并发冲突由唯一约束兜底；审计只记加盐哈希。**无 HTTP 端点、未接真实微信、未建 Profile。**
   - **#22 跨主机/异地恢复（PR #30，merge `6046679`）**：`ops/offsite_restore.py`（`preflight` / `rehearse`，无网络、无 DB 恢复）、`docs/BACKUP-RESTORE.md` §11、`app/tests/ops/test_offsite_restore.py` 26 例。测试主机真实归档：`preflight` 6/6 PASS、`rehearse` 15/15 PASS、证据 `database_step=NOT_EXECUTED`。**未执行真实跨主机/异地演练。**
@@ -196,7 +212,7 @@
 
 1. 导出模板：首个 Excel 模板与字段口径（阶段 3 前置）；金蝶接入已于 2026-10-17 取消
 2. 脱敏业务样例与现有流程
-3. OCR/ASR 供应商（#23 报告已交付：推荐腾讯云主 / 阿里云备；拍板后按报告 §8 开实现 Issue，并先关闭 §9 的 11 项未验证）
+3. ~~OCR/ASR 供应商~~ —— **已决（2026-10-18 所有者拍板：百度智能财务票据识别 `multiple_invoice`）**，见 §9.3；余下的是合规与验收（DPA / PIPIA / 留存、带标注样本集、配额与计费），不是选型
 4. 微信接入授权（是否允许本机建 Profile 做真实路由验收）
 5. 单条越权 403 vs 404
 6. `description` 长度 1–500 字符（PLAN 未规定的引入默认值）
@@ -208,6 +224,13 @@
 - B-1 工具选择：Agent 侧选（Hermes 经 MCP / function calling），后端只做契约校验、权限与澄清；不建后端意图路由（章程 D8、整合计划 §5.6）。
 - B-2 确认持久化：新增 `tool_confirmations` 轻表；参数 hash + TTL 15 分钟 + 一次性消费 + 执行前复检（整合计划 §5.7）；建表放在 Track B 的确认类 Issue。
 - 优先级：先收口阶段 1 剩余项（渠道消息路由、OCR/ASR 真实供应商、跨主机恢复演练），Track A 后置。
+- **（2026-10-18 所有者补充）**
+  - **OCR 供应商：百度智能财务票据识别 `multiple_invoice`**（替代 #23 报告推荐的腾讯云主 / 阿里云备；该排序保留为过程记录，**不再作为执行依据**）。适配器已合入 `main` 并真实联调 20/20。
+  - **凭据变量名**：`BDOCR_API_KEY` / `BDOCR_SECRET_KEY`（旧名 `AJAIMGR_BAIDU_API_KEY` / `AJAIMGR_BAIDU_SECRET_KEY` 仅作回退）；只从环境变量读取，缺一即构造失败（fail closed）。
+  - **置信度口径**：字段级取 `probability.min`（缺则 `average`，再缺回退 `0.5`）；整票 `probability` **只允许**用于 `invoice_type` 这一个字段。默认阈值 0.75 不变，低于阈值即人工复核——**阈值以下不是故障**。
+  - **金额口径**：报销金额只取 `AmountInFiguers`（价税合计）；`TotalAmount` 是不含税合计，**取错会系统性少报**。
+  - **凭据文件必须被 Git 忽略**：`.env` / `.env.*` 已入 `.gitignore`（保留 `!.env.example`），各机另有 `.git/info/exclude` 兜底。**任何凭据值不得进入仓库、日志、Issue 与对话。**
+  - **员工账号（dev）**：`mlxzlas`（所有者本人）、`tester`，均为 `employee` 角色（最小权限）；Hermes Profile 为 `emp-mlxzlas` / `emp-tester`。
 10. GitHub 协作策略微调（直推 bypass？合并方式？——当前：PR + G1–G6 + strict checks）
 11. 解析流水线产品参数确认（关键字段口径、置信度阈值——当前均为保守默认）
 
@@ -218,7 +241,7 @@
 ### 多机注记（2026-10-18 起）
 
 - 编排（gh / git / Issues / PR）：在任一编排机（Windows / Linux / macOS）执行；工作区路径见本地 `local_info.md`（不入库）。
-- 全量测试、临时库实测、迁移往返：`ssh <test-host>`（别名与连接参数见本地 `local_info.md`；后台任务内跑 SSH 可能被沙箱拦截，需前台执行）。
+- 全量测试、临时库实测、迁移往返：`ssh <test-host>`（**占位名**：真实别名以本机 `~/.ssh/config` 的 `Host` 条目为准，连接参数见本地 `local_info.md`；后台任务内跑 SSH 可能被沙箱拦截，需前台执行；`git fetch` 可能挂在网络上，见 §11 第 33 条）。
 
 ### 状态恢复（每次接手先跑）
 
@@ -303,6 +326,12 @@ psql -d ajaimgr_test -c "\d <table>"  # 看表结构
 25. **文档里的命令必须按文档原样跑一遍才算验收**：#22 的 Runbook 曾把归档放进 `--target-dir` 再做 preflight，而工具要求该目录为空——照文档执行第一步即 rc=2。复核文档类交付时，至少逐条执行关键命令。
 26. **测试不得依赖真实 `~/.hermes`**：#21 的 `_hermes_snapshot()` 比对整棵真实目录树，在测试主机上因并发写入偶发失败（5 次中 1 次）；改为 `tmp_path` + `HOME`/`USERPROFILE` 隔离后稳定。
 27. **`gh issue view --json comments` 返回的是 node id**（`IC_kw...`），更新评论须用 REST 接口的数字 `id`（`gh api repos/.../issues/<n>/comments --jq '.[].id'`）。
+28. **真实响应才是事实来源，文档与选型报告会错**：#35 严格照官方文档与选型报告实现，真实一跑就暴露三处偏差——字段置信度是 **dict** 不是标量（原实现全部静默回退 0.5）、`taxi_online_ticket` 用 **snake_case**、`result.<Field>` 是**单元素数组**。凡「按文档推断的响应形态」，首次真实调用后必须逐项回验，并把结论写进文档（见 `docs/research/W2-35-baidu-multiple-invoice-ocr.md` §2）。
+29. **「4M」这类上限要取十进制下界**：文档只写「4M」不写进制，4 MiB（4,194,304）会越过服务端限制。实现取 `4_000_000`，宁可本地早拒（#35 复核时修正）。
+30. **凭据文件必须入库忽略**：`.env` 曾未被 `.gitignore` 覆盖，`git status` 显示未跟踪项——一次 `git add -A` 就会把真实凭据提交到 public 仓库。各机 `.git/info/exclude` 只是止血，**仓库里必须有规则**（#39 已补）。
+31. **SSH 别名以本机 `~/.ssh/config` 为准**：交接文档里的 `test-host` 是**占位符**，按它直接连接会 `Could not resolve hostname`；先 `grep '^Host' ~/.ssh/config` 取真实别名。
+32. **本地敏感文件可能被安全策略阻断读取**：所有者提供的 xlsx（模板/样例）直接解析会 `PermissionError`，表格子代理也可能报 `No workbook open`。改走「所有者在编辑器打开并给 `file_id` / 直接贴表头列名 / 提供无中文名副本」；**被拒后不要反复重试等价命令**。
+33. **测试主机的 `git fetch` 会挂在网络上**：表现为后台任务十几分钟无输出、`git-remote-http` 常驻、pytest 根本没启动。跑全量前若仓库已同步就跳过 pull；必要时用 `timeout` 包裹 fetch 并加 `git -c http.version=HTTP/1.1`。
 
 ---
 
@@ -312,6 +341,6 @@ psql -d ajaimgr_test -c "\d <table>"  # 看表结构
 - [ ] 读本文档 §3、§4、§6、§9
 - [ ] 跑 §10 的「状态恢复」命令并核对 §5 快照（head、CI 状态、开放 Issue/PR）
 - [ ] 确认没有遗留运行中的子代理（WorkBuddy 任务列表 / `delegate_task(action='list')`）
-- [ ] 队列已清空：**不要**重做 #21/#22/#23；下一步等所有者输入（§6 的卡点表）
+- [ ] 队列已清空：**不要**重做 #21/#22/#23/#32/#34/#35/#37/#39；下一步等所有者输入（§6 的卡点表）
 - [ ] 若所有者给出输入：按 §6「标准循环」建 Issue → 登记 → 派发；#16 仍后置
-- [ ] 如向所有者汇报：§6 卡点表 + §7 BLOCKED + §9.2 决策清单
+- [ ] 如向所有者汇报：§6 卡点表 + §7 BLOCKED + §9.2 决策清单；**OCR 供应商已拍板**，重点催的是模板结构与脱敏/标注样例
