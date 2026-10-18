@@ -49,7 +49,7 @@
 - Branch naming: `feat/<issue>-<short>` / `fix/<issue>-<short>` / `chore/<issue>-<short>`
 - Draft PR expected early: yes（尽早开 Draft PR；确有理由时在 PR 中注明）
 - Review-fix cap: 3 rounds by default.
-- Parallelism cap: 1（依据：2 vCPU / 1.9 GiB 编排开发机；路径锁与依赖优先）。
+- Parallelism cap: 2（依据：编排开发机已升级为 4 vCPU / 7.7 GiB，原「2 vCPU / 1.9 GiB」的资源瓶颈不再成立；测试主机全量测试改由 `flock /tmp/ajaimgr-fulltest.lock` 串行化，不再需要全局并发 1）。并行前提（缺一不可）：(a) 同批次各任务的允许路径集合两两不重叠（含文档文件）；(b) 测试主机全量测试一律经 `flock /tmp/ajaimgr-fulltest.lock` 包裹串行执行；(c) 派发前仍须完成活动任务登记与依赖检查（不变）。
 - Active task registry: required Issue comment（见 `AGENT-ORCHESTRATION.md` §2 与 `templates/ACTIVE-TASK-REGISTRY.md`）。
 - Issue closure timing: after post-merge verification；关闭前在登记评论记录最终 SHA 与验证结果。（不使用 `Closes #N` 自动关闭；PR 正文用 `Refs #N`。）
 
