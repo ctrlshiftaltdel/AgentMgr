@@ -319,6 +319,49 @@ def test_export_end_to_end(session: Session, world, tmp_path: Path) -> None:
     assert events[0].details["entry_count"] == 2
 
 
+def test_export_end_to_end_voucher_template(
+    session: Session, world, tmp_path: Path
+) -> None:
+    """Issue #71：新布局 ``voucher_template``（25 列）走完整服务层链路。"""
+    from app.export.template import WORKSHEET_VOUCHER_TEMPLATE
+
+    config = make_config(
+        tmp_path,
+        layout="voucher_template",
+        aux_named_columns={"部门": {"source": "department"}},
+    )
+    principal = _principal(world, "finance")
+    before = _snapshot(session)
+
+    result = export_claims_period(
+        session,
+        principal,
+        period=PERIOD,
+        config=config,
+        storage_root=tmp_path / "storage",
+    )
+
+    assert _snapshot(session) == before
+    assert result.manifest["template"]["layout"] == "voucher_template"
+    assert result.manifest["template"]["worksheet"] == WORKSHEET_VOUCHER_TEMPLATE
+    assert result.entry_count == 2
+    assert result.voucher_count == 1
+
+    from app.documents.storage import read_file
+
+    workbook = load_workbook(io.BytesIO(read_file(tmp_path / "storage", result.file_storage_key)))
+    sheet = workbook[WORKSHEET_VOUCHER_TEMPLATE]
+    assert sheet.max_row == 3
+    assert sheet.max_column == 25
+    assert sheet[2][6].value == "560101"  # G 科目代码
+    assert sheet[3][6].value == "100201"  # G 贷方科目
+    assert sheet[2][14].value == "财务部"  # O 部门（命名列 source=department）
+
+    files = list(session.scalars(select(SourceFile)))
+    assert len(files) == 2
+    verify_file(tmp_path / "storage", result.file_storage_key, result.file_sha256)
+
+
 def test_export_is_idempotent(session: Session, world, tmp_path: Path) -> None:
     config = make_config(tmp_path)
     principal = _principal(world, "finance")

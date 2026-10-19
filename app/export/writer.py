@@ -7,6 +7,11 @@
   单元格、整数列写整数；
 * §6.5「幂等与可复现」——导出文件**不得**写入导出时间戳，否则字节不可复现。
 
+本模块按**布局**渲染：``entry_rows``（旧模板 ``录入数据`` 31 列，Issue #53）与
+``voucher_template``（新模板 ``凭证模版`` 25 列，Issue #71）。两者共用同一套
+注入防护、固定时间戳与确定性 zip 重打包，差别只在「表头 / 工作表名 / 日期列 /
+行展开函数」。
+
 **可复现性实现说明（实现口径澄清，已记录进 §9）**：``openpyxl`` 默认会在
 ``docProps/core.xml`` 写入 ``created``/``modified`` 时间戳，并给每个 zip 条目写入
 本地时间戳，导致同一内容两次保存的字节不同。本模块因此：
@@ -23,19 +28,31 @@ from __future__ import annotations
 import io
 import re
 import zipfile
+from collections.abc import Sequence
 from datetime import UTC, date, datetime
 from decimal import Decimal
 
 from openpyxl import Workbook
 
 from app.expense.money import quantize
+from app.export.config import ExportConfig
 from app.export.errors import (
     CODE_CELL_INJECTION_UNESCAPED,
+    CODE_UNSUPPORTED_LAYOUT,
+    ExportTemplateError,
     ExportValidationError,
     ValidationFailure,
 )
 from app.export.mapping import EntryRow
-from app.export.template import ENTRY_ROWS_HEADERS, WORKSHEET_ENTRY_ROWS
+from app.export.template import (
+    ENTRY_ROWS_HEADERS,
+    LAYOUT_ENTRY_ROWS,
+    LAYOUT_VOUCHER_TEMPLATE,
+    VOUCHER_TEMPLATE_HEADERS,
+    WORKSHEET_ENTRY_ROWS,
+    WORKSHEET_VOUCHER_TEMPLATE,
+)
+from app.export.voucher_layout import voucher_template_rows
 
 __all__ = [
     "DANGEROUS_PREFIXES",
@@ -43,6 +60,8 @@ __all__ = [
     "escape_text",
     "guard_no_unescaped",
     "render_entry_rows",
+    "render_export",
+    "render_voucher_template",
 ]
 
 #: 会被电子表格当作公式 / 外部引用起点的危险前缀（§6.4）。
@@ -140,38 +159,92 @@ def _deterministic_zip(raw: bytes) -> bytes:
 
 
 def render_entry_rows(entries: list[EntryRow]) -> bytes:
-    """把分录行渲染为 ``录入数据`` 工作表的 xlsx 字节（**无宏、无时间戳**）。
+    """把分录行渲染为**旧布局** ``录入数据`` 工作表的 xlsx 字节（无宏、无时间戳）。
 
     表头行逐列取自 :data:`app.export.template.ENTRY_ROWS_HEADERS`；每条分录一行，
     列序与模板 A–AE 一致。金额为数值单元格、日期为日期型单元格（``yyyy-mm-dd``）、
     ``凭证号``/``附件数``/``汇率`` 为整数型单元格。
     """
-    # 先转义（§6.4），再用纵深防御闸门复核转义结果（fail closed #12）。
-    rows: list[tuple[object, ...]] = [
-        tuple(_cell_value(value) for value in entry.cells()) for entry in entries
+    rows = [tuple(_cell_value(value) for value in entry.cells()) for entry in entries]
+    return _render_sheet(
+        headers=ENTRY_ROWS_HEADERS,
+        worksheet=WORKSHEET_ENTRY_ROWS,
+        rows=rows,
+        date_columns=(3,),  # C 凭证日期
+    )
+
+
+def render_voucher_template(entries: list[EntryRow], config: ExportConfig) -> bytes:
+    """把分录行渲染为**新布局** ``凭证模版`` 工作表的 xlsx 字节（无宏、无时间戳）。
+
+    表头逐列取自 :data:`app.export.template.VOUCHER_TEMPLATE_HEADERS`（A–Y 共 25 列）；
+    每条分录一行，列序由 :func:`app.export.voucher_layout.voucher_template_rows` 按
+    列号展开。日期为日期型单元格（``yyyy-mm-dd``），金额为数值单元格。
+    """
+    rows = [
+        tuple(_cell_value(value) for value in row)
+        for row in voucher_template_rows(entries, config)
     ]
+    return _render_sheet(
+        headers=VOUCHER_TEMPLATE_HEADERS,
+        worksheet=WORKSHEET_VOUCHER_TEMPLATE,
+        rows=rows,
+        date_columns=(1,),  # A 日期
+    )
+
+
+def render_export(entries: list[EntryRow], config: ExportConfig) -> bytes:
+    """按 ``config.template.layout`` 选择渲染器（服务层入口；**不静默降级**）。
+
+    未登记的布局抛 ``unsupported_layout``（与 :func:`app.export.template.load_template`
+    同一语义）；服务层在渲染前已装载模板，因此正常路径不会走到该分支。
+    """
+    if config.template.layout == LAYOUT_ENTRY_ROWS:
+        return render_entry_rows(entries)
+    if config.template.layout == LAYOUT_VOUCHER_TEMPLATE:
+        return render_voucher_template(entries, config)
+    raise ExportTemplateError(
+        CODE_UNSUPPORTED_LAYOUT,
+        f"layout {config.template.layout!r} is not implemented in this build",
+    )
+
+
+def _render_sheet(
+    *,
+    headers: Sequence[str],
+    worksheet: str,
+    rows: list[tuple[object, ...]],
+    date_columns: Sequence[int],
+) -> bytes:
+    """通用渲染：表头 + 数据行 → 字节可复现的 xlsx（日期列设显示格式）。
+
+    先跑纵深防御闸门复核转义结果（fail closed #12），再写工作簿；保存后经
+    :func:`_deterministic_zip` 固定元数据时间戳（§6.5）。
+    """
     guard_no_unescaped(rows)
 
     workbook = Workbook()
     workbook.properties.created = _FIXED_DATETIME.replace(tzinfo=None)
     workbook.properties.modified = _FIXED_DATETIME.replace(tzinfo=None)
     sheet = workbook.worksheets[0]
-    sheet.title = WORKSHEET_ENTRY_ROWS
+    sheet.title = worksheet
 
-    sheet.append(list(ENTRY_ROWS_HEADERS))
+    sheet.append(list(headers))
     for row in rows:
         sheet.append(list(row))
 
-    _apply_date_format(sheet, len(rows))
+    _apply_date_format(sheet, len(rows), date_columns)
 
     buffer = io.BytesIO()
     workbook.save(buffer)
     return _deterministic_zip(buffer.getvalue())
 
 
-def _apply_date_format(sheet, row_count: int) -> None:
-    """把 ``凭证日期``（C 列）设为日期显示格式（写日期型单元格，§4.4）。"""
+def _apply_date_format(sheet, row_count: int, columns: Sequence[int]) -> None:
+    """把日期列设为日期显示格式（写日期型单元格，§4.4）。"""
     for row_index in range(2, row_count + 2):
-        cell = sheet.cell(row=row_index, column=3)
-        if isinstance(cell.value, (date, datetime)):
-            cell.number_format = _DATE_FORMAT
+        for column in columns:
+            cell = sheet.cell(row=row_index, column=column)
+            if isinstance(cell.value, (date, datetime)):
+                cell.number_format = _DATE_FORMAT
+

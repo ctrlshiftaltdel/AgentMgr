@@ -1,12 +1,14 @@
 """Track D 导出测试的共享辅助（**不提交任何真实模板**）。
 
-本模块只在测试内用 ``openpyxl`` 构造**合成**的最小 ``录入数据`` 结构，并生成对应的
-TOML 配置文本；真实模板由部署方持有、**不入库**，测试一律不依赖它。
+本模块只在测试内用 ``openpyxl`` 构造**合成**的最小模板结构（旧布局 ``录入数据``
+31 列 / 新布局 ``凭证模版`` 25 列），并生成对应的 TOML 配置文本；真实模板由部署方
+持有、**不入库**，测试一律不依赖它。
 
 设计要点：
 
-* 合成模板的表头逐列取自 :data:`app.export.template.ENTRY_ROWS_HEADERS`，因此它同时
-  是「模板结构校验」的正面用例；
+* 合成模板的表头逐列取自 :data:`app.export.template.ENTRY_ROWS_HEADERS` 或
+  :data:`app.export.template.VOUCHER_TEMPLATE_HEADERS`，因此它同时是「模板结构
+  校验」的正面用例；
 * 配置一律经**真实装载器** :func:`app.export.config.load_export_config` 读取（写 TOML
   文本 → 装载），从而覆盖解析与 fail closed 路径；
 * 不依赖网络、不依赖真实凭据、不触碰仓库内文件（全部写在 ``tmp_path``）。
@@ -22,15 +24,35 @@ from pathlib import Path
 from openpyxl import Workbook
 
 from app.export.config import ExportConfig, load_export_config
-from app.export.template import ENTRY_ROWS_HEADERS, WORKSHEET_ENTRY_ROWS
+from app.export.template import (
+    ENTRY_ROWS_HEADERS,
+    LAYOUT_VOUCHER_TEMPLATE,
+    VOUCHER_TEMPLATE_HEADERS,
+    WORKSHEET_ENTRY_ROWS,
+    WORKSHEET_VOUCHER_TEMPLATE,
+)
 
 __all__ = [
+    "DEFAULT_HEADERS_BY_LAYOUT",
+    "DEFAULT_WORKSHEET_BY_LAYOUT",
     "build_config_toml",
     "build_template_xlsx",
     "make_config",
     "q",
     "write_config",
 ]
+
+#: 布局 → 合成模板的默认表头。
+DEFAULT_HEADERS_BY_LAYOUT: dict[str, tuple[str, ...]] = {
+    "entry_rows": ENTRY_ROWS_HEADERS,
+    LAYOUT_VOUCHER_TEMPLATE: VOUCHER_TEMPLATE_HEADERS,
+}
+
+#: 布局 → 合成模板/配置的默认工作表名。
+DEFAULT_WORKSHEET_BY_LAYOUT: dict[str, str] = {
+    "entry_rows": WORKSHEET_ENTRY_ROWS,
+    LAYOUT_VOUCHER_TEMPLATE: WORKSHEET_VOUCHER_TEMPLATE,
+}
 
 
 def q(value: object) -> str:
@@ -79,6 +101,8 @@ def build_config_toml(
     voucher_word: str = "记",
     preparer: str = "claimant",
     preparer_literal: str = "",
+    number_mode: str = "sequential",
+    number_start: int = 1,
     summary_template: str = "{claim_no} {employee_no} {description}",
     summary_max_length: int = 500,
     expense_map: Mapping[str, str] | None = None,
@@ -100,6 +124,7 @@ def build_config_toml(
     aux_counterparty_class: str = "",
     aux_counterparty_code: str = "",
     aux_counterparty_name: str = "",
+    aux_named_columns: Mapping[str, Mapping[str, str]] | None = None,
     attachment_basis: str = "invoices",
     on_verified_fail: str = "fail",
     on_suspected_duplicate: str = "fail",
@@ -135,6 +160,8 @@ def build_config_toml(
         f"voucher_word = {q(voucher_word)}",
         f"preparer = {q(preparer)}",
         f"preparer_literal = {q(preparer_literal)}",
+        f"number_mode = {q(number_mode)}",
+        f"number_start = {q(number_start)}",
         "",
         "[summary]",
         f"template = {q(summary_template)}",
@@ -183,6 +210,11 @@ def build_config_toml(
         lines.append("[credit.by_status]")
         for status, account in credit_by_status.items():
             lines.append(f"{status} = {q(dict(account))}")
+    if aux_named_columns is not None:
+        lines.append("")
+        lines.append("[auxiliary.named_columns]")
+        for column, spec in aux_named_columns.items():
+            lines.append(f"{q(column)} = {q(dict(spec))}")
     if extra_lines:
         lines.append("")
         lines.append(extra_lines)
@@ -195,15 +227,24 @@ def write_config(path: Path, text: str) -> Path:
 
 
 def make_config(tmp_path: Path, **overrides: object) -> ExportConfig:
-    """在 ``tmp_path`` 造出合成模板 + 配置并装载，返回 :class:`ExportConfig`。"""
+    """在 ``tmp_path`` 造出合成模板 + 配置并装载，返回 :class:`ExportConfig`。
+
+    ``layout`` 决定合成模板的**默认**表头与工作表名（``entry_rows`` 31 列 /
+    ``voucher_template`` 25 列）；``headers`` / ``sheet_name`` 可显式覆盖。
+    """
+    layout = str(overrides.pop("layout", "entry_rows"))
+    default_headers = DEFAULT_HEADERS_BY_LAYOUT[layout]
+    default_worksheet = DEFAULT_WORKSHEET_BY_LAYOUT[layout]
     template_path = tmp_path / "synthetic-template.xlsx"
     sha = build_template_xlsx(
         template_path,
-        headers=overrides.pop("headers", None),  # type: ignore[arg-type]
-        sheet_name=str(overrides.pop("sheet_name", WORKSHEET_ENTRY_ROWS)),
+        headers=overrides.pop("headers", default_headers),  # type: ignore[arg-type]
+        sheet_name=str(overrides.pop("sheet_name", default_worksheet)),
     )
     overrides.setdefault("template_path", str(template_path))
     overrides.setdefault("template_sha", sha)
+    overrides.setdefault("layout", layout)
+    overrides.setdefault("worksheet", default_worksheet)
     text = build_config_toml(**overrides)  # type: ignore[arg-type]
     config_path = write_config(tmp_path / "ajaimgr.toml", text)
     return load_export_config(config_path)

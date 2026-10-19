@@ -65,7 +65,7 @@ from app.export.mapping import (
 )
 from app.export.template import load_template
 from app.export.validation import parse_period, validate_claims, validate_export
-from app.export.writer import XLSX_MEDIA_TYPE, render_entry_rows
+from app.export.writer import XLSX_MEDIA_TYPE, render_export
 from app.identity.authorization import Principal, has_permission
 from app.integrations.models import InvoiceVerification
 
@@ -430,7 +430,7 @@ def export_claims_period(
     storage_root: Path | str | None = None,
     now: datetime | None = None,
 ) -> ExportResult:
-    """把某期间内已选状态的报销单投影为 ``录入数据`` xlsx + manifest。
+    """把某期间内已选状态的报销单投影为**目标布局**（``template.layout``）的 xlsx + manifest。
 
     流程（任一步失败即 fail closed：不写文件、不写 manifest、写拒绝审计）：
 
@@ -440,7 +440,7 @@ def export_claims_period(
     4. 装载模板（SHA-256 指纹 + 工作表 + 表头结构）；
     5. 只读选出期间内、公司内、状态合格的报销单；
     6. §6 全量校验（E1–E7 / C1–C5 / fail closed）；
-    7. 生成分录行 → 渲染 xlsx → 构建 manifest → 落存储（含哈希校验）→ 审计。
+    7. 生成分录行 → 渲染 xlsx（按布局）→ 构建 manifest → 落存储（含哈希校验）→ 审计。
 
     ``storage_root`` 默认取 ``app.documents.storage.default_storage_root()``；
     ``now`` 仅用于 manifest 的 ``exported_at``（测试可注入固定值）。
@@ -479,7 +479,7 @@ def export_claims_period(
         manifest_name = f"expense-export-{period}.manifest.json"
         root = storage_root if storage_root is not None else default_storage_root()
 
-        content = render_entry_rows(entries)
+        content = render_export(entries, resolved_config)
         stored_file = _store_blob(
             session,
             principal,
