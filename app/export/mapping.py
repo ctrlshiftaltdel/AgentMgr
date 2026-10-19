@@ -106,7 +106,12 @@ class ClaimInput:
 
 @dataclass(frozen=True)
 class EntryRow:
-    """一条 ``录入数据`` 分录行（31 列中本系统负责填写的部分）。"""
+    """一条分录行（布局无关的投影；31 列中本系统负责填写的部分 + 部门名称）。
+
+    :meth:`cells` 展开为**旧布局** ``entry_rows``（``录入数据``，31 列）的单元格；
+    **新布局** ``voucher_template``（``凭证模版``，25 列）由
+    :func:`app.export.voucher_layout.voucher_template_cells` 按列号展开。
+    """
 
     voucher_word: str
     voucher_no: int
@@ -123,6 +128,9 @@ class EntryRow:
     preparer: str
     business_no: str
     attachment_count: int
+    #: 该分录所属员工部门名称（唯一有权威来源的辅助核算，D8）；税费/贷方分录为 ``None``。
+    #: 新布局（``voucher_template``）的命名列取此值；旧布局仍走 ``aux_*`` 槽位。
+    department_name: str | None = None
     aux_class_a: str | None = None
     aux_code_a: str | None = None
     aux_name_a: str | None = None
@@ -131,7 +139,7 @@ class EntryRow:
     aux_name_b: str | None = None
 
     def cells(self) -> tuple[object, ...]:
-        """按 ``录入数据`` 列序 A–AE 展开为 31 个单元格值（工具列留空）。"""
+        """按**旧布局** ``录入数据`` 列序 A–AE 展开为 31 个单元格值（工具列留空）。"""
         return (
             self.voucher_word,
             self.voucher_no,
@@ -253,7 +261,8 @@ def build_entries(
     )
 
     entries: list[EntryRow] = []
-    for voucher_no, claim in enumerate(ordered, start=1):
+    for offset, claim in enumerate(ordered):
+        voucher_no = config.voucher.number_start + offset
         voucher_date = basis_date(claim, config.scope.date_basis)
         if voucher_date is None:
             # 校验层（validate_claims）应先于本函数拦住这种情况；这里纵深防御，
@@ -318,6 +327,7 @@ def build_entries(
                     preparer=preparer,
                     business_no=claim.claim_no,
                     attachment_count=attachment_count,
+                    department_name=line.department_name,
                     **_aux_fields(line, config),
                 )
             )

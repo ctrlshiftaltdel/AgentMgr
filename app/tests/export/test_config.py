@@ -145,6 +145,9 @@ scopes = ["company"]
     assert config.tax.split == "none"
     assert config.tax.account_code is None
     assert config.auxiliary.mode == "none"
+    assert config.auxiliary.named_columns == {}
+    assert config.voucher.number_mode == "sequential"
+    assert config.voucher.number_start == 1
     assert config.invoice_policy.on_verified_fail == "fail"
     assert config.invoice_policy.on_suspected_duplicate == "fail"
     assert config.invoice_policy.attachment_count_basis == "invoices"
@@ -331,8 +334,13 @@ def test_error_message_does_not_echo_values(tmp_path: Path) -> None:
 def test_repository_example_config_loads(tmp_path: Path) -> None:
     """``config/ajaimgr.example.toml`` 必须能被真实装载器解析（文档即契约）。"""
     config = load_export_config(REPO_ROOT / "config" / "ajaimgr.example.toml")
-    assert config.template.layout == "entry_rows"
-    assert config.template.worksheet == "录入数据"
+    # Issue #71：示例默认切到新模板布局「凭证模版」（25 列）；旧布局保留为回退。
+    assert config.template.layout == "voucher_template"
+    assert config.template.worksheet == "凭证模版"
+    assert config.voucher.number_mode == "sequential"
+    assert config.voucher.number_start == 1
+    assert config.auxiliary.named_columns["部门"].source == "department"
+    assert config.auxiliary.named_columns["供应商"].source == "blank"
     assert config.tax.split == "none"
     assert config.scope.statuses == ("paid",)
 

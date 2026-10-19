@@ -55,6 +55,7 @@ __all__ = [
     "DEFAULT_CONFIG_PATH",
     "KNOWN_SCOPES",
     "SUPPORTED_LAYOUTS",
+    "VOUCHER_TEMPLATE_NAMED_COLUMNS",
     "AccountsConfig",
     "AuxiliaryConfig",
     "CreditAccount",
@@ -62,6 +63,7 @@ __all__ = [
     "CurrencyConfig",
     "ExportConfig",
     "InvoicePolicyConfig",
+    "NamedColumn",
     "PermissionsConfig",
     "ScopeConfig",
     "SummaryConfig",
@@ -79,7 +81,10 @@ CONFIG_PATH_ENV = "AJAIMGR_CONFIG_FILE"
 DEFAULT_CONFIG_PATH = "config/ajaimgr.toml"
 
 #: 本实现支持的布局（扩展点：后续可加 ``pz`` 等，不得静默降级）。
-SUPPORTED_LAYOUTS = frozenset({"entry_rows"})
+#:
+#: * ``entry_rows`` —— 旧模板 ``录入数据`` 31 列（历史/回退布局，Issue #53）；
+#: * ``voucher_template`` —— 新模板 ``凭证模版`` 25 列（Issue #71，示例默认）。
+SUPPORTED_LAYOUTS = frozenset({"entry_rows", "voucher_template"})
 
 #: ``expense_claims.status`` 的合法取值（与 ``app.expense.models`` 的 CHECK 一致）。
 CLAIM_STATUSES = frozenset(
@@ -117,6 +122,40 @@ _TAX_SPLIT_MODES = frozenset({"none", "all", "categories"})
 _DATE_BASES = frozenset({"expense_date", "paid_at"})
 _AUX_MODES = frozenset({"none", "department", "department_counterparty"})
 
+#: 凭证号模式（Issue #71，D5 延伸）：
+#:
+#: * ``sequential`` —— 按确定性顺序从 ``number_start`` 起连续编号；
+#: * ``blank``      —— **留空**凭证号（由会计系统导入时自行分配）。
+_VOUCHER_NUMBER_MODES = frozenset({"sequential", "blank"})
+
+#: ``voucher_template`` 布局的**命名辅助核算列**（表头名；见
+#: ``docs/export-templates/voucher-template-structure.json`` 的 K–T 列）。
+#:
+#: 本集合必须与 :data:`app.export.template.VOUCHER_TEMPLATE_HEADERS` 的第 11–20 项
+#: 逐字一致（``test_voucher_layout`` 中有防漂移断言）；此处独立定义以避免
+#: ``config`` → ``template`` 的导入环。
+VOUCHER_TEMPLATE_NAMED_COLUMNS = frozenset(
+    {
+        "客户",
+        "供应商",
+        "职员",
+        "项目",
+        "部门",
+        "存货",
+        "自定义辅助核算类别",
+        "自定义辅助核算编码",
+        "自定义辅助核算类别1",
+        "自定义辅助核算编码1",
+    }
+)
+
+#: 命名辅助核算列的取值口径：
+#:
+#: * ``blank``      —— **安全默认**：明确留空（无权威数据源）；
+#: * ``department`` —— 取该分录所属员工部门的名称（本系统唯一有权威来源的辅助核算）；
+#: * ``literal``    —— 写固定文本（需同时给 ``value``；会计口径由部署方给定）。
+_NAMED_COLUMN_SOURCES = frozenset({"blank", "department", "literal"})
+
 
 # --- 配置数据模型（全部 frozen） ----------------------------------------------
 
@@ -143,11 +182,15 @@ class ScopeConfig:
 
 @dataclass(frozen=True)
 class VoucherConfig:
-    """凭证字与制单人（D5 / D12.5）。"""
+    """凭证字、凭证号模式与制单人（D5 / D12.5 / Issue #71）。"""
 
     voucher_word: str
     preparer: str
     preparer_literal: str | None = None
+    #: 凭证号模式：``sequential``（默认，从 ``number_start`` 连续编号）/ ``blank``。
+    number_mode: str = "sequential"
+    #: 首个凭证号（``number_mode = "sequential"`` 时生效；默认 1）。
+    number_start: int = 1
 
 
 @dataclass(frozen=True)
@@ -213,14 +256,32 @@ class CurrencyConfig:
 
 
 @dataclass(frozen=True)
+class NamedColumn:
+    """一个命名辅助核算列的取值口径（Issue #71；``voucher_template`` 布局）。
+
+    ``source`` 取 ``blank`` / ``department`` / ``literal``；仅 ``literal`` 携带
+    ``value``（固定文本）。
+    """
+
+    source: str
+    value: str | None = None
+
+
+@dataclass(frozen=True)
 class AuxiliaryConfig:
-    """辅助核算输出口径（D8）。"""
+    """辅助核算输出口径（D8 / Issue #71）。
+
+    ``mode`` 控制**旧布局**的辅助核算槽（A–D 组类别/代码/名称）；``named_columns``
+    控制**新布局**的命名辅助核算列（客户/供应商/…/部门）。两者独立，互不覆盖。
+    """
 
     mode: str = "none"
     department_class: str | None = None
     counterparty_class: str | None = None
     counterparty_code: str | None = None
     counterparty_name: str | None = None
+    #: 命名辅助核算列（键 = 表头名，取值见 :data:`VOUCHER_TEMPLATE_NAMED_COLUMNS`）。
+    named_columns: Mapping[str, NamedColumn] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -362,6 +423,22 @@ def _enum(value: str, allowed: frozenset[str], *, where: str) -> str:
     return value
 
 
+def _optional_int(
+    table: Mapping[str, Any], key: str, *, where: str, minimum: int, default: int
+) -> int:
+    """可选整数（缺省用 ``default``；出现但取值非法仍然报错）。"""
+    value = table.get(key)
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise _fail(CODE_CONFIG_INVALID, f"config key '{where}' must be an integer")
+    if value < minimum:
+        raise _fail(
+            CODE_CONFIG_INVALID, f"config key '{where}' must be >= {minimum}"
+        )
+    return value
+
+
 def _reject_secret_keys(node: Any, *, where: str) -> None:
     """拒绝任何看起来像凭据的配置键（配置文件不得承载凭据）。"""
     if isinstance(node, Mapping):
@@ -474,6 +551,15 @@ def _parse_voucher(data: Mapping[str, Any]) -> VoucherConfig:
         voucher_word=_require_str(table, "voucher_word", where="voucher.voucher_word"),
         preparer=preparer,
         preparer_literal=literal,
+        number_mode=_enum(
+            _optional_str(table, "number_mode", where="voucher.number_mode")
+            or "sequential",
+            _VOUCHER_NUMBER_MODES,
+            where="voucher.number_mode",
+        ),
+        number_start=_optional_int(
+            table, "number_start", where="voucher.number_start", minimum=1, default=1
+        ),
     )
 
 
@@ -608,6 +694,50 @@ def _parse_currency(data: Mapping[str, Any]) -> CurrencyConfig:
     )
 
 
+def _parse_named_columns(table: Mapping[str, Any]) -> dict[str, NamedColumn]:
+    """解析 ``[auxiliary.named_columns]``（Issue #71；键 = 表头名）。
+
+    非法一律 fail closed：未知列名 / 未知 ``source`` / ``literal`` 缺 ``value`` /
+    非 ``literal`` 却给了 ``value``。
+    """
+    raw = table.get("named_columns")
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping):
+        raise _fail(
+            CODE_CONFIG_INVALID, "config key 'auxiliary.named_columns' must be a table"
+        )
+    result: dict[str, NamedColumn] = {}
+    for column, spec in raw.items():
+        where = f"auxiliary.named_columns.{column}"
+        if str(column) not in VOUCHER_TEMPLATE_NAMED_COLUMNS:
+            raise _fail(
+                CODE_CONFIG_INVALID,
+                f"config key '{where}' is not a named auxiliary column of the "
+                "'voucher_template' layout",
+            )
+        if not isinstance(spec, Mapping):
+            raise _fail(CODE_CONFIG_INVALID, f"config key '{where}' must be a table")
+        source = _enum(
+            _require_str(spec, "source", where=f"{where}.source"),
+            _NAMED_COLUMN_SOURCES,
+            where=f"{where}.source",
+        )
+        value = _optional_str(spec, "value", where=f"{where}.value")
+        if source == "literal" and value is None:
+            raise _fail(
+                CODE_CONFIG_MISSING_KEYS,
+                f"config key '{where}.value' is required when 'source' = 'literal'",
+            )
+        if source != "literal" and value is not None:
+            raise _fail(
+                CODE_CONFIG_INVALID,
+                f"config key '{where}.value' is only allowed when 'source' = 'literal'",
+            )
+        result[str(column)] = NamedColumn(source=source, value=value)
+    return result
+
+
 def _parse_auxiliary(data: Mapping[str, Any]) -> AuxiliaryConfig:
     table = data.get("auxiliary")
     if table is None:
@@ -651,6 +781,7 @@ def _parse_auxiliary(data: Mapping[str, Any]) -> AuxiliaryConfig:
         counterparty_class=counterparty_class,
         counterparty_code=counterparty_code,
         counterparty_name=counterparty_name,
+        named_columns=_parse_named_columns(table),
     )
 
 
