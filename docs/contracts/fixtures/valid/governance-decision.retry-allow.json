@@ -5,6 +5,7 @@
   "decision_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
   "canonicalization": "rfc8785_jcs",
   "decision_type": "allow",
+  "decision_purpose": "retry",
   "reason_codes": [
     "policy_allowed"
   ],

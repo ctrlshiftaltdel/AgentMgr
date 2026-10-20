@@ -60,6 +60,11 @@
       ],
       "description": "冻结的七种决策类型。allow / managed_execution_required 是授权型决策，必须绑定已存在任务；pre_evaluation 是任务创建前的非授权评估，不得签发 Grant；其余类型均不得直接执行有副作用的动作。"
     },
+    "decision_purpose": {
+      "type": "string",
+      "enum": ["initial_execution", "retry"],
+      "description": "授权目的。授权型决策（allow / managed_execution_required）必须声明：首次授权为 initial_execution，T65 有界重试为 retry。retry 决策必须 decision_revision>=2 且 supersedes_decision_id 非空；Grant 的 decision.decision_purpose 必须与本字段一致（S-08）。"
+    },
     "reason_codes": {
       "type": "array",
       "minItems": 1,
@@ -1246,6 +1251,29 @@
             }
           }
         }
+      }
+    },
+    {
+      "if": {
+        "properties": {"decision_type": {"enum": ["allow", "managed_execution_required"]}},
+        "required": ["decision_type"]
+      },
+      "then": {
+        "required": ["decision_purpose"]
+      },
+      "description": "授权型决策必须声明 decision_purpose，供 T65 重试验证与审计区分首次执行与重试。"
+    },
+    {
+      "if": {
+        "properties": {"decision_purpose": {"const": "retry"}},
+        "required": ["decision_purpose"]
+      },
+      "then": {
+        "properties": {
+          "decision_revision": {"minimum": 2},
+          "supersedes_decision_id": {"type": "string"}
+        },
+        "description": "retry 决策必须是新评估（revision>=2）并明确替代旧决策；不得把 revision=1 或未替代任何决策的记录当作重试授权。"
       }
     },
     {

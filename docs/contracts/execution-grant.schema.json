@@ -631,7 +631,7 @@
         "retry_decision_id",
         "retry_budget_remaining"
       ],
-      "description": "执行尝试与重试预算。attempt 指“已开始的执行尝试”（task.status.attempt 只在 dispatch.accepted 时递增，首次 queued 的状态为 attempt=0）；Grant 的 attempt.number 是**本 Grant 授权的那次尝试序号**：签发时为 task.status.attempt + 1，dispatch.accepted 后与 status.attempt 相等。failed 是尝试终态；只有 attempt>=1、attempt < max_attempts 且 retry_budget_remaining > 0 时才允许 T65 重试，进入 T65 时递减 retry_budget_remaining，重试必须携带新的决策（revision 递增、purpose=retry）与新的 Grant。attempt=0 的失败不消耗重试预算，也不能走 T65。number>=2 必须 is_retry=true；is_retry=true 必须 number>=2、retry_decision_id 非空且 retry_budget_remaining>=1。number<=max_attempts 由服务端比较（Schema 无法跨字段比较）。",
+      "description": "执行尝试与重试预算。attempt 指“已开始的执行尝试”（task.status.attempt 只在 dispatch.accepted 时递增，首次 queued 的状态为 attempt=0）；Grant 的 attempt.number 是**本 Grant 授权的那次尝试序号**：签发时为 task.status.attempt + 1，dispatch.accepted 后与 status.attempt 相等。failed 是尝试终态；只有 attempt>=1、attempt < max_attempts 且 retry_budget_remaining > 0 时才允许 T65 重试，进入 T65 时递减 retry_budget_remaining，重试必须携带新的决策（revision 递增、purpose=retry）与新的 Grant。attempt=0 的失败不消耗重试预算，也不能走 T65。number>=2 必须 is_retry=true；is_retry=true 必须 number>=2、retry_decision_id 非空。retry_budget_remaining 是**本次重试授权（T65 递减）后的余额**，因此最后一次允许的重试为 0；进入 T65 前必须 >0。number<=max_attempts 由服务端比较（Schema 无法跨字段比较）。",
       "properties": {
         "number": {
           "type": "integer",
@@ -659,7 +659,8 @@
         "retry_budget_remaining": {
           "type": "integer",
           "minimum": 0,
-          "maximum": 100
+          "maximum": 100,
+          "description": "本次重试授权（T65 递减）后的剩余重试预算。最后一次允许的重试为 0；签发重试 Grant 前必须 >0，因此 0 是合法且可表示的终值，不得要求 >=1。"
         }
       }
     },
@@ -1119,11 +1120,11 @@
               "number": {"minimum": 2},
               "retry_of_attempt": {"type": "integer"},
               "retry_decision_id": {"type": "string"},
-              "retry_budget_remaining": {"minimum": 1}
+              "retry_budget_remaining": {"minimum": 0}
             }
           }
         },
-        "description": "重试 Grant 必须引用新的、revision>=2 的 retry 决策，且剩余重试预算 >0；不得复用尝试 1 的决策/Grant。"
+        "description": "重试 Grant 必须引用新的、revision>=2 的 retry 决策。retry_budget_remaining 是本次重试授权后的余额，最后一次允许的重试为 0；只有进入 T65 前的余额必须 >0。不得复用尝试 1 的决策/Grant。"
       }
     },
     {

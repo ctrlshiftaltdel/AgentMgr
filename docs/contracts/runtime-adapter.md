@@ -378,6 +378,13 @@ Adapter 把外部状态映射为内部事实；核心再把这些事实映射为
 
 同一个外部状态在不同运行时可能含义不同；Adapter 必须按本表显式映射，不能把供应商状态字符串直接透传给核心。Adapter 的 `get_status.state` 与 `get_result.outcome` 枚举必须与本节及状态机一致；新增枚举值必须升次版本并同步 fixtures。
 
+**`needs_human` 之后的恢复语义（T61）。** Adapter 只报告事实，不决定恢复路径：
+
+- **尝试仍未关闭。** 进入 `unknown` 只撤销 Grant，不关闭正在进行的尝试；进入 `needs_human` 也不关闭它。尝试只有在取得停止证据（`execution.stopped` / `execution.failed` / `execution.timed_out` 且 `stop_confirmed=true`）、`reconcile.stopped`/`failed`/`timed_out`/`not_found`，或执行结束后的 `verification.failed` 时才关闭。未关闭且无 `not_found` 证据的尝试是**未对账的 active attempt**。
+- **`unknown` 来源的 `needs_human` 禁止 T59/T60。** 该状态的 Grant 已 `revoked`；Adapter 即使查询到 `state=running` 或拿到结果，也不得映射为 `running`/`verifying`（状态机 F41）。Adapter 必须先 `cancel_task` 并取得 `stop_confirmed=true`，再由核心按 T61/T62/T63/T64/T70 处理。
+- **T61 重派需要停止证据或“从未开始”证明。** 只有当 `stop_confirmed=true`（已关闭尝试），或 Adapter 能按幂等键证明从未受理（`attempt=0` 且 `not_found` + 无副作用保证）时，核心才允许 T61；否则不得重新入队，只能继续对账或转人工。
+- **重试预算的余额在 T65 递减后记录。** Adapter 不解释预算，只透传核心写入的 `attempt.retry_budget_remaining`；最后一次允许的重试该值为 0。
+
 ## 5. 超时、重试与幂等
 
 ### 5.1 提交超时
@@ -388,7 +395,7 @@ Adapter 把外部状态映射为内部事实；核心再把这些事实映射为
 2. 先调用 `find_by_idempotency_key(task_id, grant_id, idempotency_key)`；若已获得 `runtime_task_id`，同时调用 `get_status`。
 3. 找到任务：采用该任务，按实际事实更新；即使 payload 相同也不得再创建第二个执行任务。
 4. 明确不存在且执行边界出具无副作用保证、且任务 `attempt=0`：只能经 T71（`reconcile.not_found` → `queued`）重新执行 PDP、签发新决策与新 Grant 后提交；不得直接重发。`attempt>=1` 或无法取得该保证时经 T55 进入 `failed`，再由 T65 决定是否重试（`attempt=0` 时只能 T70 转人工）。
-5. 无法确定：状态 `unknown`，进入有界对账；进入时立即撤销 Grant。超过阈值转 `needs_human`。
+5. 无法确定：状态 `unknown`，进入有界对账；进入时立即撤销 Grant。超过阈值转 `needs_human`（该来源的 T59/T60 不可用，F41；只能先停止取证再 T61，或 T62/T63/T64/T70）。
 6. 同键不同 payload：`conflict`，进入 `needs_human` 对账，不得覆盖或重发。
 7. **不得从 `unknown` 恢复执行。** 若对账发现运行时仍在运行，必须先 `cancel_task` 并取得 `stop_confirmed=true`；停止未确认时保持 `unknown`/`needs_human`，不得把 `state=running` 直接映射回核心 `running`。
 

@@ -5,6 +5,7 @@
   "decision_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
   "canonicalization": "rfc8785_jcs",
   "decision_type": "managed_execution_required",
+  "decision_purpose": "initial_execution",
   "reason_codes": [
     "managed_execution_required"
   ],

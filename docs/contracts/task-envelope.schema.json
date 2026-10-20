@@ -3,7 +3,7 @@
   "$id": "https://schemas.example.com/agentmgr/task-envelope/1.0.0",
   "$comment": "$id uses the reserved example.com namespace as an offline placeholder. Implementations must not resolve it over the network and must pin the contract bundle SHA-256 instead of fetching the schema.",
   "title": "AgentMgr Task Envelope",
-  "description": "任务请求与任务记录的统一契约，契约版本 1.0.0（尚未冻结发布的候选版本）。本文件用 oneOf 区分两个形状：clientTaskRequest 只包含客户端可提供的字段；taskRecord 只包含服务端权威字段。客户端无法构造合法记录，服务端也不接受客户端自报的身份、责任、审批、授权或状态。priority 只影响调度，不提升权限。完成定义必须是结构化、可机器判定的标准；payload 哈希使用 RFC 8785 JCS（见 task-state-machine.md §16）。记录完整性由 record_completeness 显式标记：只有执行前退出（draft/awaiting_clarification 或 early denied/cancelled/needs_human/failed）可以是 pre_execution_incomplete，且不得关联 Grant；执行开始与执行后状态必须完整。任务终态与 unknown 不得保留可用 Grant；unknown 必须立即撤销 Grant，且撤销后的 Grant 永不复用。attempt 只在 dispatch.accepted 时递增，首次 queued 为 0。queued/dispatched/running/verifying/awaiting_* 要求 Owner 已解析且 active；终态/历史记录允许 Owner 已停用，但必须带 owner_escalation。",
+  "description": "任务请求与任务记录的统一契约，契约版本 1.0.0（尚未冻结发布的候选版本）。本文件用 oneOf 区分两个形状：clientTaskRequest 只包含客户端可提供的字段；taskRecord 只包含服务端权威字段。客户端无法构造合法记录，服务端也不接受客户端自报的身份、责任、审批、授权或状态。priority 只影响调度，不提升权限。完成定义必须是结构化、可机器判定的标准；payload 哈希使用 RFC 8785 JCS（见 task-state-machine.md §16）。记录完整性由 record_completeness 显式标记：只有执行前退出（draft/awaiting_clarification 或 early denied/cancelled/needs_human/failed）可以是 pre_execution_incomplete，且不得关联 Grant；执行开始与执行后状态必须完整。任务终态与 unknown 不得保留可用 Grant；unknown 必须立即撤销 Grant，且撤销后的 Grant 永不复用。attempt 只在 dispatch.accepted 时递增，首次 queued 为 0；queued 且 attempt>=1 必须带停止证据（T61/T65 重新入队前必须关闭上一尝试）。queued/dispatched/running/verifying 与 awaiting_confirmation/awaiting_approval 要求 Owner 已解析且 active；终态/历史记录允许 Owner 已解析但 disabled/unbound/unknown，但必须带 owner_escalation。",
   "oneOf": [
     {"$ref": "#/$defs/clientTaskRequest"},
     {"$ref": "#/$defs/taskRecord"}
@@ -810,7 +810,7 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 100,
-          "description": "剩余可重试次数。T65 要求 attempt>=1 且 >0，并在进入 T65 时递减 1，且必须重新评估并签发新 Grant。attempt=0 的预派发失败不消耗本预算。"
+          "description": "剩余可重试次数（**T65 递减后的余额**）。T65 进入条件要求递减前 >0；进入 T65 时原子递减 1，因此最后一次允许的重试在授权后本字段为 0，且 Grant.attempt.retry_budget_remaining 也记录 0。attempt=0 的预派发失败不消耗本预算。T61 人工重派只要求本字段 >0，不执行 T65 的自动递减（见 §6.13）。"
         }
       }
     },
@@ -1334,10 +1334,11 @@
         "required": ["envelope_kind", "accountable_owner"]
       },
       "then": {
+        "required": ["owner_escalation"],
         "properties": {
-          "owner_escalation": {"type": "object"}
+          "owner_escalation": {"$ref": "#/$defs/ownerEscalation"}
         },
-        "description": "R4：已解析但已停用/解绑/状态未知的 Owner 不得静默存在；记录必须带 owner_escalation 原因。"
+        "description": "R4：已解析但已停用/解绑/状态未知的 Owner 不得静默存在；记录必须带完整的 owner_escalation（reason_code、recorded_at、escalated_to_principal_id），仅声明字段类型不够。"
       }
     },
     {
@@ -1469,7 +1470,7 @@
       "if": {
         "properties": {
           "envelope_kind": {"const": "record"},
-          "status": {"properties": {"state": {"enum": ["queued", "dispatched", "running", "verifying", "succeeded", "partial_success"]}}, "required": ["state"]}
+          "status": {"properties": {"state": {"enum": ["queued", "dispatched", "running", "verifying"]}}, "required": ["state"]}
         },
         "required": ["envelope_kind", "status"]
       },
@@ -1483,7 +1484,7 @@
           "decision": {"type": "object", "properties": {"decision_type": {"enum": ["allow", "managed_execution_required"]}}},
           "linkage": {"properties": {"grant_id": {"type": "string"}}}
         },
-        "description": "R4：queued/dispatched/running/verifying/succeeded/partial_success 要求 Owner 已解析且 active；不得用 owner_escalation 掩盖执行中 Owner 失效，必须先按状态机转 failed/cancelled，再带升级标记。"
+        "description": "R4：执行中/排队中的记录（queued/dispatched/running/verifying）要求 Owner 已解析且 active，且不得用 owner_escalation 掩盖失效 Owner；必须先按状态机转 failed/cancelled。终态/历史记录不在此列：允许 Owner 已解析但 disabled/unbound/unknown，但必须带 owner_escalation（见 owner 非 active 分支）。"
       }
     },
     {
@@ -1498,6 +1499,21 @@
         "properties": {
           "resource_scope": {"properties": {"scope_type": {"enum": ["none", "self", "department", "company", "approval_chain", "project", "record_set", "connector"]}}}
         }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "envelope_kind": {"const": "record"},
+          "status": {"properties": {"state": {"const": "queued"}, "attempt": {"minimum": 1}}, "required": ["state", "attempt"]}
+        },
+        "required": ["envelope_kind", "status"]
+      },
+      "then": {
+        "properties": {
+          "result": {"properties": {"stop_confirmed": {"const": true}}}
+        },
+        "description": "T61：queued 且 attempt>=1 表示这是 T33/T61/T65 的再次入队，之前必然存在一次已受理尝试。必须先关闭该尝试：result.stop_confirmed=true（停止证据），否则不得重新入队。attempt=0 的 queued 是首次入队或 T71（从未 dispatch.accepted），不需要停止证据。"
       }
     },
     {
@@ -1759,8 +1775,10 @@
       },
       "then": {
         "properties": {
-          "accountable_owner": {"properties": {"resolution": {"const": "server_resolved"}, "principal_id": {"type": "string"}, "account_status": {"const": "active"}}}
-        }
+          "accountable_owner": {"properties": {"resolution": {"const": "server_resolved"}, "principal_id": {"type": "string"}, "account_status": {"const": "active"}}},
+          "owner_escalation": {"const": null}
+        },
+        "description": "R4：awaiting_confirmation/awaiting_approval 是执行前门禁状态，仍要求 Owner 已解析且 active，且不得携带 owner_escalation；Owner 失效必须转 needs_human/cancelled，而不是继续等待。awaiting_clarification 按 A1 属于执行前不完整记录，Owner 可暂未解析。"
       }
     },
     {

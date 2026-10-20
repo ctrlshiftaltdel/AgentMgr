@@ -253,7 +253,7 @@
 
 - **威胁/风险**：重试或重派时复用旧 `decision_id`/`decision_hash`，或使用已过期、基于旧 `task_revision` 的决策签发新 Grant，绕过新的审批/确认/范围检查。
 - **受影响边界**：B1/B2/B4。
-- **缓解**：授权型决策必须绑定当前 `task_id`/`task_revision`；`decision_revision` 单调递增；`decision.decision_hash` 与 `task_revision` 进入 Grant 的 `revalidation`/`binding`；T65/T61 必须重新执行 PDP 并签发新 Grant；`decision.freshness` 固定 `fresh_evaluation`；PEP 比较 `decision.expires_at` 与当前时间；`attempt` 只在 `dispatch.accepted` 递增，首次 `queued` 为 0，T65 要求 `attempt>=1` 并递减 `retry_budget_remaining`。
+- **缓解**：授权型决策必须绑定当前 `task_id`/`task_revision`；`decision_revision` 单调递增；`decision.decision_hash` 与 `task_revision` 进入 Grant 的 `revalidation`/`binding`；T65/T61 必须重新执行 PDP 并签发新 Grant；`decision.freshness` 固定 `fresh_evaluation`；PEP 比较 `decision.expires_at` 与当前时间；`attempt` 只在 `dispatch.accepted` 递增，首次 `queued` 为 0，T65 要求 `attempt>=1` 且进入前 `retry_budget_remaining>0`，递减后的余额可为 0；T61 另需 `stop_confirmed=true` 或证明从未开始，且不得存在未对账的 active attempt。
 - **负向测试**：用已过期决策或旧 revision 签发 Grant；断言 `decision_expired`/`decision_revision_stale`、`task.retry_authorized` 未发生、无新 Grant；重试使用旧 Grant 断言 `replay_detected`；`decision.freshness` 非 `fresh_evaluation` 断言 schema 拒绝；`attempt=0` 的失败尝试 T65 断言拒绝且预算不变；`attempt>=1` 的 T65 断言预算减 1。
 - **剩余风险**：决策存储与任务存储的一致性、时钟偏差；需要事务与 NTP 监控。
 - **状态**：`设计（未实现）`。

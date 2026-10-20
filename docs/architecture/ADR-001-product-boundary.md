@@ -67,9 +67,9 @@ AgentMgr **不负责**：
 
 **`unknown` 必须 fail-closed。** 不存在 `unknown → running` / `unknown → verifying`（原 T53/T54 已撤销）。恢复只能通过：`unknown → queued`（T71，`attempt=0` + 无副作用证据 + 新决策 + 新 Grant）、`unknown → failed`（T55）后经 T65 有界重试、或 `unknown → cancelled`/`needs_human`/`timed_out` 终止/人工接管。若执行边界实际仍在运行，必须先停止并取得停止证据；不得直接恢复执行。
 
-**`attempt` 只统计已开始的执行。** 首次 `queued` 的 `attempt=0`；只在 `dispatch.accepted` 递增。预派发失败（`attempt=0`）不消耗 `retry_budget_remaining`，也不能走 T65；`attempt=0` 的人工失败必须登记为 `cancelled` 或 `denied`。T65 要求 `attempt>=1` 并递减重试预算。
+**`attempt` 只统计已开始的执行。** 首次 `queued` 的 `attempt=0`；只在 `dispatch.accepted` 递增。预派发失败（`attempt=0`）不消耗 `retry_budget_remaining`，也不能走 T65；`attempt=0` 的人工失败必须登记为 `cancelled` 或 `denied`。T65 要求 `attempt>=1` 且进入前 `retry_budget_remaining>0`，进入时递减 1；递减后的余额可为 0（最后一次允许的重试），Grant 的 `attempt.retry_budget_remaining` 记录同一余额。`unknown`/`needs_human` 不关闭尝试；T61 必须已有 `stop_confirmed=true` 或证明从未开始，且不得存在未对账的 active attempt。
 
-**Owner 停用必须显式升级。** `queued`/`dispatched`/`running`/`verifying`/`awaiting_confirmation`/`awaiting_approval` 要求 Owner 已解析且 `active`；终态/历史记录允许 Owner 已解析但 `disabled`/`unbound`，但必须带 `owner_escalation`（原因、时间、接管/通知主体），不得静默允许。`awaiting_clarification` 按 A1 仍可未解析，但离开该状态前必须解析并校验。
+**Owner 停用必须显式升级。** `queued`/`dispatched`/`running`/`verifying`/`awaiting_confirmation`/`awaiting_approval` 要求 Owner 已解析且 `active`，且不得携带 `owner_escalation`；终态/历史记录（含 `succeeded`/`partial_success`）允许 Owner 已解析但 `disabled`/`unbound`/`unknown`，但必须带完整 `owner_escalation`（原因、时间、接管/通知主体），Schema 已将其设为条件必填。`awaiting_clarification` 按 A1 仍可未解析，但离开该状态前必须解析并校验。
 
 ### 2.3 信任边界
 
@@ -208,7 +208,7 @@ MVP 在**一个可独立部署的服务**内按领域分层：身份、策略、
 本 ADR 的契约由以下可执行证据支撑（Phase 0 仅验证文档/契约，不声称产品能力已实现）：
 
 - 三个 JSON Schema 通过 JSON Schema 2020-12 元 schema 校验，且每个 schema 的合法/非法 fixtures 全部可验证；
-- 状态机逐条列出 72 条有效允许转换（T00–T73，T53/T54 已撤销）、F01–F40 禁止转换，并给出 Schema 无法表达的 S-01–S-18 服务端断言矩阵；
+- 状态机逐条列出 72 条有效允许转换（T00–T73，T53/T54 已撤销）、F01–F41 禁止转换，并给出 Schema 无法表达的 S-01–S-19 服务端断言矩阵；
 - 威胁模型至少 15 项（本版 30 项），覆盖身份、越权、审批、Grant、决策重放、模式混淆、完成检查、取消、绕行、凭据、审计等；
 - Runtime 能力以 `verified / partially_verified / unverified` 标注，并保留证据引用字段；
 - 契约包哈希包含三个 Schema、五份文档与全部 fixtures；候选必须固定完整哈希；
