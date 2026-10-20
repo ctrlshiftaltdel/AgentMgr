@@ -2,7 +2,7 @@
 
 - 版本：v2.0（架构定位修订草案）
 - 日期：2026-10-20（v2.0 架构定位修订草案）
-- 来源：templates/PLAN.md v2.1；架构目标以 docs/AGENTMGR_STANDALONE_PLATFORM_PLAN.md 为准
+- 来源：templates/PLAN.md v2.2；架构目标以 docs/AGENTMGR_STANDALONE_PLATFORM_PLAN.md 为准
 - 状态：架构目标按项目所有者 2026-10-20 的新方向修订；本版本包含尚待 Phase 0 冻结的治理服务方案，现有业务模块与财务导出边界继续有效
 
 ## v1.1 变更摘要（2026-10-17 所有者决定）
