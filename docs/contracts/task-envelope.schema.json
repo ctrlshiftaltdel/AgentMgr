@@ -1,0 +1,846 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.example.com/agentmgr/task-envelope/1.0.0",
+  "title": "AgentMgr Task Envelope",
+  "description": "任务请求/记录的统一结构化信封，契约版本 1.0.0。字段来源分两类：【服务端权威】只能由认证会话、身份目录、策略服务和任务存储解析，客户端/模型提交的同名字段必须忽略或复核后覆盖；【客户端提供，服务端复核】可来自调用方，但不构成身份、职权、审批或授权证明。priority 只影响调度，不提升权限。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "envelope_kind",
+    "task_id",
+    "idempotency_key",
+    "requester",
+    "accountable_owner",
+    "assignee",
+    "executor",
+    "approver",
+    "goal",
+    "priority",
+    "due_at",
+    "sla",
+    "execution_mode",
+    "requested_capabilities",
+    "resource_scope",
+    "policy_version",
+    "risk",
+    "confirmations",
+    "approvals",
+    "timestamps",
+    "status",
+    "linkage"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0.0",
+      "description": "本契约的主版本；破坏性变更必须升主版本。"
+    },
+    "envelope_kind": {
+      "type": "string",
+      "enum": ["request", "record"],
+      "description": "request 表示提交请求（task_id 必须为 null，由服务端在接受时分配）；record 表示持久化任务记录（task_id 必须已存在）。"
+    },
+    "task_id": {
+      "type": ["string", "null"],
+      "pattern": "^task_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$",
+      "description": "【服务端权威】任务 ID。request 中必须为 null；record 中必须非空。客户端提供的任务 ID 不得作为授权或幂等依据。"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "pattern": "^idem_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$",
+      "description": "【客户端提供，服务端复核】提交幂等键。服务端按已验证主体、操作类型与作用域绑定；重复键必须返回同一任务，不得重复产生副作用。"
+    },
+    "client_task_ref": {
+      "type": ["string", "null"],
+      "pattern": "^cref_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$",
+      "description": "【客户端提供，服务端复核】客户端本地引用，仅用于关联展示，不是权威 task_id，也不得用于授权。"
+    },
+    "requester": {
+      "$ref": "#/$defs/principalRef",
+      "description": "【服务端权威】任务发起者，必须由认证会话解析为 server_resolved。"
+    },
+    "accountable_owner": {
+      "$ref": "#/$defs/principalRef",
+      "description": "【服务端权威】对业务结果负责的人员或组织角色。不得用 Agent 名称、队列或运行时实例替代；resolution=pending 时任务必须处于 awaiting_clarification。"
+    },
+    "assignee": {
+      "$ref": "#/$defs/principalRef",
+      "description": "【服务端权威】负责推进工作的人员、Agent、角色或队列；可为 null 表示尚未分派。"
+    },
+    "executor": {
+      "$ref": "#/$defs/principalRef",
+      "description": "【服务端权威】实际执行者。runtime/agent_instance 只能作为 executor，不能替代 accountable_owner 或 approver。"
+    },
+    "approver": {
+      "$ref": "#/$defs/principalRef",
+      "description": "【服务端权威】具有独立审批权的主体；必须遵守职责分离，不得等于 requester 或 executor（除非策略显式允许且已记录风险）。"
+    },
+    "delegations": {
+      "type": "array",
+      "maxItems": 16,
+      "items": {
+        "$ref": "#/$defs/delegation"
+      },
+      "description": "【服务端权威】本任务依赖的有范围、有期限、可撤销委派。"
+    },
+    "goal": {
+      "$ref": "#/$defs/goal"
+    },
+    "priority": {
+      "$ref": "#/$defs/priority"
+    },
+    "due_at": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "【客户端提供，服务端复核】期望完成时间；不得用于扩大权限。"
+    },
+    "sla": {
+      "$ref": "#/$defs/sla"
+    },
+    "execution_mode": {
+      "type": "string",
+      "enum": [
+        "advisory",
+        "governed_resource_access",
+        "managed_execution",
+        "undetermined"
+      ],
+      "description": "【服务端权威】执行模式。undetermined 只允许出现在 draft/评估前；每个可执行任务、界面、API 与审计记录必须标明最终模式及剩余风险。"
+    },
+    "requested_capabilities": {
+      "type": "array",
+      "uniqueItems": true,
+      "maxItems": 64,
+      "items": {
+        "$ref": "#/$defs/capability"
+      },
+      "description": "【客户端提供，服务端复核】请求的能力类别及契约版本；请求不等于授权，服务端必须按策略重新判定。"
+    },
+    "resource_scope": {
+      "$ref": "#/$defs/resourceScope",
+      "description": "【服务端权威】实际资源范围；请求方可提出建议，但最终值必须由策略解析。"
+    },
+    "policy_version": {
+      "$ref": "#/$defs/policyVersion",
+      "description": "【服务端权威】评估任务时使用的策略版本与内容哈希。"
+    },
+    "risk": {
+      "$ref": "#/$defs/risk"
+    },
+    "requested_limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_calls", "max_runtime_seconds", "max_cost_units"],
+      "description": "【客户端提供，服务端复核】请求的预算上限；服务端只能收紧，不能因请求值更大而放宽策略上限。",
+      "properties": {
+        "max_calls": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100000
+        },
+        "max_runtime_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400
+        },
+        "max_cost_units": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100000000
+        }
+      }
+    },
+    "confirmations": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "$ref": "#/$defs/confirmation"
+      },
+      "description": "【服务端权威】确认记录。确认绑定规范化 payload hash、TTL 和一次性消费，不得由模型自报。"
+    },
+    "approvals": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "$ref": "#/$defs/approval"
+      },
+      "description": "【服务端权威】审批记录。approved 必须由独立 approver 作出并通过职责分离检查。"
+    },
+    "timestamps": {
+      "$ref": "#/$defs/timestamps"
+    },
+    "status": {
+      "$ref": "#/$defs/status"
+    },
+    "linkage": {
+      "$ref": "#/$defs/linkage"
+    },
+    "labels": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "maxLength": 128
+      },
+      "maxProperties": 16,
+      "description": "【客户端提供，服务端复核】非权威展示标签；不得包含凭据、个人数据或安全决策。"
+    }
+  },
+  "$defs": {
+    "principalRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["principal_id", "principal_type", "resolution", "account_status"],
+      "description": "身份引用。服务端解析后才可写入 resolution=server_resolved。",
+      "properties": {
+        "principal_id": {
+          "type": ["string", "null"],
+          "pattern": "^(prin|svc|role|queue|rt)_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$",
+          "description": "服务端主体 ID；resolution=pending 时可为 null。"
+        },
+        "principal_type": {
+          "type": "string",
+          "enum": ["person", "service", "role", "queue", "runtime", "agent_instance"]
+        },
+        "resolution": {
+          "type": "string",
+          "enum": ["server_resolved", "pending"],
+          "description": "server_resolved 表示来自可信身份目录；pending 表示尚未解析，不得据此授权。"
+        },
+        "account_status": {
+          "type": "string",
+          "enum": ["active", "disabled", "unbound", "unknown"],
+          "description": "服务端身份状态；disabled/unbound 不得被授权为 requester、owner、approver 或 executor。"
+        },
+        "role_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "maxItems": 32,
+          "items": {
+            "type": "string",
+            "pattern": "^role_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
+          }
+        },
+        "department_id": {
+          "type": ["string", "null"],
+          "pattern": "^dept_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
+        },
+        "service_identity_id": {
+          "type": ["string", "null"],
+          "pattern": "^svc_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
+        },
+        "delegation_ref": {
+          "type": ["string", "null"],
+          "pattern": "^dlg_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
+        }
+      }
+    },
+    "delegation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "delegation_id",
+        "delegator_principal_id",
+        "delegate_principal_id",
+        "not_before",
+        "expires_at",
+        "revoked",
+        "scope"
+      ],
+      "description": "【服务端权威】受限委派。",
+      "properties": {
+        "delegation_id": {
+          "type": "string",
+          "pattern": "^dlg_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
+        },
+        "delegator_principal_id": {
+          "type": "string",
+          "pattern": "^prin_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
+        },
+        "delegate_principal_id": {
+          "type": "string",
+          "pattern": "^prin_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
+        },
+        "not_before": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "expires_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "revoked": {
+          "type": "boolean"
+        },
+        "scope": {
+          "$ref": "#/$defs/resourceScope"
+        }
+      }
+    },
+    "goal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["summary", "success_criteria", "out_of_scope"],
+      "description": "结构化目标。模型可起草，但必须由服务端校验完整性与范围。",
+      "properties": {
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500,
+          "description": "【客户端提供，服务端复核】任务目标摘要。"
+        },
+        "success_criteria": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          },
+          "description": "可验证的完成定义；缺少时不得直接进入 queued。"
+        },
+        "required_inputs": {
+          "type": "array",
+          "maxItems": 50,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          }
+        },
+        "out_of_scope": {
+          "type": "array",
+          "maxItems": 50,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 300
+          },
+          "description": "明确排除的行为、资源或副作用。"
+        }
+      }
+    },
+    "priority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requested_level", "effective_level", "authority_effect"],
+      "description": "优先级只影响调度顺序、SLA 与升级，不改变安全决策。",
+      "properties": {
+        "requested_level": {
+          "type": "string",
+          "enum": ["low", "normal", "high", "urgent"],
+          "description": "【客户端提供，服务端复核】请求优先级。"
+        },
+        "effective_level": {
+          "type": "string",
+          "enum": ["low", "normal", "high", "urgent"],
+          "description": "【服务端权威】调度实际采用的优先级；高优先级仍不能覆盖 deny、审批、确认或资源范围。"
+        },
+        "authority_effect": {
+          "const": "scheduling_only",
+          "description": "固定值：优先级绝不授予能力、身份、审批权或数据范围。"
+        },
+        "rationale": {
+          "type": ["string", "null"],
+          "maxLength": 500,
+          "description": "【客户端提供，服务端复核】升级理由，仅供审计与排序解释。"
+        }
+      }
+    },
+    "sla": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["response_by", "complete_by", "escalation_after_minutes"],
+      "properties": {
+        "response_by": {
+          "type": ["string", "null"],
+          "format": "date-time"
+        },
+        "complete_by": {
+          "type": ["string", "null"],
+          "format": "date-time"
+        },
+        "escalation_after_minutes": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "maximum": 525600
+        }
+      }
+    },
+    "capability": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*@[0-9]+\\.[0-9]+\\.[0-9]+$",
+      "description": "能力名称 + 契约版本；能力本身不等于权限。"
+    },
+    "resourceScope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope_type", "resource_ids", "data_classifications"],
+      "properties": {
+        "scope_type": {
+          "type": "string",
+          "enum": [
+            "undetermined",
+            "none",
+            "self",
+            "department",
+            "approval_chain",
+            "project",
+            "record_set",
+            "connector"
+          ]
+        },
+        "resource_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "maxItems": 1000,
+          "items": {
+            "type": "string",
+            "pattern": "^res_[A-Za-z0-9][A-Za-z0-9_-]{2,95}$"
+          }
+        },
+        "connector_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "maxItems": 32,
+          "items": {
+            "type": "string",
+            "pattern": "^conn_[A-Za-z0-9][A-Za-z0-9_-]{2,63}$"
+          }
+        },
+        "data_classifications": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": ["public", "internal", "confidential", "restricted"]
+          }
+        },
+        "exclude_resource_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "maxItems": 1000,
+          "items": {
+            "type": "string",
+            "pattern": "^res_[A-Za-z0-9][A-Za-z0-9_-]{2,95}$"
+          }
+        }
+      }
+    },
+    "policyVersion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy_set_id", "version", "content_hash"],
+      "properties": {
+        "policy_set_id": {
+          "type": "string",
+          "pattern": "^polset_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
+        },
+        "version": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+        },
+        "content_hash": {
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        },
+        "effective_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "risk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["level", "source"],
+      "description": "【服务端权威】风险判定来自确定性策略或已批准的风险登记，不来自模型自评。",
+      "properties": {
+        "level": {
+          "type": "string",
+          "enum": ["low", "medium", "high", "critical"]
+        },
+        "score": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "maximum": 100
+        },
+        "source": {
+          "const": "server_policy"
+        }
+      }
+    },
+    "confirmation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "confirmation_id",
+        "payload_hash",
+        "purpose",
+        "issued_at",
+        "expires_at",
+        "consumed_at",
+        "status",
+        "confirmed_by_principal_id"
+      ],
+      "description": "确认记录；与审批不同，确认通常由受影响的用户对具体 payload 作出。",
+      "properties": {
+        "confirmation_id": {
+          "type": "string",
+          "pattern": "^conf_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
+        },
+        "payload_hash": {
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        },
+        "purpose": {
+          "type": "string",
+          "enum": [
+            "high_impact_action",
+            "data_release",
+            "irreversible_action",
+            "payload_change",
+            "manual_override"
+          ]
+        },
+        "issued_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "expires_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "consumed_at": {
+          "type": ["string", "null"],
+          "format": "date-time"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "satisfied", "consumed", "expired", "rejected"]
+        },
+        "confirmed_by_principal_id": {
+          "type": "string",
+          "pattern": "^prin_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
+        }
+      }
+    },
+    "approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "approval_id",
+        "approver_principal_id",
+        "payload_hash",
+        "decision",
+        "decided_at",
+        "expires_at",
+        "separation_check"
+      ],
+      "description": "审批记录；approved 必须由独立 approver 作出。",
+      "properties": {
+        "approval_id": {
+          "type": "string",
+          "pattern": "^appr_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
+        },
+        "approver_principal_id": {
+          "type": "string",
+          "pattern": "^prin_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
+        },
+        "payload_hash": {
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        },
+        "decision": {
+          "type": "string",
+          "enum": ["pending", "approved", "rejected", "expired", "revoked"]
+        },
+        "decided_at": {
+          "type": ["string", "null"],
+          "format": "date-time"
+        },
+        "expires_at": {
+          "type": ["string", "null"],
+          "format": "date-time"
+        },
+        "separation_check": {
+          "type": "string",
+          "enum": ["passed", "failed", "not_required"],
+          "description": "【服务端权威】职责分离检查结果。approved 且 failed 的记录非法。"
+        }
+      }
+    },
+    "timestamps": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["created_at", "updated_at", "submitted_at", "evaluated_at", "last_event_at"],
+      "properties": {
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "submitted_at": {
+          "type": ["string", "null"],
+          "format": "date-time"
+        },
+        "evaluated_at": {
+          "type": ["string", "null"],
+          "format": "date-time"
+        },
+        "last_event_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "status": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "state_revision", "last_event_id", "attempt"],
+      "properties": {
+        "state": {
+          "type": "string",
+          "enum": [
+            "draft",
+            "evaluated",
+            "awaiting_clarification",
+            "awaiting_confirmation",
+            "awaiting_approval",
+            "queued",
+            "dispatched",
+            "running",
+            "verifying",
+            "succeeded",
+            "denied",
+            "cancel_requested",
+            "cancelled",
+            "failed",
+            "timed_out",
+            "needs_human",
+            "partial_success",
+            "unknown"
+          ],
+          "description": "任务状态机中的状态；转换必须由服务端验证并写入 task event。"
+        },
+        "state_revision": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "单调递增的状态版本，用于乐观并发与过期授权检测。"
+        },
+        "last_event_id": {
+          "type": "string",
+          "pattern": "^evt_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
+        },
+        "attempt": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100,
+          "description": "执行尝试次数；重试必须受策略上限约束。"
+        }
+      }
+    },
+    "linkage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "grant_id",
+        "runtime_task_id",
+        "parent_task_id",
+        "supersedes_task_id",
+        "correlation_id"
+      ],
+      "properties": {
+        "grant_id": {
+          "type": ["string", "null"],
+          "pattern": "^grnt_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
+        },
+        "runtime_task_id": {
+          "type": ["string", "null"],
+          "pattern": "^rt_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$",
+          "description": "【服务端权威】运行时不透明句柄；核心业务不得解释其内部结构。"
+        },
+        "parent_task_id": {
+          "type": ["string", "null"],
+          "pattern": "^task_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
+        },
+        "supersedes_task_id": {
+          "type": ["string", "null"],
+          "pattern": "^task_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
+        },
+        "correlation_id": {
+          "type": "string",
+          "pattern": "^corr_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"envelope_kind": {"const": "request"}},
+        "required": ["envelope_kind"]
+      },
+      "then": {
+        "properties": {
+          "task_id": {"const": null}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"envelope_kind": {"const": "record"}},
+        "required": ["envelope_kind"]
+      },
+      "then": {
+        "properties": {
+          "task_id": {"type": "string"}
+        }
+      }
+    },
+    {
+      "properties": {
+        "requester": {
+          "properties": {"resolution": {"const": "server_resolved"}}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "accountable_owner": {
+            "properties": {"resolution": {"const": "pending"}}
+          }
+        },
+        "required": ["accountable_owner"]
+      },
+      "then": {
+        "properties": {
+          "status": {
+            "properties": {"state": {"const": "awaiting_clarification"}}
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "properties": {
+              "state": {
+                "enum": [
+                  "queued",
+                  "dispatched",
+                  "running",
+                  "verifying",
+                  "succeeded",
+                  "partial_success"
+                ]
+              }
+            }
+          }
+        },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "assignee": {
+            "properties": {"resolution": {"const": "server_resolved"}}
+          },
+          "executor": {
+            "properties": {"resolution": {"const": "server_resolved"}}
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {"properties": {"state": {"const": "awaiting_approval"}}}
+        },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "approver": {
+            "properties": {"resolution": {"const": "server_resolved"}}
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "resource_scope": {
+            "properties": {
+              "scope_type": {"enum": ["none", "undetermined"]}
+            }
+          }
+        },
+        "required": ["resource_scope"]
+      },
+      "then": {
+        "properties": {
+          "resource_scope": {
+            "properties": {
+              "resource_ids": {"maxItems": 0},
+              "connector_ids": {"maxItems": 0},
+              "data_classifications": {"maxItems": 0},
+              "exclude_resource_ids": {"maxItems": 0}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "envelope_kind": {"const": "record"},
+          "status": {
+            "properties": {
+              "state": {
+                "enum": [
+                  "queued",
+                  "dispatched",
+                  "running",
+                  "verifying",
+                  "succeeded",
+                  "partial_success"
+                ]
+              }
+            }
+          }
+        },
+        "required": ["envelope_kind", "status"]
+      },
+      "then": {
+        "properties": {
+          "execution_mode": {
+            "enum": ["advisory", "governed_resource_access", "managed_execution"]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "approvals": {
+          "items": {
+            "if": {
+              "properties": {"decision": {"const": "approved"}},
+              "required": ["decision"]
+            },
+            "then": {
+              "properties": {
+                "decided_at": {"type": "string"},
+                "separation_check": {"const": "passed"}
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}
