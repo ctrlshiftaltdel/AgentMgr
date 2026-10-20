@@ -229,7 +229,7 @@ T66–T69 与 Adapter 提交结果一一对应：`rejected → T66`、`unsupport
 | T30 | `dispatched` → `failed` | `execution.failed` | 执行边界明确失败且确认已停止；记录错误码；无未对账副作用 |
 | T31 | `dispatched` → `unknown` | `execution.lost` | 查询超阈值或状态矛盾；进入对账，不得重发 |
 | T32 | `dispatched` → `cancel_requested` | `task.cancel_requested` | 取消请求已登记；未确认停止 |
-| T33 | `dispatched` → `queued` | `worker.lease_expired` | 查询确认执行边界未受理、无副作用；重试预算未耗尽；幂等键已记录；`attempt` 不回退、`retry_budget_remaining` 不递减（本次受理未产生副作用） |
+| T33 | `dispatched` → `queued` | `worker.lease_expired` | 查询确认执行边界未受理、无副作用；幂等键已记录；**本次受理作废**：`attempt` 回退 1（该次受理从未开始执行，回到受理前的值），`retry_budget_remaining` 不递减，原 Grant 保持有效（其 `attempt.number` 仍等于回退后的 `attempt + 1`）。`attempt` 回退只允许发生在 T33，且必须记录作废事件与证据 |
 | T34 | `dispatched` → `timed_out` | `dispatch.deadline_exceeded` | 提交窗口截止，且查询明确无执行任务/无副作用；否则走 T31 |
 | T35 | `dispatched` → `needs_human` | `human.escalation_required` | 能力不支持或受理结果互相矛盾，无法自动判定 |
 
@@ -466,7 +466,7 @@ T66–T69 与 Adapter 提交结果一一对应：`rejected → T66`、`unsupport
 ## 13. 尝试与重试记账
 
 - **`attempt` 的定义。** `attempt` 是**已开始的执行尝试次数**：首次 `queued` 为 0，只在 `dispatch.accepted`（T23）递增。`dispatched`/`running`/`verifying`/`succeeded`/`partial_success` 必须 `attempt>=1`；`failed`/`cancelled`/`timed_out` 可因从未开始而为 0。
-- **预派发失败不消耗重试预算。** `queued → failed`（T28/T66）与 `dispatched → queued`（T33）发生在执行开始之前/未产生副作用时，`retry_budget_remaining` 不变，且 `attempt=0` 的 `failed` 只能经 T70 转人工。
+- **预派发失败不消耗重试预算。** `queued → failed`（T28/T66）不消耗 `retry_budget_remaining`，且 `attempt=0` 的 `failed` 只能经 T70 转人工。`dispatched → queued`（T33）作废一次从未开始执行的受理：`attempt` 回退 1、预算不变、原 Grant 继续有效；这是唯一允许 `attempt` 回退的转换，且必须有作废证据。
 - **`failed` 只在有界条件下经 T65 重试。** 必须 `attempt>=1` 且 `attempt < max_attempts` 且 `retry_budget_remaining>0`；**进入 T65 时递减 `retry_budget_remaining`（减 1）**。`attempt=0` 的失败不得走 T65。`denied`、`cancelled`、`timed_out`、`partial_success` 不得自动重试。`unknown` 必须先经 T71 或 T55 才能重新进入队列。
 - **重试必须有新决策与新 Grant。** `decision_revision` 递增且 >=2、`decision_purpose=retry`；不得复用旧决策或旧 Grant。Grant 的 `attempt.retry_decision_id` 必须指向该新决策，`attempt.number = status.attempt + 1`，`retry_of_attempt = status.attempt`。
 - **`attempt.number>=2` 与 `is_retry=true` 必须同时成立**；`is_retry=true` 必须 `retry_decision_id` 非空、`retry_budget_remaining>=1`。同时检查 `max_attempts`；耗尽时走 T70（`attempt.number<=max_attempts` 由服务端比较）。
@@ -613,7 +613,7 @@ JSON Schema 只能校验单实例结构与格式。下表断言必须在服务�
 | S-12 | `unknown → queued`（T71）必须有 `attempt=0`、`no_side_effect` 证据、新决策与新 `grant_id`，旧 Grant 为 `revoked`/`consumed`/`expired` | A3、R1、F36 |
 | S-13 | `separation_check` 由服务端依据 principal 身份计算，不接受客户端提交值；`role_` 审批人解析为实际行为人 | D3、R2、TH-01 |
 | S-14 | 已解析的任务级 `approver.principal_id` 必须等于授权 Grant 的 `approval_ref.approval_id` 所指向 `approvals[]` 条目的实际 `approver_principal_id`（角色审批人按解析后的行为人比较）；不相等即 fail closed | R2、D3、F18 |
-| S-15 | `attempt` 只在 `dispatch.accepted` 递增；首次 `queued` 为 0；`attempt=0` 的记录不得走 T65；T65 必须递减 `retry_budget_remaining`；`attempt=0` 的人工失败只允许 T62/T63 | R3、F39、§13 |
+| S-15 | `attempt` 只在 `dispatch.accepted` 递增；首次 `queued` 为 0；`attempt=0` 的记录不得走 T65；T65 必须递减 `retry_budget_remaining`；`attempt=0` 的人工失败只允许 T62/T63；仅 T33 可作废一次未开始执行的受理并回退 `attempt` | R3、F39、§13 |
 | S-16 | 已 `revoked` 的 Grant 是终态：不得改回 `active`，不得在 T71/T65 中复用；恢复必须使用新 `grant_id` + 新决策 | R1、F40、TH-06 |
 | S-17 | 闰年/闰秒与 RFC 3339 合法性由服务端复核（`2026-02-29` 能通过正则）；`format` 未启用时不得把结构校验当作日期合法证明 | §16.1、TH-26 |
 | S-18 | `queued`/`dispatched`/`running`/`verifying`/`awaiting_*` 的 Owner 必须已解析且 active；终态/历史记录的 disabled/unbound Owner 必须带 `owner_escalation` 原因 | R4、TH-02、TH-22 |
