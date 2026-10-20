@@ -1,6 +1,6 @@
 # AgentMgr
 
-面向企业的 **独立 Agent 治理与企业决策服务**。AgentMgr 管理任务必要性、优先级、责任归属、职权、可执行/禁止能力、确认与审批、执行边界及审计；WorkBuddy、Hermes、Rakazo、Codex、OpenCode 等已有 Agent 工具链由各自运行时提供，AgentMgr 不重复造轮子。项目继续承载现有企业业务模块（首期业务为报销），通过 MCP / REST 对外提供受控接口；Hermes 是兼容运行时之一，不再是产品硬依赖。
+面向企业的 **独立 Agent 治理与企业决策服务**。AgentMgr 管理任务必要性、优先级、责任归属、职权、可执行/禁止能力、确认与审批、执行边界及审计；WorkBuddy、Hermes、Rakazo、Codex、OpenCode 等已有 Agent 工具链由各自运行时提供，AgentMgr 不重复造轮子。项目继续承载现有企业业务模块（首期业务为报销），通过 MCP / REST 对外提供受控接口；Hermes 是现有兼容实现与首个候选 Runtime Adapter；完整适配能力待 Phase 4 真实验证，不再是产品硬依赖。
 
 ## 现状
 
@@ -19,7 +19,8 @@
 
 ## 文档索引
 
-- 项目章程：`docs/PROJECT-CHARTER.md`；实施方案：`templates/PLAN.md`；部署要求：`docs/DEPLOYMENT-REQUIREMENTS.md`
+- 目标架构与独立执行蓝图：`docs/AGENTMGR_STANDALONE_PLATFORM_PLAN.md`
+- 项目章程：`docs/PROJECT-CHARTER.md`；既有业务模块实施方案（Hermes 兼容/迁移背景）：`templates/PLAN.md`；部署要求：`docs/DEPLOYMENT-REQUIREMENTS.md`
 - 调研报告：`docs/research/`（微信、Profile 隔离、发票查验、数据合规、多 Profile 实测）
 - 会话交接：`HANDOVER.md`
 

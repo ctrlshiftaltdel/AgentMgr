@@ -11,6 +11,8 @@
 
 > **架构定位修订声明（2026-10-20）**：本文件保留既有业务域（报销、工作流、财务导出等）的实施背景。目标架构和新能力必须遵循 docs/AGENTMGR_STANDALONE_PLATFORM_PLAN.md：AgentMgr 负责企业治理、权限、责任、任务优先级/必要性、审批、执行边界与审计；不重复构建 Agent 已有工具链。凡旧内容把 Hermes Profile 或 Hermes 内部 API 规定为所有部署的永久前提，均视为兼容实现/迁移阶段说明，不再是产品核心约束。
 
+> **兼容/迁移材料（2026-10-20）**：以下内容描述**现有 Hermes 兼容/迁移实现**，不是新部署的要求：§2（总体架构）、§2.1/§2.2（Profile 路由与隔离）、§3（Agent 选型行）、§5.1、§8（`agent_profiles`）、§10/§12/§13，以及所有 Hermes/Profile 负载测试与检查清单条目。新部署必须以 `docs/AGENTMGR_STANDALONE_PLATFORM_PLAN.md` 为准。
+
 
 ## 1. 项目定位
 
@@ -47,10 +49,10 @@
                 |
                 v
    身份绑定与消息路由 Identity Router
-   校验外部身份 -> 内部员工 -> Profile
+   校验外部身份 -> 内部主体/任务上下文
                 |
                 v
-     每员工独立 Hermes Profile 进程
+     可替换 Agent Runtime（现有 Hermes Profile 为兼容实现）
      独立配置、会话、记忆、工作目录、工具授权
                 |
                 v
@@ -69,38 +71,38 @@
   事务性 Outbox / 后台任务 / 同步重试 / 审计
 ```
 
-### 2.1 通讯适配层与 Profile 的分工
+### 2.1 通讯适配层与运行时的分工
 
-不要默认在每个员工 Profile 内分别登录同一个微信 Bot。首期采用共享的渠道接入/路由服务：
+不要默认在每个运行时实例内分别登录同一个微信 Bot。首期采用共享的渠道接入/路由服务：
 
 1. 渠道适配器收取消息并保留渠道事件 ID、外部用户 ID、会话 ID、时间和附件引用。
 2. 身份服务验证该渠道用户是否已经绑定公司员工账号。
-3. 路由服务确定目标员工 Profile，并把消息转给对应的本地 Hermes API/进程入口。
+3. 路由服务确定目标主体/任务上下文，并把消息转给所选 Agent Runtime 的入口（现有 Hermes Profile 为兼容实现）。
 4. Agent 工具请求由代理附加经过验证的操作主体和请求上下文；不能依靠模型自行填入的 `employee_id`。
 5. 回复和通知通过渠道适配层发回对应员工的已绑定身份。
 
-每个 Profile 的 API 服务仅监听 localhost 或 Unix socket，不直接暴露公网。若官方接入模式不支持多员工路由，应由单独的适配/路由服务实现，不得假定 Hermes 原生就支持任意多租户路由。
+每个运行时实例的 API 服务仅监听 localhost 或 Unix socket，不直接暴露公网。若官方接入模式不支持多员工路由，应由单独的适配/路由服务实现，不得假定 Hermes 原生就支持任意多租户路由。
 
-### 2.2 每位员工的隔离边界
+### 2.2 主体/任务的隔离边界
 
-每个员工至少单独拥有：
+每个主体/任务至少单独拥有（Hermes Profile 为现有兼容实现的隔离单元）：
 
-- Hermes Profile 及运行进程；
+- Agent Runtime 实例及运行进程；
 - `config.yaml`、角色指令、技能清单及模型配置；
 - 会话历史、记忆命名空间与状态数据；
 - 工作目录和临时文件目录；
 - 独立的内部 API 身份/短期调用凭据；
 - 独立工具授权集合和访问审计上下文。
 
-目录权限至少限于该 Profile 对应的服务身份。不能仅靠提示词或文件路径约定隔离文件。部署 Agent 进程时采用非 root 身份；由平台 Agent 评估 systemd 独立服务账户、Linux namespace 或容器隔离。共享路由服务只拥有路由所需权限，不能随意读取所有 Profile 的记忆。
+目录权限至少限于该运行时实例对应的服务身份。不能仅靠提示词或文件路径约定隔离文件。部署 Agent 进程时采用非 root 身份；由平台 Agent 评估 systemd 独立服务账户、Linux namespace 或容器隔离。共享路由服务只拥有路由所需权限，不能随意读取所有运行时实例的记忆。
 
-20–100 个常驻进程需要在阶段 0 进行负载测试。若内存成本过高，可优化模型调用与进程资源，但不能未经用户批准把架构改成所有员工共用同一个 Profile。
+20–100 个常驻进程需要在阶段 0 进行负载测试。若内存成本过高，可优化模型调用与进程资源，但未经批准不得让不同主体/任务共用同一运行时身份、凭据或隔离域。
 
 ## 3. 面向中国大陆的技术选型
 
 | 层 | 推荐选型 | 原则 |
 |---|---|---|
-| Agent | Hermes Agent Profile | 固定经过验证的版本；逐人配置与运行 |
+| Agent | 可替换 Agent Runtime（当前 Hermes Profile 为兼容实现） | 固定经过验证的版本；逐主体/任务配置与运行 |
 | 微信 | Hermes Weixin/iLink 适配器 + 自建身份路由 | 先验证真实多员工场景、主动通知与账号限制 |
 | 未来渠道 | 独立 Channel Adapter 插件 | 渠道变化不能影响报销/库存域服务 |
 | 业务 API | Python + FastAPI | 模块化单体，按领域划分接口 |
@@ -179,7 +181,7 @@ Agent 间可共享的是授权业务记录与任务信息，不是各自的私�
 
 - 公司、部门、员工、主管关系；
 - 外部渠道身份绑定/解绑；
-- Hermes Profile 生命周期及状态监控；
+- 运行时实例生命周期及状态监控（含 Hermes Profile 兼容实现）；
 - 角色、权限、数据范围；
 - 文件收件与解析；
 - 统一业务 API 和工具代理；
@@ -281,13 +283,13 @@ Agent 间可共享的是授权业务记录与任务信息，不是各自的私�
 
 正式业务数据库采用 PostgreSQL；文件原件与业务元数据分开保存。以下为首期核心表建议，可随 API 契约调整，但必须由 Master Agent 统一审定，不允许各 Agent 各自建立冲突 schema。
 
-### 身份、Profile 与权限
+### 身份、运行时实例与权限
 
 - `companies(id, name, country_code, base_currency, status)`
 - `departments(id, company_id, parent_id, name)`
 - `employees(id, company_id, department_id, manager_id, employee_no, status)`
 - `employee_channel_bindings(id, employee_id, channel_type, external_user_id, external_account_id, verified_at, status)`
-- `agent_profiles(id, employee_id, profile_name, runtime_status, config_version, status)`
+- `agent_profiles(id, employee_id, profile_name, runtime_status, config_version, status)` —— Hermes 兼容模型；目标模型使用 `runtime_instances`（见独立计划 §7）
 - `roles(id, name)`、`permissions(id, resource, action, scope)`
 - `employee_roles(employee_id, role_id)`、`role_permissions(role_id, permission_id)`
 - `agent_profile_services(profile_id, service_name, service_identity_ref, status)`
@@ -377,7 +379,7 @@ Agent 间可共享的是授权业务记录与任务信息，不是各自的私�
 并行调查：
 
 1. 微信 iLink：多员工私聊、稳定外部 ID、主动通知、文件/语音消息、限流和断线恢复；确认普通群聊限制及替代路径。
-2. Hermes Profile：建立多个 Profile，分别运行进程和配置；测试内部 API 路由、凭据隔离和服务恢复。
+2. Hermes Profile（兼容/迁移验收）：建立多个 Profile，分别运行进程和配置；测试内部 API 路由、凭据隔离和服务恢复。
 3. 负载：以 20 个 Profile 起步，模拟 100 个用户的消息并发和进程常驻内存；决定单机配置和资源限制。
 4. 财务导出：确认首个导出模板、字段口径（期间/币种/单据号）、目标财务系统的导入要求及唯一权威数据源。
 5. 发票查验：确认可用官方路径、授权服务商接口或人工辅助流程；不默认存在通用公开 API。
@@ -391,7 +393,7 @@ Agent 间可共享的是授权业务记录与任务信息，不是各自的私�
 功能：
 
 - 员工、部门、角色和渠道身份绑定；
-- 每员工独立 Hermes Profile 进程及独立目录；
+- 每主体/任务独立 Agent Runtime 进程及独立目录（当前 Hermes Profile 为兼容实现）；
 - 微信消息路由和统一输入格式；
 - 文字/语音/图片/文件接收与解析草稿；
 - 报销创建、明细、票据附件、提交、撤回、审批、退回补件和状态查询；
@@ -403,7 +405,7 @@ Agent 间可共享的是授权业务记录与任务信息，不是各自的私�
 验收：
 
 - 至少 3 个测试员工走通完整报销流程；
-- 20 个 Profile 同时运行测试通过，具备向 100 个用户扩容的测试数据；
+- （Hermes 兼容/迁移验收）20 个 Profile 同时运行测试通过，具备向 100 个用户扩容的测试数据；
 - 跨员工会话、记忆、文件和业务记录访问测试全部通过；
 - 重复消息不会重复创建报销单/审批任务；
 - 金额、日期、必填字段异常会被拒绝或要求确认；
@@ -456,16 +458,18 @@ Master Agent 负责架构决策、接口契约、任务依赖、合并审查及�
 
 ### Wave 0（并行调研）
 
+> 本 Wave 的 W0-2 与 Wave 1 的 W1-3 属 Hermes 兼容/迁移调研与实现项，不是新部署的运行时前提。
+
 | ID | Agent | 交付物 |
 |---|---|---|
 | W0-1 | WeChat/Platform Agent | iLink 多用户/媒体/主动通知/限流测试与 Go/No-Go 报告 |
-| W0-2 | Hermes Runtime Agent | 多 Profile 独立进程、独立目录和 API 路由原型；20/100 用户资源测试 |
+| W0-2 | Hermes Runtime Agent | 多 Profile 独立进程、独立目录和 API 路由原型；20/100 用户资源测试（Hermes 兼容性） |
 | W0-3 | Finance Export Agent | 首个导出模板与字段口径、目标系统导入要求、对账规则草案 |
 | W0-4 | Tax Invoice Agent | 官方发票查验路径、授权服务商/API 可行性及人工辅助方案 |
 | W0-5 | Security/Data Agent | 大陆数据处理边界、威胁模型、权限/文件隔离设计 |
 | W0-6 | Business Analyst Agent | 脱敏 Excel/Word/PDF 样例、报销规则、库存流程和模板目录 |
 
-Master Agent 在 Wave 1 前审定：统一身份模型、消息事件 schema、Profile 路由协议、权限模型、业务对象 ownership、数据库 schema v1 和接口错误码。
+Master Agent 在 Wave 1 前审定：统一身份模型、消息事件 schema、运行时路由协议（Hermes Profile 为兼容实现）、权限模型、业务对象 ownership、数据库 schema v1 和接口错误码。
 
 ### Wave 1（基础底座与报销，可按接口并行）
 
@@ -473,7 +477,7 @@ Master Agent 在 Wave 1 前审定：统一身份模型、消息事件 schema、P
 |---|---|---|---|
 | W1-1 | Backend Agent | FastAPI、PostgreSQL、Alembic、组织/员工/审计基础模块 | W0 设计审定 |
 | W1-2 | Security Agent | RBAC、数据范围、调用主体绑定、文件权限和拒绝访问测试 | W0-5、API 契约 |
-| W1-3 | Runtime Agent | Profile provisioning、独立进程/服务、配置注入、健康检查、消息路由 | W0-1、W0-2 |
+| W1-3 | Runtime Agent | Runtime 实例 provisioning、独立进程/服务、配置注入、健康检查、消息路由（Hermes Profile 为兼容实现） | W0-1、W0-2 |
 | W1-4 | Intake/Document Agent | 文件接收、散列、OCR/ASR 解析草稿、模板文档生成 | W1-1、W1-2 |
 | W1-5 | Expense Agent | 报销域模型、状态机、附件关联、费用规则与 API | W1-1、W1-2 |
 | W1-6 | Workflow Agent | 审批任务、负责人路由、通知 Outbox、重试和幂等 | W1-1、W1-2 |
@@ -523,7 +527,9 @@ W1-5 与 W1-6 可并行，但必须共用统一状态机与审批事件契约。
 
 ## 12. 全局发布验收清单
 
-### Profile 与通道
+### Profile 与通道（Hermes 兼容/迁移项）
+
+> 本节为现有 Hermes 兼容实现的验收项，不是新部署的通用要求；新部署按独立计划选择运行时隔离单元。
 
 - [ ] 每位员工 Profile/进程/配置/记忆/文件工作目录隔离。
 - [ ] 不同员工的消息被稳定映射到正确的 Profile。
@@ -581,14 +587,14 @@ Master Agent 随后统一审定：
 
 审定通过后再启动 Wave 1。每个 Wave 结束时必须进行集成测试、代码审查、权限测试和实际验收；通过的模块才成为下一 Wave 的稳定依赖。
 
-项目优先级依次为：身份与权限正确性、业务数据一致性、工作流可靠性、外部接口可追溯性，然后才是交互体验和功能数量。最终目标是让 Hermes 成为企业日常工作的 AI 操作入口，而不是让模型直接成为数据库管理员、会计系统或付款执行者。
+项目优先级依次为：身份与权限正确性、业务数据一致性、工作流可靠性、外部接口可追溯性，然后才是交互体验和功能数量。最终目标是让 AgentMgr 成为企业任务治理与执行授权的入口，而不是让模型直接成为数据库管理员、会计系统或付款执行者。
 
 ---
 
 ## 参考资料
 
-- Hermes Agent Profiles: https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/profiles.md
-- Hermes Agent Weixin 接入: https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/messaging/weixin.md
+- （兼容参考）Hermes Agent Profiles: https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/profiles.md
+- （兼容参考）Hermes Agent Weixin 接入: https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/messaging/weixin.md
 - 国家税务总局全国增值税发票查验平台: https://inv-veri.chinatax.gov.cn/
 - 《中华人民共和国个人信息保护法》: https://www.cac.gov.cn/2021-08/20/c_1631050028355286.htm
 - 《网络数据安全管理条例》: https://app.www.gov.cn/govdata/gov/202409/30/520076/article.html
