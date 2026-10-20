@@ -40,13 +40,12 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.db.base import Base
-from app.db.models.organization import TimestampMixin
-
 # Import the identity models so ``service_identity_roles.role_id -> roles.id``
 # resolves when this module is imported on its own (the model-import
 # self-sufficiency test runs each module in a fresh interpreter).
-import app.identity.models  # noqa: F401,E402
+import app.identity.models  # noqa: F401
+from app.db.base import Base
+from app.db.models.organization import TimestampMixin
 
 __all__ = [
     "ExecutionGrant",
@@ -302,6 +301,11 @@ class GovernanceDecisionRecord(Base):
     policy_version: Mapped[str | None] = mapped_column(Text, nullable=True)
     policy_content_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
     constraints: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    #: The complete contract-shaped decision document (including the
+    #: ``decision_hash``).  Persisting the document lets issuance and the PEP
+    #: recompute and verify the hash instead of trusting a caller-supplied
+    #: record.  It is also the authority for every field a Grant derives.
+    document: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     request_hash: Mapped[str] = mapped_column(Text, nullable=False)
     evaluated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
@@ -344,6 +348,12 @@ class GovernanceDecisionRecord(Base):
             name="policy_content_hash_format",
         ),
         CheckConstraint("decision_revision >= 1", name="revision_positive"),
+        UniqueConstraint(
+            "task_id",
+            "principal_id",
+            "decision_revision",
+            name="uq_governance_decisions_task_principal_revision",
+        ),
         Index("ix_governance_decisions_task_id", "task_id"),
         Index(
             "ix_governance_decisions_task_principal",
@@ -379,12 +389,28 @@ class ExecutionGrant(TimestampMixin, Base):
     decision_purpose: Mapped[str] = mapped_column(
         Text, nullable=False, server_default=text("'initial_execution'")
     )
+    decision_type: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default=text("'allow'")
+    )
+    decision_evaluated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    decision_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     correlation_id: Mapped[str] = mapped_column(Text, nullable=False)
     task_id: Mapped[str] = mapped_column(Text, nullable=False)
     task_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    #: The task submission idempotency key carried by the issuing decision's
+    #: ``task_ref``.  Grants must not invent a new task identity.
+    task_idempotency_key: Mapped[str] = mapped_column(Text, nullable=False)
     subject_type: Mapped[str] = mapped_column(Text, nullable=False)
     subject_id: Mapped[str] = mapped_column(Text, nullable=False)
+    #: Requester employee for a service identity acting on someone's behalf;
+    #: the employee themselves for a person/agent_instance.
+    subject_employee_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     subject_service_identity_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    issued_by_service_identity_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     delegation_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
     execution_mode: Mapped[str] = mapped_column(Text, nullable=False)
     capabilities: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
@@ -436,6 +462,20 @@ class ExecutionGrant(TimestampMixin, Base):
             name="idempotency_key_format",
         ),
         CheckConstraint(
+            "task_id ~ '^task_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$'",
+            name="task_id_format",
+        ),
+        CheckConstraint(
+            "task_idempotency_key ~ '^idem_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$'",
+            name="task_idempotency_key_format",
+        ),
+        CheckConstraint(
+            "issued_by_service_identity_id IS NULL OR "
+            "issued_by_service_identity_id ~ "
+            "'^svc_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$'",
+            name="issued_by_service_identity_id_format",
+        ),
+        CheckConstraint(
             "decision_hash ~ '^sha256:[a-f0-9]{64}$'",
             name="decision_hash_format",
         ),
@@ -451,6 +491,20 @@ class ExecutionGrant(TimestampMixin, Base):
         CheckConstraint(
             "subject_type IN ('person', 'service', 'runtime', 'agent_instance')",
             name="subject_type_allowed",
+        ),
+        CheckConstraint(
+            "subject_id ~ '^(prin|rt|svc)_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$'",
+            name="subject_id_format",
+        ),
+        CheckConstraint(
+            "delegation_ref IS NULL OR "
+            "delegation_ref ~ '^dlg_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$'",
+            name="delegation_ref_format",
+        ),
+        CheckConstraint(
+            "NOT (consumption_mode = 'single_use' AND "
+            "(budget ->> 'max_calls')::int <> 1)",
+            name="single_use_budget_is_one",
         ),
         CheckConstraint(
             "status IN ('active', 'consumed', 'revoked', 'expired')",

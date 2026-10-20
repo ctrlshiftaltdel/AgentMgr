@@ -25,6 +25,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.audit.service import record_event
 from app.db.models.organization import Employee
 from app.governance.errors import PrincipalResolutionError
 from app.governance.models import ServiceIdentity, ServiceIdentityRole
@@ -38,6 +39,7 @@ __all__ = [
     "GovernancePrincipal",
     "principal_ref",
     "reject_client_asserted_identity",
+    "require_management_permission",
     "resolve_employee_principal",
     "resolve_principal",
     "resolve_service_principal",
@@ -59,6 +61,52 @@ def principal_ref(prefix: str, value: int | str) -> str:
     if text.isdigit():
         text = text.zfill(4)
     return f"{prefix}_{text}"
+
+def _audit_resolution_failure(
+    session: Session,
+    *,
+    reason_code: str,
+    resource_id: str | None,
+    context: Mapping[str, Any],
+) -> None:
+    """Record a resolution failure before raising.
+
+    Resolution may happen before a PDP evaluation, so without this event a
+    failed login/identity binding would be invisible to the audit trail.
+    """
+    record_event(
+        session,
+        actor_id=None,
+        action="governance.principal.resolution_denied",
+        resource_type="principal",
+        resource_id=resource_id,
+        details={"reason_code": reason_code, **dict(context)},
+    )
+
+
+def require_management_permission(
+    principal: GovernancePrincipal,
+    *,
+    resource: str = "identity",
+    action: str = "manage",
+    scope: str = "company",
+) -> GovernancePrincipal:
+    """Require an active principal holding an existing RBAC management permission.
+
+    Policy publication and grant revocation are management operations, not
+    subject to the caller's self-asserted actor id.
+    """
+    principal.require_active()
+    if (resource, action, scope) not in principal.effective_permissions:
+        raise PrincipalResolutionError(
+            "capability_not_granted",
+            context={
+                "principal_id": principal.principal_id,
+                "required_permission": [resource, action, scope],
+            },
+        )
+    return principal
+
 
 #: Fields a client or model must never be allowed to assert.  They may appear in
 #: a tool payload for explanation, but the governance layer rejects them rather
@@ -125,7 +173,7 @@ class GovernancePrincipal:
             subject["delegation_ref"] = self.delegation_ref
         return subject
 
-    def require_active(self) -> "GovernancePrincipal":
+    def require_active(self) -> GovernancePrincipal:
         if not self.is_active:
             raise PrincipalResolutionError(
                 "principal_disabled",
@@ -161,6 +209,19 @@ def _assurance(value: str) -> str:
     return value
 
 
+def _assurance_with_audit(session: Session, value: str) -> str:
+    try:
+        return _assurance(value)
+    except PrincipalResolutionError as exc:
+        _audit_resolution_failure(
+            session,
+            reason_code=exc.reason_code,
+            resource_id=None,
+            context=exc.context,
+        )
+        raise
+
+
 def _employee_roles(session: Session, employee_id: int) -> tuple[int, ...]:
     return role_ids_for_employee(session, employee_id)
 
@@ -178,7 +239,7 @@ def resolve_employee_principal(
     verified assertion), never from a request body.  Missing, non-active or
     unbound employees fail closed.
     """
-    _assurance(identity_assurance)
+    _assurance_with_audit(session, identity_assurance)
     if principal_type not in {"person", "agent_instance"}:
         raise PrincipalResolutionError(
             "identity_unverified", context={"principal_type": principal_type}
@@ -186,14 +247,23 @@ def resolve_employee_principal(
 
     employee = session.get(Employee, employee_id)
     if employee is None:
-        raise PrincipalResolutionError(
-            "principal_unbound", context={"employee_id": employee_id}
+        context = {"employee_id": employee_id}
+        _audit_resolution_failure(
+            session,
+            reason_code="principal_unbound",
+            resource_id=principal_ref("prin", employee_id),
+            context=context,
         )
+        raise PrincipalResolutionError("principal_unbound", context=context)
     if employee.status != "active":
-        raise PrincipalResolutionError(
-            "principal_disabled",
-            context={"employee_id": employee_id, "status": employee.status},
+        context = {"employee_id": employee_id, "status": employee.status}
+        _audit_resolution_failure(
+            session,
+            reason_code="principal_disabled",
+            resource_id=principal_ref("prin", employee.id),
+            context=context,
         )
+        raise PrincipalResolutionError("principal_disabled", context=context)
 
     role_ids = _employee_roles(session, employee.id)
     permissions = effective_permissions_for_role_ids(session, role_ids)
@@ -251,30 +321,56 @@ def resolve_service_principal(
     company and its effective permissions are intersected with the requester's;
     an empty intersection is a valid (deny-by-default) result, not an error.
     """
-    _assurance(identity_assurance)
+    _assurance_with_audit(session, identity_assurance)
     pk = _service_identity_pk(service_identity_id)
     row = session.get(ServiceIdentity, pk)
     if row is None:
-        raise PrincipalResolutionError(
-            "principal_unbound", context={"service_identity_id": str(service_identity_id)}
+        context = {"service_identity_id": str(service_identity_id)}
+        _audit_resolution_failure(
+            session,
+            reason_code="principal_unbound",
+            resource_id=None,
+            context=context,
         )
+        raise PrincipalResolutionError("principal_unbound", context=context)
     if row.status != "active":
-        raise PrincipalResolutionError(
-            "principal_disabled",
-            context={"service_identity_id": principal_ref("svc", row.id), "status": row.status},
+        context = {
+            "service_identity_id": principal_ref("svc", row.id),
+            "status": row.status,
+        }
+        _audit_resolution_failure(
+            session,
+            reason_code="principal_disabled",
+            resource_id=principal_ref("svc", row.id),
+            context=context,
         )
+        raise PrincipalResolutionError("principal_disabled", context=context)
 
     owner = session.get(Employee, row.owner_employee_id)
     if owner is None:
-        raise PrincipalResolutionError(
-            "principal_unbound",
-            context={"service_identity_id": principal_ref("svc", row.id), "owner_missing": True},
+        context = {
+            "service_identity_id": principal_ref("svc", row.id),
+            "owner_missing": True,
+        }
+        _audit_resolution_failure(
+            session,
+            reason_code="principal_unbound",
+            resource_id=principal_ref("svc", row.id),
+            context=context,
         )
+        raise PrincipalResolutionError("principal_unbound", context=context)
     if owner.status != "active":
-        raise PrincipalResolutionError(
-            "principal_disabled",
-            context={"service_identity_id": principal_ref("svc", row.id), "owner_status": owner.status},
+        context = {
+            "service_identity_id": principal_ref("svc", row.id),
+            "owner_status": owner.status,
+        }
+        _audit_resolution_failure(
+            session,
+            reason_code="principal_disabled",
+            resource_id=principal_ref("svc", row.id),
+            context=context,
         )
+        raise PrincipalResolutionError("principal_disabled", context=context)
 
     service_role_ids = _service_role_ids(session, row.id)
     service_permissions = effective_permissions_for_role_ids(session, service_role_ids)
@@ -285,13 +381,17 @@ def resolve_service_principal(
     if requester is not None:
         requester.require_active()
         if requester.company_id != owner.company_id:
-            raise PrincipalResolutionError(
-                "principal_unbound",
-                context={
-                    "service_identity_id": principal_ref("svc", row.id),
-                    "reason": "company_mismatch",
-                },
+            context = {
+                "service_identity_id": principal_ref("svc", row.id),
+                "reason": "company_mismatch",
+            }
+            _audit_resolution_failure(
+                session,
+                reason_code="principal_unbound",
+                resource_id=principal_ref("svc", row.id),
+                context=context,
             )
+            raise PrincipalResolutionError("principal_unbound", context=context)
         employee_id = requester.employee_id
         company_id = requester.company_id
         # No inherited excess: service authority is bounded by the requester.
@@ -334,7 +434,7 @@ def resolve_principal(
     (``rt_``) require a runtime identity registry, which Issue #78 does not
     create; they are therefore rejected rather than trusted by assertion.
     """
-    _assurance(identity_assurance)
+    _assurance_with_audit(session, identity_assurance)
     if not isinstance(principal_id, str):
         raise PrincipalResolutionError("identity_unverified")
     if principal_id.startswith("prin_"):
@@ -363,6 +463,11 @@ def resolve_principal(
             identity_assurance=identity_assurance,
             delegation_ref=delegation_ref,
         )
-    raise PrincipalResolutionError(
-        "identity_unverified", context={"principal_id": principal_id}
+    context = {"principal_id": principal_id, "reason": "unsupported_prefix"}
+    _audit_resolution_failure(
+        session,
+        reason_code="identity_unverified",
+        resource_id=principal_id if isinstance(principal_id, str) else None,
+        context=context,
     )
+    raise PrincipalResolutionError("identity_unverified", context=context)

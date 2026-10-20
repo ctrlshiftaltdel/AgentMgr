@@ -291,6 +291,11 @@ def upgrade() -> None:
             postgresql.JSONB(astext_type=sa.Text()),
             nullable=False,
         ),
+        sa.Column(
+            "document",
+            postgresql.JSONB(astext_type=sa.Text()),
+            nullable=False,
+        ),
         sa.Column("request_hash", sa.Text(), nullable=False),
         sa.Column("evaluated_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
@@ -302,6 +307,12 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("id", name="pk_governance_decisions"),
         sa.UniqueConstraint("decision_id", name="uq_governance_decisions_decision_id"),
+        sa.UniqueConstraint(
+            "task_id",
+            "principal_id",
+            "decision_revision",
+            name="uq_governance_decisions_task_principal_revision",
+        ),
         sa.CheckConstraint(
             "decision_id ~ '^gdec_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$'",
             name="decision_id_format",
@@ -359,12 +370,20 @@ def upgrade() -> None:
             server_default=sa.text("'initial_execution'"),
             nullable=False,
         ),
+        sa.Column(
+            "decision_type", sa.Text(), server_default=sa.text("'allow'"), nullable=False
+        ),
+        sa.Column("decision_evaluated_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("decision_expires_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("correlation_id", sa.Text(), nullable=False),
         sa.Column("task_id", sa.Text(), nullable=False),
         sa.Column("task_revision", sa.Integer(), nullable=False),
+        sa.Column("task_idempotency_key", sa.Text(), nullable=False),
         sa.Column("subject_type", sa.Text(), nullable=False),
         sa.Column("subject_id", sa.Text(), nullable=False),
+        sa.Column("subject_employee_id", sa.BigInteger(), nullable=True),
         sa.Column("subject_service_identity_id", sa.Text(), nullable=True),
+        sa.Column("issued_by_service_identity_id", sa.Text(), nullable=True),
         sa.Column("delegation_ref", sa.Text(), nullable=True),
         sa.Column("execution_mode", sa.Text(), nullable=False),
         sa.Column(
@@ -443,6 +462,20 @@ def upgrade() -> None:
             name="idempotency_key_format",
         ),
         sa.CheckConstraint(
+            "task_id ~ '^task_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$'",
+            name="task_id_format",
+        ),
+        sa.CheckConstraint(
+            "task_idempotency_key ~ '^idem_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$'",
+            name="task_idempotency_key_format",
+        ),
+        sa.CheckConstraint(
+            "issued_by_service_identity_id IS NULL OR "
+            "issued_by_service_identity_id ~ "
+            "'^svc_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$'",
+            name="issued_by_service_identity_id_format",
+        ),
+        sa.CheckConstraint(
             "decision_hash ~ '^sha256:[a-f0-9]{64}$'", name="decision_hash_format"
         ),
         sa.CheckConstraint(
@@ -457,6 +490,20 @@ def upgrade() -> None:
         sa.CheckConstraint(
             "subject_type IN ('person', 'service', 'runtime', 'agent_instance')",
             name="subject_type_allowed",
+        ),
+        sa.CheckConstraint(
+            "subject_id ~ '^(prin|rt|svc)_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$'",
+            name="subject_id_format",
+        ),
+        sa.CheckConstraint(
+            "delegation_ref IS NULL OR "
+            "delegation_ref ~ '^dlg_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$'",
+            name="delegation_ref_format",
+        ),
+        sa.CheckConstraint(
+            "NOT (consumption_mode = 'single_use' AND "
+            "(budget ->> 'max_calls')::int <> 1)",
+            name="single_use_budget_is_one",
         ),
         sa.CheckConstraint(
             "status IN ('active', 'consumed', 'revoked', 'expired')",

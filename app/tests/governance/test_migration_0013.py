@@ -50,8 +50,19 @@ def test_0013_creates_and_drops_governance_tables(test_db_url: str) -> None:
             "policy_set_id",
             "policy_version",
             "constraints",
+            "document",
             "request_hash",
         }.issubset(decision_columns)
+        decision_constraints = {
+            constraint["name"]
+            for constraint in inspect(engine).get_unique_constraints(
+                "governance_decisions"
+            )
+        }
+        assert (
+            "uq_governance_decisions_task_principal_revision"
+            in decision_constraints
+        )
 
         grant_columns = {
             column["name"] for column in inspect(engine).get_columns("execution_grants")
@@ -59,9 +70,15 @@ def test_0013_creates_and_drops_governance_tables(test_db_url: str) -> None:
         assert {
             "grant_id",
             "decision_id",
+            "decision_type",
+            "decision_evaluated_at",
+            "decision_expires_at",
             "task_id",
             "task_revision",
+            "task_idempotency_key",
             "subject_id",
+            "subject_employee_id",
+            "issued_by_service_identity_id",
             "execution_mode",
             "capabilities",
             "resource_scope",

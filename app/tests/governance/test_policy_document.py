@@ -92,6 +92,120 @@ def test_policy_document_validation() -> None:
         parse_policy_document(bad_rule)
 
 
+def test_deny_rule_default_reason_and_effect_validation() -> None:
+    policy_set_id = unique_policy_set()
+    document = policy_document(
+        policy_set_id,
+        rules=[
+            {
+                "rule_id": "deny_without_reason",
+                "capability": "expense.delete@1.0.0",
+                "effect": "deny",
+            }
+        ],
+    )
+    parsed = parse_policy_document(document)
+    rule = parsed.rule_for("expense.delete@1.0.0")
+    assert rule is not None
+    assert rule.effect == "deny"
+    assert rule.reason_code == "policy_denied"
+
+    # A deny effect may not carry an allow-only reason code.
+    bad = policy_document(
+        policy_set_id,
+        rules=[
+            {
+                "rule_id": "bad_reason",
+                "capability": "expense.delete@1.0.0",
+                "effect": "deny",
+                "reason_code": "policy_allowed",
+            }
+        ],
+    )
+    with pytest.raises(PolicyError):
+        parse_policy_document(bad)
+
+
+def test_deny_rule_wins_regardless_of_document_order() -> None:
+    policy_set_id = unique_policy_set()
+    document = policy_document(
+        policy_set_id,
+        rules=[
+            {
+                "rule_id": "allow_first",
+                "capability": "expense.delete@1.0.0",
+                "effect": "allow",
+            },
+            {
+                "rule_id": "deny_second",
+                "capability": "expense.delete@1.0.0",
+                "effect": "deny",
+            },
+        ],
+    )
+    parsed = parse_policy_document(document)
+    rule = parsed.rule_for("expense.delete@1.0.0")
+    assert rule is not None
+    assert rule.effect == "deny"
+
+
+def test_rbac_scope_must_map_to_resource_scope() -> None:
+    policy_set_id = unique_policy_set()
+    bad = policy_document(
+        policy_set_id,
+        rules=[
+            {
+                "rule_id": "own_cannot_be_company",
+                "capability": "expense.read@1.0.0",
+                "required_permissions": [["expense_claim", "read", "own"]],
+                "allowed_scope_types": ["company"],
+            }
+        ],
+    )
+    with pytest.raises(PolicyError) as excinfo:
+        parse_policy_document(bad)
+    assert excinfo.value.reason_code == "policy_version_invalid"
+
+    good = policy_document(
+        policy_set_id,
+        rules=[
+            {
+                "rule_id": "team_maps_department",
+                "capability": "expense.read@1.0.0",
+                "required_permissions": [["expense_claim", "read", "team"]],
+                "allowed_scope_types": ["department"],
+            }
+        ],
+    )
+    assert parse_policy_document(good).rule_for("expense.read@1.0.0") is not None
+
+
+def test_max_cost_units_upper_bound() -> None:
+    policy_set_id = unique_policy_set()
+    document = policy_document(
+        policy_set_id,
+        rules=[
+            {
+                "rule_id": "too_costly",
+                "capability": "expense.read@1.0.0",
+                "max_cost_units": 100_000_001,
+            }
+        ],
+    )
+    with pytest.raises(PolicyError):
+        parse_policy_document(document)
+
+
+def test_jcs_small_and_large_numbers() -> None:
+    assert canonical_json(1e-7) == "1e-7"
+    assert canonical_json(1e-6) == "0.000001"
+    assert canonical_json(1e21) == "1e+21"
+    assert canonical_json(9007199254740991) == "9007199254740991"
+    assert canonical_json(-0.0) == "0"
+    with pytest.raises(ValueError):
+        canonical_json(9007199254740992)
+
+
 def test_scope_subset_rules() -> None:
     allowed = scope(
         "self",

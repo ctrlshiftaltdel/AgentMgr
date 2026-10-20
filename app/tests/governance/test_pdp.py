@@ -19,6 +19,8 @@ from app.governance.policies import (
 from app.governance.principal import principal_ref, resolve_employee_principal
 from app.tests.governance.helpers import (
     PolicyContext,
+    FakeEvidenceVerifier,
+    admin_principal,
     approval_ref,
     confirmation_ref,
     scope,
@@ -150,6 +152,7 @@ def test_unpublished_draft_is_not_usable(session, org) -> None:
             "hard_denies": [],
             "rules": [],
         },
+        principal=admin_principal(session, org),
         created_by_employee_id=org.finance.id,
     )
     assert draft.status == "draft"
@@ -237,6 +240,8 @@ def test_confirmation_and_approval_gates(session, org, policy) -> None:
     assert urgent.decision_type == "needs_confirmation"
 
     principal_id = principal_ref("prin", org.employee.id)
+    payload_hash = "sha256:" + "1" * 64
+    verifier = FakeEvidenceVerifier()
     needs_approval = evaluate(
         session,
         _request(
@@ -244,8 +249,12 @@ def test_confirmation_and_approval_gates(session, org, policy) -> None:
             org,
             policy,
             capability="expense.submit@1.0.0",
-            confirmation_ref=confirmation_ref(principal_id=principal_id),
+            confirmation_ref=confirmation_ref(
+                principal_id=principal_id, payload_hash=payload_hash
+            ),
+            payload_hash=payload_hash,
         ),
+        evidence_verifier=verifier,
     )
     assert needs_approval.decision_type == "needs_approval"
     assert needs_approval.reason_codes == ("approval_required",)
@@ -257,17 +266,40 @@ def test_confirmation_and_approval_gates(session, org, policy) -> None:
             org,
             policy,
             capability="expense.submit@1.0.0",
-            confirmation_ref=confirmation_ref(principal_id=principal_id),
-            approval_ref=approval_ref(),
+            confirmation_ref=confirmation_ref(
+                principal_id=principal_id, payload_hash=payload_hash
+            ),
+            approval_ref=approval_ref(payload_hash=payload_hash),
+            payload_hash=payload_hash,
         ),
+        evidence_verifier=verifier,
     )
     assert allowed.decision_type == "allow"
     assert "confirmation_satisfied" in allowed.reason_codes
     assert "approval_satisfied" in allowed.reason_codes
 
+    # Without a trusted verifier, a well-formed caller-asserted reference is
+    # not evidence: the decision stays needs_*, never allow.
+    unverified = evaluate(
+        session,
+        _request(
+            session,
+            org,
+            policy,
+            capability="expense.submit@1.0.0",
+            confirmation_ref=confirmation_ref(
+                principal_id=principal_id, payload_hash=payload_hash
+            ),
+            approval_ref=approval_ref(payload_hash=payload_hash),
+            payload_hash=payload_hash,
+        ),
+    )
+    assert unverified.decision_type == "needs_confirmation"
+
 
 def test_gate_reference_validation_fails_closed(session, org, policy) -> None:
     principal_id = principal_ref("prin", org.employee.id)
+    payload_hash = "sha256:" + "1" * 64
     consumed = evaluate(
         session,
         _request(
@@ -277,10 +309,13 @@ def test_gate_reference_validation_fails_closed(session, org, policy) -> None:
             capability="expense.submit@1.0.0",
             confirmation_ref=confirmation_ref(
                 principal_id=principal_id,
+                payload_hash=payload_hash,
                 consumed_at="2026-01-01T00:00:00Z",
             ),
-            approval_ref=approval_ref(),
+            approval_ref=approval_ref(payload_hash=payload_hash),
+            payload_hash=payload_hash,
         ),
+        evidence_verifier=FakeEvidenceVerifier(),
     )
     assert consumed.decision_type == "deny"
     assert "replay_detected" in consumed.reason_codes
@@ -292,12 +327,111 @@ def test_gate_reference_validation_fails_closed(session, org, policy) -> None:
             org,
             policy,
             capability="expense.submit@1.0.0",
-            confirmation_ref=confirmation_ref(principal_id=principal_id),
-            approval_ref=approval_ref(approver_principal_id=principal_id),
+            confirmation_ref=confirmation_ref(
+                principal_id=principal_id, payload_hash=payload_hash
+            ),
+            approval_ref=approval_ref(
+                approver_principal_id=principal_id, payload_hash=payload_hash
+            ),
+            payload_hash=payload_hash,
         ),
+        evidence_verifier=FakeEvidenceVerifier(),
     )
     assert self_approved.decision_type == "deny"
     assert "self_approval_forbidden" in self_approved.reason_codes
+
+
+def test_fabricated_and_role_approvals_fail_closed(session, org, policy) -> None:
+    principal_id = principal_ref("prin", org.employee.id)
+    payload_hash = "sha256:" + "1" * 64
+
+    # A fabricated approval reference that the trusted store cannot resolve is
+    # not evidence, even when the confirmation is genuine.
+    class NoApprovalVerifier(FakeEvidenceVerifier):
+        def verify_approval(self, ref, **kwargs):
+            return None
+
+    fabricated = evaluate(
+        session,
+        _request(
+            session,
+            org,
+            policy,
+            capability="expense.submit@1.0.0",
+            confirmation_ref=confirmation_ref(
+                principal_id=principal_id, payload_hash=payload_hash
+            ),
+            approval_ref=approval_ref(payload_hash=payload_hash),
+            payload_hash=payload_hash,
+        ),
+        evidence_verifier=NoApprovalVerifier(),
+    )
+    assert fabricated.decision_type == "needs_approval"
+
+    # A role approver that cannot be resolved to a person does not satisfy the
+    # gate, even when a verifier is present.
+    unresolved_role = evaluate(
+        session,
+        _request(
+            session,
+            org,
+            policy,
+            capability="expense.submit@1.0.0",
+            confirmation_ref=confirmation_ref(
+                principal_id=principal_id, payload_hash=payload_hash
+            ),
+            approval_ref=approval_ref(
+                approver_principal_id="role_gov_approver", payload_hash=payload_hash
+            ),
+            payload_hash=payload_hash,
+        ),
+        evidence_verifier=FakeEvidenceVerifier(
+            role_resolutions={"role_gov_approver": "role_gov_approver"}
+        ),
+    )
+    assert unresolved_role.decision_type == "needs_approval"
+
+    # A role resolved to the requester themselves is self-approval.
+    self_role = evaluate(
+        session,
+        _request(
+            session,
+            org,
+            policy,
+            capability="expense.submit@1.0.0",
+            confirmation_ref=confirmation_ref(
+                principal_id=principal_id, payload_hash=payload_hash
+            ),
+            approval_ref=approval_ref(
+                approver_principal_id="role_gov_approver", payload_hash=payload_hash
+            ),
+            payload_hash=payload_hash,
+        ),
+        evidence_verifier=FakeEvidenceVerifier(
+            role_resolutions={"role_gov_approver": principal_id}
+        ),
+    )
+    assert self_role.decision_type == "deny"
+    assert "self_approval_forbidden" in self_role.reason_codes
+
+    # A payload mismatch is a denial, not a skipped binding.
+    mismatch = evaluate(
+        session,
+        _request(
+            session,
+            org,
+            policy,
+            capability="expense.submit@1.0.0",
+            confirmation_ref=confirmation_ref(
+                principal_id=principal_id, payload_hash="sha256:" + "2" * 64
+            ),
+            approval_ref=approval_ref(payload_hash=payload_hash),
+            payload_hash=payload_hash,
+        ),
+        evidence_verifier=FakeEvidenceVerifier(),
+    )
+    assert mismatch.decision_type == "deny"
+    assert "payload_hash_mismatch" in mismatch.reason_codes
 
 
 def test_authorizing_decision_requires_task_binding(session, org, policy) -> None:

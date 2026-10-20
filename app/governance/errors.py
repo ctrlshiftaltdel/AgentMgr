@@ -100,6 +100,86 @@ REASON_CODES: frozenset[str] = frozenset(
     }
 )
 
+#: Reason codes that may appear on an authorizing (allow) decision.
+ALLOW_REASON_CODES: frozenset[str] = frozenset(
+    {
+        "policy_allowed",
+        "delegated_authority_valid",
+        "approval_satisfied",
+        "confirmation_satisfied",
+        "managed_execution_boundary_verified",
+        "managed_execution_required",
+    }
+)
+
+#: Reason codes that may appear on a deny decision.
+DENY_REASON_CODES: frozenset[str] = frozenset(
+    {
+        "identity_unverified",
+        "principal_disabled",
+        "principal_unbound",
+        "delegation_expired",
+        "capability_not_granted",
+        "resource_scope_denied",
+        "data_classification_denied",
+        "policy_denied",
+        "policy_unavailable",
+        "policy_version_invalid",
+        "tool_contract_mismatch",
+        "separation_of_duties_violation",
+        "self_approval_forbidden",
+        "accountable_owner_missing",
+        "approval_missing",
+        "confirmation_missing",
+        "grant_missing",
+        "grant_expired",
+        "grant_revoked",
+        "grant_consumed",
+        "grant_scope_mismatch",
+        "grant_outlives_decision",
+        "budget_exceeded",
+        "payload_hash_mismatch",
+        "replay_detected",
+        "decision_expired",
+        "decision_revision_stale",
+        "execution_mode_mismatch",
+        "priority_cannot_override_deny",
+        "unsupported_execution_mode",
+        "runtime_capability_unverified",
+        "retry_budget_exhausted",
+        "risk_above_ceiling",
+        "goal_missing",
+        "required_input_missing",
+        "resource_scope_ambiguous",
+        "accountable_owner_unresolved",
+        "due_date_ambiguous",
+        "capability_ambiguous",
+        "payload_changed",
+        "high_impact_action",
+        "risk_threshold_exceeded",
+        "amount_threshold_exceeded",
+        "separation_of_duties_required",
+        "client_local_control_insufficient",
+        "capability_requires_pep",
+        "runtime_isolation_required",
+        "evidence_missing",
+        "stop_not_confirmed",
+    }
+)
+
+#: Reason codes that may appear on a non-authorizing needs_* decision.
+NEEDS_REASON_CODES: frozenset[str] = frozenset(
+    {
+        "task_not_created",
+        "required_input_missing",
+        "resource_scope_ambiguous",
+        "capability_ambiguous",
+        "confirmation_required",
+        "approval_required",
+        "pre_evaluation_only",
+    }
+)
+
 #: The seven decision types frozen by the contract.
 DECISION_TYPES: frozenset[str] = frozenset(
     {

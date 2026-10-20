@@ -44,6 +44,7 @@ class GovernanceService:
         self,
         document: Mapping[str, Any],
         *,
+        principal: GovernancePrincipal,
         created_by_employee_id: int | None = None,
         actor_id: int | None = None,
         supersedes_id: int | None = None,
@@ -51,6 +52,7 @@ class GovernanceService:
         return policies.create_draft(
             self.session,
             document=document,
+            principal=principal,
             created_by_employee_id=created_by_employee_id,
             actor_id=actor_id,
             supersedes_id=supersedes_id,
@@ -64,6 +66,7 @@ class GovernanceService:
         self,
         policy_version_id: int,
         *,
+        principal: GovernancePrincipal,
         published_by_employee_id: int | None = None,
         actor_id: int | None = None,
         now: datetime | None = None,
@@ -71,6 +74,7 @@ class GovernanceService:
         return policies.publish(
             self.session,
             policy_version_id=policy_version_id,
+            principal=principal,
             published_by_employee_id=published_by_employee_id,
             actor_id=actor_id,
             now=now,
@@ -82,6 +86,7 @@ class GovernanceService:
     def rollback_policy(
         self,
         *,
+        principal: GovernancePrincipal,
         policy_set_id: str,
         target_version: str,
         new_version: str | None = None,
@@ -90,6 +95,7 @@ class GovernanceService:
     ) -> GovernancePolicyVersion:
         return policies.rollback(
             self.session,
+            principal=principal,
             policy_set_id=policy_set_id,
             target_version=target_version,
             new_version=new_version,
@@ -150,7 +156,9 @@ class GovernanceService:
         tool_contract_hash: str | None = None,
         confirmation_ref: Mapping[str, Any] | None = None,
         approval_ref: Mapping[str, Any] | None = None,
+        issued_by_service_identity_id: str | None = None,
         idempotency_key: str | None = None,
+        client_payload: Mapping[str, Any] | None = None,
         actor_id: int | None = None,
         now: datetime | None = None,
     ) -> ExecutionGrant:
@@ -172,13 +180,12 @@ class GovernanceService:
             tool_contract_hash=tool_contract_hash,
             confirmation_ref=confirmation_ref,
             approval_ref=approval_ref,
+            issued_by_service_identity_id=issued_by_service_identity_id,
             idempotency_key=idempotency_key,
+            client_payload=client_payload,
             actor_id=actor_id,
             now=now,
         )
-
-    def consume_grant(self, **kwargs: Any) -> ExecutionGrant:
-        return grants.consume_grant(self.session, **kwargs)
 
     def get_grant(self, grant_id: str, *, for_update: bool = False) -> ExecutionGrant | None:
         return grants.get_grant(self.session, grant_id, for_update=for_update)

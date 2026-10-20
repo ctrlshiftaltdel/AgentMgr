@@ -14,11 +14,12 @@ from app.governance.errors import PrincipalResolutionError
 from app.governance.principal import (
     principal_ref,
     reject_client_asserted_identity,
+    require_management_permission,
     resolve_employee_principal,
     resolve_principal,
     resolve_service_principal,
 )
-from app.tests.governance.helpers import Org, make_service_identity
+from app.tests.governance.helpers import Org, admin_principal, make_service_identity
 
 
 def test_resolve_employee_principal_reads_directory(session, org: Org) -> None:
@@ -70,6 +71,37 @@ def test_client_asserted_identity_is_rejected(session) -> None:
     with pytest.raises(PrincipalResolutionError) as excinfo:
         resolve_principal(session, principal_id="rt_runtime_0001")
     assert excinfo.value.reason_code == "identity_unverified"
+
+
+def test_management_permission_comes_from_resolved_principal(session, org: Org) -> None:
+    employee = resolve_employee_principal(session, employee_id=org.employee.id)
+    with pytest.raises(PrincipalResolutionError) as excinfo:
+        require_management_permission(employee)
+    assert excinfo.value.reason_code == "capability_not_granted"
+
+    admin = admin_principal(session, org)
+    assert require_management_permission(admin) is admin
+
+
+def test_resolution_failure_is_audited(session, org: Org) -> None:
+    from sqlalchemy import select
+
+    from app.audit.models import AuditEvent
+
+    with pytest.raises(PrincipalResolutionError):
+        resolve_employee_principal(session, employee_id=999_999_999)
+
+    event = session.scalar(
+        select(AuditEvent)
+        .where(
+            AuditEvent.action == "governance.principal.resolution_denied",
+            AuditEvent.resource_id == principal_ref("prin", 999_999_999),
+        )
+        .order_by(AuditEvent.id.desc())
+        .limit(1)
+    )
+    assert event is not None
+    assert event.details["reason_code"] == "principal_unbound"
 
 
 def test_service_identity_permissions_are_bounded_by_requester(session, org: Org) -> None:

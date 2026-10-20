@@ -10,7 +10,7 @@ from __future__ import annotations
 import copy
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +26,10 @@ from app.governance.models import (
     ServiceIdentityRole,
 )
 from app.governance.policies import create_draft, publish
+from app.governance.principal import (
+    GovernancePrincipal,
+    resolve_employee_principal,
+)
 from app.identity.models import EmployeeRole, Role
 from app.identity.seed import seed_permission_catalog
 
@@ -46,6 +50,7 @@ class Org:
     manager: Employee
     finance: Employee
     auditor: Employee
+    admin: Employee
 
 
 @dataclass(frozen=True)
@@ -82,6 +87,7 @@ def make_org(session: Session) -> Org:
     manager = employee("E-gov-manager")
     finance = employee("E-gov-finance")
     auditor = employee("E-gov-auditor")
+    admin = employee("E-gov-admin")
     manager.manager_id = None
     session.flush()
 
@@ -90,7 +96,7 @@ def make_org(session: Session) -> Org:
         for role in session.scalars(
             select(Role).where(
                 Role.name.in_(
-                    ["employee", "manager", "finance_lead", "auditor"]
+                    ["employee", "manager", "finance_lead", "auditor", "sysadmin"]
                 )
             )
         )
@@ -101,6 +107,7 @@ def make_org(session: Session) -> Org:
             EmployeeRole(employee_id=manager.id, role_id=roles["manager"].id),
             EmployeeRole(employee_id=finance.id, role_id=roles["finance_lead"].id),
             EmployeeRole(employee_id=auditor.id, role_id=roles["auditor"].id),
+            EmployeeRole(employee_id=admin.id, role_id=roles["sysadmin"].id),
         ]
     )
     session.flush()
@@ -110,7 +117,61 @@ def make_org(session: Session) -> Org:
         manager=manager,
         finance=finance,
         auditor=auditor,
+        admin=admin,
     )
+
+
+def admin_principal(session: Session, org: Org) -> GovernancePrincipal:
+    """Resolve the sysadmin employee used for policy/grant management tests."""
+    return resolve_employee_principal(session, employee_id=org.admin.id)
+
+
+class FakeEvidenceVerifier:
+    """A test double standing in for a trusted approval/confirmation store.
+
+    Production code defaults to :class:`DenyAllApprovalEvidenceVerifier`; this
+    class exists only to prove that *with* a trusted verifier the gate logic
+    resolves roles to people and still rejects self-approval.
+    """
+
+    def __init__(self, *, role_resolutions: dict[str, str] | None = None) -> None:
+        self.role_resolutions = dict(role_resolutions or {})
+        self.confirmation_calls = 0
+        self.approval_calls = 0
+
+    def verify_confirmation(
+        self,
+        ref: dict[str, Any],
+        *,
+        principal_id: str,
+        payload_hash: str | None,
+        now: datetime,
+    ) -> bool:
+        self.confirmation_calls += 1
+        return (
+            ref.get("status") == "satisfied"
+            and ref.get("consumed_at") is None
+            and ref.get("payload_hash") == payload_hash
+        )
+
+    def verify_approval(
+        self,
+        ref: dict[str, Any],
+        *,
+        requester_principal_id: str,
+        owner_principal_ids: frozenset[str],
+        payload_hash: str | None,
+        now: datetime,
+    ) -> str | None:
+        self.approval_calls += 1
+        if ref.get("decision") != "approved" or ref.get("payload_hash") != payload_hash:
+            return None
+        approver = ref.get("approver_principal_id")
+        if isinstance(approver, str) and approver.startswith("role_"):
+            return self.role_resolutions.get(approver)
+        if isinstance(approver, str) and approver.startswith("prin_"):
+            return approver
+        return None
 
 
 def scope(
@@ -138,7 +199,7 @@ def confirmation_ref(
     status: str = "satisfied",
     consumed_at: str | None = None,
 ) -> dict[str, Any]:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return {
         "confirmation_id": "conf_gov_0001",
         "payload_hash": payload_hash,
@@ -164,7 +225,7 @@ def approval_ref(
     decision: str = "approved",
     separation_check: str = "passed",
 ) -> dict[str, Any]:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return {
         "approval_id": "appr_gov_0001",
         "approver_principal_id": approver_principal_id,
@@ -281,6 +342,7 @@ def publish_policy(
     rules: list[dict[str, Any]] | None = None,
     hard_denies: list[dict[str, Any]] | None = None,
     decision_ttl_seconds: int = 900,
+    principal: GovernancePrincipal | None = None,
 ) -> PolicyContext:
     policy_set_id = policy_set_id or unique_policy_set()
     document = policy_document(
@@ -290,15 +352,18 @@ def publish_policy(
         hard_denies=hard_denies,
         decision_ttl_seconds=decision_ttl_seconds,
     )
+    actor = principal or admin_principal(session, org)
     draft = create_draft(
         session,
         document=document,
+        principal=actor,
         created_by_employee_id=org.finance.id,
         actor_id=org.finance.id,
     )
     row = publish(
         session,
         policy_version_id=draft.id,
+        principal=actor,
         published_by_employee_id=org.finance.id,
         actor_id=org.finance.id,
     )
@@ -348,7 +413,7 @@ def make_delegation(
     expires_at: datetime | None = None,
     status: str = "active",
 ) -> GovernanceDelegation:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     delegation = GovernanceDelegation(
         delegation_id=f"dlg_{uuid.uuid4().hex[:16]}",
         delegator_employee_id=delegator.id,

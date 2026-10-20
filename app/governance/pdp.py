@@ -26,18 +26,23 @@ from __future__ import annotations
 import re
 import uuid
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import Any
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
+from typing import Any, Protocol
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.audit.service import record_event
+from app.db.models.organization import Employee
 from app.governance.errors import (
+    ALLOW_REASON_CODES,
+    DENY_REASON_CODES,
+    NEEDS_REASON_CODES,
+    REASON_CODES,
     GovernanceError,
     PolicyError,
-    REASON_CODES,
 )
 from app.governance.models import (
     GovernanceDecisionRecord,
@@ -59,16 +64,24 @@ from app.governance.policies import (
     sha256_digest,
     validate_resource_scope,
 )
-from app.governance.principal import GovernancePrincipal, VERIFIED_ASSURANCES
+from app.governance.principal import (
+    VERIFIED_ASSURANCES,
+    GovernancePrincipal,
+    principal_ref,
+)
 from app.identity.authorization import effective_permissions
 
 __all__ = [
+    "PRIORITY_LEVELS",
+    "ApprovalEvidenceVerifier",
+    "DenyAllApprovalEvidenceVerifier",
     "EvaluationRequest",
     "GovernanceDecision",
-    "PRIORITY_LEVELS",
+    "decision_document_hash",
     "evaluate",
     "validate_approval_ref",
     "validate_confirmation_ref",
+    "verify_decision_document",
 ]
 
 PRIORITY_LEVELS = frozenset({"low", "normal", "high", "urgent"})
@@ -77,15 +90,81 @@ _ZERO_HASH = "sha256:" + "0" * 64
 _POLICY_SET_ID = re.compile(r"^polset_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$")
 _SEMVER = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 _NON_AUTHORIZING_TTL_SECONDS = 300
+_TASK_ID = re.compile(r"^task_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$")
+_IDEM_KEY = re.compile(r"^idem_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$")
+_CORRELATION_ID = re.compile(r"^corr_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$")
+_SHA256 = re.compile(r"^sha256:[a-f0-9]{64}$")
+_APPROVER_ID = re.compile(r"^(prin|role)_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$")
+_RESOLVED_PERSON = re.compile(r"^prin_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$")
+
+
+class ApprovalEvidenceVerifier(Protocol):
+    """Trusted resolver for confirmation/approval evidence.
+
+    Issue #78 has no approval store, so the only safe default is
+    :class:`DenyAllApprovalEvidenceVerifier`.  A deployment that owns a
+    trustworthy store injects a verifier that re-reads the evidence and, for a
+    ``role_`` approver, returns the actual person.  A caller-asserted reference
+    is never sufficient by itself.
+    """
+
+    def verify_confirmation(
+        self,
+        ref: Mapping[str, Any],
+        *,
+        principal_id: str,
+        payload_hash: str | None,
+        now: datetime,
+    ) -> bool:
+        """Return True only if the confirmation is authentic and unconsumed."""
+
+    def verify_approval(
+        self,
+        ref: Mapping[str, Any],
+        *,
+        requester_principal_id: str,
+        owner_principal_ids: frozenset[str],
+        payload_hash: str | None,
+        now: datetime,
+    ) -> str | None:
+        """Return the resolved person (``prin_*``) or ``None`` if untrusted."""
+
+
+class DenyAllApprovalEvidenceVerifier:
+    """Default verifier: no evidence store exists, so nothing is satisfied."""
+
+    def verify_confirmation(
+        self,
+        ref: Mapping[str, Any],
+        *,
+        principal_id: str,
+        payload_hash: str | None,
+        now: datetime,
+    ) -> bool:
+        return False
+
+    def verify_approval(
+        self,
+        ref: Mapping[str, Any],
+        *,
+        requester_principal_id: str,
+        owner_principal_ids: frozenset[str],
+        payload_hash: str | None,
+        now: datetime,
+    ) -> str | None:
+        return None
+
+
+DENY_ALL_EVIDENCE = DenyAllApprovalEvidenceVerifier()
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _rfc3339(value: datetime) -> str:
     return (
-        value.astimezone(timezone.utc)
+        value.astimezone(UTC)
         .isoformat(timespec="seconds")
         .replace("+00:00", "Z")
     )
@@ -99,8 +178,8 @@ def _parse_rfc3339(value: Any) -> datetime | None:
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def _new_id(prefix: str) -> str:
@@ -197,10 +276,15 @@ class GovernanceDecision:
 def validate_confirmation_ref(
     ref: Mapping[str, Any],
     *,
-    payload_hash: str | None = None,
+    payload_hash: str | None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Validate a satisfied, unconsumed, single-use confirmation reference."""
+    """Structurally validate a satisfied, unconsumed, single-use confirmation.
+
+    This only proves the reference is well formed.  Whether it is *authentic*
+    is decided by :class:`ApprovalEvidenceVerifier`; shape validation alone
+    never satisfies a gate.
+    """
     timestamp = now or _utcnow()
     if not isinstance(ref, Mapping):
         raise GovernanceError("confirmation_missing")
@@ -218,6 +302,12 @@ def validate_confirmation_ref(
     if missing:
         raise GovernanceError("confirmation_missing", context={"missing": missing})
 
+    if not isinstance(ref.get("confirmation_id"), str) or not re.fullmatch(
+        r"conf_[A-Za-z0-9][A-Za-z0-9_-]{3,63}", ref["confirmation_id"]
+    ):
+        raise GovernanceError("confirmation_missing", context={"field": "confirmation_id"})
+    if ref.get("canonicalization") not in {None, "rfc8785_jcs"}:
+        raise GovernanceError("confirmation_missing", context={"field": "canonicalization"})
     if ref.get("status") != "satisfied":
         if ref.get("status") == "consumed":
             raise GovernanceError("replay_detected")
@@ -228,7 +318,10 @@ def validate_confirmation_ref(
         raise GovernanceError("replay_detected")
     if ref.get("single_use") is not True:
         raise GovernanceError("confirmation_missing", context={"field": "single_use"})
-    if not isinstance(ref.get("confirmed_by_principal_id"), str):
+    confirmer = ref.get("confirmed_by_principal_id")
+    if not isinstance(confirmer, str) or not re.fullmatch(
+        r"^(prin|rt|svc)_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$", confirmer
+    ):
         raise GovernanceError(
             "confirmation_missing", context={"field": "confirmed_by_principal_id"}
         )
@@ -236,9 +329,14 @@ def validate_confirmation_ref(
     if expires_at is None or expires_at <= timestamp:
         raise GovernanceError("confirmation_missing", context={"field": "expires_at"})
     ref_hash = ref.get("payload_hash")
-    if not isinstance(ref_hash, str) or not ref_hash.startswith("sha256:"):
+    if not isinstance(ref_hash, str) or not _SHA256.fullmatch(ref_hash):
         raise GovernanceError("payload_hash_mismatch")
-    if payload_hash is not None and ref_hash != payload_hash:
+    # The payload hash is mandatory: omitting it must not skip binding.
+    if not isinstance(payload_hash, str) or not _SHA256.fullmatch(payload_hash):
+        raise GovernanceError(
+            "payload_hash_mismatch", context={"field": "payload_hash", "missing": True}
+        )
+    if ref_hash != payload_hash:
         raise GovernanceError("payload_hash_mismatch")
     return dict(ref)
 
@@ -247,10 +345,17 @@ def validate_approval_ref(
     ref: Mapping[str, Any],
     *,
     principal_id: str,
-    payload_hash: str | None = None,
+    owner_principal_ids: frozenset[str] | set[str] | None = None,
+    payload_hash: str | None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Validate an approved, separation-checked, unexpired approval reference."""
+    """Structurally validate an approved, separation-checked, unexpired approval.
+
+    ``role_`` approvers pass shape validation but must still be resolved to a
+    person by the trusted verifier.  Self-approval is rejected here when the
+    approver is already a concrete ``prin_`` id; the verified person is checked
+    again after resolution.
+    """
     timestamp = now or _utcnow()
     if not isinstance(ref, Mapping):
         raise GovernanceError("approval_missing")
@@ -267,6 +372,12 @@ def validate_approval_ref(
     if missing:
         raise GovernanceError("approval_missing", context={"missing": missing})
 
+    if not isinstance(ref.get("approval_id"), str) or not re.fullmatch(
+        r"appr_[A-Za-z0-9][A-Za-z0-9_-]{3,63}", ref["approval_id"]
+    ):
+        raise GovernanceError("approval_missing", context={"field": "approval_id"})
+    if ref.get("canonicalization") not in {None, "rfc8785_jcs"}:
+        raise GovernanceError("approval_missing", context={"field": "canonicalization"})
     if ref.get("decision") != "approved":
         raise GovernanceError(
             "approval_missing", context={"decision": ref.get("decision")}
@@ -278,9 +389,11 @@ def validate_approval_ref(
         raise GovernanceError("approval_missing", context={"field": "separation_check"})
 
     approver = ref.get("approver_principal_id")
-    if not isinstance(approver, str) or not approver.startswith(("prin_", "role_")):
+    if not isinstance(approver, str) or not _APPROVER_ID.fullmatch(approver):
         raise GovernanceError("approval_missing", context={"field": "approver_principal_id"})
-    if approver == principal_id:
+    owners = set(owner_principal_ids or ())
+    owners.add(principal_id)
+    if approver.startswith("prin_") and approver in owners:
         raise GovernanceError("self_approval_forbidden")
 
     decided_at = _parse_rfc3339(ref.get("decided_at"))
@@ -289,11 +402,55 @@ def validate_approval_ref(
         raise GovernanceError("approval_missing", context={"field": "expires_at"})
 
     ref_hash = ref.get("payload_hash")
-    if not isinstance(ref_hash, str) or not ref_hash.startswith("sha256:"):
+    if not isinstance(ref_hash, str) or not _SHA256.fullmatch(ref_hash):
         raise GovernanceError("payload_hash_mismatch")
-    if payload_hash is not None and ref_hash != payload_hash:
+    if not isinstance(payload_hash, str) or not _SHA256.fullmatch(payload_hash):
+        raise GovernanceError(
+            "payload_hash_mismatch", context={"field": "payload_hash", "missing": True}
+        )
+    if ref_hash != payload_hash:
         raise GovernanceError("payload_hash_mismatch")
     return dict(ref)
+
+
+def _owner_principal_ids(principal: GovernancePrincipal) -> frozenset[str]:
+    owners = {principal.principal_id}
+    if principal.employee_id is not None:
+        owners.add(principal_ref("prin", principal.employee_id))
+    if principal.owner_employee_id is not None:
+        owners.add(principal_ref("prin", principal.owner_employee_id))
+    return frozenset(owners)
+
+
+def _verify_approval_evidence(
+    verifier: ApprovalEvidenceVerifier,
+    ref: Mapping[str, Any],
+    *,
+    principal: GovernancePrincipal,
+    payload_hash: str | None,
+    now: datetime,
+) -> str | None:
+    """Return the resolved approver, or ``None`` when evidence is untrusted.
+
+    A verifier may not resolve a ``role_`` to another role: only an actual
+    person (``prin_*``) satisfies an approval.
+    """
+    resolved = verifier.verify_approval(
+        ref,
+        requester_principal_id=principal.principal_id,
+        owner_principal_ids=_owner_principal_ids(principal),
+        payload_hash=payload_hash,
+        now=now,
+    )
+    if resolved is None:
+        return None
+    if not isinstance(resolved, str) or not _RESOLVED_PERSON.fullmatch(resolved):
+        return None
+    if resolved in _owner_principal_ids(principal):
+        raise GovernanceError(
+            "self_approval_forbidden", context={"approver": resolved}
+        )
+    return resolved
 
 
 # ---------------------------------------------------------------------------
@@ -378,9 +535,11 @@ def _request_hash(request: EvaluationRequest) -> str:
         "principal_id": request.principal.principal_id,
         "principal_type": request.principal.principal_type,
         "service_identity_id": request.principal.service_identity_id,
+        "employee_id": request.principal.employee_id,
         "capability": request.capability,
         "task_id": request.task_id,
         "task_revision": request.task_revision,
+        "task_idempotency_key": request.task_idempotency_key,
         "resource_scope": _safe_scope(request.resource_scope),
         "priority": request.priority,
         "execution_mode": request.execution_mode,
@@ -432,35 +591,79 @@ def _build_decision(
     unknown = set(unique_reasons) - REASON_CODES
     if unknown:
         raise ValueError(f"unknown reason codes: {sorted(unknown)}")
+    if decision_type in {"allow", "managed_execution_required"}:
+        allowed_reasons = ALLOW_REASON_CODES
+    elif decision_type == "deny":
+        allowed_reasons = DENY_REASON_CODES
+    else:
+        allowed_reasons = NEEDS_REASON_CODES
+    invalid = set(unique_reasons) - allowed_reasons
+    if invalid:
+        raise ValueError(
+            f"reason codes not valid for {decision_type}: {sorted(invalid)}"
+        )
 
     decision_id = _new_id("gdec_")
-    correlation_id = request.correlation_id or _new_id("corr_")
+    correlation_id = (
+        request.correlation_id
+        if isinstance(request.correlation_id, str)
+        and _CORRELATION_ID.fullmatch(request.correlation_id)
+        else _new_id("corr_")
+    )
     revision = _next_revision(
         session,
         task_id=request.task_id,
         principal_id=request.principal.principal_id,
     )
-    if decision_purpose == "retry" and revision < 2:
-        revision = 2
 
     policy_version = _policy_version_document(
         policy_row,
         policy_set_id=request.policy_set_id,
         version=request.policy_version,
     )
-    task_ref = {
-        "task_id": None if decision_type == "pre_evaluation" else request.task_id,
-        "idempotency_key": request.task_idempotency_key or _new_id("idem_"),
-        "task_revision": (
-            None
-            if decision_type == "pre_evaluation"
-            else (
-                request.task_revision
-                if isinstance(request.task_revision, int)
-                and not isinstance(request.task_revision, bool)
-                and request.task_revision >= 0
-                else None
+    safe_task_id = (
+        request.task_id
+        if isinstance(request.task_id, str) and _TASK_ID.fullmatch(request.task_id)
+        else None
+    )
+    safe_idempotency = (
+        request.task_idempotency_key
+        if isinstance(request.task_idempotency_key, str)
+        and _IDEM_KEY.fullmatch(request.task_idempotency_key)
+        else None
+    )
+    if safe_idempotency is None and safe_task_id is not None:
+        # Reuse the task submission key from the previous decision so a retry
+        # stays bound to the same task identity instead of inventing a new one.
+        previous_key = session.scalar(
+            select(GovernanceDecisionRecord)
+            .where(
+                GovernanceDecisionRecord.task_id == safe_task_id,
+                GovernanceDecisionRecord.principal_id
+                == request.principal.principal_id,
             )
+            .order_by(GovernanceDecisionRecord.decision_revision.desc())
+            .limit(1)
+            .with_only_columns(GovernanceDecisionRecord.document)
+        )
+        if isinstance(previous_key, Mapping):
+            candidate = (previous_key.get("task_ref") or {}).get("idempotency_key")
+            if isinstance(candidate, str) and _IDEM_KEY.fullmatch(candidate):
+                safe_idempotency = candidate
+    if safe_idempotency is None:
+        safe_idempotency = _new_id("idem_")
+    safe_task_revision = (
+        request.task_revision
+        if isinstance(request.task_revision, int)
+        and not isinstance(request.task_revision, bool)
+        and request.task_revision >= 0
+        else None
+    )
+    task_ref = {
+        "task_id": None if decision_type == "pre_evaluation" else safe_task_id,
+        "idempotency_key": safe_idempotency,
+        "task_revision": (
+            None if decision_type == "pre_evaluation" else safe_task_revision
         ),
     }
     body: dict[str, Any] = {
@@ -528,6 +731,53 @@ def _obligations(
     return tuple(dict.fromkeys(obligations))
 
 
+def decision_document_hash(document: Mapping[str, Any]) -> str:
+    """Return the contract hash: JCS of the document without ``decision_hash``."""
+    body = dict(document)
+    body.pop("decision_hash", None)
+    return sha256_digest(canonical_json(body).encode("utf-8"))
+
+
+def verify_decision_document(record: GovernanceDecisionRecord) -> dict[str, Any]:
+    """Verify a persisted decision document and return it, else fail closed.
+
+    Grants and the PEP derive every field from this document, so a mismatch
+    between the stored hash, the stored document and the row must never be
+    tolerated.
+    """
+    document = record.document
+    if not isinstance(document, Mapping):
+        raise GovernanceError(
+            "policy_version_invalid", context={"reason": "decision_document_missing"}
+        )
+    if document.get("decision_id") != record.decision_id:
+        raise GovernanceError(
+            "policy_version_invalid", context={"reason": "decision_id_mismatch"}
+        )
+    if document.get("decision_type") != record.decision_type:
+        raise GovernanceError(
+            "policy_version_invalid", context={"reason": "decision_type_mismatch"}
+        )
+    if document.get("decision_revision") != record.decision_revision:
+        raise GovernanceError(
+            "policy_version_invalid", context={"reason": "decision_revision_mismatch"}
+        )
+    computed = decision_document_hash(document)
+    stored_document_hash = document.get("decision_hash")
+    if (
+        computed != record.decision_hash
+        or stored_document_hash != record.decision_hash
+    ):
+        raise GovernanceError(
+            "policy_version_invalid", context={"reason": "decision_hash_mismatch"}
+        )
+    if document.get("constraints") != record.constraints:
+        raise GovernanceError(
+            "policy_version_invalid", context={"reason": "constraints_mismatch"}
+        )
+    return dict(document)
+
+
 def _persist(
     session: Session,
     *,
@@ -537,6 +787,7 @@ def _persist(
     request_hash: str,
     policy_row: GovernancePolicyVersion | None,
 ) -> GovernanceDecision:
+    task_ref = decision.task_ref
     record = GovernanceDecisionRecord(
         decision_id=decision.decision_id,
         decision_revision=decision.decision_revision,
@@ -544,28 +795,41 @@ def _persist(
         decision_purpose=decision.decision_purpose,
         supersedes_decision_id=decision.supersedes_decision_id,
         correlation_id=decision.correlation_id,
-        task_id=(
-            None if decision.decision_type == "pre_evaluation" else request.task_id
-        ),
-        task_revision=(
-            None
-            if decision.decision_type == "pre_evaluation"
-            else request.task_revision
-        ),
+        task_id=task_ref.get("task_id"),
+        task_revision=task_ref.get("task_revision"),
         principal_type=request.principal.principal_type,
         principal_id=request.principal.principal_id,
         decision_type=decision.decision_type,
         reason_codes=list(decision.reason_codes),
-        policy_set_id=policy_row.policy_set_id if policy_row is not None else request.policy_set_id,
-        policy_version=policy_row.version if policy_row is not None else request.policy_version,
-        policy_content_hash=policy_row.content_hash if policy_row is not None else None,
+        policy_set_id=decision.policy_version["policy_set_id"],
+        policy_version=decision.policy_version["version"],
+        policy_content_hash=(
+            policy_row.content_hash if policy_row is not None else None
+        ),
         constraints=decision.constraints,
+        document=decision.to_document(),
         request_hash=request_hash,
         evaluated_at=evaluated_at,
         expires_at=_parse_rfc3339(decision.expires_at) or evaluated_at,
     )
-    session.add(record)
-    session.flush()
+    # The unique (task_id, principal_id, decision_revision) constraint is the
+    # concurrency guard: two evaluators racing for the same revision produce
+    # one row, and the loser gets a contract-shaped stale-revision error
+    # instead of a raw IntegrityError.  A savepoint keeps the outer
+    # transaction usable after the conflict.
+    try:
+        with session.begin_nested():
+            session.add(record)
+            session.flush()
+    except IntegrityError as exc:
+        raise GovernanceError(
+            "decision_revision_stale",
+            context={
+                "task_id": request.task_id,
+                "principal_id": request.principal.principal_id,
+                "decision_revision": decision.decision_revision,
+            },
+        ) from exc
 
     actor_id = request.principal.employee_id
     if decision.decision_type in {"allow", "managed_execution_required"}:
@@ -617,7 +881,12 @@ def _deny(
     constraints = _constraints(
         execution_mode="none",
         allowed_capabilities=[],
-        denied_capabilities=[request.capability] if request.capability else [],
+        denied_capabilities=(
+            [request.capability]
+            if isinstance(request.capability, str)
+            and CAPABILITY_PATTERN.fullmatch(request.capability)
+            else []
+        ),
         resource_scope=_safe_scope(scope if scope is not None else request.resource_scope),
         ttl_seconds=0,
         max_calls=0,
@@ -744,6 +1013,15 @@ def _validate_delegation(
         raise GovernanceError("delegation_expired", context={"status": row.status})
     if not (row.starts_at <= now < row.expires_at):
         raise GovernanceError("delegation_expired", context={"delegation_ref": reference})
+    delegator = session.get(Employee, row.delegator_employee_id)
+    if delegator is None or delegator.status != "active":
+        raise GovernanceError(
+            "delegation_expired",
+            context={
+                "delegation_ref": reference,
+                "reason": "delegator_inactive",
+            },
+        )
     if row.policy_set_id is not None and row.policy_set_id != policy_row.policy_set_id:
         raise GovernanceError("policy_version_invalid", context={"delegation_ref": reference})
     if row.policy_version != policy_row.version:
@@ -781,6 +1059,7 @@ def evaluate(
     *,
     principal: GovernancePrincipal | None = None,
     now: datetime | None = None,
+    evidence_verifier: ApprovalEvidenceVerifier | None = None,
     **request_fields: Any,
 ) -> GovernanceDecision:
     """Evaluate one governance request deterministically and persist the decision.
@@ -807,20 +1086,11 @@ def evaluate(
 
     evaluated_at = now or _utcnow()
     request_hash = _request_hash(request)
+    verifier = evidence_verifier or DENY_ALL_EVIDENCE
     decision_purpose = request.decision_purpose
     if decision_purpose not in {"initial_execution", "retry"}:
         decision_purpose = "initial_execution"
     supersedes = request.supersedes_decision_id
-    if decision_purpose == "retry" and not supersedes and request.task_id:
-        supersedes = session.scalar(
-            select(GovernanceDecisionRecord.decision_id)
-            .where(
-                GovernanceDecisionRecord.task_id == request.task_id,
-                GovernanceDecisionRecord.principal_id == request.principal.principal_id,
-            )
-            .order_by(GovernanceDecisionRecord.decision_revision.desc())
-            .limit(1)
-        )
 
     def deny(reason_codes: Sequence[str], *, policy_row=None, scope=None):
         return _deny(
@@ -841,11 +1111,84 @@ def evaluate(
     if not request.principal.is_active:
         return deny(["principal_disabled"])
 
-    # A retry decision must supersede a prior decision for the same task; a
-    # retry without history is stale and fails closed.
-    if decision_purpose == "retry" and not supersedes:
-        decision_purpose = "initial_execution"
-        return deny(["decision_revision_stale"])
+    # 1b. Request-shape validation: reject malformed identifiers before they
+    # reach a database cast or become a silently-ignored field.
+    if request.task_id is not None and (
+        not isinstance(request.task_id, str)
+        or not _TASK_ID.fullmatch(request.task_id)
+    ):
+        return deny(["required_input_missing"], scope=request.resource_scope)
+    if request.task_revision is not None and (
+        not isinstance(request.task_revision, int)
+        or isinstance(request.task_revision, bool)
+        or request.task_revision < 0
+        or request.task_revision > 2**53 - 1
+    ):
+        return deny(["required_input_missing"], scope=request.resource_scope)
+    if request.task_idempotency_key is not None and (
+        not isinstance(request.task_idempotency_key, str)
+        or not _IDEM_KEY.fullmatch(request.task_idempotency_key)
+    ):
+        return deny(["required_input_missing"], scope=request.resource_scope)
+    if request.payload_hash is not None and (
+        not isinstance(request.payload_hash, str)
+        or not _SHA256.fullmatch(request.payload_hash)
+    ):
+        return deny(["payload_hash_mismatch"], scope=request.resource_scope)
+    if request.correlation_id is not None and (
+        not isinstance(request.correlation_id, str)
+        or not _CORRELATION_ID.fullmatch(request.correlation_id)
+    ):
+        return deny(["required_input_missing"], scope=request.resource_scope)
+    if request.delegation_ref is not None and (
+        not isinstance(request.delegation_ref, str)
+        or not re.fullmatch(
+            r"^dlg_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$", request.delegation_ref
+        )
+    ):
+        return deny(["required_input_missing"], scope=request.resource_scope)
+
+    # 1c. A retry must supersede the current decision of the same task and
+    # principal.  There is no synthetic revision 2 without history.
+    if decision_purpose == "retry":
+        if not request.task_id:
+            return deny(["task_not_created"], scope=request.resource_scope)
+        latest = session.scalar(
+            select(GovernanceDecisionRecord)
+            .where(
+                GovernanceDecisionRecord.task_id == request.task_id,
+                GovernanceDecisionRecord.principal_id
+                == request.principal.principal_id,
+            )
+            .order_by(GovernanceDecisionRecord.decision_revision.desc())
+            .limit(1)
+        )
+        if latest is None:
+            # There is no retry chain to join; record a plain denial instead of
+            # fabricating revision 2 or a supersedes reference.
+            decision_purpose = "initial_execution"
+            supersedes = None
+            return deny(["decision_revision_stale"], scope=request.resource_scope)
+        if supersedes is not None:
+            superseded = session.scalar(
+                select(GovernanceDecisionRecord).where(
+                    GovernanceDecisionRecord.decision_id == supersedes
+                )
+            )
+            if (
+                superseded is None
+                or superseded.task_id != request.task_id
+                or superseded.principal_id != request.principal.principal_id
+                or superseded.decision_revision != latest.decision_revision
+            ):
+                # Keep the deny on the real chain rather than referencing a
+                # decision that does not exist or belongs elsewhere.
+                supersedes = latest.decision_id
+                return deny(
+                    ["decision_revision_stale"], scope=request.resource_scope
+                )
+        else:
+            supersedes = latest.decision_id
 
     # 2. Policy must exist and be the published version (fail closed).
     try:
@@ -988,6 +1331,15 @@ def evaluate(
             )
         except GovernanceError as exc:
             return deny([exc.reason_code], policy_row=policy_row, scope=scope)
+        # Persist the delegation that actually authorized this decision on the
+        # decision subject, so the grant can bind and revalidate it.
+        if request.principal.delegation_ref != delegation_reference:
+            request = replace(
+                request,
+                principal=replace(
+                    request.principal, delegation_ref=delegation_reference
+                ),
+            )
 
     # 10. Confirmation and approval gates.
     owed_reasons: list[str] = []
@@ -1017,6 +1369,31 @@ def evaluate(
             )
         except GovernanceError as exc:
             return deny([exc.reason_code], policy_row=policy_row, scope=scope)
+        try:
+            verified = verifier.verify_confirmation(
+                confirmation_ref,
+                principal_id=request.principal.principal_id,
+                payload_hash=request.payload_hash,
+                now=evaluated_at,
+            )
+        except Exception:  # noqa: BLE001 - untrusted verifier: fail closed
+            verified = False
+        if not verified:
+            # A caller-asserted reference is not evidence.
+            return _non_authorizing(
+                session,
+                request=request,
+                decision_type="needs_confirmation",
+                reason_codes=["confirmation_required"],
+                policy_row=policy_row,
+                evaluated_at=evaluated_at,
+                request_hash=request_hash,
+                decision_purpose=decision_purpose,
+                supersedes_decision_id=supersedes,
+                scope=scope,
+                required_confirmation=True,
+                required_approval=rule.required_approval,
+            )
         owed_reasons.append("confirmation_satisfied")
     if rule.required_approval:
         if request.approval_ref is None:
@@ -1038,11 +1415,36 @@ def evaluate(
             approval_ref = validate_approval_ref(
                 request.approval_ref,
                 principal_id=request.principal.principal_id,
+                owner_principal_ids=_owner_principal_ids(request.principal),
+                payload_hash=request.payload_hash,
+                now=evaluated_at,
+            )
+            resolved_approver = _verify_approval_evidence(
+                verifier,
+                approval_ref,
+                principal=request.principal,
                 payload_hash=request.payload_hash,
                 now=evaluated_at,
             )
         except GovernanceError as exc:
             return deny([exc.reason_code], policy_row=policy_row, scope=scope)
+        except Exception:  # noqa: BLE001 - untrusted verifier: fail closed
+            resolved_approver = None
+        if resolved_approver is None:
+            return _non_authorizing(
+                session,
+                request=request,
+                decision_type="needs_approval",
+                reason_codes=["approval_required"],
+                policy_row=policy_row,
+                evaluated_at=evaluated_at,
+                request_hash=request_hash,
+                decision_purpose=decision_purpose,
+                supersedes_decision_id=supersedes,
+                scope=scope,
+                required_confirmation=rule.required_confirmation,
+                required_approval=True,
+            )
         owed_reasons.append("approval_satisfied")
 
     # 11. Pre-evaluation is never authorizing.

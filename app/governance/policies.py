@@ -22,15 +22,24 @@ import re
 import struct
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.audit.service import record_event
-from app.governance.errors import PolicyError, REASON_CODES
+from app.governance.errors import (
+    ALLOW_REASON_CODES,
+    DENY_REASON_CODES,
+    REASON_CODES,
+    PolicyError,
+)
 from app.governance.models import GovernancePolicyVersion
+from app.governance.principal import (
+    GovernancePrincipal,
+    require_management_permission,
+)
 
 __all__ = [
     "CAPABILITY_PATTERN",
@@ -79,6 +88,17 @@ POLICY_SCOPE_TYPES: frozenset[str] = frozenset(
     }
 )
 ALL_SCOPE_TYPES = POLICY_SCOPE_TYPES | {"none", "undetermined"}
+
+#: ADR-001 §3.3.1 mapping from the existing RBAC ``permissions.scope`` to the
+#: governance ``resource_scope.scope_type``.  A rule that requires an RBAC
+#: permission may not declare a wider resource scope type than that permission
+#: actually grants (``own`` must never authorize ``company`` data).
+RBAC_SCOPE_TO_RESOURCE_SCOPE: dict[str, frozenset[str]] = {
+    "own": frozenset({"self"}),
+    "team": frozenset({"department"}),
+    "company": frozenset({"company"}),
+    "authorized": frozenset({"approval_chain"}),
+}
 DATA_CLASSIFICATIONS = frozenset(
     {"public", "internal", "confidential", "restricted"}
 )
@@ -105,17 +125,84 @@ def _utf16_sort_key(value: str) -> tuple[int, ...]:
     )
 
 
-def _canonical_number(value: int | float) -> str:
-    if isinstance(value, int) and not isinstance(value, bool):
+MAX_SAFE_INTEGER = 2**53 - 1
+
+
+def _ecmascript_number(value: float) -> str:
+    """Render a finite float the way ECMAScript ``Number::toString`` does.
+
+    Python's ``repr`` and ECMAScript both print the *shortest* round-tripping
+    decimal digits, so only the presentation differs: ECMAScript uses fixed
+    notation for ``1e-6 <= |x| < 1e21`` and exponential notation outside that
+    range, with no zero padding in the exponent (RFC 8785 JCS number rules).
+    """
+    if value == 0:
+        # JCS maps both +0 and -0 to "0".
+        return "0"
+    if value.is_integer() and abs(value) < 1e21:
+        return str(int(value))
+
+    rendered = repr(value)
+    negative = rendered.startswith("-")
+    if negative:
+        rendered = rendered[1:]
+
+    if "e" in rendered or "E" in rendered:
+        mantissa, _, exponent_text = rendered.lower().partition("e")
+        exponent = int(exponent_text)
+    else:
+        mantissa, exponent = rendered, 0
+
+    if "." in mantissa:
+        whole, fraction = mantissa.split(".", 1)
+    else:
+        whole, fraction = mantissa, ""
+    digits = (whole + fraction).lstrip("0")
+    if not digits:
+        return "0"
+    # Exponent of the first significant digit.
+    if whole.strip("0"):
+        decimal_exponent = len(whole.lstrip("0")) - 1 + exponent
+    else:
+        first_significant = next(
+            index for index, char in enumerate(fraction) if char != "0"
+        )
+        decimal_exponent = -(first_significant + 1) + exponent
+
+    digits = digits.rstrip("0") or "0"
+    magnitude = abs(value)
+    sign = "-" if negative else ""
+
+    if 1e-6 <= magnitude < 1e21:
+        if decimal_exponent >= 0:
+            if len(digits) <= decimal_exponent + 1:
+                fixed = digits + "0" * (decimal_exponent + 1 - len(digits))
+                return sign + fixed
+            return sign + digits[: decimal_exponent + 1] + "." + digits[
+                decimal_exponent + 1 :
+            ]
+        return sign + "0." + "0" * (-decimal_exponent - 1) + digits
+
+    # Exponential form: d[.ddd]e±n, no leading zeros in the exponent.
+    mantissa_digits = digits[0] + (
+        "." + digits[1:] if len(digits) > 1 else ""
+    )
+    exponent_sign = "+" if decimal_exponent >= 0 else "-"
+    return f"{sign}{mantissa_digits}e{exponent_sign}{abs(decimal_exponent)}"
+
+
+def _canonical_number(value: float) -> str:
+    if isinstance(value, bool):
+        raise TypeError("bool is not a JSON number")
+    if isinstance(value, int):
+        if abs(value) > MAX_SAFE_INTEGER:
+            raise ValueError(
+                "JCS numbers must stay within the IEEE-754 safe integer range"
+            )
         return str(value)
     if not math.isfinite(value):
         raise ValueError("JCS does not allow NaN or Infinity")
-    if value.is_integer() and abs(value) < 1e21:
-        return str(int(value))
-    # Python and ECMAScript agree on the significant digits; only the exponent
-    # padding differs ("1e-07" vs "1e-7").
-    rendered = repr(value)
-    return re.sub(r"e([+-])0+([0-9]+)", r"e\1\2", rendered)
+    return _ecmascript_number(value)
 
 
 def canonical_json(value: Any) -> str:
@@ -211,11 +298,21 @@ class PolicyDocument:
         return None
 
     def rule_for(self, capability: str) -> PolicyRule | None:
-        """Return the first matching rule in document order (deterministic)."""
+        """Return a matching rule, with deny always winning.
+
+        A ``deny`` rule beats every ``allow`` rule for the same capability
+        regardless of document order; document order only decides between
+        rules of the same effect.
+        """
+        first_allow: PolicyRule | None = None
         for rule in self.rules:
-            if capability_matches(rule.capability, capability):
+            if not capability_matches(rule.capability, capability):
+                continue
+            if rule.effect == "deny":
                 return rule
-        return None
+            if first_allow is None:
+                first_allow = rule
+        return first_allow
 
 
 def capability_matches(pattern: str, capability: str) -> bool:
@@ -348,11 +445,25 @@ def _parse_rule(raw: Mapping[str, Any], *, default_effect: str = "allow") -> Pol
     effect = raw.get("effect", default_effect)
     if effect not in {"allow", "deny"}:
         raise PolicyError("policy_version_invalid", context={"field": "effect"})
+    # The default reason code follows the *rule's* effect, never the document
+    # default: a deny rule without a reason must emit a deny reason.
     reason_code = raw.get(
-        "reason_code", "policy_denied" if default_effect == "deny" else "policy_allowed"
+        "reason_code", "policy_denied" if effect == "deny" else "policy_allowed"
     )
-    if reason_code not in REASON_CODES:
+    if not isinstance(reason_code, str) or reason_code not in REASON_CODES:
         raise PolicyError("policy_version_invalid", context={"field": "reason_code"})
+    allowed_reasons = (
+        ALLOW_REASON_CODES if effect == "allow" else DENY_REASON_CODES
+    )
+    if reason_code not in allowed_reasons:
+        raise PolicyError(
+            "policy_version_invalid",
+            context={
+                "field": "reason_code",
+                "reason": "not_valid_for_effect",
+                "effect": effect,
+            },
+        )
 
     allowed_scope_types = _string_set(
         raw.get("allowed_scope_types", sorted(POLICY_SCOPE_TYPES)),
@@ -362,6 +473,23 @@ def _parse_rule(raw: Mapping[str, Any], *, default_effect: str = "allow") -> Pol
         raise PolicyError(
             "policy_version_invalid", context={"field": "allowed_scope_types"}
         )
+
+    required_permissions = _permissions(
+        raw.get("required_permissions", []), "required_permissions"
+    )
+    # ADR-001 §3.3.1: RBAC scope must map onto the matching resource scope.
+    # Requiring ``own`` may never authorize ``department``/``company`` data.
+    for _resource, _action, rbac_scope in required_permissions:
+        mapped = RBAC_SCOPE_TO_RESOURCE_SCOPE[rbac_scope]
+        if not allowed_scope_types.issubset(mapped):
+            raise PolicyError(
+                "policy_version_invalid",
+                context={
+                    "field": "allowed_scope_types",
+                    "reason": "rbac_scope_mismatch",
+                    "rbac_scope": rbac_scope,
+                },
+            )
 
     risk_levels = _string_set(raw.get("risk_levels", sorted(RISK_LEVELS)), "risk_levels")
     if not risk_levels.issubset(RISK_LEVELS):
@@ -413,7 +541,7 @@ def _parse_rule(raw: Mapping[str, Any], *, default_effect: str = "allow") -> Pol
             raise PolicyError(
                 "policy_version_invalid", context={"field": "max_cost_units"}
             )
-        if max_cost_units < 0:
+        if max_cost_units < 0 or max_cost_units > 100_000_000:
             raise PolicyError(
                 "policy_version_invalid", context={"field": "max_cost_units"}
             )
@@ -424,9 +552,7 @@ def _parse_rule(raw: Mapping[str, Any], *, default_effect: str = "allow") -> Pol
     return PolicyRule(
         rule_id=rule_id,
         capability=capability,
-        required_permissions=_permissions(
-            raw.get("required_permissions", []), "required_permissions"
-        ),
+        required_permissions=required_permissions,
         allowed_scope_types=frozenset(allowed_scope_types),
         required_confirmation=_require_bool(
             raw.get("required_confirmation", False), "required_confirmation"
@@ -726,11 +852,17 @@ def create_draft(
     session: Session,
     document: Mapping[str, Any],
     *,
+    principal: GovernancePrincipal,
     created_by_employee_id: int | None = None,
     actor_id: int | None = None,
     supersedes_id: int | None = None,
 ) -> GovernancePolicyVersion:
-    """Validate ``document`` and persist a new ``draft`` policy version."""
+    """Validate ``document`` and persist a new ``draft`` policy version.
+
+    A draft is a management operation: the caller must be a resolved principal
+    holding the existing ``identity/manage/company`` permission.
+    """
+    require_management_permission(principal)
     parsed = parse_policy_document(document)
     existing = session.scalar(
         select(GovernancePolicyVersion.id).where(
@@ -775,13 +907,20 @@ def publish(
     session: Session,
     policy_version_id: int,
     *,
+    principal: GovernancePrincipal,
     published_by_employee_id: int | None = None,
     actor_id: int | None = None,
     now: datetime | None = None,
 ) -> GovernancePolicyVersion:
     """Publish a draft, retiring the currently published version of the set."""
-    timestamp = now or datetime.now(timezone.utc)
-    row = session.get(GovernancePolicyVersion, policy_version_id, with_for_update=True)
+    require_management_permission(principal)
+    timestamp = now or datetime.now(UTC)
+    row = session.get(
+        GovernancePolicyVersion,
+        policy_version_id,
+        with_for_update=True,
+        populate_existing=True,
+    )
     if row is None:
         raise PolicyError("policy_version_invalid", context={"field": "policy_version_id"})
     if row.status == "published":
@@ -847,9 +986,13 @@ def get_active(
     When ``version`` is supplied it must be the *published* version; an old or
     draft version reference is never silently accepted.
     """
-    stmt = select(GovernancePolicyVersion).where(
-        GovernancePolicyVersion.policy_set_id == policy_set_id,
-        GovernancePolicyVersion.status == "published",
+    stmt = (
+        select(GovernancePolicyVersion)
+        .where(
+            GovernancePolicyVersion.policy_set_id == policy_set_id,
+            GovernancePolicyVersion.status == "published",
+        )
+        .execution_options(populate_existing=True)
     )
     if version is not None:
         stmt = stmt.where(GovernancePolicyVersion.version == version)
@@ -902,6 +1045,7 @@ def _next_version(
 def rollback(
     session: Session,
     *,
+    principal: GovernancePrincipal,
     policy_set_id: str,
     target_version: str,
     new_version: str | None = None,
@@ -914,6 +1058,7 @@ def rollback(
     ``supersedes_id`` pointing at the current published version (or the target
     if there is none), preserving the full version history.
     """
+    require_management_permission(principal)
     target = get_version(session, policy_set_id, target_version)
     if target is None:
         raise PolicyError(
@@ -942,6 +1087,7 @@ def rollback(
     draft = create_draft(
         session,
         document=document,
+        principal=principal,
         created_by_employee_id=actor_id,
         actor_id=actor_id,
         supersedes_id=(current.id if current is not None else target.id),
@@ -949,6 +1095,7 @@ def rollback(
     published = publish(
         session,
         policy_version_id=draft.id,
+        principal=principal,
         published_by_employee_id=actor_id,
         actor_id=actor_id,
         now=now,
