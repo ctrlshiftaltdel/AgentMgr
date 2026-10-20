@@ -384,7 +384,7 @@ Adapter 把外部状态映射为内部事实；核心再把这些事实映射为
 - **`unknown` 来源的 `needs_human` 禁止 T59/T60。** 该状态的 Grant 已 `revoked`；Adapter 即使查询到 `state=running` 或拿到结果，也不得映射为 `running`/`verifying`（状态机 F41）。Adapter 必须先 `cancel_task` 并取得 `stop_confirmed=true`，再由核心按 T61/T62/T63/T64 处理（T70 是 `failed → needs_human` 的入边，不是 `needs_human` 的出口）。
 - **T61 重派需要停止证据或“从未开始”证明。** 只有当 `stop_confirmed=true`（已关闭尝试），或 Adapter 能按幂等键证明从未受理（`attempt=0` 且 `not_found` + 无副作用保证）时，核心才允许 T61；否则不得重新入队，只能继续对账或转人工。
 - **T62 撤销授权同样需要停止证据。** `needs_human → denied` 在 `attempt>=1` 时必须已有 `stop_confirmed=true`，或 `attempt=0` 证明从未受理；Adapter 不得把 `cancel` 被受理当作停止证据。否则保持 `needs_human` 并继续对账（S-20）。
-- **T59/T60 只适用于仍有有效授权的 `needs_human`。** 来自 `failed`（T70）的 `needs_human` 尝试已是尝试终态，来自 `unknown`（T57/T72/T73）的 Grant 已 `revoked`；Adapter 不得把运行时的 `running` 或结果映射回核心 `running`/`verifying`（F41）。
+- **T59/T60 只适用于仍有有效授权的 `needs_human`。** 来自 `failed`（T70）的 `needs_human` 记录已是尝试终态（`attempt=0` 时从未开始），来自 `unknown`（T57/T72/T73）的 Grant 已 `revoked`；Adapter 不得把运行时的 `running` 或结果映射回核心 `running`/`verifying`（F41）。
 - **重试预算的余额在 T65 递减后记录。** Adapter 不解释预算，只透传核心写入的 `attempt.retry_budget_remaining`；最后一次允许的重试该值为 0。
 
 ## 5. 超时、重试与幂等

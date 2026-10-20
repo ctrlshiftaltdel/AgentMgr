@@ -288,14 +288,14 @@ T66–T69 与 Adapter 提交结果一一对应：`rejected → T66`、`unsupport
 
 | ID | From → To | 事件 | 守卫 |
 |---|---|---|---|
-| T59 | `needs_human` → `running` | `human.takeover.running` | 人工确认任务确实在运行；**仅当 `attempt>=1` 且当前 Grant 仍为 `active`，或已由本尝试消费（`consumed`），且执行证据证明同一尝试仍在运行时可用**；来自 `unknown`（T57/T72/T73）的 Grant 已 `revoked`，来自 `failed`（T70）的尝试已处于尝试终态；两者都**不得走 T59（F41）**。记录操作者与证据；不新增能力 |
-| T60 | `needs_human` → `verifying` | `human.result_submitted` | 人工提交结构化结果与证据；**仅当 `attempt>=1`、该尝试刚结束待验证且 Grant 为 `active`/本尝试 `consumed` 时可用**；来自 `unknown`（T57/T72/T73）的 Grant 已 `revoked`，来自 `failed`（T70）的尝试已是尝试终态；两者都**不得走 T60（F41）**。仍需走验证，不得直接成功 |
+| T59 | `needs_human` → `running` | `human.takeover.running` | 人工确认任务确实在运行；**仅当 `attempt>=1` 且当前 Grant 仍为 `active`，或已由本尝试消费（`consumed`），且执行证据证明同一尝试仍在运行时可用**；来自 `unknown`（T57/T72/T73）的 Grant 已 `revoked`，来自 `failed`（T70）的记录已是尝试终态（`attempt=0` 时从未开始）；两者都**不得走 T59（F41）**。记录操作者与证据；不新增能力 |
+| T60 | `needs_human` → `verifying` | `human.result_submitted` | 人工提交结构化结果与证据；**仅当 `attempt>=1`、该尝试刚结束待验证且 Grant 为 `active`/本尝试 `consumed` 时可用**；来自 `unknown`（T57/T72/T73）的 Grant 已 `revoked`，来自 `failed`（T70）的记录已是尝试终态（`attempt=0` 时从未开始）；两者都**不得走 T60（F41）**。仍需走验证，不得直接成功 |
 | T61 | `needs_human` → `queued` | `human.redispatch` | 已决定重派；**不得存在未对账的 active attempt**：要么 `stop_confirmed=true`（已关闭该尝试），要么 `attempt=0` 且能证明从未 `dispatch.accepted`（从未开始）。`attempt>=1` 且无停止证据时 T61 禁止。**必须重新执行 PDP 并签发新决策与新 Grant**（新 `decision_id`/`grant_id`，`decision_revision` 递增；旧 Grant 不得复用）；`task_revision`、确认、审批全部重验；`retry_budget_remaining > 0`（T61 不执行 T65 的自动递减）；无未对账副作用 |
 | T62 | `needs_human` → `denied` | `human.authorization_revoked` | 人工/策略撤销授权；记录原因码与审计；**不得存在未对账的 active attempt**：必须 `result.stop_confirmed=true`（已关闭该尝试）或 `attempt=0`（从未 `dispatch.accepted`）。`attempt>=1` 且无停止证据时 T62 禁止（Schema 已拒绝 `denied` + `attempt>=1` + `stop_confirmed=false`，见 S-20） |
 | T63 | `needs_human` → `cancelled` | `human.stop_confirmed` | 人工确认已停止且无新副作用；`stop_confirmed=true`；这是关闭仍打开尝试的人工路径 |
 | T64 | `needs_human` → `failed` | `human.declared_failed` | 人工判定失败且不再重试；记录证据；**要求 `attempt>=1`**。`attempt=0` 的人工失败不得进入 `failed`，只能登记为 `cancelled`（T63）或 `denied`（T62），避免 T64/T70 的空转循环 |
 
-**`needs_human` 的可达性与出口按进入来源区分。** T59/T60 只在 `attempt>=1` 且当前 Grant 为 `active` 或由本尝试 `consumed` 时可用，并分别需要“同一尝试仍在运行”/“该尝试刚结束待验证”的执行证据：T40/T45/T52/T35 进入的 `needs_human` 保留 T59 或 T60 的可能（按证据二选一）。T10/T14/T18/T22/T26/T69 是 `attempt=0` 的执行前/预派发来源，没有可接管的运行尝试，T59/T60 不可用。**T57/T72/T73（来自 `unknown`）的 Grant 已 `revoked`（T72 时尝试可能仍在运行），不满足 T59/T60 的 `active`/本尝试 `consumed` 条件，禁止实现（F41）。T70（来自 `failed`）的尝试已处于尝试终态且 Grant 已失效：T59 要求同一尝试仍在运行、T60 要求该尝试刚结束待验证，两者都不成立，同样禁止（F41）。** `needs_human` 的可执行出口是 **T61**（停止证据或 `attempt=0` + 新决策/新 Grant）、**T62**（同样要求 `stop_confirmed=true` 或 `attempt=0`）、**T63**、**T64**。**T70 不是 `needs_human` 的出边**：它是 `failed → needs_human` 的入边（预派发失败或重试耗尽后转人工），列在 §6.14；把 T64（`needs_human → failed`）后再经 T70 回到 `needs_human` 视为 T64/T70 循环，不得作为退出路径。T73 本身仍可达（`unknown → needs_human`），但它的结果不得直接进入验证或执行。
+**`needs_human` 的可达性与出口按进入来源区分。** T59/T60 只在 `attempt>=1` 且当前 Grant 为 `active` 或由本尝试 `consumed` 时可用，并分别需要“同一尝试仍在运行”/“该尝试刚结束待验证”的执行证据：T40/T35/T52 进入的 `needs_human` 保留 T59 的可能（需同一尝试仍在运行的证据）；T45 保留 T60 的可能（执行已结束、结果待验证）。T10/T14/T18/T22/T26/T69 是 `attempt=0` 的执行前/预派发来源，没有可接管的运行尝试，T59/T60 不可用。**T57/T72/T73（来自 `unknown`）的 Grant 已 `revoked`（T72 时尝试可能仍在运行），不满足 T59/T60 的 `active`/本尝试 `consumed` 条件，禁止实现（F41）。T70（来自 `failed`）的记录已是尝试终态（`attempt=0` 时从未开始）且 Grant 已失效：T59 要求同一尝试仍在运行、T60 要求该尝试刚结束待验证，两者都不成立，同样禁止（F41）。** `needs_human` 的可执行出口是 **T61**（停止证据或 `attempt=0` + 新决策/新 Grant）、**T62**（同样要求 `stop_confirmed=true` 或 `attempt=0`）、**T63**、**T64**。**T70 不是 `needs_human` 的出边**：它是 `failed → needs_human` 的入边（预派发失败或重试耗尽后转人工），列在 §6.14；把 T64（`needs_human → failed`）后再经 T70 回到 `needs_human` 视为 T64/T70 循环，不得作为退出路径。T73 本身仍可达（`unknown → needs_human`），但它的结果不得直接进入验证或执行。
 
 ### 6.14 从 `failed`
 
@@ -354,7 +354,7 @@ T66–T69 与 Adapter 提交结果一一对应：`rejected → T66`、`unsupport
 | F38 | `unknown` → `verifying`（原 T54） | **R1**：对账结果不得绕过停止确认与重新授权直接进入验证；经 T73 转人工裁决 |
 | F39 | `attempt=0` 的人工“失败”经 `human.declared_failed` 进入 `failed` 后再走 T64/T70 循环 | **R3**：从未开始执行的失败必须登记为 `cancelled`/`denied`；`failed` 需要已开始的尝试或预派发失败事件 |
 | F40 | 将被 `revoked` 的 Grant 改回 `active`、复活或复用于 T71/T65 | Grant 撤销是终态；恢复必须签发新 `grant_id` + 新决策 |
-| F41 | 由 `unknown`（T57/T72/T73）或 `failed`（T70）进入的 `needs_human` 经 T59/T60 恢复 `running`/`verifying` | 撤销后的 Grant 不得授权执行或验证，且 T70 来源的尝试已是尝试终态；`unknown` 来源只能 T61/T62/T63/T64（T70 不是 `needs_human` 的出边），T61 仍需停止证据与全新授权 |
+| F41 | 由 `unknown`（T57/T72/T73）或 `failed`（T70）进入的 `needs_human` 经 T59/T60 恢复 `running`/`verifying` | 撤销后的 Grant 不得授权执行或验证，且 T70 来源的 `failed` 已是尝试终态（`attempt=0` 时从未开始）；`unknown` 来源只能 T61/T62/T63/T64（T70 不是 `needs_human` 的出边），T61 仍需停止证据与全新授权 |
 
 ## 8. 确认与审批生命周期
 
