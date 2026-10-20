@@ -118,10 +118,10 @@ def _load_decision(session: Session, decision_id: str) -> GovernanceDecisionReco
             .where(GovernanceDecisionRecord.decision_id == decision_id)
             .execution_options(populate_existing=True)
         )
-        if row is not None and sa_inspect(row).modified:
-            # Decisions are immutable.  If a caller mutated the identity-map
-            # object, force a database refresh rather than trusting (or
-            # flushing) those local values.
+        if row is not None:
+            # Decisions are immutable.  Always refresh so a caller-mutated
+            # identity-map object cannot supply forged constraints/document,
+            # even if SQLAlchemy considers the object clean.
             session.refresh(row)
     if row is None:
         raise GovernanceError("grant_missing", context={"decision_id": decision_id})
@@ -661,7 +661,10 @@ def get_grant(
         stmt = stmt.with_for_update()
     with session.no_autoflush:
         row = session.scalar(stmt)
-        if row is not None and sa_inspect(row).modified:
+        if row is not None:
+            # Re-read even when the identity map already holds the object; a
+            # stale/locally-mutated grant must never hide a revocation or a
+            # consumption committed by another session.
             session.refresh(row, with_for_update=for_update)
         return row
 
