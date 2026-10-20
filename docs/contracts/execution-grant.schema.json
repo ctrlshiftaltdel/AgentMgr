@@ -231,7 +231,7 @@
       "properties": {
         "principal_id": {
           "type": "string",
-          "pattern": "^prin_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
+          "pattern": "^(prin|rt)_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
         },
         "principal_type": {
           "type": "string",
