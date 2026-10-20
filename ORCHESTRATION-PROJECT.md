@@ -6,9 +6,17 @@
 
 - Repository: `ctrlshiftaltdel/AgentMgr`（https://github.com/ctrlshiftaltdel/AgentMgr ，public）
 - Default branch: `main`
-- Product goal / one-sentence summary: 面向中国大陆 20–100 人企业的 Hermes Agent 原生管理系统，首期交付报销闭环；以 AI 对话/语音/图片/文件为主要工作入口，不接入金蝶等特定第三方财务系统，对外账务交接采用模板驱动的 Excel 导出（远期自研财务/ERP）。
+- Product goal / one-sentence summary: 面向企业的独立 Agent 治理与企业决策服务；管理任务必要性、优先级、责任归属、职权、允许/禁止能力、审批、可强制执行边界与审计；不重复构建 WorkBuddy/Hermes/Rakazo 等 Agent 已有工具链。通过 MCP/REST 接入客户端，通过可替换 Runtime Adapter 接入服务器端 Agent。继续维护现有报销等企业业务模块；Hermes 是现有兼容实现与首个候选 Runtime Adapter，完整适配能力待 Phase 4 真实验证，不是产品硬依赖。
 - Existing repository / new repository: 已有仓库（含完整开发历史；起源于单机离线版规则包，2026-10-16 切换为 GitHub 版规则并首次推送）。
-- Primary design/spec files: `docs/PROJECT-CHARTER.md`（项目章程）、`templates/PLAN.md`（实施方案 v2.0）、`docs/DEPLOYMENT-REQUIREMENTS.md`（部署要求）、`docs/research/`（W0-1/W0-2/W0-4/W0-5/W0-7 调研报告）。
+- Primary design/spec files: `docs/AGENTMGR_STANDALONE_PLATFORM_PLAN.md`（新目标架构与执行计划）、`docs/PROJECT-CHARTER.md`（项目章程）、`templates/PLAN.md`（既有业务模块实施方案）、`docs/DEPLOYMENT-REQUIREMENTS.md`（部署与安全要求）、`docs/research/`（历史调研证据）。
+
+## 架构方向（2026-10-20）
+
+- AgentMgr 是独立的 Agent 治理与企业决策服务，不是 Hermes 专属产品。
+- 复用已有 Agent Runtime 工具链，不平行开发 Shell、浏览器、文件和通用连接器。
+- 客户端 MCP/REST、服务端 Agent 业务工具、运行时控制适配器属于不同信任边界。
+- 强制治理必须有 PEP 或受控执行环境；仅靠提示词不能约束客户端本地工具。
+- 在有真实需求前保持模块化单体；运行时兼容性必须由真实证据验证后才能标记为支持。
 
 ## Permissions
 
@@ -62,5 +70,5 @@
 - 并行模式下继续共享主工作树 `.venv`（`UV_PROJECT_ENVIRONMENT` 指向该 `.venv`，实际路径见本地 `local_info.md`）；不在 worktree 内生成独立 `.venv`。并行执行必须使用 `uv run --no-sync`（禁止并发 `uv sync` 就地改写环境）；任何会改动 `pyproject.toml` / `uv.lock` 的任务必须独占派发（不与其它执行实例并行）。
 - TMPDIR 指向仓库外且不在 `~/.hermes` 下。
 - 提交作者：仓库级占位 `Agent Orchestration <agent@localhost>`（所有者已明确不更换）。
-- 本机为编排与开发机；生产 Profile 主机另行准备（规格待真实负载测试）。
+- 本机为编排与开发机；生产受控执行节点另行准备（规格待真实负载测试）。
 - `.orchestration/` 为离线版规则包时期的历史归档（纸质台账 + 工具副本），不再更新；GitHub Issues/PR 是当前事实来源。

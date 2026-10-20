@@ -1,17 +1,26 @@
 # AgentMgr
 
-面向中国大陆 20–100 人企业的 **Hermes Agent 原生管理系统**。以 AI 对话/语音/图片/文件为主要工作入口；**不接入金蝶等特定第三方财务系统**，对外账务交接采用模板驱动的 Excel 导出（远期自研财务/ERP）。**首期模块：报销**。
+面向企业的 **独立 Agent 治理与企业决策服务**。AgentMgr 管理任务必要性、优先级、责任归属、职权、可执行/禁止能力、确认与审批、执行边界及审计；WorkBuddy、Hermes、Rakazo、Codex、OpenCode 等已有 Agent 工具链由各自运行时提供，AgentMgr 不重复造轮子。项目继续承载现有企业业务模块（首期业务为报销），当前通过 REST 对外提供受控接口；MCP 为 Phase 3 目标（未验证）；Hermes 是现有兼容实现与首个候选 Runtime Adapter；完整适配能力待 Phase 4 真实验证，不再是产品硬依赖。
 
 ## 现状
 
 - **Wave 1 已完成**：后端底座与迁移、身份与权限（RBAC + 越权矩阵）、报销域与状态机、工作流与事务性 Outbox、受理与文件服务、PDF/XLSX 导出、API 层、最小管理后台、端到端负面测试。
 - **发票查验链条已完成**：渠道 Provider（腾讯云、百度为首选渠道）+ 人工辅助录入 + 报销单与发票挂账（`expense_invoices`）。
-- 测试基线：**675 passed**（本地 PostgreSQL 17）；迁移链 `0001` → `0011`。
+- 历史测试基线以 HANDOVER.md 和当前 head 对应的 CI / 真实运行结果为准；README 中的历史数字不得作为当前验收证据。
 - 阶段 1 尚缺：微信消息路由、OCR/ASR 解析流水线、备份异地存储与恢复演练收口。
+
+## 新产品定位与架构基线
+
+- 完整可独立启动的目标与实施规格： [docs/AGENTMGR_STANDALONE_PLATFORM_PLAN.md](docs/AGENTMGR_STANDALONE_PLATFORM_PLAN.md)。
+- AgentMgr 是策略、任务、职权、责任、审批、执行边界与审计层；不要复制已有 Agent 的 CLI、文件、浏览器或通用连接器。
+- 旧文档中把 Hermes Profile、会话或内部 API 规定为永久强制前提的内容，应按新计划逐步迁移。现有 Hermes Profile 与业务模块属于兼容实现/已有资产，不要求立即废弃。
+- 强制治理必须在策略执行点（PEP）或受控运行环境落地。远程 AgentMgr 无法拦截客户端 Agent 在本地任意使用的 Shell、文件、浏览器或用户自有凭据。
+- 当前阶段为架构切换与契约冻结；未经过真实测试的客户端和运行时能力一律标记为“未验证”。
 
 ## 文档索引
 
-- 项目章程：`docs/PROJECT-CHARTER.md`；实施方案：`templates/PLAN.md`；部署要求：`docs/DEPLOYMENT-REQUIREMENTS.md`
+- 目标架构与独立执行蓝图：`docs/AGENTMGR_STANDALONE_PLATFORM_PLAN.md`
+- 项目章程：`docs/PROJECT-CHARTER.md`；既有业务模块实施方案（Hermes 兼容/迁移背景）：`templates/PLAN.md`；部署要求：`docs/DEPLOYMENT-REQUIREMENTS.md`
 - 调研报告：`docs/research/`（微信、Profile 隔离、发票查验、数据合规、多 Profile 实测）
 - 会话交接：`HANDOVER.md`
 
