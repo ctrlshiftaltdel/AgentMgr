@@ -10,15 +10,13 @@
 - Existing repository / new repository: 已有仓库（含完整开发历史；起源于单机离线版规则包，2026-10-16 切换为 GitHub 版规则并首次推送）。
 - Primary design/spec files: `docs/AGENTMGR_STANDALONE_PLATFORM_PLAN.md`（新目标架构与执行计划）、`docs/PROJECT-CHARTER.md`（项目章程）、`templates/PLAN.md`（既有业务模块实施方案）、`docs/DEPLOYMENT-REQUIREMENTS.md`（部署与安全要求）、`docs/research/`（历史调研证据）。
 
+## 架构方向（2026-10-20）
 
-
-## Architecture direction (2026-10-20)
-
-- AgentMgr is an independent Agent governance and enterprise decision service, not a Hermes-only product.
-- Reuse existing Agent runtime tools; do not build parallel shell/browser/file/connector infrastructure.
-- Client MCP/REST, server-side Agent business tools, and runtime control adapters are separate trust boundaries.
-- Mandatory governance requires PEP or a managed execution environment; prompts alone cannot enforce restrictions on local client tools.
-- Keep the current codebase as a modular monolith until demonstrated needs justify service extraction. Runtime capabilities require real compatibility evidence before being described as supported.
+- AgentMgr 是独立的 Agent 治理与企业决策服务，不是 Hermes 专属产品。
+- 复用已有 Agent Runtime 工具链，不平行开发 Shell、浏览器、文件和通用连接器。
+- 客户端 MCP/REST、服务端 Agent 业务工具、运行时控制适配器属于不同信任边界。
+- 强制治理必须有 PEP 或受控执行环境；仅靠提示词不能约束客户端本地工具。
+- 在有真实需求前保持模块化单体；运行时兼容性必须由真实证据验证后才能标记为支持。
 
 ## Permissions
 
