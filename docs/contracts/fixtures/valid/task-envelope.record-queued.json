@@ -189,7 +189,7 @@
     "state": "queued",
     "state_revision": 5,
     "last_event_id": "evt_queued_0001",
-    "attempt": 1,
+    "attempt": 0,
     "max_attempts": 3,
     "retry_budget_remaining": 2
   },

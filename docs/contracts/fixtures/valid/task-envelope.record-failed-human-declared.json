@@ -16,51 +16,77 @@
     "delegation_ref": null
   },
   "accountable_owner": {
-    "principal_id": null,
-    "principal_type": "role",
-    "resolution": "pending",
-    "account_status": "unknown",
-    "identity_assurance": "unverified",
-    "role_ids": [],
-    "department_id": null,
+    "principal_id": "prin_owner_0001",
+    "principal_type": "person",
+    "resolution": "server_resolved",
+    "account_status": "active",
+    "identity_assurance": "verified_session",
+    "role_ids": [
+      "role_manager_0001"
+    ],
+    "department_id": "dept_finance_0001",
     "service_identity_id": null,
     "delegation_ref": null
   },
   "assignee": {
-    "principal_id": null,
-    "principal_type": "queue",
-    "resolution": "pending",
-    "account_status": "unknown",
-    "identity_assurance": "unverified",
+    "principal_id": "prin_agent_0001",
+    "principal_type": "agent_instance",
+    "resolution": "server_resolved",
+    "account_status": "active",
+    "identity_assurance": "verified_session",
     "role_ids": [],
-    "department_id": null,
+    "department_id": "dept_finance_0001",
     "service_identity_id": null,
     "delegation_ref": null
   },
   "executor": {
-    "principal_id": null,
+    "principal_id": "prin_agent_0001",
     "principal_type": "agent_instance",
-    "resolution": "pending",
-    "account_status": "unknown",
-    "identity_assurance": "unverified",
+    "resolution": "server_resolved",
+    "account_status": "active",
+    "identity_assurance": "verified_session",
     "role_ids": [],
-    "department_id": null,
+    "department_id": "dept_finance_0001",
     "service_identity_id": null,
     "delegation_ref": null
   },
   "approver": {
-    "principal_id": null,
-    "principal_type": "role",
-    "resolution": "pending",
-    "account_status": "unknown",
-    "identity_assurance": "unverified",
-    "role_ids": [],
-    "department_id": null,
+    "principal_id": "prin_approver_0001",
+    "principal_type": "person",
+    "resolution": "server_resolved",
+    "account_status": "active",
+    "identity_assurance": "verified_session",
+    "role_ids": [
+      "role_manager_0001"
+    ],
+    "department_id": "dept_finance_0001",
     "service_identity_id": null,
     "delegation_ref": null
   },
   "delegations": [],
-  "goal": null,
+  "goal": {
+    "summary": "Submit a synthetic expense report for review.",
+    "completion_criteria": [
+      {
+        "criterion_id": "crit_expense_state_0001",
+        "type": "business_state_equals",
+        "verifier": {
+          "verifier_id": "ver_expense_state_0001",
+          "version": "1.0.0"
+        },
+        "resource_ref": "res_expense_0001",
+        "expected": "submitted",
+        "evidence_ref": "evidence:expense_state_0001",
+        "evidence_hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+      }
+    ],
+    "required_inputs": [
+      "synthetic receipt reference"
+    ],
+    "out_of_scope": [
+      "No payment execution."
+    ]
+  },
   "priority": {
     "requested_level": "high",
     "effective_level": "high",
@@ -73,16 +99,22 @@
     "complete_by": "2026-10-27T09:00:00Z",
     "escalation_after_minutes": 240
   },
-  "execution_mode": "undetermined",
+  "execution_mode": "governed_resource_access",
   "requested_capabilities": [
     "expense.submit@1.0.0",
     "expense.read@1.0.0"
   ],
   "resource_scope": {
-    "scope_type": "undetermined",
-    "resource_ids": [],
-    "connector_ids": [],
-    "data_classifications": [],
+    "scope_type": "record_set",
+    "resource_ids": [
+      "res_expense_0001"
+    ],
+    "connector_ids": [
+      "conn_finance_0001"
+    ],
+    "data_classifications": [
+      "internal"
+    ],
     "exclude_resource_ids": []
   },
   "policy_version": {
@@ -120,22 +152,22 @@
   },
   "timestamps": {
     "created_at": "2026-10-20T01:55:00Z",
-    "updated_at": "2026-10-20T01:55:00Z",
-    "submitted_at": null,
+    "updated_at": "2026-10-21T02:00:00Z",
+    "submitted_at": "2026-10-20T01:56:00Z",
     "evaluated_at": "2026-10-20T02:00:00Z",
-    "last_event_at": "2026-10-20T01:55:00Z"
+    "last_event_at": "2026-10-21T02:00:00Z"
   },
   "status": {
     "state": "failed",
-    "state_revision": 3,
+    "state_revision": 9,
     "last_event_id": "evt_human_declared_failed_0001",
-    "attempt": 0,
+    "attempt": 1,
     "max_attempts": 3,
     "retry_budget_remaining": 2
   },
   "linkage": {
-    "grant_id": null,
-    "grant_status": null,
+    "grant_id": "grnt_expense_0001",
+    "grant_status": "revoked",
     "runtime_task_id": null,
     "execution_ref": null,
     "parent_task_id": null,
@@ -143,16 +175,17 @@
     "correlation_id": "corr_expense_0001"
   },
   "decision": {
-    "decision_id": "gdec_clarify_0001",
-    "decision_type": "needs_clarification",
+    "decision_id": "gdec_allow_0001",
+    "decision_type": "allow",
     "decision_revision": 1,
     "decided_at": "2026-10-20T02:00:00Z"
   },
   "record_completeness": {
-    "completeness": "pre_execution_incomplete",
-    "incomplete_reason": "multiple_incomplete_fields"
+    "completeness": "complete",
+    "incomplete_reason": null
   },
   "labels": {
-    "fixture": "synthetic"
+    "fixture": "synthetic",
+    "path": "T64 human.declared_failed after attempt 1"
   }
 }

@@ -59,11 +59,17 @@ AgentMgr **不负责**：
 
 **失败是尝试终态。** `failed` 不是任务终态；重试必须重新执行 PDP、签发新决策与新 Grant，并受 `max_attempts`/`retry_budget_remaining` 约束。禁止复用过期决策或旧 Grant。
 
-**默认禁止自审。** 1.0.0 冻结 `Accountable Owner ≠ Approver`；不存在策略例外。未来若要允许例外，必须升主版本并增加例外引用、理由、策略版本与审计字段。职责分离按 **principal 身份**判定：同一 principal 不得审批自己的任务，同一组织角色下的不同人员可以审批；`separation_check` 由服务端计算，不接受客户端提交值。
+**默认禁止自审。** 1.0.0 冻结 `Accountable Owner ≠ Approver`；不存在策略例外。未来若要允许例外，必须升主版本并增加例外引用、理由、策略版本与审计字段。职责分离按 **principal 身份**判定：同一 principal 不得审批自己的任务，同一组织角色下的不同人员可以审批；`separation_check` 由服务端计算，不接受客户端提交值。服务端必须检查 `approvals[]` 中所有 `decision=approved` 的实际审批人以及 Grant 的 `approval_ref.approver_principal_id`，不能只检查任务级 `approver`；任务级 `approver` 必须解析为实际行为人并与授权 Grant 引用的审批一致（S-14）。
 
 **早期退出必须显式标注不完整。** 任务在 `draft`/`awaiting_clarification`，或在该阶段被 `denied`/`cancelled`/`needs_human`、登记为执行前 `cancel_requested`（以及由这些状态产生的 `failed`）时，允许 `goal=null`、`accountable_owner` 未解析、`execution_mode`/`scope_type=undetermined`，但记录必须标记 `record_completeness.completeness=pre_execution_incomplete` 并说明 `incomplete_reason`，且不得关联任何 Grant。执行开始（`attempt>=1`）后与执行后状态必须是完整记录。
 
-**终态必须使 Grant 失效。** 任务或尝试进入 `succeeded`/`partial_success`/`failed`/`cancelled`/`timed_out`/`denied`（以及 `unknown`）时，Grant 必须为 `revoked` 或 `consumed`；PEP 除校验 Grant 外还必须读取当前任务状态，终态任务上的 active Grant 一律拒绝。
+**终态必须使 Grant 失效。** 任务或尝试进入 `succeeded`/`partial_success`/`failed`/`cancelled`/`timed_out`/`denied` 时，Grant 必须为 `revoked` 或 `consumed`；进入 `unknown` 时必须在同一事务内立即 `revoked`（`reason_code=execution_evidence_lost`）。被撤销的 Grant 永不复活、永不复用；PEP 除校验 Grant 外还必须读取当前任务状态，终态或 `unknown` 任务上的 active Grant 一律拒绝。
+
+**`unknown` 必须 fail-closed。** 不存在 `unknown → running` / `unknown → verifying`（原 T53/T54 已撤销）。恢复只能通过：`unknown → queued`（T71，`attempt=0` + 无副作用证据 + 新决策 + 新 Grant）、`unknown → failed`（T55）后经 T65 有界重试、或 `unknown → cancelled`/`needs_human`/`timed_out` 终止/人工接管。若执行边界实际仍在运行，必须先停止并取得停止证据；不得直接恢复执行。
+
+**`attempt` 只统计已开始的执行。** 首次 `queued` 的 `attempt=0`；只在 `dispatch.accepted` 递增。预派发失败（`attempt=0`）不消耗 `retry_budget_remaining`，也不能走 T65；`attempt=0` 的人工失败必须登记为 `cancelled` 或 `denied`。T65 要求 `attempt>=1` 并递减重试预算。
+
+**Owner 停用必须显式升级。** `queued`/`dispatched`/`running`/`verifying`/`awaiting_confirmation`/`awaiting_approval` 要求 Owner 已解析且 `active`；终态/历史记录允许 Owner 已解析但 `disabled`/`unbound`，但必须带 `owner_escalation`（原因、时间、接管/通知主体），不得静默允许。`awaiting_clarification` 按 A1 仍可未解析，但离开该状态前必须解析并校验。
 
 ### 2.3 信任边界
 
@@ -126,7 +132,7 @@ AgentMgr **不负责**：
 | `rtask_` | 运行时任务句柄（不是主体） | `linkage.runtime_task_id` |
 | `exec_` | Advisory/Governed 执行句柄（不是主体） | `linkage.execution_ref` |
 
-`accountable_owner` 与 `approver` 只能是 `person` 或 `role`，不得是 `agent_instance`、运行时或队列。`resolution=server_resolved` 时 `principal_id` 必须非空；`pending` 只允许出现在 `record_completeness.completeness=pre_execution_incomplete` 的记录中，即 `draft`、`awaiting_clarification`、`decision_type=needs_clarification` 的 `evaluated`，以及执行前退出的 `denied`/`cancelled`/`needs_human`/`failed`。
+`accountable_owner` 与 `approver` 只能是 `person` 或 `role`，不得是 `agent_instance`、运行时或队列。`requester` 只能是 `prin_`/`svc_`/`rt_`（人员、服务、运行时或 agent_instance），不得是 `role_`/`queue_`。`resolution=server_resolved` 时 `principal_id` 必须非空；`pending` 只允许出现在 `record_completeness.completeness=pre_execution_incomplete` 的记录中，即 `draft`、`awaiting_clarification`、`decision_type=needs_clarification` 的 `evaluated`，以及执行前退出的 `denied`/`cancelled`/`needs_human`/`failed`。
 
 主体前缀与类型必须一致，并由 Schema 与服务端同时校验：`prin_`↔person/agent_instance、`rt_`↔runtime、`svc_`↔service、`role_`↔role、`queue_`↔queue。`role_`/`queue_` 不是可认证主体，不得出现在决策 subject 或 Grant subject 中。
 
@@ -202,7 +208,7 @@ MVP 在**一个可独立部署的服务**内按领域分层：身份、策略、
 本 ADR 的契约由以下可执行证据支撑（Phase 0 仅验证文档/契约，不声称产品能力已实现）：
 
 - 三个 JSON Schema 通过 JSON Schema 2020-12 元 schema 校验，且每个 schema 的合法/非法 fixtures 全部可验证；
-- 状态机逐条列出 72 条允许转换与 F01–F36 禁止转换，并给出 Schema 无法表达的 S-01–S-13 服务端断言矩阵；
+- 状态机逐条列出 72 条有效允许转换（T00–T73，T53/T54 已撤销）、F01–F40 禁止转换，并给出 Schema 无法表达的 S-01–S-18 服务端断言矩阵；
 - 威胁模型至少 15 项（本版 30 项），覆盖身份、越权、审批、Grant、决策重放、模式混淆、完成检查、取消、绕行、凭据、审计等；
 - Runtime 能力以 `verified / partially_verified / unverified` 标注，并保留证据引用字段；
 - 契约包哈希包含三个 Schema、五份文档与全部 fixtures；候选必须固定完整哈希；

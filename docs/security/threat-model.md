@@ -46,8 +46,8 @@
 
 - **威胁/风险**：员工离职、服务账号停用或渠道身份解绑后，旧会话、旧 Grant 或缓存决策仍可执行。
 - **受影响边界**：B1/B3 → B2。
-- **缓解**：`account_status` 必须为 `active` 才能进入 `allow`/`managed_execution_required` 与 active Grant；停用/解绑后 Grant 立即 `status=revoked`；PEP 每次调用重验，不缓存；身份变更写审计事件。
-- **负向测试**：停用主体后立即提交新的 `clientTaskRequest` 并调用受控工具；断言 `governance.denied` + `principal_disabled`、未产生 `dispatch.accepted`、Grant `status=revoked`/`usable=false`、无副作用；已 `queued` 任务不得进入 `dispatched`。
+- **缓解**：`account_status` 必须为 `active` 才能进入 `allow`/`managed_execution_required` 与 active Grant；停用/解绑后 Grant 立即 `status=revoked`；PEP 每次调用重验，不缓存；身份变更写审计事件。Owner 在执行中停用时，active 状态不得继续；必须转 `failed`/`cancelled` 并带 `owner_escalation`。
+- **负向测试**：停用主体后立即提交新的 `clientTaskRequest` 并调用受控工具；断言 `governance.denied` + `principal_disabled`、未产生 `dispatch.accepted`、Grant `status=revoked`/`usable=false`、无副作用；已 `queued` 任务不得进入 `dispatched`；Owner 在执行中停用后断言 `queued`/`dispatched`/`running`/`verifying` 不能保留 disabled Owner，终态记录必须带 `owner_escalation`。
 - **剩余风险**：身份目录同步延迟、缓存 TTL 与外部 IdP 故障窗口；需要监控撤销失败。
 - **状态**：`设计（未实现）`；现有 RBAC 可部分复用（`部分（未按本契约验证）`）。
 
@@ -82,8 +82,8 @@
 
 - **威胁/风险**：攻击者复用旧 Grant、已消费 Grant、已撤销 Grant，或在过期后继续调用。
 - **受影响边界**：B2/B3。
-- **缓解**：Grant 绑定 `task_id`、`task_revision`、`subject`、`execution_mode`、`capabilities`、`resource_scope`、`policy_version`、`tool_contract`、`issued_at/expires_at`、预算与撤销状态；`single_use` 在首个受控调用产生副作用前原子消费；PEP 每次调用检查 `status=active`、`usable`、`expires_at`、`revocation.revoked=false`、`remaining_calls>=1`、`decision.decision_hash` 与版本，**并读取当前任务状态**：任务/尝试进入 `succeeded`/`partial_success`/`failed`/`cancelled`/`timed_out`/`denied`/`unknown` 后，Grant 必须是 `revoked` 或 `consumed`（原因码 `task_terminal`/`attempt_failed`/`execution_evidence_lost`）；不接受客户端自造 Grant。
-- **负向测试**：分别使用过期 Grant、`status=revoked`、`status=consumed`、`usable=false`、`remaining_calls=0`、同一 `single_use` Grant 的第二次调用，以及在 `failed`/`cancelled` 任务上保留 active Grant 的调用；断言全部拒绝且无副作用，原因码分别为 `grant_expired`/`grant_revoked`/`grant_consumed`/`replay_detected`，终态任务断言无授权并记录安全事件。
+- **缓解**：Grant 绑定 `task_id`、`task_revision`、`subject`、`execution_mode`、`capabilities`、`resource_scope`、`policy_version`、`tool_contract`、`issued_at/expires_at`、预算与撤销状态；`single_use` 在首个受控调用产生副作用前原子消费；PEP 每次调用检查 `status=active`、`usable`、`expires_at`、`revocation.revoked=false`、`remaining_calls>=1`、`decision.decision_hash` 与版本，**并读取当前任务状态**：任务/尝试进入 `succeeded`/`partial_success`/`failed`/`cancelled`/`timed_out`/`denied` 后，Grant 必须是 `revoked` 或 `consumed`（原因码 `task_terminal`/`attempt_failed`）；进入 `unknown` 时必须立即 `revoked`（`execution_evidence_lost`）。`revoked` 是终态，不得改回 `active` 或在 T71/T65 中复用；恢复必须签发新 `grant_id`。不接受客户端自造 Grant。
+- **负向测试**：分别使用过期 Grant、`status=revoked`、`status=consumed`、`usable=false`、`remaining_calls=0`、同一 `single_use` Grant 的第二次调用，在 `failed`/`cancelled` 任务上保留 active Grant 的调用，以及 `unknown` 后复用被撤销 Grant 的调用；断言全部拒绝且无副作用，原因码分别为 `grant_expired`/`grant_revoked`/`grant_consumed`/`replay_detected`，终态/`unknown` 任务断言无授权并记录安全事件。
 - **剩余风险**：时钟偏差、PEP 缓存、撤销传播延迟；需要 NTP 监控与撤销失败告警。
 - **状态**：`设计（未实现）`。
 
@@ -100,8 +100,8 @@
 
 - **威胁/风险**：Requester、Executor、Accountable Owner 或同一利益主体批准自己的任务，绕过职责分离。
 - **受影响边界**：B1/B2/B4。
-- **缓解**：Approver 只能是 `person` 或 `role`，不得是 `agent_instance`/运行时/队列；`separation_check` 必须 `passed`；1.0.0 **默认且强制**禁止 Accountable Owner 审批自己的任务，无策略例外；审批记录绑定 payload hash、TTL。
-- **负向测试**：Requester/Accountable Owner 尝试以自己为 approver；断言 `self_approval_forbidden`、任务保持 `awaiting_approval` 或 `denied`、不签发 Grant；`approval.separation_check=failed` 的请求不得进入 `approvals[]` 的 approved 状态。
+- **缓解**：Approver 只能是 `person` 或 `role`，不得是 `agent_instance`/运行时/队列；`separation_check` 必须 `passed`；1.0.0 **默认且强制**禁止 Accountable Owner 审批自己的任务，无策略例外；审批记录绑定 payload hash、TTL。服务端必须检查 `approvals[]` 中每个 `decision=approved` 的实际审批人和 Grant 的 `approval_ref.approver_principal_id`，`role_` 审批人解析为实际行为人；任务级 `approver` 必须与授权 Grant 引用的实际审批一致（S-14）。
+- **负向测试**：Requester/Accountable Owner 尝试以自己为 approver；**以及一个 Schema 合法但 `approver` 字段写成他人、`approvals[]`/`approval_ref` 实际指向 owner 本人的向量**；断言 `self_approval_forbidden`、任务保持 `awaiting_approval` 或 `denied`、不签发 Grant；`approval.separation_check=failed` 的请求不得进入 `approvals[]` 的 approved 状态；任务级 `approver` 与实际审批人不一致时断言 S-14 拒绝。
 - **剩余风险**：共谋、账号共享、审批人账号被攻陷；需要账号安全与审计抽查。
 - **状态**：`设计（未实现）`；现有报销审批规则可部分复用（`部分（未按本契约验证）`）。
 
@@ -145,8 +145,8 @@
 
 - **威胁/风险**：`submit_task` 超时后客户端/Worker 盲目重发，创建两个执行任务；或把超时当作未执行而丢失已产生的副作用。
 - **受影响边界**：B3 → B2。
-- **缓解**：提交超时进入 `unknown`（T67/T68）；先调用 `find_by_idempotency_key`/`get_status`；找到则采用；明确未受理且执行边界出具无副作用保证才允许经 T71 重新评估入队（新决策 + 新 Grant），否则经 T55 进入 `failed` 再由 T65 决定；无法确定时有界对账后转 T57。
-- **负向测试**：Adapter 模拟“已创建但响应超时”；断言 Worker 先调用 `find_by_idempotency_key`、只采用一个 `runtime_task_id`、无第二次创建；再模拟“无法查询”，断言进入 `unknown`（`execution.lost`/`dispatch.timeout`）而非 `succeeded`/`failed`。
+- **缓解**：提交超时进入 `unknown`（T67/T68）；进入时立即撤销 Grant（`execution_evidence_lost`）；先调用 `find_by_idempotency_key`/`get_status`；找到则采用；仅当 `attempt=0` 且执行边界出具无副作用保证才允许经 T71 重新评估入队（新决策 + 新 Grant），否则经 T55 进入 `failed` 再由 T65 决定（`attempt=0` 时只能 T70）；无法确定时有界对账后转 T57。**不得从 `unknown` 直接恢复到 `running`/`verifying`**；仍在运行必须先停止并取证（T72）。
+- **负向测试**：Adapter 模拟“已创建但响应超时”；断言 Worker 先调用 `find_by_idempotency_key`、只采用一个 `runtime_task_id`、无第二次创建；再模拟“无法查询”，断言进入 `unknown`（`execution.lost`/`dispatch.timeout`）而非 `succeeded`/`failed`；随后 Adapter 报告 `running`，断言核心不进入 `running`、Grant 保持 `revoked`、必须先 `cancel_task` 并取得 `stop_confirmed=true`。
 - **剩余风险**：执行边界不支持按幂等键查询或查询本身不可靠；需要 Adapter 能力声明与人工兜底。
 - **状态**：`设计（未实现）`。
 
@@ -226,8 +226,8 @@
 
 - **威胁/风险**：任务没有可追责的 Accountable Owner、审批人不可用或责任被推给 Agent 名称，导致无人负责、无法升级或审批链断裂。
 - **受影响边界**：B1/B2/B4。
-- **缓解**：`accountable_owner.principal_type` 只能是 `person` 或 `role`；`pending` 时记录必须是 `record_completeness.completeness=pre_execution_incomplete`（`draft`/`awaiting_clarification`/`evaluated`(`needs_clarification`) 或执行前退出的 `denied`/`cancelled`/`needs_human`/`failed`），且不得关联 Grant；`approver` 同样只能是人员/角色；Agent 名称不得替代 owner；SLA 升级。
-- **负向测试**：提交 owner 为 `agent_instance`、approver 为 `agent_instance` 或 owner 未解析的任务；断言 schema 拒绝或不能进入 `queued`；状态为 `awaiting_clarification`；审批人缺失断言 `approval_missing`。
+- **缓解**：`accountable_owner.principal_type` 只能是 `person` 或 `role`；`pending` 时记录必须是 `record_completeness.completeness=pre_execution_incomplete`（`draft`/`awaiting_clarification`/`evaluated`(`needs_clarification`) 或执行前退出的 `denied`/`cancelled`/`needs_human`/`failed`），且不得关联 Grant；执行中/等待门禁状态必须 Owner 已解析且 active；终态/历史记录的 disabled/unbound Owner 必须带 `owner_escalation`；`approver` 同样只能是人员/角色；Agent 名称不得替代 owner；SLA 升级。
+- **负向测试**：提交 owner 为 `agent_instance`、approver 为 `agent_instance` 或 owner 未解析的任务；断言 schema 拒绝或不能进入 `queued`；状态为 `awaiting_clarification`；审批人缺失断言 `approval_missing`；Owner 在执行中被停用后不得静默进入终态，必须带 `owner_escalation`，active 状态 + disabled Owner 断言 schema 拒绝。
 - **剩余风险**：组织职责本身不清晰、人员离职；需要组织流程与定期复核。
 - **状态**：`设计（未实现）`。
 
@@ -253,8 +253,8 @@
 
 - **威胁/风险**：重试或重派时复用旧 `decision_id`/`decision_hash`，或使用已过期、基于旧 `task_revision` 的决策签发新 Grant，绕过新的审批/确认/范围检查。
 - **受影响边界**：B1/B2/B4。
-- **缓解**：授权型决策必须绑定当前 `task_id`/`task_revision`；`decision_revision` 单调递增；`decision.decision_hash` 与 `task_revision` 进入 Grant 的 `revalidation`/`binding`；T65/T61 必须重新执行 PDP 并签发新 Grant；`decision.freshness` 固定 `fresh_evaluation`；PEP 比较 `decision.expires_at` 与当前时间。
-- **负向测试**：用已过期决策或旧 revision 签发 Grant；断言 `decision_expired`/`decision_revision_stale`、`task.retry_authorized` 未发生、无新 Grant；重试使用旧 Grant 断言 `replay_detected`；`decision.freshness` 非 `fresh_evaluation` 断言 schema 拒绝。
+- **缓解**：授权型决策必须绑定当前 `task_id`/`task_revision`；`decision_revision` 单调递增；`decision.decision_hash` 与 `task_revision` 进入 Grant 的 `revalidation`/`binding`；T65/T61 必须重新执行 PDP 并签发新 Grant；`decision.freshness` 固定 `fresh_evaluation`；PEP 比较 `decision.expires_at` 与当前时间；`attempt` 只在 `dispatch.accepted` 递增，首次 `queued` 为 0，T65 要求 `attempt>=1` 并递减 `retry_budget_remaining`。
+- **负向测试**：用已过期决策或旧 revision 签发 Grant；断言 `decision_expired`/`decision_revision_stale`、`task.retry_authorized` 未发生、无新 Grant；重试使用旧 Grant 断言 `replay_detected`；`decision.freshness` 非 `fresh_evaluation` 断言 schema 拒绝；`attempt=0` 的失败尝试 T65 断言拒绝且预算不变；`attempt>=1` 的 T65 断言预算减 1。
 - **剩余风险**：决策存储与任务存储的一致性、时钟偏差；需要事务与 NTP 监控。
 - **状态**：`设计（未实现）`。
 
@@ -280,8 +280,8 @@
 
 - **威胁/风险**：Accountable Owner 利用负责人身份批准自己的任务，规避独立审批。
 - **受影响边界**：B1/B2/B4。
-- **缓解**：1.0.0 强制 `Approver ≠ Accountable Owner`；`approver.principal_type` 只能是 person/role；`separation_check=passed` 是 approved 的必要条件；T06/T19 校验；F18/F33 禁止。
-- **负向测试**：构造 `accountable_owner.principal_id == approver.principal_id` 的任务；断言 `self_approval_forbidden`、状态保持 `awaiting_approval` 或 `denied`、无 Grant、无 `task.queued`；`separation_check=failed` 断言 schema 拒绝。
+- **缓解**：1.0.0 强制 `Approver ≠ Accountable Owner`；`approver.principal_type` 只能是 person/role；`separation_check=passed` 是 approved 的必要条件；T06/T19 校验；F18/F33 禁止。服务端按实际审批记录与 Grant `approval_ref` 的实际行为人判定，不能只看任务级 `approver`（S-01/S-02/S-14）。
+- **负向测试**：构造 `accountable_owner.principal_id == approver.principal_id` 的任务；断言 `self_approval_forbidden`、状态保持 `awaiting_approval` 或 `denied`、无 Grant、无 `task.queued`；`separation_check=failed` 断言 schema 拒绝；**Schema-valid 向量：任务级 `approver` 写成 `prin_approver_0001`，但 `approvals[]` 与 Grant `approval_ref` 指向 `prin_owner_0001`，断言 S-01 拒绝（该向量只写入状态机 §19.1，不放入 invalid fixtures）**。
 - **剩余风险**：组织角色重叠、代理审批；需要组织治理与审计抽查。
 - **状态**：`设计（未实现）`。
 

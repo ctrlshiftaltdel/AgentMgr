@@ -161,7 +161,7 @@
     "state": "failed",
     "state_revision": 6,
     "last_event_id": "evt_dispatch_rejected_0001",
-    "attempt": 1,
+    "attempt": 0,
     "max_attempts": 3,
     "retry_budget_remaining": 2
   },
@@ -185,6 +185,7 @@
     "incomplete_reason": null
   },
   "labels": {
-    "fixture": "synthetic"
+    "fixture": "synthetic",
+    "path": "T66 dispatch.rejected at attempt 0"
   }
 }

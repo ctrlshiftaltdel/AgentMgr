@@ -3,7 +3,7 @@
   "$id": "https://schemas.example.com/agentmgr/task-envelope/1.0.0",
   "$comment": "$id uses the reserved example.com namespace as an offline placeholder. Implementations must not resolve it over the network and must pin the contract bundle SHA-256 instead of fetching the schema.",
   "title": "AgentMgr Task Envelope",
-  "description": "任务请求与任务记录的统一契约，契约版本 1.0.0（尚未冻结发布的候选版本）。本文件用 oneOf 区分两个形状：clientTaskRequest 只包含客户端可提供的字段；taskRecord 只包含服务端权威字段。客户端无法构造合法记录，服务端也不接受客户端自报的身份、责任、审批、授权或状态。priority 只影响调度，不提升权限。完成定义必须是结构化、可机器判定的标准；payload 哈希使用 RFC 8785 JCS（见 task-state-machine.md §16）。记录完整性由 record_completeness 显式标记：只有执行前退出（draft/awaiting_clarification 或 early denied/cancelled/needs_human/failed）可以是 pre_execution_incomplete，且不得关联 Grant；执行开始与执行后状态必须完整。任务终态与 unknown 不得保留可用 Grant。",
+  "description": "任务请求与任务记录的统一契约，契约版本 1.0.0（尚未冻结发布的候选版本）。本文件用 oneOf 区分两个形状：clientTaskRequest 只包含客户端可提供的字段；taskRecord 只包含服务端权威字段。客户端无法构造合法记录，服务端也不接受客户端自报的身份、责任、审批、授权或状态。priority 只影响调度，不提升权限。完成定义必须是结构化、可机器判定的标准；payload 哈希使用 RFC 8785 JCS（见 task-state-machine.md §16）。记录完整性由 record_completeness 显式标记：只有执行前退出（draft/awaiting_clarification 或 early denied/cancelled/needs_human/failed）可以是 pre_execution_incomplete，且不得关联 Grant；执行开始与执行后状态必须完整。任务终态与 unknown 不得保留可用 Grant；unknown 必须立即撤销 Grant，且撤销后的 Grant 永不复用。attempt 只在 dispatch.accepted 时递增，首次 queued 为 0。queued/dispatched/running/verifying/awaiting_* 要求 Owner 已解析且 active；终态/历史记录允许 Owner 已停用，但必须带 owner_escalation。",
   "oneOf": [
     {"$ref": "#/$defs/clientTaskRequest"},
     {"$ref": "#/$defs/taskRecord"}
@@ -145,6 +145,31 @@
           "then": {"properties": {"incomplete_reason": {"type": "string"}}}
         }
       ]
+    },
+    "ownerEscalation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reason_code", "recorded_at", "escalated_to_principal_id"],
+      "description": "Owner 停用/解绑后的显式升级标记。只有“已解析但非 active”的历史/终态记录才允许携带本对象；active 记录缺少 active owner 时不得用本对象掩盖，必须按状态机拒绝。",
+      "properties": {
+        "reason_code": {
+          "type": "string",
+          "enum": ["owner_disabled", "owner_unbound", "owner_left_org", "owner_identity_conflict"]
+        },
+        "recorded_at": {
+          "$ref": "#/$defs/dateTime"
+        },
+        "escalated_to_principal_id": {
+          "type": "string",
+          "pattern": "^(prin|role)_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$",
+          "description": "接管责任或已通知的上级/代管主体；不得是 Agent、运行时或队列。"
+        },
+        "note": {
+          "type": ["string", "null"],
+          "maxLength": 500,
+          "description": "可选说明；不得包含凭据或个人敏感数据。"
+        }
+      }
     },
     "delegation": {
       "type": "object",
@@ -773,7 +798,7 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 100,
-          "description": "已开始的执行尝试次数；running/verifying/succeeded/partial_success 时必须 >=1。failed/timed_out/cancelled 可因从未开始执行而为 0（此时记录通常为 pre_execution_incomplete 或来自 queued 的队列超时）。不得超过 max_attempts（跨字段比较由服务端执行）。"
+          "description": "已开始的执行尝试次数：只在 dispatch.accepted（T23）时递增；首次 queued 必须为 0。dispatched/running/verifying/succeeded/partial_success 必须 >=1。failed/timed_out/cancelled 可因从未开始执行而为 0：预派发失败（T28/T66/T55）可保留已撤销/消费的 Grant；人工在 attempt=0 的失败必须登记为 cancelled/denied（F39）。attempt=0 的失败不消耗 retry_budget，也不能走 T65。不得超过 max_attempts（跨字段比较由服务端执行）。"
         },
         "max_attempts": {
           "type": "integer",
@@ -785,7 +810,7 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 100,
-          "description": "剩余可重试次数；T65 要求 >0，且必须重新评估并签发新 Grant。"
+          "description": "剩余可重试次数。T65 要求 attempt>=1 且 >0，并在进入 T65 时递减 1，且必须重新评估并签发新 Grant。attempt=0 的预派发失败不消耗本预算。"
         }
       }
     },
@@ -1160,6 +1185,13 @@
         "record_completeness": {
           "$ref": "#/$defs/recordCompleteness"
         },
+        "owner_escalation": {
+          "oneOf": [
+            {"$ref": "#/$defs/ownerEscalation"},
+            {"type": "null"}
+          ],
+          "description": "仅当已解析的 Accountable Owner 已停用/解绑时，终态或历史记录必须显式携带本标记与原因；不得静默允许停用 owner。active 状态不得携带。"
+        },
         "labels": {
           "type": "object",
           "additionalProperties": {
@@ -1274,8 +1306,7 @@
           "accountable_owner": {
             "properties": {
               "resolution": {"const": "server_resolved"},
-              "principal_id": {"type": "string"},
-              "account_status": {"const": "active"}
+              "principal_id": {"type": "string"}
             }
           },
           "execution_mode": {"enum": ["advisory", "governed_resource_access", "managed_execution"]},
@@ -1285,7 +1316,48 @@
             }
           }
         },
-        "description": "complete 记录必须资料齐全：结构化目标、已解析责任人、已确定执行模式与资源范围。"
+        "description": "complete 记录必须资料齐全：结构化目标、已解析责任人、已确定执行模式与资源范围。Owner 是否为 active 由下一步的状态条件约束：执行中/等待门禁状态必须 active；终态/历史记录允许 disabled，但必须带 owner_escalation。"
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "envelope_kind": {"const": "record"},
+          "accountable_owner": {
+            "properties": {
+              "resolution": {"const": "server_resolved"},
+              "account_status": {"enum": ["disabled", "unbound", "unknown"]}
+            },
+            "required": ["resolution", "account_status"]
+          }
+        },
+        "required": ["envelope_kind", "accountable_owner"]
+      },
+      "then": {
+        "properties": {
+          "owner_escalation": {"type": "object"}
+        },
+        "description": "R4：已解析但已停用/解绑/状态未知的 Owner 不得静默存在；记录必须带 owner_escalation 原因。"
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "envelope_kind": {"const": "record"},
+          "owner_escalation": {"type": "object"}
+        },
+        "required": ["envelope_kind", "owner_escalation"]
+      },
+      "then": {
+        "properties": {
+          "accountable_owner": {
+            "properties": {
+              "resolution": {"const": "server_resolved"},
+              "account_status": {"enum": ["disabled", "unbound", "unknown"]}
+            }
+          }
+        },
+        "description": "owner_escalation 只适用于已解析但非 active 的历史/终态 Owner；不得用它绕过 active owner 要求。"
       }
     },
     {
@@ -1293,10 +1365,12 @@
         "requester": {
           "properties": {
             "resolution": {"const": "server_resolved"},
-            "principal_id": {"type": "string"},
+            "principal_id": {"type": "string", "pattern": "^(prin|rt|svc)_"},
+            "principal_type": {"enum": ["person", "service", "runtime", "agent_instance"]},
             "account_status": {"const": "active"},
             "identity_assurance": {"enum": ["verified_session", "verified_mtls", "verified_signed_token"]}
-          }
+          },
+          "description": "R5：Requester 只能是人员、服务、运行时或 agent_instance（prin_/svc_/rt_）；role_/queue_ 不是可认证主体，不能作为 Requester。"
         }
       }
     },
@@ -1336,11 +1410,11 @@
           "then": {
             "properties": {
               "principal_id": {"type": "string"},
-              "account_status": {"const": "active"},
               "identity_assurance": {"enum": ["verified_session", "verified_mtls", "verified_signed_token"]}
             }
           },
-          "else": {"properties": {"principal_id": {"const": null}}}
+          "else": {"properties": {"principal_id": {"const": null}}},
+          "description": "已解析的 Owner 必须是经验证主体；是否 active 由状态条件约束：执行中/等待门禁要求 active，终态/历史记录允许 disabled 但必须带 owner_escalation。"
         },
         "assignee": {
           "if": {"properties": {"resolution": {"const": "server_resolved"}}, "required": ["resolution"]},
@@ -1402,11 +1476,14 @@
       "then": {
         "properties": {
           "goal": {"type": "object"},
+          "accountable_owner": {"properties": {"resolution": {"const": "server_resolved"}, "principal_id": {"type": "string"}, "account_status": {"const": "active"}}},
+          "owner_escalation": {"const": null},
           "assignee": {"properties": {"resolution": {"const": "server_resolved"}, "principal_id": {"type": "string"}, "account_status": {"const": "active"}}},
           "executor": {"properties": {"resolution": {"const": "server_resolved"}, "principal_id": {"type": "string"}, "account_status": {"const": "active"}}},
           "decision": {"type": "object", "properties": {"decision_type": {"enum": ["allow", "managed_execution_required"]}}},
           "linkage": {"properties": {"grant_id": {"type": "string"}}}
-        }
+        },
+        "description": "R4：queued/dispatched/running/verifying/succeeded/partial_success 要求 Owner 已解析且 active；不得用 owner_escalation 掩盖执行中 Owner 失效，必须先按状态机转 failed/cancelled，再带升级标记。"
       }
     },
     {
@@ -1476,14 +1553,15 @@
       "if": {
         "properties": {
           "envelope_kind": {"const": "record"},
-          "status": {"properties": {"state": {"enum": ["running", "verifying", "succeeded", "partial_success"]}}, "required": ["state"]}
+          "status": {"properties": {"state": {"enum": ["dispatched", "running", "verifying", "succeeded", "partial_success"]}}, "required": ["state"]}
         },
         "required": ["envelope_kind", "status"]
       },
       "then": {
         "properties": {
           "status": {"properties": {"attempt": {"minimum": 1}}}
-        }
+        },
+        "description": "R3：dispatched/running/verifying/succeeded/partial_success 都对应至少一次 dispatch.accepted，因此 attempt>=1。"
       }
     },
     {
@@ -1584,6 +1662,29 @@
           }
         },
         "description": "failed 是尝试终态：必须有失败/停止证据，且停止已确认（无法确认停止时必须停留在 unknown）。"
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "envelope_kind": {"const": "record"},
+          "status": {
+            "properties": {"state": {"const": "failed"}, "attempt": {"const": 0}},
+            "required": ["state", "attempt"]
+          }
+        },
+        "required": ["envelope_kind", "status"]
+      },
+      "then": {
+        "properties": {
+          "linkage": {
+            "properties": {
+              "grant_id": {"type": "string"},
+              "grant_status": {"enum": ["revoked", "consumed"]}
+            }
+          }
+        },
+        "description": "R3：attempt=0 的 failed 只能来自预派发失败（T28/T66 或 T55），此时仍持有已撤销/消费的 Grant；从未执行、无 Grant 的人工“失败”必须登记为 cancelled/denied（F39），不得进入 failed 后走 T64/T70。"
       }
     },
     {

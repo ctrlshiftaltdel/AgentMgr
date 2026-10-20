@@ -36,9 +36,9 @@
 | `timed_out` | 已确认超时且执行边界关闭 | **是** | 否 |
 | `needs_human` | 需要人工接管、裁决或补充证据 | 否 | 是（人工动作） |
 | `partial_success` | 仅部分完成定义通过且有证据 | **是** | 否（新任务另立） |
-| `unknown` | 无法确定执行边界事实，等待对账 | 否 | 是（对账后：T53–T58、T71） |
+| `unknown` | 无法确定执行边界事实，等待对账；进入时 Grant 立即撤销 | 否 | 是（对账后：T55–T58、T71–T73；不得直接恢复执行） |
 
-`unknown` 和 `needs_human` **不是终态**；不得把它们当作成功、失败或取消的替代。`failed` 是尝试终态，不是任务终态：只能在有界预算内重新评估并重试，或转人工。
+`unknown` 和 `needs_human` **不是终态**；不得把它们当作成功、失败或取消的替代。`failed` 是尝试终态，不是任务终态：只能在有界预算内重新评估并重试，或转人工。`unknown` 采用 **fail-closed** 语义：进入 `unknown` 的同一事务内撤销当前 Grant（`reason_code=execution_evidence_lost`），撤销后的 Grant 永不复活、永不复用；恢复只能通过新决策 + 新 Grant（T71/T65）或转人工/终止（T56/T57/T58/T72/T73）。
 
 ## 3. 执行边界与模式（模式中立）
 
@@ -65,6 +65,8 @@
 - **事件产生者必须记录在事件中。** 每个 `execution.*` 事件包含 `boundary`（`b1_client` / `b2_pep` / `b3_runtime`）、`task_id`、`grant_id`、`state_revision`、`evidence_ref` 与时间戳。
 - **空集合不是全量。** 资源范围、数据分类和能力为空都表示“没有”，不是“全部”。`undetermined` 只允许出现在 `pre_execution_incomplete` 记录（`draft`、`awaiting_clarification`，以及执行前退出的 `denied`/`cancelled`/`needs_human`/`failed`）或 `decision_type=needs_clarification` 的 `evaluated` 记录。
 - **记录完整性显式标注。** `record_completeness.completeness=pre_execution_incomplete` 必须带 `incomplete_reason` 且不得关联 Grant（`linkage.grant_id=null`、`attempt=0`）；它只允许出现在执行前状态：`draft`、`awaiting_clarification`、`decision_type=needs_clarification` 的 `evaluated`、执行前的 `cancel_requested`，以及执行前退出的 `denied`/`cancelled`/`needs_human`/`failed`。一旦开始执行（`attempt>=1`），或进入 `queued`/`dispatched`/`running`/`verifying`/`succeeded`/`partial_success`/`timed_out`/`unknown`/`awaiting_confirmation`/`awaiting_approval`，记录必须是 `complete`，即 `goal` 非空、`accountable_owner` 已解析、`execution_mode` 与 `scope_type` 均已确定。
+- **`attempt` 只统计已开始的执行。** 首次 `queued` 的 `status.attempt=0`；只有 `dispatch.accepted`（T23）递增 `attempt`。预派发失败（`attempt=0`）不消耗 `retry_budget_remaining`，也不能走 T65；`attempt=0` 的人工“失败”必须登记为 `cancelled` 或 `denied`，不得进入 `failed` 后用 T64/T70 循环。`execution-grant.attempt.number` 是 Grant 授权的那次尝试序号：签发时为 `status.attempt + 1`，`dispatch.accepted` 后与 `status.attempt` 相等。
+- **Owner 必须可追责且状态有效。** `queued`/`dispatched`/`running`/`verifying`/`awaiting_confirmation`/`awaiting_approval` 要求 `accountable_owner` 已解析且 `account_status=active`；终态/历史记录允许 Owner 已解析但 `disabled`/`unbound`，但必须带 `owner_escalation`（原因、时间、接管/通知主体），不得静默允许。`awaiting_clarification` 属于 A1 的执行前不完整记录，仍允许 Owner 未解析；一旦离开该状态进入门禁/执行，必须先解析并校验 active。
 
 ## 4. 事件类型（规范性、穷尽）
 
@@ -109,8 +111,8 @@
 | `verification.failed` | 核心验证器 | 验证不通过且无重试价值 |
 | `verification.inconclusive` | 核心验证器 | 证据不足/冲突 |
 | `verification.evidence_unavailable` | 核心验证器 | 证据源不可用 |
-| `reconcile.running` | Worker / 人工 | 对账取得运行证据 |
-| `reconcile.completed` | Worker / 人工 | 对账取得结果 |
+| `reconcile.running` | Worker / 人工 | 对账取得运行证据；必须立即请求停止并取证，不得恢复执行；停止未确认时经 T72 转人工 |
+| `reconcile.completed` | Worker / 人工 | 对账取得结果；任务已处于 `unknown` 且 Grant 已撤销，不得直接进入验证；经 T73 转人工裁决 |
 | `reconcile.failed` | Worker / 人工 | 对账确认失败且已停止 |
 | `reconcile.not_found` | Worker / 人工 | 对账在有限窗口内确认执行边界从未受理，且执行边界出具无副作用保证 |
 | `reconcile.stopped` | Worker / 人工 | 对账确认停止 |
@@ -135,17 +137,19 @@
 - 调用者已认证且不是停用/解绑主体；
 - 任务 `state_revision` 与事件预期版本一致；
 - 策略版本、Grant、工具契约版本在有效期内且匹配；
-- 责任字段完整：`accountable_owner` 已解析为人员/组织角色，`approver` 在需要审批时独立且不是 Accountable Owner 本人；
+- 责任字段完整：`accountable_owner` 已解析为人员/组织角色；`approver` 在需要审批时独立且不是 Accountable Owner 本人；**职责分离必须检查 `approvals[]` 中所有 `decision=approved` 的实际 `approver_principal_id`，以及 `execution-grant.approval_ref.approver_principal_id`**，不能只检查任务级 `approver` 字段；`role_` 审批人必须解析为实际行为人后再比较；
 - 记录完整性与状态一致：`pre_execution_incomplete` 记录不得关联 Grant 且 `attempt=0`；`attempt>=1` 与所有执行后状态必须是 `complete` 记录（执行前的 `cancel_requested` 可保持不完整）；
 - `decision.decision_type` 与当前授权一致；授权型决策必须绑定非空 `task_id` 与 `task_revision`；
-- **终态必须使 Grant 失效**：任务或尝试进入 `succeeded`/`partial_success`/`failed`/`cancelled`/`timed_out`/`denied`（以及 `unknown`）时，Grant 必须为 `revoked` 或 `consumed`；撤销原因使用 `attempt_failed` / `task_terminal` / `execution_evidence_lost`。PEP 除校验 Grant 外**还必须读取当前任务状态**，在终态或 `unknown` 任务上的 active Grant 一律拒绝；
-- 主体前缀与类型一致：`prin_`↔person/agent_instance、`rt_`↔runtime、`svc_`↔service、`role_`↔role、`queue_`↔queue；`role_`/`queue_` 不得成为被认证 subject 或 Grant 执行主体；
+- **终态与 `unknown` 必须使 Grant 失效**：任务或尝试进入 `succeeded`/`partial_success`/`failed`/`cancelled`/`timed_out`/`denied` 时，Grant 必须为 `revoked` 或 `consumed`（`task_terminal` / `attempt_failed`）；进入 `unknown` 时必须在同一事务内立即 `revoked`（`reason_code=execution_evidence_lost`）。撤销后的 Grant 永不复活、永不复用；T71/T65 必须签发新的 `grant_id` 与新决策。PEP 除校验 Grant 外**还必须读取当前任务状态**，在终态或 `unknown` 任务上的 active Grant 一律拒绝；
+- 主体前缀与类型一致：`prin_`↔person/agent_instance、`rt_`↔runtime、`svc_`↔service、`role_`↔role、`queue_`↔queue；`role_`/`queue_` 不得成为被认证 subject、Requester 或 Grant 执行主体；
 - 事件幂等键未被消费，或重复事件返回原结果；
 - 写入 task event 与审计事件在同一事务内完成（Outbox 至少一次投递）。
 
 ## 6. 允许的转换（共 72 条，含初始创建）
 
-> 表格中的“Grant”均指当前任务绑定的、未撤销、未过期、范围/版本匹配、且 `decision.decision_hash` 与 `task_revision` 匹配的 Execution Grant；除 T29 明确允许“由本尝试消费的 `consumed`”之外，进入 `queued`/`dispatched` 必须是 `status=active` 且未消费（消费时点见 §8.3）。任何 Grant 校验失败都不得进入 `queued` 或 `dispatched`。
+> 编号 T00–T73 是稳定标识，**T53/T54 已撤销并保留空号，不得重新使用**（原因见 §6.12）：`unknown` 不得直接恢复到 `running`/`verifying`。因此 T00–T73 中实际有效的允许转换是 72 条。
+>
+> 表格中的“Grant”均指当前任务绑定的、未撤销、未过期、范围/版本匹配、且 `decision.decision_hash` 与 `task_revision` 匹配的 Execution Grant；除 T29 明确允许“由本尝试消费的 `consumed`”之外，进入 `queued`/`dispatched` 必须是 `status=active` 且未消费（消费时点见 §8.3）。任何 Grant 校验失败都不得进入 `queued` 或 `dispatched`。**已 `revoked` 的 Grant 是终态，不得改回 `active` 或在恢复流程中复用。**
 
 ### 6.1 初始创建
 
@@ -204,13 +208,13 @@
 
 | ID | From → To | 事件 | 守卫 |
 |---|---|---|---|
-| T23 | `queued` → `dispatched` | `dispatch.accepted` | Worker 持有未过期租约与 fencing token；Grant 每项绑定匹配；门禁满足；无其他活动 attempt；模式能力守卫通过；已绑定 `runtime_task_id`（Managed）或 `execution_ref`（Advisory/Governed） |
+| T23 | `queued` → `dispatched` | `dispatch.accepted` | Worker 持有未过期租约与 fencing token；Grant 每项绑定匹配；门禁满足；无其他活动 attempt；模式能力守卫通过；已绑定 `runtime_task_id`（Managed）或 `execution_ref`（Advisory/Governed）；**本转换为唯一 `attempt += 1` 时点，`grant.attempt.number` 必须等于递增后的 `status.attempt`** |
 | T24 | `queued` → `cancel_requested` | `task.cancel_requested` | 取消请求在 dispatch 前到达；幂等 |
 | T25 | `queued` → `denied` | `governance.denied` | Grant 被撤销、策略/审批在排队期间失效；未 dispatch，无副作用 |
 | T26 | `queued` → `needs_human` | `human.escalation_required` | 超过排队 SLA 仍无合格执行者，或运行时能力降级 |
 | T27 | `queued` → `timed_out` | `task.deadline_exceeded` | 队列/SLA 截止已过且从未 dispatch；确认无副作用 |
-| T28 | `queued` → `failed` | `dispatch.unavailable` | 无可用 Adapter/配置不可恢复；确认无副作用；记录兼容性缺口；Grant 必须撤销 |
-| T66 | `queued` → `failed` | `dispatch.rejected` | 执行边界明确拒绝提交且确认无副作用；记录错误码；不得在缺少新决策/新 Grant 时重试（重试只能经 T65） |
+| T28 | `queued` → `failed` | `dispatch.unavailable` | 无可用 Adapter/配置不可恢复；确认无副作用；记录兼容性缺口；Grant 必须撤销。此时 `attempt=0`：不消耗重试预算，且只能经 T70 转人工（不得走 T65） |
+| T66 | `queued` → `failed` | `dispatch.rejected` | 执行边界明确拒绝提交且确认无副作用；记录错误码；此时 `attempt=0`，**不得在缺少新决策/新 Grant 时重试**；`attempt=0` 不满足 T65，只能经 T70 转人工或由新任务/新决策重新授权 |
 | T67 | `queued` → `unknown` | `dispatch.timeout` | 提交超时且无法确认是否受理；**先按幂等键查询**；禁止重发创建请求 |
 | T68 | `queued` → `unknown` | `dispatch.unknown` | 提交响应不可解析或连接中断；先查询，不得猜测未执行 |
 | T69 | `queued` → `needs_human` | `dispatch.unsupported` | 运行时/连接器不支持该模式或能力；确认无副作用；记录能力缺口，不自动重试 |
@@ -225,7 +229,7 @@ T66–T69 与 Adapter 提交结果一一对应：`rejected → T66`、`unsupport
 | T30 | `dispatched` → `failed` | `execution.failed` | 执行边界明确失败且确认已停止；记录错误码；无未对账副作用 |
 | T31 | `dispatched` → `unknown` | `execution.lost` | 查询超阈值或状态矛盾；进入对账，不得重发 |
 | T32 | `dispatched` → `cancel_requested` | `task.cancel_requested` | 取消请求已登记；未确认停止 |
-| T33 | `dispatched` → `queued` | `worker.lease_expired` | 查询确认执行边界未受理、无副作用；重试预算未耗尽；幂等键已记录 |
+| T33 | `dispatched` → `queued` | `worker.lease_expired` | 查询确认执行边界未受理、无副作用；重试预算未耗尽；幂等键已记录；`attempt` 不回退、`retry_budget_remaining` 不递减（本次受理未产生副作用） |
 | T34 | `dispatched` → `timed_out` | `dispatch.deadline_exceeded` | 提交窗口截止，且查询明确无执行任务/无副作用；否则走 T31 |
 | T35 | `dispatched` → `needs_human` | `human.escalation_required` | 能力不支持或受理结果互相矛盾，无法自动判定 |
 
@@ -263,15 +267,21 @@ T66–T69 与 Adapter 提交结果一一对应：`rejected → T66`、`unsupport
 
 ### 6.12 从 `unknown`
 
+`unknown` 是**授权已失效**的状态。进入 `unknown` 的同一事务必须把当前 Grant 置为 `revoked`（`reason_code=execution_evidence_lost`）；被撤销的 Grant 永不复活。**不存在从 `unknown` 直接恢复到 `running` 或 `verifying` 的转换**：T53（`unknown` → `running`，`reconcile.running`）与 T54（`unknown` → `verifying`，`reconcile.completed`）已撤销，编号保留但不得实现。若对账发现执行边界实际仍在运行，必须先发送停止并取得停止证据，再走下列终止/人工路径；不得直接恢复执行。
+
 | ID | From → To | 事件 | 守卫 |
 |---|---|---|---|
-| T53 | `unknown` → `running` | `reconcile.running` | 对账获得新鲜运行证据；Grant 未过期/未撤销 |
-| T54 | `unknown` → `verifying` | `reconcile.completed` | 对账取得结构化结果与证据；进入验证 |
-| T55 | `unknown` → `failed` | `reconcile.failed` | 对账确认明确失败且已停止；副作用已记录 |
+| ~~T53~~ | ~~`unknown` → `running`~~ | ~~`reconcile.running`~~ | **已撤销**：撤销后的 Grant 不得复活；仍在运行时必须先停止并取证，经 T72 转人工 |
+| ~~T54~~ | ~~`unknown` → `verifying`~~ | ~~`reconcile.completed`~~ | **已撤销**：对账取得的结果不得绕过停止确认与新授权进入验证，经 T73 转人工 |
+| T55 | `unknown` → `failed` | `reconcile.failed` | 对账确认明确失败且已停止（`stop_confirmed=true`）；副作用已记录；`attempt>=1` 时失败不消耗新的重试预算，后续只能经 T65（新决策 + 新 Grant）；`attempt=0` 时只能经 T70 |
 | T56 | `unknown` → `cancelled` | `reconcile.stopped` | 对账确认已停止且无新副作用；`stop_confirmed=true` |
 | T57 | `unknown` → `needs_human` | `reconcile.unresolved` | 对账尝试耗尽或证据冲突；转人工，不猜测 |
 | T58 | `unknown` → `timed_out` | `reconcile.timed_out` | 对账取得超时证据且 `stop_confirmed=true`；否则保持 `unknown`/`needs_human` |
-| T71 | `unknown` → `queued` | `reconcile.not_found` | 有界查询窗口已结束；执行边界**显式保证无副作用**（`no_side_effect` 证据）且按幂等键确认从未受理；`retry_budget_remaining > 0`；**必须重新执行 PDP 并签发新决策与新 Grant**；旧 Grant 必须已 `revoked`/`expired`，不得复用 |
+| T71 | `unknown` → `queued` | `reconcile.not_found` | **仅当 `attempt=0`（从未 dispatch.accepted）**；有界查询窗口已结束；执行边界**显式保证无副作用**（`no_side_effect` 证据）且按幂等键确认从未受理；**必须重新执行 PDP 并签发新决策与新 Grant（新 `decision_id`、新 `grant_id`）**；旧 Grant 必须已 `revoked`/`consumed`/`expired`，不得复用。`attempt` 保持 0，本转换不消耗 `retry_budget_remaining` |
+| T72 | `unknown` → `needs_human` | `reconcile.running` | 对账发现执行边界仍在运行；**不得恢复执行**；必须先请求停止并取得停止证据（`stop_confirmed`）；停止未确认或运行时拒绝停止时转人工接管 |
+| T73 | `unknown` → `needs_human` | `reconcile.completed` | 对账取得结果/证据，但任务已处于 `unknown` 且原 Grant 已撤销；不得直接进入 `verifying` 或 `succeeded`，交由人工裁决（新建任务、重新授权或人工补证） |
+
+**`unknown` 的可执行出口只有：** T71（`attempt=0` + 无副作用证据 → 新决策 + 新 Grant 重新排队）、T55（失败 → T65 有界重试）、T56（确认停止）、T58（确认超时）、T57/T72/T73（人工接管）。不得从 `unknown` 直接恢复执行，也不得复用被撤销的 Grant。
 
 ### 6.13 从 `needs_human`
 
@@ -282,14 +292,14 @@ T66–T69 与 Adapter 提交结果一一对应：`rejected → T66`、`unsupport
 | T61 | `needs_human` → `queued` | `human.redispatch` | 已决定重派；**必须重新执行 PDP 并签发新决策与新 Grant**；`task_revision`、确认、审批、预算全部重验；重试预算 >0；无未对账副作用 |
 | T62 | `needs_human` → `denied` | `human.authorization_revoked` | 人工/策略撤销授权；记录原因码与审计 |
 | T63 | `needs_human` → `cancelled` | `human.stop_confirmed` | 人工确认已停止且无新副作用；`stop_confirmed=true` |
-| T64 | `needs_human` → `failed` | `human.declared_failed` | 人工判定失败且不再重试；记录证据 |
+| T64 | `needs_human` → `failed` | `human.declared_failed` | 人工判定失败且不再重试；记录证据；**要求 `attempt>=1`**。`attempt=0` 的人工失败不得进入 `failed`，只能登记为 `cancelled`（T63）或 `denied`（T62），避免 T64/T70 的空转循环 |
 
 ### 6.14 从 `failed`
 
 | ID | From → To | 事件 | 守卫 |
 |---|---|---|---|
-| T65 | `failed` → `queued` | `task.retry_authorized` | `attempt >= 1`（存在已开始的尝试）且 `attempt < max_attempts` 且 `retry_budget_remaining > 0`；**重新执行 PDP 并签发新决策与新 Grant**；决策 revision 必须递增（>=2）且 `decision_purpose=retry`；确认/审批/预算重验；确认无未对账副作用；幂等策略成立；不得复用过期决策或旧 Grant |
-| T70 | `failed` → `needs_human` | `task.retry_exhausted` | `attempt >= max_attempts`、`retry_budget_remaining = 0`、`attempt = 0`（从未开始执行），或动作不可安全幂等；不得自动重试，转人工裁决 |
+| T65 | `failed` → `queued` | `task.retry_authorized` | `attempt >= 1`（存在已开始的尝试）且 `attempt < max_attempts` 且 `retry_budget_remaining > 0`；**进入本转换时原子递减 `retry_budget_remaining`（减 1）**；**重新执行 PDP 并签发新决策与新 Grant**；决策 revision 必须递增（>=2）且 `decision_purpose=retry`；新 Grant 的 `attempt.number = status.attempt + 1`、`retry_of_attempt = status.attempt`、`retry_decision_id` 指向新决策；确认/审批/预算重验；确认无未对账副作用；幂等策略成立；不得复用过期决策或旧 Grant |
+| T70 | `failed` → `needs_human` | `task.retry_exhausted` | `attempt >= max_attempts`、`retry_budget_remaining = 0`、`attempt = 0`（从未开始执行，含 T28/T66 的预派发失败），或动作不可安全幂等；不得自动重试，转人工裁决 |
 
 ### 6.15 终态
 
@@ -314,11 +324,11 @@ T66–T69 与 Adapter 提交结果一一对应：`rejected → T66`、`unsupport
 | F11 | `timed_out` → `running` | 已关闭的执行边界不应复活；需新任务 |
 | F12 | `failed` → `succeeded` | 跳过验证与证据 |
 | F13 | `partial_success` → `succeeded` 静默补齐 | 未完成项必须有新验证/新任务 |
-| F14 | 任一任务终态（`succeeded`/`denied`/`cancelled`/`timed_out`/`partial_success`）→ 任一非终态 | 改写历史；新工作必须新任务。注意 `failed` 是**尝试终态**，只允许 T65/T70 |
+| F14 | 任一任务终态（`succeeded`/`denied`/`cancelled`/`timed_out`/`partial_success`）→ 任一非终态 | 改写历史；新工作必须新任务。注意 `failed` 是**尝试终态**（不是任务终态），只允许 T65/T70 |
 | F15 | 使用过期/撤销/已消费 Grant 进入 `dispatched` | Grant 生命周期约束 |
 | F16 | `single_use` Grant 第二次调用 | 一次性消费语义 |
 | F17 | 用任务 A 的 Grant 执行任务 B | Grant 必须绑定 `task_id` 及 `task_revision` |
-| F18 | 自审批（Requester/Executor/Accountable Owner 作为 Approver） | 职责分离；1.0.0 无策略例外 |
+| F18 | 自审批（Requester/Executor/Accountable Owner，或任一实际审批人 principal 与三者相同） | 职责分离；1.0.0 无策略例外 |
 | F19 | 高优先级修改导致 `denied` 重开 | 优先级不提升权限 |
 | F20 | `unknown` → `cancelled` 无停止/对账证据 | 未知不等于已停止 |
 | F21 | `dispatched` → `running` 无执行句柄或 Grant 已失效 | 无绑定的运行事实不可信 |
@@ -337,6 +347,10 @@ T66–T69 与 Adapter 提交结果一一对应：`rejected → T66`、`unsupport
 | F34 | 任务/尝试已进入终态或 `unknown` 却保留 `active` Grant，或 PEP 在终态任务上放行 active Grant | D3/A2：终态必须使 Grant 失效，PEP 必须检查当前任务状态 |
 | F35 | `pre_execution_incomplete` 记录关联 Grant，或在 `attempt>=1` / 执行后状态使用该标记 | 未执行记录不得持有授权；执行后必须补齐资料 |
 | F36 | `unknown` 任务在缺少 `reconcile.not_found` 无副作用证据时直接重派或重新入队 | 未知不等于未执行；必须先对账 |
+| F37 | `unknown` → `running`（原 T53） | **R1**：进入 `unknown` 即撤销 Grant，撤销后不得恢复执行；仍在运行必须先停止并取证，经 T72 转人工 |
+| F38 | `unknown` → `verifying`（原 T54） | **R1**：对账结果不得绕过停止确认与重新授权直接进入验证；经 T73 转人工裁决 |
+| F39 | `attempt=0` 的人工“失败”经 `human.declared_failed` 进入 `failed` 后再走 T64/T70 循环 | **R3**：从未开始执行的失败必须登记为 `cancelled`/`denied`；`failed` 需要已开始的尝试或预派发失败事件 |
+| F40 | 将被 `revoked` 的 Grant 改回 `active`、复活或复用于 T71/T65 | Grant 撤销是终态；恢复必须签发新 `grant_id` + 新决策 |
 
 ## 8. 确认与审批生命周期
 
@@ -371,9 +385,10 @@ T66–T69 与 Adapter 提交结果一一对应：`rejected → T66`、`unsupport
 
 规则：
 
-- `approved` 必须 `separation_check=passed`，且 Approver ≠ Requester、Executor、Accountable Owner。
+- `approved` 必须 `separation_check=passed`，且审批的实际行为人 ≠ Requester、Executor、Accountable Owner。
 - 1.0.0 **不允许** Accountable Owner 审批自己的任务；未来策略例外必须升主版本并增加例外引用、理由、策略版本与审计字段。
-- **职责分离按 principal 身份判定，由服务端计算 `separation_check`。** 同一 `principal_id` 不得审批自己的任务；同一组织角色下的不同人员可以审批（角色相同不构成冲突）。JSON Schema 无法比较两个 `principal_id`，因此 `owner==approver` 是服务端强制断言（见 §19 S-01），不是 Schema 校验。
+- **职责分离按实际 principal 身份判定，由服务端计算 `separation_check`。** 服务端必须逐一检查 `approvals[]` 中每个 `decision=approved` 的 `approver_principal_id`，以及授权 Grant 的 `approval_ref.approver_principal_id`，并与 `accountable_owner`、`requester`、`executor` 比较；**不能只检查任务级 `approver` 字段**。`role_` 审批人必须先解析为实际行为人（principal_id）再比较：同一 `principal_id` 不得自审；同一组织角色下的不同人员可以审批（角色相同不构成冲突）。JSON Schema 无法比较两个 `principal_id`，因此 `owner==实际审批人` 是服务端强制断言（见 §19 S-01/S-02/S-14），不是 Schema 校验。
+- **任务级 `approver` 必须与实际审批一致。** 已解析的 `approver.principal_id` 必须等于授权 Grant 所引用审批（`approval_ref.approval_id` 对应的 `approvals[]` 条目）的实际 `approver_principal_id`；角色审批人按解析后的行为人比较。不一致时 fail closed（S-14）。
 - **过期或撤销只能作用于已通过的批准**：`expired`/`revoked` 必须 `separation_check=passed`、`decided_at` 与 `expires_at` 非空；分离检查失败（`failed`）的审批只能停在 `rejected`。
 - `pending` 必须 `decided_at=null`、`separation_check=not_required`；`rejected` 必须 `decided_at` 非空。
 - 审批绑定 payload hash、TTL 与审批人身份；引用 `rejected`/`expired`/`revoked` 审批的 Grant 非法。
@@ -389,9 +404,9 @@ T66–T69 与 Adapter 提交结果一一对应：`rejected → T66`、`unsupport
 规则：
 
 - `running`/`verifying` 允许 Grant 为 `active` 或**由本尝试消费**的 `consumed`；T29 因此接受这两种状态（见 §6.8）。
-- `queued`/`dispatched` 必须是 `active`；终态与 `unknown` 必须是 `revoked`/`consumed`。
+- `queued`/`dispatched` 必须是 `active`；终态与 `unknown` 必须是 `revoked`/`consumed`。**进入 `unknown` 必须使用 `revoked` + `reason_code=execution_evidence_lost`**；`revoked` 是终态，不得改回 `active`，也不得在 T71/T65 中复用（必须签发新 `grant_id`）。
 - 消费记录与副作用提交必须在同一事务/幂等单元内完成；不得“先执行后记账”。
-- 任何 `active` 且 `usable=true` 的 Grant 在终态任务上都是缺陷状态，必须由对账任务告警。
+- 任何 `active` 且 `usable=true` 的 Grant 在终态或 `unknown` 任务上都是缺陷状态，必须由对账任务告警。
 
 ## 9. 幂等、重复副作用与并发
 
@@ -424,17 +439,19 @@ T66–T69 与 Adapter 提交结果一一对应：`rejected → T66`、`unsupport
 - 心跳丢失但租约未过期：保持租约，不重复派发。
 - 状态写入使用 `state_revision` 乐观锁；旧 revision 返回冲突并触发对账。
 
-## 11. 超时与 `unknown` 恢复
+## 11. 超时与 `unknown` 恢复（fail-closed）
 
 1. **先查询，后重试。** 提交超时/连接中断时禁止重发创建请求；用 `runtime_task_id`、`execution_ref` 或幂等键查询。
-2. **`not_found` 不等于失败，也不等于可以重试。** `unknown` 只有两条可执行恢复路径，二者都必须重新签名授权：
-   - **(a) `reconcile.not_found` → `queued`（T71）**：有界查询窗口结束时，执行边界按幂等键**显式保证从未受理且无副作用**（`no_side_effect` 证据，含查询次数、窗口起止、边界标识），且 `retry_budget_remaining > 0`；核心必须重新执行 PDP、签发新决策与新 Grant，旧 Grant 必须已 `revoked`/`expired`。缺少无副作用证据时不得走本路径。
-   - **(b) `reconcile.failed` → `failed`（T55）→ T65**：无法取得无副作用保证时，任务先进入 `failed`（尝试终态），再由 T65 在有界预算内重新评估并签发新决策/新 Grant。
-   禁止把 `not_found` 直接视为可入队或可重派；T71 与 T65 的前置条件一致（新决策 + 新 Grant + 预算 + 无未对账副作用）。
-3. 状态查询超时/心跳丢失 → `unknown`；按退避策略对账（次数与总时长有上限）。
-4. 对账取得运行证据 → T53；取得结果 → T54；确认停止 → T56；确认失败 → T55；确认从未受理且无副作用 → T71；证据冲突/耗尽 → T57。
-5. `unknown` 期间不得签发新 Grant、不得调用新工具、不得显示为成功或已取消；进入 `unknown` 时必须把当前 Grant 置为 `revoked`（`reason_code=execution_evidence_lost`）或 `consumed`。PEP 在 `unknown` 任务上不得放行任何 active Grant。
-6. 执行边界恢复后，已过期 Grant 不得复活；需要继续时必须重新评估并重签 Grant。
+2. **进入 `unknown` 立即撤销 Grant。** 同一事务写 `grant_status=revoked` 与 `execution-grant.revocation.reason_code=execution_evidence_lost`；撤销后的 Grant 永不复活、永不复用，`unknown` 期间不得签发新 Grant、不得调用新工具、不得显示为成功或已取消。PEP 在 `unknown` 任务上不得放行任何 active Grant。
+3. **不得直接恢复执行。** 已撤销的 T53/T54（`unknown → running` / `unknown → verifying`）不存在。若对账发现执行边界实际仍在运行，必须先发送停止并取得停止证据（`stop_confirmed=true`），再走 §6.12 的终止/人工路径；运行时拒绝停止或停止无法确认时经 T72 转 `needs_human`，不得恢复。
+4. **可执行恢复路径（都必须重新授权）：**
+   - **(a) `reconcile.not_found` → `queued`（T71）**：仅当 `attempt=0`（从未 `dispatch.accepted`）。有界查询窗口结束时，执行边界按幂等键**显式保证从未受理且无副作用**（`no_side_effect` 证据，含查询次数、窗口起止、边界标识）；核心必须重新执行 PDP、签发新决策与新 Grant（新 `decision_id`/`grant_id`），旧 Grant 必须已 `revoked`/`consumed`/`expired`。缺少无副作用证据或 `attempt>=1` 时不得走本路径。重复的重新入队受对账窗口与队列 SLA 约束，超限转 T57，不得无限循环。
+   - **(b) `reconcile.failed` → `failed`（T55）→ T65**：`attempt>=1` 时先进入 `failed`（尝试终态），再由 T65 在有界预算内重新评估并签发新决策/新 Grant；`attempt=0` 时只能 T70 转人工。
+   - **(c) 对账取得结果（`reconcile.completed`，T73）或仍在运行（`reconcile.running`，T72）→ `needs_human`**：不得直接进入 `verifying`/`succeeded`；由人工裁决是否新建任务、重新授权或补证。
+   - **(d) `reconcile.stopped` → `cancelled`（T56）、`reconcile.timed_out` → `timed_out`（T58）、`reconcile.unresolved` → `needs_human`（T57）**：终止或人工接管，不再执行。
+   禁止把 `not_found` 直接视为可入队或可重派；T71 与 T65 的前置条件一致（新决策 + 新 Grant + 无未对账副作用）。
+5. 状态查询超时/心跳丢失 → `unknown`；按退避策略对账（次数与总时长有上限）。
+6. 执行边界恢复后，已过期/已撤销 Grant 不得复活；需要继续时必须重新评估并重签 Grant。
 7. **Grant 在运行中过期**（`expires_at` 到达）时，核心必须立即停止产生新副作用：进入 `cancel_requested` 并尝试停止；无法确认停止则进入 `unknown`/`needs_human`。不得继续运行到完成。Grant 的 `binding.runtime_within_grant_ttl` 必须为 true，且 `budget.max_runtime_seconds` 不得超过 `ttl_seconds`。
 
 ## 12. 取消语义
@@ -446,11 +463,14 @@ T66–T69 与 Adapter 提交结果一一对应：`rejected → T66`、`unsupport
 - 执行边界不支持取消 → `needs_human`，不得虚报已停止。
 - 取消竞态不得通过“最后写入者获胜”解决；以执行边界事实 + 证据为准。
 
-## 13. 重试
+## 13. 尝试与重试记账
 
-- 仅 `failed` 可在有界条件下经 T65 重试，且必须存在已开始的尝试（`attempt>=1`）；`attempt=0` 的早期失败只能经 T70 转人工。`denied`、`cancelled`、`timed_out`、`partial_success` 不得自动重试。`unknown` 必须先经 T71 或 T55 才能重新进入队列。
-- 重试必须有**新的 PDP 决策**（`decision_revision` 递增且 >=2、`decision_purpose=retry`）和**新的 Grant**；不得复用旧决策或旧 Grant。Grant 的 `attempt.retry_decision_id` 必须指向该新决策。
-- 每次重试必须递增 `attempt`，且 `attempt.number>=2` 与 `is_retry=true` 必须同时成立；`is_retry=true` 必须 `retry_decision_id` 非空、`retry_budget_remaining>=1`。同时检查 `max_attempts`；耗尽时走 T70（`attempt.number<=max_attempts` 由服务端比较）。
+- **`attempt` 的定义。** `attempt` 是**已开始的执行尝试次数**：首次 `queued` 为 0，只在 `dispatch.accepted`（T23）递增。`dispatched`/`running`/`verifying`/`succeeded`/`partial_success` 必须 `attempt>=1`；`failed`/`cancelled`/`timed_out` 可因从未开始而为 0。
+- **预派发失败不消耗重试预算。** `queued → failed`（T28/T66）与 `dispatched → queued`（T33）发生在执行开始之前/未产生副作用时，`retry_budget_remaining` 不变，且 `attempt=0` 的 `failed` 只能经 T70 转人工。
+- **`failed` 只在有界条件下经 T65 重试。** 必须 `attempt>=1` 且 `attempt < max_attempts` 且 `retry_budget_remaining>0`；**进入 T65 时递减 `retry_budget_remaining`（减 1）**。`attempt=0` 的失败不得走 T65。`denied`、`cancelled`、`timed_out`、`partial_success` 不得自动重试。`unknown` 必须先经 T71 或 T55 才能重新进入队列。
+- **重试必须有新决策与新 Grant。** `decision_revision` 递增且 >=2、`decision_purpose=retry`；不得复用旧决策或旧 Grant。Grant 的 `attempt.retry_decision_id` 必须指向该新决策，`attempt.number = status.attempt + 1`，`retry_of_attempt = status.attempt`。
+- **`attempt.number>=2` 与 `is_retry=true` 必须同时成立**；`is_retry=true` 必须 `retry_decision_id` 非空、`retry_budget_remaining>=1`。同时检查 `max_attempts`；耗尽时走 T70（`attempt.number<=max_attempts` 由服务端比较）。
+- **人工在 `attempt=0` 宣告失败**必须登记为 `cancelled`（T63）或 `denied`（T62），不得进入 `failed` 后再走 T64/T70 循环。
 - 重试不得扩大 capability、resource scope、TTL 或预算；确认/审批必须按新 payload 重新检查。
 - 不可安全幂等的动作不得自动重试；需要人工确认或补偿。
 - T61 人工重派与 T65 自动重试遵循相同的新决策/新 Grant 规则。
@@ -510,6 +530,9 @@ JSON Schema 只能校验结构与格式，无法比较“确认 hash 是否等�
 |---|---|---|
 | `fixtures/valid/governance-decision.allow.json` | `gdec_allow_0001` | 无门禁授权决策；`allowed_capabilities=["expense.read@1.0.0"]`、`scope_type=self`、`ttl_seconds=900`、`max_calls=20` |
 | `fixtures/valid/governance-decision.allow-with-gates.json` | `gdec_allow_gates_0001` | 带确认+审批门禁的授权决策；`allowed_capabilities=["expense.submit@1.0.0"]` |
+| `fixtures/valid/governance-decision.retry-allow.json` | `gdec_retry_0002` | 重试参考决策：`decision_revision=2`、`supersedes_decision_id=gdec_allow_0001`；`execution-grant.retry-attempt` 的 `decision` 引用 |
+| `fixtures/valid/governance-decision.deny-policy.json` | `gdec_deny_policy_0001` | 已创建任务的策略拒绝参考决策（`task_id` 非空、`execution_mode=none`、无能力、无 Grant） |
+| `fixtures/valid/governance-decision.deny-early.json` | `gdec_deny_early_0001` | 任务创建前的早期拒绝参考决策（`task_id=null`、`task_revision=null`） |
 
 **参考 payload（P1，用于确认/审批 hash）**：
 
@@ -535,6 +558,8 @@ P2 sha256:    sha256:1decdbfffaafb454911d751efd460c23afe6e3cab47230c2d567211c993
 
 **结构性占位值。** fixtures 中形如 `sha256:0000…`、`sha256:1111…`、`sha256:2222…`、`sha256:3333…` 的值是结构性占位符，只用于满足格式与唯一性，不代表真实内容哈希；只有 §16 测试向量与本节 P1/P2 是真实计算值。实现与评审不得把占位符当作可复算证据。
 
+**日期合法性。** `dateTime` 的正则已排除 `2026-02-30`、`2026-04-31` 等不可能日期，但正则无法判断闰年（`2026-02-29` 会通过正则）。契约要求验证器启用 `format: date-time` 断言；**若运行环境未安装/未启用 date-time format checker（本仓库独立校验器即如此），则闰年 2 月 29 日与闰秒必须由服务端按 RFC 3339 复核（S-17），不得把“Schema 通过”当作日期合法证明**。fixtures 目录只放结构可判定的非闰日/不合法日期样本，不放仅依赖 format 才可拒绝的样本，以保持 invalid 目录“Schema 可判定为非法”的约定。
+
 ## 17. 与契约字段的对应
 
 | 状态机概念 | 契约字段 |
@@ -542,7 +567,8 @@ P2 sha256:    sha256:1decdbfffaafb454911d751efd460c23afe6e3cab47230c2d567211c993
 | 当前状态 | `task-envelope.status.state` |
 | 状态版本 | `task-envelope.status.state_revision` |
 | 最后事件 | `task-envelope.status.last_event_id` |
-| 尝试次数 / 上限 / 重试预算 | `task-envelope.status.attempt` / `max_attempts` / `retry_budget_remaining` |
+| 尝试次数 / 上限 / 重试预算 | `task-envelope.status.attempt` / `max_attempts` / `retry_budget_remaining`；`attempt` 只在 `dispatch.accepted` 递增 |
+| Grant 尝试绑定 | `execution-grant.attempt.number`（签发时 = `status.attempt+1`；dispatch 后 = `status.attempt`）/ `retry_of_attempt` / `retry_decision_id` |
 | Grant 绑定 | `execution-grant.task_ref` / `task-envelope.linkage.grant_id` |
 | 决策绑定 | `task-envelope.decision` / `execution-grant.decision` |
 | Managed 执行句柄 | `task-envelope.linkage.runtime_task_id` (`rtask_`) |
@@ -553,6 +579,7 @@ P2 sha256:    sha256:1decdbfffaafb454911d751efd460c23afe6e3cab47230c2d567211c993
 | 优先级不越权 | `task-envelope.priority.authority_effect = scheduling_only` |
 | 模式与范围 | `execution_mode` / `resource_scope.scope_type`（`undetermined` 仅限 `pre_execution_incomplete` 记录） |
 | 记录完整性 | `task-envelope.record_completeness.completeness` / `incomplete_reason` |
+| Owner 停用升级 | `task-envelope.owner_escalation.reason_code` / `recorded_at` / `escalated_to_principal_id` |
 | 取消请求 | `status.state=cancel_requested`，不得据 `cancel_requested` 推断已停止 |
 | Grant 终态失效 | `task-envelope.linkage.grant_status` ∈ {`revoked`,`consumed`}；`execution-grant.revocation.reason_code` = `task_terminal`/`attempt_failed`/`execution_evidence_lost` |
 | Grant 消费时点 | `execution-grant.consumption.mode` / `consumed_at` / `consumed_by_call_id` / `remaining_calls` |
@@ -561,9 +588,9 @@ P2 sha256:    sha256:1decdbfffaafb454911d751efd460c23afe6e3cab47230c2d567211c993
 ## 18. 验收要点
 
 - 每个状态至少有一个允许入边和一个允许出边（终态除外）。
-- 72 条允许转换必须各有事件、守卫和测试用例；F01–F36 必须各有拒绝用例。
+- 72 条有效允许转换（T00–T73，其中 T53/T54 已撤销）必须各有事件、守卫和测试用例；F01–F40 必须各有拒绝用例。
 - 每条负向测试必须断言“状态未变 + 安全事件已记录”，而不仅是返回错误。
-- 状态机测试必须覆盖并发 revision、重复事件、取消竞态、提交超时、幂等重取、对账恢复（含 T71）、三种模式的能力守卫、重试新决策与新 Grant、终态 Grant 失效。
+- 状态机测试必须覆盖并发 revision、重复事件、取消竞态、提交超时、幂等重取、对账恢复（T55–T58、T71–T73，含撤销 Grant 后禁止 running/verifying）、三种模式的能力守卫、重试新决策与新 Grant、attempt 记账（首次 queued=0、T65 递减预算、attempt=0 不走 T65）、Owner 停用升级、终态 Grant 失效。
 - 未实现的转换不得注册为可调用 API；不得用文档承诺替代测试。
 
 ## 19. 服务端强制断言矩阵（Schema 无法表达）
@@ -572,16 +599,49 @@ JSON Schema 只能校验单实例结构与格式。下表断言必须在服务�
 
 | ID | 断言 | 关联条目 |
 |---|---|---|
-| S-01 | `accountable_owner.principal_id != approver.principal_id`（同一 principal 不得自审；同角色不同人员允许） | D3、F18、F33、TH-08/TH-28 |
-| S-02 | `approver.principal_id != requester.principal_id` 且 `!= executor.principal_id` | F18、T19 |
+| S-01 | 对每个 `approvals[].decision=approved` 的实际 `approver_principal_id`，以及 `execution-grant.approval_ref.approver_principal_id`，都要求 `!= accountable_owner.principal_id`（角色审批人先解析为实际行为人；同角色不同人员允许） | D3、R2、F18、F33、TH-08/TH-28 |
+| S-02 | 对每个 `approvals[].decision=approved` 的实际 `approver_principal_id`，以及 `execution-grant.approval_ref.approver_principal_id`，都要求 `!= requester.principal_id` 且 `!= executor.principal_id` | R2、F18、T19、TH-08 |
 | S-03 | `expires_at > issued_at`；`grant.expires_at <= decision.expires_at`；`decision.expires_at > evaluated_at` | TH-06、TH-26 |
 | S-04 | `decision.decision_hash` = JCS(decision − decision_hash) 的 SHA-256 | C2、TH-25 |
 | S-05 | `confirmation.payload_hash` / `approval.payload_hash` = JCS(当前执行 payload) 的 SHA-256 | TH-10、§16.1 |
 | S-06 | Grant 的 capabilities/scope/ttl/budget 是决策 `constraints` 的子集，模式一致 | C2、TH-26 |
-| S-07 | `attempt.number <= attempt.max_attempts`；`grant.attempt.number == task.status.attempt` | D2、F32 |
-| S-08 | `attempt.is_retry=true` 时 `retry_decision_id == decision.decision_id` 且 `decision_revision` 单调递增 | D2、§13 |
-| S-09 | 终态或 `unknown` 任务上的 active Grant 拒绝授权（PEP 读取当前任务状态） | A2、F34 |
-| S-10 | 进入终态/`unknown` 时同事务写 `grant_status=revoked|consumed` 与 `revocation.reason_code` | A2、§8.3 |
+| S-07 | `attempt.number <= max_attempts`；Grant 签发时 `grant.attempt.number == task.status.attempt + 1`，`dispatch.accepted` 后 `== task.status.attempt` | D2、R3、F32 |
+| S-08 | `attempt.is_retry=true` 时 `retry_decision_id == decision.decision_id`、`retry_of_attempt == status.attempt` 且 `decision_revision` 单调递增 | D2、R3、§13 |
+| S-09 | 终态或 `unknown` 任务上的 active Grant 拒绝授权（PEP 读取当前任务状态） | A2、R1、F34 |
+| S-10 | 进入终态时同事务写 `grant_status=revoked|consumed` 与 `revocation.reason_code`；进入 `unknown` 时同事务写 `revoked` + `execution_evidence_lost` | A2、R1、§8.3 |
 | S-11 | `pre_execution_incomplete` 记录无 Grant、`attempt=0`；`attempt>=1` 必须 `complete` | A1、F35 |
-| S-12 | `unknown → queued`（T71）必须有 `no_side_effect` 证据、`retry_budget_remaining>0` 与新决策/新 Grant | A3、F36 |
-| S-13 | `separation_check` 由服务端依据 principal 身份计算，不接受客户端提交值 | D3、TH-01 |
+| S-12 | `unknown → queued`（T71）必须有 `attempt=0`、`no_side_effect` 证据、新决策与新 `grant_id`，旧 Grant 为 `revoked`/`consumed`/`expired` | A3、R1、F36 |
+| S-13 | `separation_check` 由服务端依据 principal 身份计算，不接受客户端提交值；`role_` 审批人解析为实际行为人 | D3、R2、TH-01 |
+| S-14 | 已解析的任务级 `approver.principal_id` 必须等于授权 Grant 的 `approval_ref.approval_id` 所指向 `approvals[]` 条目的实际 `approver_principal_id`（角色审批人按解析后的行为人比较）；不相等即 fail closed | R2、D3、F18 |
+| S-15 | `attempt` 只在 `dispatch.accepted` 递增；首次 `queued` 为 0；`attempt=0` 的记录不得走 T65；T65 必须递减 `retry_budget_remaining`；`attempt=0` 的人工失败只允许 T62/T63 | R3、F39、§13 |
+| S-16 | 已 `revoked` 的 Grant 是终态：不得改回 `active`，不得在 T71/T65 中复用；恢复必须使用新 `grant_id` + 新决策 | R1、F40、TH-06 |
+| S-17 | 闰年/闰秒与 RFC 3339 合法性由服务端复核（`2026-02-29` 能通过正则）；`format` 未启用时不得把结构校验当作日期合法证明 | §16.1、TH-26 |
+| S-18 | `queued`/`dispatched`/`running`/`verifying`/`awaiting_*` 的 Owner 必须已解析且 active；终态/历史记录的 disabled/unbound Owner 必须带 `owner_escalation` 原因 | R4、TH-02、TH-22 |
+
+### 19.1 服务端断言测试向量（Schema-valid，必须被 S-01 拒绝）
+
+以下测试向量**结构合法**（JSON Schema 通过），但服务端必须按 S-01 拒绝。它们**不得**放入 `fixtures/invalid/`：该目录的约定是“Schema 可判定为非法”，而这些向量只能由服务端跨字段比较发现。
+
+```json
+{
+  "task_id": "task_expense_0001",
+  "accountable_owner": {"resolution": "server_resolved", "principal_id": "prin_owner_0001", "principal_type": "person"},
+  "approver": {"resolution": "server_resolved", "principal_id": "prin_owner_0001", "principal_type": "person"},
+  "approvals": [
+    {
+      "approval_id": "appr_self_0001",
+      "approver_principal_id": "prin_owner_0001",
+      "decision": "approved",
+      "separation_check": "passed"
+    }
+  ],
+  "linkage": {"grant_id": "grnt_self_0001"},
+  "expected": "S-01 fail: owner == actual approver == Grant approval_ref approver; state unchanged, approval rejected, no task.queued, security event recorded"
+}
+```
+
+**owner 自审（owner==实际审批人）**：即使任务级 `approver` 写成别人，只要 `approvals[]` 或 Grant 的 `approval_ref` 指向 owner 本人，S-01 必须拒绝。
+
+**S-14 负向测试向量**：任务级 `approver.principal_id=prin_approver_0001`，但 `approvals[]` 中 `approval_id=appr_expense_0001` 的 `approver_principal_id=prin_approver_0002`，且 Grant 的 `approval_ref.approval_id=appr_expense_0001`；断言 S-14 拒绝（`separation_of_duties_violation`），不得入队、不得签发 Grant，并记录安全事件。
+
+**角色审批人**：任务级 `approver.principal_id=role_finance_manager_0001`、`approvals[].approver_principal_id=role_finance_manager_0001` 合法（同角色）；但若解析后的实际行为人是 `prin_owner_0001`，S-01 必须拒绝。

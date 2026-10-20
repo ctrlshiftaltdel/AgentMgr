@@ -180,7 +180,7 @@ Adapter 至少声明以下能力名（版本随契约升级）：
 | 值 | 语义 | 核心动作 |
 |---|---|---|
 | `found` | 同一幂等键已有执行任务 | 采用该 `runtime_task_id`，按实际状态走 T29/T31/T41 等；禁止重发 |
-| `not_found` | 查询明确不存在 | 不等于可重试：有界窗口结束且 Adapter 出具无副作用保证 → T71 `reconcile.not_found` → `queued`（新决策 + 新 Grant）；无法出具保证 → T55 `failed` → T65 |
+| `not_found` | 查询明确不存在 | 不等于可重试：仅当 `attempt=0`、有界窗口结束且 Adapter 出具无副作用保证 → T71 `reconcile.not_found` → `queued`（新决策 + 新 Grant）；`attempt>=1` 或无法出具保证 → T55 `failed` → T65，或 T73 转人工 |
 | `conflict` | 同键但 payload hash 不同 | 拒绝重试；`conflict`，进入 `needs_human` 对账 |
 | `unknown` | 查询超时/不可解析 | `unknown`，有界对账；不得重发 |
 
@@ -220,9 +220,9 @@ Adapter 至少声明以下能力名（版本随契约升级）：
 | `stopped` | 已确认停止，且不再产生副作用 |
 | `timed_out` | 运行时确认超时并已停止 |
 | `unknown` | 无法查询、响应不可解析、心跳丢失或状态矛盾 |
-| `not_found` | 查询明确返回不存在；核心按 `unknown` 处理并进入对账（T71 或 T55），不得直接判定成功、失败或可重派 |
+| `not_found` | 查询明确返回不存在；核心按 `unknown` 处理并进入对账，不得直接判定成功、失败或可重派。仅当 `attempt=0`、有界窗口结束且执行边界出具无副作用保证时可经 T71；否则经 T55/T73 转失败或人工 |
 
-`stop_confirmed=true` 只能由 Adapter 在获得运行时停止证据后设置；`cancel` 被受理不等于已停止。
+`stop_confirmed=true` 只能由 Adapter 在获得运行时停止证据后设置；`cancel` 被受理不等于已停止。**若核心当前处于 `unknown`，`state=running` 不得被映射为恢复执行（原 T53 已撤销）。** Adapter 必须先执行 `cancel_task` 并取得 `stop_confirmed=true` 证据；核心保持 `unknown` 直到停止得到确认，再按 T56/T58/T72 处理。
 
 ### 3.4 `poll_events(runtime_task_id, cursor, limit)`
 
@@ -318,13 +318,13 @@ Adapter 至少声明以下能力名（版本随契约升级）：
 
 | Adapter `outcome` | 核心动作 |
 |---|---|
-| `succeeded` | T36/T50/T54 → `verifying`；绝不直接 `succeeded` |
-| `partial_success` | → `verifying`，按 `completion_criteria` 判定 `verification.partial` |
-| `failed` | T37/T55 → `failed`（确认已停止）；是否重试由 T65/T70 决定 |
+| `succeeded` | T36/T50 → `verifying`；绝不直接 `succeeded`。若任务当前处于 `unknown`，结果不得直接进入验证，按 T73 转 `needs_human` |
+| `partial_success` | → `verifying`，按 `completion_criteria` 判定 `verification.partial`。`unknown` 状态下的部分结果同样按 T73 转人工 |
+| `failed` | T37/T55 → `failed`（确认已停止，且到达 `failed` 时 `attempt>=1` 或来自预派发失败事件）；是否重试由 T65/T70 决定 |
 | `cancelled` | `stop_confirmed=true` → `cancel_requested`/`cancelled`（T48/T56）；否则 `unknown`（T51） |
 | `timed_out` | `stop_confirmed=true` → `timed_out`（T38/T58）；否则 `unknown` |
-| `needs_human` | → `needs_human`（T40/T45/T52/T57） |
-| `unknown` | → `unknown`（T41/T46/T51/T57）；先对账，不重发 |
+| `needs_human` | → `needs_human`（T40/T45/T52/T57/T72/T73） |
+| `unknown` | → `unknown`（T41/T46/T51/T57）；进入时立即撤销 Grant（`execution_evidence_lost`）；先对账，不重发，不恢复执行 |
 
 规则：
 
@@ -362,13 +362,13 @@ Adapter 把外部状态映射为内部事实；核心再把这些事实映射为
 | Adapter 事实 | 核心事件 | 核心状态 | 说明 |
 |---|---|---|---|
 | submit `accepted` / status `accepted` | `dispatch.accepted` | `dispatched` | 已绑定 `rtask_` 句柄，尚未确认运行 |
-| status `running` | `execution.started` | `running` | 有新鲜心跳或可验证执行证据 |
+| status `running` | `execution.started` | `running` | 有新鲜心跳或可验证执行证据；**仅限非 `unknown` 任务**。`unknown` 任务必须先停止并取得停止证据，不得经本映射恢复 |
 | status `waiting_input` | `human.escalation_required` 或保持 | `running` 或 `needs_human` | 有授权自动回答源则保持运行；否则需人工输入 |
 | status `completed` + `get_result` 可取 | `execution.completed` | `verifying` | 绝不直接 `succeeded` |
 | status `failed` | `execution.failed` | `failed` | 明确失败且已停止；是否重试由 T65/T70 决定 |
 | status `stopped` + `stop_confirmed` | `execution.stopped` | `cancelled` | 仍需对账副作用 |
 | status `timed_out` + `stop_confirmed` | `execution.timed_out` | `timed_out` | 未确认停止时保持 `unknown` |
-| status `unknown` / `not_found` / 查询超时 | `execution.lost` | `unknown` | 先对账，不重发创建请求 |
+| status `unknown` / `not_found` / 查询超时 | `execution.lost` | `unknown` | 进入即撤销 Grant；先对账，不重发创建请求；仍在运行必须先停止 |
 | cancel `requested` | `task.cancel_requested` | `cancel_requested` | 不是停止 |
 | cancel `already_terminal` | 按结果走 `execution.completed` / 对应终态 | `verifying` / 终态 | 按结果对账，不得丢弃已完成结果 |
 | submit `rejected` | `dispatch.rejected` | `failed` | 确认无副作用；不自动重试 |
@@ -387,9 +387,10 @@ Adapter 把外部状态映射为内部事实；核心再把这些事实映射为
 1. **禁止盲目重发创建请求。**
 2. 先调用 `find_by_idempotency_key(task_id, grant_id, idempotency_key)`；若已获得 `runtime_task_id`，同时调用 `get_status`。
 3. 找到任务：采用该任务，按实际事实更新；即使 payload 相同也不得再创建第二个执行任务。
-4. 明确不存在且执行边界出具无副作用保证：只能经 T71（`reconcile.not_found` → `queued`）重新执行 PDP、签发新决策与新 Grant 后提交；不得直接重发。无法取得该保证时经 T55 进入 `failed`，再由 T65 决定是否重试。
-5. 无法确定：状态 `unknown`，进入有界对账；超过阈值转 `needs_human`。
+4. 明确不存在且执行边界出具无副作用保证、且任务 `attempt=0`：只能经 T71（`reconcile.not_found` → `queued`）重新执行 PDP、签发新决策与新 Grant 后提交；不得直接重发。`attempt>=1` 或无法取得该保证时经 T55 进入 `failed`，再由 T65 决定是否重试（`attempt=0` 时只能 T70 转人工）。
+5. 无法确定：状态 `unknown`，进入有界对账；进入时立即撤销 Grant。超过阈值转 `needs_human`。
 6. 同键不同 payload：`conflict`，进入 `needs_human` 对账，不得覆盖或重发。
+7. **不得从 `unknown` 恢复执行。** 若对账发现运行时仍在运行，必须先 `cancel_task` 并取得 `stop_confirmed=true`；停止未确认时保持 `unknown`/`needs_human`，不得把 `state=running` 直接映射回核心 `running`。
 
 ### 5.2 查询与事件失败
 
@@ -454,7 +455,7 @@ Adapter 验收必须包含：
 11. **隔离负向**：读取其他任务目录、未授权网络、访问宿主凭据全部失败（Managed Execution）。
 12. **凭据与日志**：日志/事件/错误中无令牌、密码、API Key、完整个人数据。
 13. **健康降级**：运行时不可用时不再提交新任务，已提交任务进入 `unknown` 对账。
-14. **终态 Grant**：任务已进入终态或 `unknown` 后，用同一 `grant_id` 继续提交/调用必须被拒绝；Adapter 只报告事实，由核心撤销 Grant 并拒绝放行。
+14. **终态/未知 Grant**：任务已进入终态或 `unknown` 后，用同一 `grant_id` 继续提交/调用必须被拒绝；进入 `unknown` 时 Grant 必须在同一事务撤销（`execution_evidence_lost`），且不得复活或复用；Adapter 只报告事实，由核心撤销 Grant 并拒绝放行。
 
 Mock 测试只能证明 Adapter 与契约映射，不得作为运行时兼容性证据；真实运行时证据必须单独记录。
 

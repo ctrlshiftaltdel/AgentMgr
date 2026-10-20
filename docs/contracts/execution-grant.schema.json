@@ -122,7 +122,7 @@
     "status": {
       "type": "string",
       "enum": ["active", "consumed", "revoked", "expired"],
-      "description": "Grant 生命周期状态。只有 active 且 usable=true 的 Grant 可用于新调用；verified 不等于 active。"
+      "description": "Grant 生命周期状态。只有 active 且 usable=true 的 Grant 可用于新调用；verified 不等于 active。consumed/revoked/expired 都是终态：不得改回 active，也不得在恢复流程中复用。任务进入 unknown 时必须立即置为 revoked（reason_code=execution_evidence_lost）；后续恢复（T71/T65）必须签发新的 grant_id。"
     },
     "usable": {
       "type": "boolean",
@@ -275,12 +275,11 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["scope_type", "resource_ids", "connector_ids", "data_classifications", "exclude_resource_ids"],
-      "description": "授权资源范围。必须是签发决策范围的子集；范围扩大、scope_type 改变或新增未列出资源都必须拒绝并要求重新签发。空集合表示“没有该类别资源”，不表示“全部”。",
+      "description": "授权资源范围。必须是签发决策范围的子集；范围扩大、scope_type 改变或新增未列出资源都必须拒绝并要求重新签发。空集合表示“没有该类别资源”，不表示“全部”。Grant 必须有至少一个数据分类；scope_type=none 不构成授权范围，不属于 Grant。",
       "properties": {
         "scope_type": {
           "type": "string",
           "enum": [
-            "none",
             "self",
             "department",
             "company",
@@ -288,7 +287,8 @@
             "project",
             "record_set",
             "connector"
-          ]
+          ],
+          "description": "Grant 只存在于授权型决策之上，而授权型决策要求非空资源范围与至少一个数据分类，因此 Grant 不允许 scope_type=none 或 undetermined（这两个值只出现在任务记录的未授权/不完整状态）。"
         },
         "resource_ids": {
           "type": "array",
@@ -458,7 +458,7 @@
             "approval_revoked",
             "runtime_compromised"
           ],
-          "description": "task_terminal = 任务进入任一终态；attempt_failed = 本次尝试失败/超时。两者都要求 PEP 立即停止放行并关闭执行边界。"
+          "description": "task_terminal = 任务进入任一终态；attempt_failed = 本次尝试失败/超时；execution_evidence_lost = 任务进入 unknown，必须立即撤销 Grant。三者都要求 PEP 立即停止放行并关闭执行边界；撤销后的 Grant 永不复活。"
         },
         "revoked_by_principal_id": {
           "type": ["string", "null"],
@@ -631,13 +631,13 @@
         "retry_decision_id",
         "retry_budget_remaining"
       ],
-      "description": "执行尝试与重试预算。failed 是尝试终态；只有 attempt < max_attempts 且 retry_budget_remaining > 0 时才允许 T65 重试，重试必须携带新的决策（revision 递增、purpose=retry）与新的 Grant。number>=2 必须 is_retry=true；is_retry=true 必须 number>=2、retry_decision_id 非空且 retry_budget_remaining>=1。number<=max_attempts 由服务端比较（Schema 无法跨字段比较）。",
+      "description": "执行尝试与重试预算。attempt 指“已开始的执行尝试”（task.status.attempt 只在 dispatch.accepted 时递增，首次 queued 的状态为 attempt=0）；Grant 的 attempt.number 是**本 Grant 授权的那次尝试序号**：签发时为 task.status.attempt + 1，dispatch.accepted 后与 status.attempt 相等。failed 是尝试终态；只有 attempt>=1、attempt < max_attempts 且 retry_budget_remaining > 0 时才允许 T65 重试，进入 T65 时递减 retry_budget_remaining，重试必须携带新的决策（revision 递增、purpose=retry）与新的 Grant。attempt=0 的失败不消耗重试预算，也不能走 T65。number>=2 必须 is_retry=true；is_retry=true 必须 number>=2、retry_decision_id 非空且 retry_budget_remaining>=1。number<=max_attempts 由服务端比较（Schema 无法跨字段比较）。",
       "properties": {
         "number": {
           "type": "integer",
           "minimum": 1,
           "maximum": 100,
-          "description": "本次 Grant 对应的尝试序号；必须 <= max_attempts（跨字段比较由服务端执行）。"
+          "description": "本 Grant 授权的尝试序号。签发时 = task.status.attempt + 1（首次 queued 即 1）；dispatch.accepted 后 = task.status.attempt。重试 Grant 的 number>=2。必须 <= max_attempts（跨字段比较由服务端执行）。"
         },
         "max_attempts": {
           "type": "integer",
@@ -1082,24 +1082,6 @@
         "properties": {
           "budget": {"properties": {"currency": {"enum": ["CNY", "USD"]}}},
           "usage": {"properties": {"cost_consumed": {"type": "number"}}}
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {"resource_scope": {"properties": {"scope_type": {"const": "none"}}, "required": ["scope_type"]}},
-        "required": ["resource_scope"]
-      },
-      "then": {
-        "properties": {
-          "resource_scope": {
-            "properties": {
-              "resource_ids": {"maxItems": 0},
-              "connector_ids": {"maxItems": 0},
-              "data_classifications": {"maxItems": 0},
-              "exclude_resource_ids": {"maxItems": 0}
-            }
-          }
         }
       }
     },

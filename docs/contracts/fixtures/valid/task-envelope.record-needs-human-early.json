@@ -148,7 +148,7 @@
   },
   "record_completeness": {
     "completeness": "pre_execution_incomplete",
-    "incomplete_reason": "owner_unresolved"
+    "incomplete_reason": "multiple_incomplete_fields"
   },
   "labels": {
     "fixture": "synthetic"
