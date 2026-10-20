@@ -35,7 +35,9 @@ from app.identity.authorization import (
     Principal,
     can_approve,
     effective_permissions,
+    effective_permissions_for_role_ids,
     has_permission,
+    role_ids_for_employee,
     visible_employee_ids,
 )
 from app.identity.models import (
@@ -294,3 +296,17 @@ def test_sysadmin_cannot_approve(session: Session) -> None:
             ("channel_binding", "manage", "company"),
         }
     )
+
+
+def test_role_permission_helpers_reuse_the_catalog(session: Session) -> None:
+    """Governance reuses the existing RBAC primitives (no second model)."""
+    company = _company(session, "W1-4 helpers")
+    employee = _employee(session, company, "E-helpers")
+    _grant(session, employee, "manager")
+
+    role_ids = role_ids_for_employee(session, employee.id)
+    assert role_ids == tuple(sorted(role_ids))
+    assert effective_permissions_for_role_ids(session, role_ids) == (
+        effective_permissions(session, employee.id)
+    )
+    assert effective_permissions_for_role_ids(session, ()) == frozenset()

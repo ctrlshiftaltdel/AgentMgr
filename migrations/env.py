@@ -63,6 +63,13 @@ import app.intake.models  # noqa: E402,F401
 # models because invoice_verifications references source_files.
 import app.integrations.models  # noqa: E402,F401
 
+# Governance-domain models (service identities, policy versions, delegations,
+# decisions, execution grants) live in their own package; importing them here
+# registers them on Base.metadata so ``alembic check`` / autogenerate can see
+# them.  Imported after identity models because service_identity_roles
+# references roles.
+import app.governance.models  # noqa: E402,F401
+
 config = context.config
 
 if config.config_file_name is not None:
