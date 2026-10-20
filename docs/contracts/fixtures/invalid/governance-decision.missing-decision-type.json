@@ -1,6 +1,9 @@
 {
   "schema_version": "1.0.0",
   "decision_id": "gdec_allow_0001",
+  "decision_revision": 1,
+  "decision_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "canonicalization": "rfc8785_jcs",
   "reason_codes": [
     "policy_allowed"
   ],
@@ -52,6 +55,7 @@
     "ttl_seconds": 900,
     "max_calls": 20,
     "max_cost_units": 0,
+    "max_runtime_seconds": 600,
     "required_confirmation": false,
     "required_approval": false,
     "confirmation_ref": null,

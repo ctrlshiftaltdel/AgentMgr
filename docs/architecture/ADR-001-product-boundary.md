@@ -53,6 +53,14 @@ AgentMgr **不负责**：
 
 模式判定由服务端策略给出，客户端不能自选为更强模式。`advisory` 任务即使用户要求，也不得自动升级为 `managed_execution`；升级必须重新评估、重新签发 Grant，并具备已验证的运行时能力（见 [runtime-adapter](../contracts/runtime-adapter.md)）。
 
+**模式中立执行边界。** 三种模式共用同一任务状态机与 `execution.*` 事件：Advisory 由受控客户端调用（B1）产生，Governed 由 PEP/连接器（B2）产生，Managed 由 Runtime Adapter（B3）产生。不得把 Runtime Adapter 当成唯一执行边界，也不得要求 Advisory/Governed 具备运行时能力。能力守卫按模式求值；任务记录与审计必须保存模式及 `limitations`。
+
+**授权型决策绑定任务。** `allow` / `managed_execution_required` 必须绑定非空 `task_id` 与 `task_revision`。任务创建前只能返回 `deny` / `needs_*` / `pre_evaluation`；不存在可空 `task_id` 的预授权。
+
+**失败是尝试终态。** `failed` 不是任务终态；重试必须重新执行 PDP、签发新决策与新 Grant，并受 `max_attempts`/`retry_budget_remaining` 约束。禁止复用过期决策或旧 Grant。
+
+**默认禁止自审。** 1.0.0 冻结 `Accountable Owner ≠ Approver`；不存在策略例外。未来若要允许例外，必须升主版本并增加例外引用、理由、策略版本与审计字段。
+
 ### 2.3 信任边界
 
 系统至少区分以下边界。它们不得共享同一个无限制管理员令牌，也不得互相代替认证。
@@ -100,7 +108,21 @@ AgentMgr **不负责**：
 - **PDP / PEP**：无副作用的策略判定 / 在调用点强制执行判定。
 - **Execution Grant**：某次任务的授权快照。
 
-这些角色不得合并为一个 `agent_id`。模型可以建议 owner、assignee 或优先级，但最终值由服务端身份目录、策略和职责分离规则解析；模型自报的身份与权限字段必须被忽略或拒绝（见 [threat-model](../security/threat-model.md) T01）。
+这些角色不得合并为一个 `agent_id`。模型可以建议 owner、assignee 或优先级，但最终值由服务端身份目录、策略和职责分离规则解析；模型自报的身份与权限字段必须被忽略或拒绝（见 [threat-model](../security/threat-model.md) TH-01）。
+
+**主体 ID 命名（三份契约统一）：**
+
+| 前缀 | 用途 | 允许的角色 |
+|---|---|---|
+| `prin_` | 人员或 `agent_instance` 主体 | Requester、Accountable Owner、Assignee、Executor、Approver |
+| `rt_` | 运行时主体 | Executor（Managed） |
+| `svc_` | 服务身份 | Requester（服务调用）、连接器身份 |
+| `role_` | 组织角色 | Accountable Owner、Assignee、Approver |
+| `queue_` | 工作队列 | Assignee |
+| `rtask_` | 运行时任务句柄（不是主体） | `linkage.runtime_task_id` |
+| `exec_` | Advisory/Governed 执行句柄（不是主体） | `linkage.execution_ref` |
+
+`accountable_owner` 与 `approver` 只能是 `person` 或 `role`，不得是 `agent_instance`、运行时或队列。`resolution=server_resolved` 时 `principal_id` 必须非空；`pending` 只允许出现在 `draft`/`awaiting_clarification`/`denied`。
 
 ### 2.6 优先级不提升权限
 
@@ -143,6 +165,19 @@ MVP 在**一个可独立部署的服务**内按领域分层：身份、策略、
 - 现有 Hermes 兼容实现保留，但它是**首个候选 Runtime Adapter**，不是产品硬依赖；完整适配能力在 Phase 4 真实验证前保持“未验证”。
 - 旧文档中把 Hermes Profile、会话或内部 API 作为永久强制前提的内容按新计划迁移；本 ADR 不追溯宣称旧行为已验证。
 
+### 3.3.1 与现有业务契约的映射/取代
+
+新契约不静默改义旧字段；下表明确映射或取代关系。无法映射的值必须由目录显式登记，不得推断。
+
+| 现有契约/字段 | 新契约位置 | 关系 | 规则 |
+|---|---|---|---|
+| RBAC `permissions.scope`：`own` / `team` / `company` / `authorized` | `resource_scope.scope_type`：`self` / `department` / `company` / `approval_chain`（+ `project`/`record_set`/`connector`/`none`/`undetermined`） | 映射 | `own→self`、`team→department`、`company→company`、`authorized→approval_chain`；`authorized` 不再表示“任意已授权”，必须落为具体 `resource_ids`/`connector_ids`。空集合表示没有资源，不是全部。 |
+| 业务工具 `version`：整数 | `capability` 的 `name@x.y.z`、`tool_contract.tool_versions` 的语义化版本 | 取代 | 整数版本必须由工具目录显式映射为 `x.y.z`（例如登记 `3 → 3.0.0`），不得隐式补零；新工具只允许语义化版本。 |
+| 工具结果类别：`ok` / `needs_more_info` / `needs_confirmation` / `invalid_argument` / `unauthenticated` / `forbidden` / `not_found` / `conflict` / `internal_error` | 决策类型、任务状态、`result.outcome`、运行时错误码 | 映射 | `ok→allow/succeeded`；`needs_more_info→needs_clarification/awaiting_clarification`；`needs_confirmation→needs_confirmation`；`unauthenticated→deny(identity_unverified)`；`forbidden→deny(capability_not_granted|resource_scope_denied)`；`not_found/conflict/internal_error` 映射为运行时错误码，不得作为成功。 |
+| `tool_confirmations` 的渠道绑定（微信/Web/MCP） | `confirmation.channel_binding.channel` + `channel_identity_ref` | 取代/扩展 | 现有渠道语义保留；确认只能在其绑定渠道消费，跨渠道默认拒绝；仍绑定 JCS payload hash、TTL 与一次性消费。 |
+| 现有审批工作流实例 | `approvals[]` + `approval_ref` | 扩展 | 工作流可作为审批来源，但必须产出 `decision=approved`、`separation_check=passed`、payload hash 与 TTL；不得用工作流“完成”替代独立审批。 |
+| 现有任务/审计表 | `taskRecord`、`task_events`、审计关联 | 扩展 | 保留现有存储；新契约字段是权威映射层，不要求推翻旧表；迁移时以契约字段为准补齐。 |
+
 ## 4. 备选方案与被拒理由
 
 | 方案 | 描述 | 拒绝理由 |
@@ -160,11 +195,11 @@ MVP 在**一个可独立部署的服务**内按领域分层：身份、策略、
 
 本 ADR 的契约由以下可执行证据支撑（Phase 0 仅验证文档/契约，不声称产品能力已实现）：
 
-- 三个 JSON Schema 通过 JSON Schema 2020-12 元 schema 校验；
-- 每个 schema 至少 2 个合法、4 个非法 fixture，非法原因可复现；
-- 状态机逐条列出允许/禁止转换；
-- 威胁模型至少 15 项，覆盖身份、越权、审批、Grant、取消、绕行、凭据、审计等；
+- 三个 JSON Schema 通过 JSON Schema 2020-12 元 schema 校验，且每个 schema 的合法/非法 fixtures 全部可验证；
+- 状态机逐条列出 71 条允许转换与 F01–F33 禁止转换；
+- 威胁模型至少 15 项（本版 30 项），覆盖身份、越权、审批、Grant、决策重放、模式混淆、完成检查、取消、绕行、凭据、审计等；
 - Runtime 能力以 `verified / partially_verified / unverified` 标注，并保留证据引用字段；
+- 契约包哈希包含三个 Schema、四份文档与全部 fixtures；候选必须固定完整哈希；
 - 产品负责人确认 Phase 0 契约前，不启动依赖这些契约的并行产品实现。
 
 本 ADR 不声称任何运行时、PEP、隔离环境或端到端链路已经验证。
@@ -181,13 +216,30 @@ MVP 在**一个可独立部署的服务**内按领域分层：身份、策略、
 - MVP 实现完整 SaaS 多租户；数据模型可预留组织边界。
 - 用 Agent 记忆、对话历史或模型自述替代任务、审批、授权和审计的权威记录。
 
-## 7. 待产品负责人确认的事项
+## 7. 产品负责人决策与剩余待确认事项
 
-以下不是实现阻塞，但在 Phase 0 冻结前需要明确接受：
+### 7.1 已确认决策（2026-10-20）
 
-1. Advisory 模式的对外表述必须包含“无法强制约束客户端本地工具”的限制。
-2. Managed Execution 在 Phase 5 完成隔离、任务级凭据与出口限制的真实验证前，不得对外宣称“受控执行”已商用。
-3. 是否允许“同一人既是 Accountable Owner 又是 Approver”由策略配置显式决定；默认禁止自审，例外必须记录风险与审计。
-4. 高风险动作（付款、删除、不可撤回外发）的确认/审批门槛属于业务策略，不在本 ADR 内替产品负责人决定。
+以下决策由产品负责人确认，已写入契约并作为 1.0.0 冻结约束：
+
+1. **授权型决策必须绑定任务。** `allow` / `managed_execution_required` 必须包含非空 `task_id` 与 `task_revision`。任务创建前的评估只能返回 `deny` / `needs_clarification` / `needs_confirmation` / `needs_approval`，或独立的非授权 `pre_evaluation` 类型；不存在可空 `task_id` 的 `allow`。
+2. **`failed` 是尝试终态，不是任务终态。** 保留有界重试，但 T65/T61 必须重新执行 PDP、签发新决策与新 Grant，并受 `max_attempts`/`retry_budget_remaining` 约束；禁止复用过期决策或无新决策重签 Grant。
+3. **默认禁止自审。** 1.0.0 冻结职责分离：`Accountable Owner` 不得审批自己的任务，无策略例外。**已采纳，不再是待确认项。**
+
+### 7.2 复审建议的默认处理（已采纳）
+
+1. **高风险阈值留在版本化策略层。** 付款、删除、不可撤回外发的确认/审批阈值不在 schema 中写死，由 `policy_version` 管理。
+2. **Advisory 不宣称本地强制治理。** 任何对外表述必须包含“无法强制约束客户端本地工具”；Advisory 任务必须记录 `client_local_tools_uncontrolled`。
+3. **Managed Execution 暂不宣称已受控。** 在 Phase 5 隔离、任务级凭据与出口限制负向测试通过前，能力状态保持 `unverified`，不得对外宣称“受控执行”已商用。
+4. **候选固定完整契约包哈希。** 哈希包含三个 Schema、四份文档与全部 valid/invalid fixtures；不接受 schema-only 哈希或本地私有 fixture。
+5. **`pre_evaluation` 仅用于任务创建前评估。** 它不得签发 Grant，且 `task_id`/`task_revision` 必须为 null。
+6. **1.0.0 版本状态。** 1.0.0 尚未被接受或发布；本轮修复产生 1.0.0 候选。冻结后任何破坏性变更必须升主版本。
+
+### 7.3 仍需产品负责人确认的事项
+
+1. 高风险动作（付款、删除、不可撤回外发）的具体阈值与审批层级属于业务策略，不在本 ADR 内替产品负责人决定。
+2. Phase 0 契约的最终验收与冻结；在此之前 Issue #78–#83 不得启动依赖实现。
+
+Accountable Owner 自审在 1.0.0 已明确禁止，不是待确认项；未来若要引入例外，必须在新主版本中增加例外引用、理由、策略版本与审计字段，并重新进行威胁评估。
 
 在上述事项确认前，本 ADR 状态保持 Proposed。

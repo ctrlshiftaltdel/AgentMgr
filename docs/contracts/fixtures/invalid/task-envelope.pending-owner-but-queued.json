@@ -9,9 +9,8 @@
     "principal_type": "person",
     "resolution": "server_resolved",
     "account_status": "active",
-    "role_ids": [
-      "role_employee_0001"
-    ],
+    "identity_assurance": "verified_session",
+    "role_ids": [],
     "department_id": "dept_finance_0001",
     "service_identity_id": null,
     "delegation_ref": null
@@ -20,11 +19,10 @@
     "principal_id": null,
     "principal_type": "person",
     "resolution": "pending",
-    "account_status": "active",
-    "role_ids": [
-      "role_manager_0001"
-    ],
-    "department_id": "dept_finance_0001",
+    "account_status": "unknown",
+    "identity_assurance": "unverified",
+    "role_ids": [],
+    "department_id": null,
     "service_identity_id": null,
     "delegation_ref": null
   },
@@ -33,6 +31,7 @@
     "principal_type": "agent_instance",
     "resolution": "server_resolved",
     "account_status": "active",
+    "identity_assurance": "verified_session",
     "role_ids": [],
     "department_id": "dept_finance_0001",
     "service_identity_id": null,
@@ -43,6 +42,7 @@
     "principal_type": "agent_instance",
     "resolution": "server_resolved",
     "account_status": "active",
+    "identity_assurance": "verified_session",
     "role_ids": [],
     "department_id": "dept_finance_0001",
     "service_identity_id": null,
@@ -53,6 +53,7 @@
     "principal_type": "person",
     "resolution": "server_resolved",
     "account_status": "active",
+    "identity_assurance": "verified_session",
     "role_ids": [
       "role_manager_0001"
     ],
@@ -63,8 +64,19 @@
   "delegations": [],
   "goal": {
     "summary": "Submit a synthetic expense report for review.",
-    "success_criteria": [
-      "A synthetic expense record exists in submitted state."
+    "completion_criteria": [
+      {
+        "criterion_id": "crit_expense_state_0001",
+        "type": "business_state_equals",
+        "verifier": {
+          "verifier_id": "ver_expense_state_0001",
+          "version": "1.0.0"
+        },
+        "resource_ref": "res_expense_0001",
+        "expected": "submitted",
+        "evidence_ref": "evidence:expense_state_0001",
+        "evidence_hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+      }
     ],
     "required_inputs": [
       "synthetic receipt reference"
@@ -118,29 +130,22 @@
     "max_runtime_seconds": 600,
     "max_cost_units": 0
   },
-  "confirmations": [
-    {
-      "confirmation_id": "conf_expense_0001",
-      "payload_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-      "purpose": "data_release",
-      "issued_at": "2026-10-20T02:00:00Z",
-      "expires_at": "2026-10-20T02:30:00Z",
-      "consumed_at": "2026-10-20T02:05:00Z",
-      "status": "consumed",
-      "confirmed_by_principal_id": "prin_user_0001"
-    }
-  ],
-  "approvals": [
-    {
-      "approval_id": "appr_expense_0001",
-      "approver_principal_id": "prin_approver_0001",
-      "payload_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-      "decision": "approved",
-      "decided_at": "2026-10-20T02:10:00Z",
-      "expires_at": "2026-10-21T02:10:00Z",
-      "separation_check": "passed"
-    }
-  ],
+  "confirmations": [],
+  "approvals": [],
+  "limitations": [],
+  "result": {
+    "outcome": "none",
+    "result_ref": null,
+    "evidence_refs": [],
+    "stop_confirmed": false,
+    "verification": {
+      "result": "pending",
+      "verifier_id": null,
+      "verified_at": null,
+      "evidence_refs": []
+    },
+    "completed_at": null
+  },
   "timestamps": {
     "created_at": "2026-10-20T01:55:00Z",
     "updated_at": "2026-10-20T02:10:00Z",
@@ -152,14 +157,24 @@
     "state": "queued",
     "state_revision": 5,
     "last_event_id": "evt_queued_0001",
-    "attempt": 1
+    "attempt": 1,
+    "max_attempts": 3,
+    "retry_budget_remaining": 2
   },
   "linkage": {
     "grant_id": "grnt_expense_0001",
+    "grant_status": "active",
     "runtime_task_id": null,
+    "execution_ref": null,
     "parent_task_id": null,
     "supersedes_task_id": null,
     "correlation_id": "corr_expense_0001"
+  },
+  "decision": {
+    "decision_id": "gdec_allow_0001",
+    "decision_type": "allow",
+    "decision_revision": 1,
+    "decided_at": "2026-10-20T02:00:00Z"
   },
   "labels": {
     "fixture": "synthetic"

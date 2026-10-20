@@ -27,6 +27,7 @@
 - `docs/architecture/task-state-machine.md`
 - `docs/architecture/ADR-001-product-boundary.md`
 - `docs/security/threat-model.md`
+- `docs/architecture/parallel-agent-development.md`
 - `docs/contracts/fixtures/valid/*.json`
 - `docs/contracts/fixtures/invalid/*.json`
 
@@ -40,6 +41,7 @@ git ls-files \
   'docs/contracts/runtime-adapter.md' \
   'docs/architecture/task-state-machine.md' \
   'docs/architecture/ADR-001-product-boundary.md' \
+  'docs/architecture/parallel-agent-development.md' \
   'docs/security/threat-model.md' \
   'docs/contracts/fixtures/valid/*.json' \
   'docs/contracts/fixtures/invalid/*.json' \
@@ -51,8 +53,9 @@ git ls-files \
 记录到 Issue/PR 的形式：
 
 ```text
-contract_version: 1.0.0
+contract_version: 1.0.0 (unreleased candidate; not yet accepted)
 contract_bundle_sha256: <64-hex>
+contract_bundle_includes_fixtures: true
 plan_version: v1.0
 fixtures: docs/contracts/fixtures/{valid,invalid}
 ```
@@ -60,9 +63,11 @@ fixtures: docs/contracts/fixtures/{valid,invalid}
 规则：
 
 - 哈希必须对应当前提交；文档或 fixture 任一字节变化都会改变哈希。
+- **哈希包含 fixtures。** 不接受 schema-only 哈希、Mock fixture 或本地私有 fixture 作为候选身份。
 - 候选不得修改契约包来“适配”自己的实现；需要修改时走 §6。
 - 哈希不一致的候选不具可比性，必须重新同步后再比较。
 - Mock、示例或本地私有 fixture 不得替代冻结 fixtures。
+- 1.0.0 尚未被接受或发布；Phase 0 冻结前的破坏性修改仍以 1.0.0 候选处理，但必须在 Issue/PR 记录旧/新哈希。冻结后的任何破坏性变更必须升主版本。
 
 ## 3. 模式 A：全新仓库独立实现
 
@@ -190,11 +195,14 @@ Phase 0 冻结后，把实现拆成**路径不重叠的垂直工作包**，例�
 
 1. **越权/权限提升**：伪造身份、绕过 Grant、扩大 capability/resource scope、优先级覆盖硬拒绝。
 2. **凭据泄漏**：令牌、密码、API Key、完整票据进入提示词/日志/Trace/审计/Git/错误响应。
-3. **审批旁路**：自审、缺审批直接执行、伪造审批、确认 payload 不符仍执行。
+3. **审批旁路**：自审、Accountable Owner 自审、缺审批直接执行、伪造审批、确认 payload 不符仍执行。
 4. **数据越界**：跨任务/部门/项目读取或写入未授权数据，或客户端直连绕过 PEP 而声称已治理。
 5. **审计伪造/删除**：无法追溯的授权或执行记录，或删除/改写历史状态。
 6. **虚假证据**：声称未运行的测试通过，或 Mock 冒充真实运行时兼容性。
 7. **破坏契约**：修改冻结 Schema/fixtures 以适配实现，且未走 §6。
+8. **决策/Grant 重放**：复用过期决策、旧 Grant 重签、Grant 晚于决策过期仍执行。
+9. **模式混淆**：宣称 Advisory/Governed 具备未验证的强制治理，或用一种模式的 Grant 执行另一种模式。
+10. **完成检查绕过**：无结构化完成条件、结果引用或验证证据仍标记 `succeeded`。
 
 硬失败必须书面记录证据与影响范围；不得私下“修复后再算通过”。
 
@@ -231,7 +239,8 @@ Phase 0 冻结后，把实现拆成**路径不重叠的垂直工作包**，例�
 ## 7. Phase 0 门禁与当前状态
 
 - Issue #77 的验收标准 6 明确：**产品负责人确认 Phase 0 契约前，不启动依赖这些契约的并行产品实现。**
-- 当前状态：契约已作为冻结候选提交，产品负责人确认仍是独立门禁；Issue #78–#83 不得据此提前启动。
+- 当前状态：1.0.0 契约包已作为冻结候选提交；产品负责人确认仍是独立门禁；Issue #78–#83 不得据此提前启动。
+- 已确认的产品负责人决策（2026-10-20）：授权型决策绑定任务、`failed` 为尝试终态且重试必须新鲜决策/新 Grant、1.0.0 默认禁止自审。详见 [ADR-001](ADR-001-product-boundary.md) §7。
 - 确认前允许的活动：文档/契约评审、fixtures 校验、威胁与状态机审查、运行时只读 Spike（不写产品实现、不改核心契约）。
 - 确认后：按 §4 拆垂直工作包，先建立身份/策略/任务骨架与共享测试，再接入客户端与运行时。
 
@@ -240,8 +249,9 @@ Phase 0 冻结后，把实现拆成**路径不重叠的垂直工作包**，例�
 每个交付至少包含：
 
 ```text
-contract_version: 1.0.0
+contract_version: 1.0.0 (unreleased candidate; not yet accepted)
 contract_bundle_sha256: <64-hex>
+contract_bundle_includes_fixtures: true
 head_sha: <git sha>
 commands:
   - <command>
@@ -255,6 +265,9 @@ hard_fail_checks:
   credential_leak: pass|fail
   approval_bypass: pass|fail
   data_escape: pass|fail
+  decision_replay: pass|fail
+  mode_confusion: pass|fail
+  completion_check_bypass: pass|fail
 unverified:
   - <item>
 deviations:

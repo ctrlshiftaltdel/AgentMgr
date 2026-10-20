@@ -9,6 +9,8 @@
 
 Runtime Adapter 把 AgentMgr 的内部任务契约映射到具体 Agent 运行时。它属于**内部信任边界 B3**，不是公开 API，也不是 MCP 工具接口。
 
+**它是受控执行模式（Managed Execution）的执行边界，不是唯一执行边界。** Advisory/BYOA（B1）与 Governed Resource Access（B2）分别由受控客户端调用/PEP 产生 `execution.*` 事实；任务状态机对三种模式使用同一套模式中立事件。不得把 Runtime Adapter 的能力要求套用到 Advisory/Governed，也不得因为某运行时通过 Adapter 契约测试就推断客户端本地工具已被治理（见 [task-state-machine](../architecture/task-state-machine.md) §3）。
+
 硬性规则：
 
 1. 核心业务只依赖本文定义的方法、字段和状态语义，不依赖 Hermes/Rakazo 的私有对象、数据库 schema、Profile 路径、会话文件或内部 HTTP 端点。
@@ -16,6 +18,7 @@ Runtime Adapter 把 AgentMgr 的内部任务契约映射到具体 Agent 运行�
 3. Adapter 不得与客户端 MCP、服务端业务工具 MCP 或管理 REST 共用无限制管理员令牌。它使用独立 workload identity；运行时凭据按任务注入。
 4. Adapter 只报告事实（受理、运行、停止、结果、健康），**不直接写任务状态机**。状态转换由核心服务验证并写入 task event。
 5. Adapter 不得把凭据、令牌、完整个人数据或受保护业务字段写入日志、事件或错误响应。
+6. **Grant 是执行授权的唯一权威。** Adapter 不得接受客户端、模型或运行时自报的 Grant、能力或范围；只接受 AgentMgr 核心在服务端解析的 Grant 或其安全引用。未知字段必须拒绝，不得静默忽略。
 
 ## 2. 能力声明与状态标签
 
@@ -24,9 +27,11 @@ Runtime Adapter 把 AgentMgr 的内部任务契约映射到具体 Agent 运行�
 ```json
 {
   "adapter_contract_version": "1.0.0",
+  "boundary": "b3_runtime_adapter",
   "runtime_id": "rt_hermes_candidate_0001",
   "runtime_type": "hermes",
-  "runtime_version": "unverified",
+  "runtime_version": null,
+  "version_source": "unknown",
   "observed_at": "2026-10-20T00:00:00Z",
   "capabilities": [
     {
@@ -43,9 +48,11 @@ Runtime Adapter 把 AgentMgr 的内部任务契约映射到具体 Agent 运行�
 `capabilities()` 必须返回：
 
 - `adapter_contract_version`：本文版本；
+- `boundary`：固定 `b3_runtime_adapter`，用于事件来源与审计；
 - `runtime_id`：AgentMgr 侧的运行时不透明标识，不是主机名/路径；
 - `runtime_type`：`hermes` / `rakazo` / `other`；
-- `runtime_version`：运行时自报版本，仅作诊断；未经验证时不得作为兼容性证据；
+- `runtime_version`：运行时自报版本；未知时必须为 `null`，禁止用 `"unverified"`、`"unknown"` 等字符串冒充版本号；
+- `version_source`：`runtime_self_reported` / `operator_verified` / `unknown`；只有 `operator_verified` 可作为兼容性证据；
 - `capabilities[]`：逐项能力，包含 `name`、`version`、`status`、`evidence_ref`、`limitations`；
 - `observed_at`：快照时间。
 
@@ -71,6 +78,7 @@ Adapter 至少声明以下能力名（版本随契约升级）：
 | 能力名 | 说明 | 必需 |
 |---|---|---|
 | `task.submit` | 提交任务并返回受理/拒绝/未知 | 是 |
+| `task.lookup` | 按幂等键查询已提交的执行任务 | 是 |
 | `task.status` | 查询任务状态、心跳与停止确认 | 是 |
 | `task.events.poll` | 基于游标拉取事件 | 是（或 `task.events.subscribe`） |
 | `task.events.subscribe` | 订阅事件流 | 否 |
@@ -90,6 +98,11 @@ Adapter 至少声明以下能力名（版本随契约升级）：
 
 ### 3.1 `submit_task(task, grant)`
 
+**Grant 是唯一权威授权来源。** 请求中的 `execution_mode`、`capabilities`、`resource_scope` 必须与 Grant 完全一致或是其子集；不一致时 Adapter 必须拒绝（`forbidden`），不得“按请求执行”。核心只传递由服务端签发并已重验的 Grant 或安全引用：
+
+- `grant_source="inline_verified"`：核心已重验并内联完整 Grant 对象；
+- `grant_source="server_side_reference"`：核心传入不透明 `grant_ref`，Adapter 必须通过受认证的内部接口解析，禁止从请求文本、提示词或客户端参数读取 Grant。
+
 请求至少包含：
 
 ```json
@@ -97,12 +110,13 @@ Adapter 至少声明以下能力名（版本随契约升级）：
   "task_id": "task_expense_0001",
   "idempotency_key": "idem_expense_0001",
   "grant_id": "grnt_expense_0001",
-  "grant": { "...": "execution-grant v1.0.0 对象或其安全引用" },
+  "grant_source": "server_side_reference",
+  "grant_ref": "grantref_expense_0001",
   "execution_mode": "managed_execution",
   "capabilities": ["expense.read@1.0.0"],
-  "resource_scope": { "...": "任务实际范围" },
+  "resource_scope": {"scope_type": "self", "resource_ids": ["res_expense_0001"]},
   "deadline_at": "2026-10-20T03:00:00Z",
-  "input": { "...": "已最小化的任务输入" }
+  "input": {"...": "已最小化的任务输入"}
 }
 ```
 
@@ -111,9 +125,9 @@ Adapter 至少声明以下能力名（版本随契约升级）：
 ```json
 {
   "outcome": "accepted",
-  "runtime_task_id": "rt_hermes_0001",
+  "runtime_task_id": "rtask_hermes_0001",
   "accepted_at": "2026-10-20T02:00:05Z",
-  "reported_state": "queued",
+  "reported_state": "accepted",
   "error": null
 }
 ```
@@ -122,24 +136,67 @@ Adapter 至少声明以下能力名（版本随契约升级）：
 
 | 值 | 语义 | 核心动作 |
 |---|---|---|
-| `accepted` | 运行时明确受理；可能尚未开始执行 | 绑定 `runtime_task_id`，状态 `dispatched` |
-| `rejected` | 运行时明确拒绝，且确认未产生副作用 | 状态 `failed`（或按策略回到 `queued` 前先修正） |
-| `unsupported` | 运行时/Adapter 不支持该能力或模式 | 不重试；记录兼容性缺口，状态 `failed` 或 `needs_human` |
-| `unknown` | 超时、连接中断或响应不可解析；**不知道是否已受理** | 状态 `unknown`；先查询，不重发 |
+| `accepted` | 运行时明确受理；可能尚未开始执行 | 绑定 `runtime_task_id`，T23 → `dispatched` |
+| `rejected` | 运行时明确拒绝，且确认未产生副作用 | T66 → `failed`（不得自动重试） |
+| `unsupported` | 运行时/Adapter 不支持该能力或模式 | T69 → `needs_human`；记录兼容性缺口，不自动重试 |
+| `timeout` | 提交超时；**不知道是否已受理** | T67 → `unknown`；先查询，不重发 |
+| `unknown` | 响应不可解析/连接中断；不知道是否已受理 | T68 → `unknown`；先查询，不重发 |
 
 幂等规则：
 
 - `(task_id, grant_id, idempotency_key)` 是提交幂等键；Adapter 必须保证同一键最多创建一个运行时任务。
-- 相同键、不同 payload hash 必须返回冲突错误，而不是创建第二个任务。
-- Adapter 必须在内部记录“请求已发出/已受理”的持久状态，不能只靠内存去重。
+- 相同键、相同 `payload_hash` 的重复提交必须返回**同一个** `runtime_task_id` 与 `outcome=accepted`，不得创建第二个任务。
+- 相同键、不同 `payload_hash` 必须返回 `conflict`，而不是创建第二个任务。
+- Adapter 必须在内部持久记录“请求已发出/已受理/已拒绝”的状态，不能只靠内存去重。
+- 超时后核心先调用 `find_by_idempotency_key`；找到则采用原任务，明确不存在且无副作用才允许按预算重试。
 
-### 3.2 `get_status(runtime_task_id)`
+安全引用解析规则：
+
+- `grant_ref` 必须是不透明、带命名空间的引用；Adapter 只能通过受认证的内部解析接口按 ID 查找，禁止把它当作文件路径、URL、SQL 或任意对象引用解引用。
+- 解析接口必须校验调用者 workload identity、Grant 的 `task_id`/`grant_id` 与当前提交一致，并返回完整、已重验的 Grant；解析失败一律 fail closed。
+- 引用中不得包含令牌、凭据、个人数据或运行时私有路径；日志只记录引用 ID 与结果码。
+- 客户端、模型或运行时提供的 Grant/引用一律不得采信；Adapter 不暴露“接受任意 Grant”的入口。
+
+### 3.2 `find_by_idempotency_key(task_id, grant_id, idempotency_key)`
+
+提交超时或连接中断后，核心**必须先调用本方法**，不得盲目重发创建请求。
 
 响应：
 
 ```json
 {
-  "runtime_task_id": "rt_hermes_0001",
+  "outcome": "found",
+  "runtime_task_id": "rtask_hermes_0001",
+  "reported_state": "running",
+  "payload_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "accepted_at": "2026-10-20T02:00:05Z",
+  "observed_at": "2026-10-20T02:00:40Z",
+  "error": null
+}
+```
+
+`outcome`：
+
+| 值 | 语义 | 核心动作 |
+|---|---|---|
+| `found` | 同一幂等键已有执行任务 | 采用该 `runtime_task_id`，按实际状态走 T29/T31/T41 等；禁止重发 |
+| `not_found` | 查询明确不存在 | 只有在执行边界保证无副作用且查询窗口结束后，才可按预算重试（T33/T66） |
+| `conflict` | 同键但 payload hash 不同 | 拒绝重试；`conflict`，进入 `needs_human` 对账 |
+| `unknown` | 查询超时/不可解析 | `unknown`，有界对账；不得重发 |
+
+规则：
+
+- 查询必须持久化、跨重启可用；不得只查内存缓存。
+- 返回的 `payload_hash` 必须与提交时的 JCS 规范化 payload 一致。
+- `not_found` 不是失败证明；执行边界必须显式声明“查询窗口内无副作用”才能重试。
+
+### 3.3 `get_status(runtime_task_id)`
+
+响应：
+
+```json
+{
+  "runtime_task_id": "rtask_hermes_0001",
   "state": "running",
   "external_state": "executing",
   "observed_at": "2026-10-20T02:01:00Z",
@@ -167,7 +224,7 @@ Adapter 至少声明以下能力名（版本随契约升级）：
 
 `stop_confirmed=true` 只能由 Adapter 在获得运行时停止证据后设置；`cancel` 被受理不等于已停止。
 
-### 3.3 `poll_events(runtime_task_id, cursor, limit)`
+### 3.4 `poll_events(runtime_task_id, cursor, limit)`
 
 响应：
 
@@ -192,7 +249,7 @@ Adapter 至少声明以下能力名（版本随契约升级）：
 - `redacted=true` 表示事件已去除敏感字段；核心不得要求 Adapter 回传凭据或完整个人数据。
 - 事件只是证据来源之一，不能替代 `get_result` 与核心验证。
 
-### 3.4 `subscribe_events(runtime_task_id, cursor)`
+### 3.5 `subscribe_events(runtime_task_id, cursor)`
 
 若支持订阅，必须提供：
 
@@ -203,7 +260,7 @@ Adapter 至少声明以下能力名（版本随契约升级）：
 
 不支持时返回 `unsupported`，核心降级到轮询，并在运行时不兼容报告中记录。
 
-### 3.5 `provide_input(runtime_task_id, input_request_id, payload_hash, payload)`
+### 3.6 `provide_input(runtime_task_id, input_request_id, payload_hash, payload)`
 
 响应 `accepted | rejected | expired | unsupported | unknown`。
 
@@ -211,7 +268,7 @@ Adapter 至少声明以下能力名（版本随契约升级）：
 - 相同 `input_request_id` 的重复提交必须幂等；payload 不同则拒绝。
 - 输入不得包含凭据；需要秘密时由运行时凭据注入机制处理。
 
-### 3.6 `cancel_task(runtime_task_id, reason, idempotency_key)`
+### 3.7 `cancel_task(runtime_task_id, reason, idempotency_key)`
 
 响应：
 
@@ -236,13 +293,14 @@ Adapter 至少声明以下能力名（版本随契约升级）：
 
 **取消请求与实际停止是不同事实。** 核心只能在 `stop_confirmed=true` 或等价证据后进入 `cancelled`；`cancel_requested` 不得被展示为“已停止”。
 
-### 3.7 `get_result(runtime_task_id)`
+### 3.8 `get_result(runtime_task_id)`
 
 响应：
 
 ```json
 {
   "outcome": "succeeded",
+  "result_ref": "result_expense_0001",
   "summary": "Synthetic expense submitted.",
   "structured_payload": {"record_id": "res_expense_0001"},
   "artifacts": [
@@ -250,21 +308,34 @@ Adapter 至少声明以下能力名（版本随契约升级）：
   ],
   "evidence_refs": ["evidence:evt_0001"],
   "verification_hints": ["record state == submitted"],
+  "stop_confirmed": false,
   "completed_at": "2026-10-20T02:10:00Z",
   "error": null
 }
 ```
 
-`outcome`：`succeeded | partial_success | failed | cancelled | timed_out | needs_human | unknown`。
+`outcome` 与核心状态映射：
+
+| Adapter `outcome` | 核心动作 |
+|---|---|
+| `succeeded` | T36/T50/T54 → `verifying`；绝不直接 `succeeded` |
+| `partial_success` | → `verifying`，按 `completion_criteria` 判定 `verification.partial` |
+| `failed` | T37/T55 → `failed`（确认已停止）；是否重试由 T65/T70 决定 |
+| `cancelled` | `stop_confirmed=true` → `cancel_requested`/`cancelled`（T48/T56）；否则 `unknown`（T51） |
+| `timed_out` | `stop_confirmed=true` → `timed_out`（T38/T58）；否则 `unknown` |
+| `needs_human` | → `needs_human`（T40/T45/T52/T57） |
+| `unknown` | → `unknown`（T41/T46/T51/T57）；先对账，不重发 |
 
 规则：
 
-- **运行时的“我完成了”不是完成定义。** 核心必须按任务 `success_criteria` 做确定性验证，证据不足进入 `verifying → needs_human/failed`。
+- **运行时的“我完成了”不是完成定义。** 核心必须按 `goal.completion_criteria` 做确定性验证，证据不足进入 `verifying → needs_human/failed`。
+- `result_ref` 与至少一个 `evidence_refs` 是进入 `verifying` 的最低要求；`succeeded` 还要求 `verification.result=passed`。
+- `stop_confirmed` 只能由执行边界在获得停止证据后设置；取消被受理不等于已停止。
 - `artifacts[].ref` 只能是受控引用；不得把绝对路径、运行时私有 URL 或凭据放进核心合同。
 - 结构化结果必须区分“业务结果”和“过程证据”；不得把原始日志当作业务结果。
 - 结果缺失或不可解析时返回 `unknown`，核心进入对账，不得默认成功。
 
-### 3.8 `health()`
+### 3.9 `health()`
 
 ```json
 {
@@ -276,7 +347,7 @@ Adapter 至少声明以下能力名（版本随契约升级）：
 
 `status`：`healthy | degraded | unavailable`。`unavailable` 时核心不得提交新任务；已提交任务进入 `unknown` 对账流程。
 
-### 3.9 错误模型
+### 3.10 错误模型
 
 统一错误码至少包含：
 
@@ -286,23 +357,26 @@ Adapter 至少声明以下能力名（版本随契约升级）：
 
 ## 4. 状态映射
 
-Adapter 把外部状态映射为内部事实；核心再映射到 [task-state-machine](../architecture/task-state-machine.md)。
+Adapter 把外部状态映射为内部事实；核心再把这些事实映射为模式中立的 `execution.*` 事件并写入 [task-state-machine](../architecture/task-state-machine.md)。本表只适用于 **Managed Execution / B3**；Advisory（B1）与 Governed（B2）由受控调用/PEP 产生同名 `execution.*` 事件。
 
-| Adapter 事实 | 核心状态 | 说明 |
-|---|---|---|
-| submit `accepted` / status `accepted` | `dispatched` | 已绑定运行时任务，尚未确认运行 |
-| status `running` | `running` | 有新鲜心跳或可验证执行证据 |
-| status `waiting_input` | `running` 或 `needs_human` | 有授权自动回答源则保持运行；否则需人工输入 |
-| status `completed` + result 可取 | `verifying` | 绝不直接 `succeeded` |
-| status `failed` | `failed` | 明确失败；是否重试由策略决定 |
-| status `stopped` + `stop_confirmed` | `cancelled` | 仍需对账副作用 |
-| status `timed_out` + `stop_confirmed` | `timed_out` | 未确认停止时保持 `unknown` |
-| status `unknown` / `not_found` / 查询超时 | `unknown` | 先对账，不重发创建请求 |
-| cancel `requested` | `cancel_requested` | 不是停止 |
-| cancel `already_terminal` | `verifying` / 对应终态 | 按结果对账 |
-| `unsupported` | 不改变状态 | 记录能力缺口，升级人工或失败 |
+| Adapter 事实 | 核心事件 | 核心状态 | 说明 |
+|---|---|---|---|
+| submit `accepted` / status `accepted` | `dispatch.accepted` | `dispatched` | 已绑定 `rtask_` 句柄，尚未确认运行 |
+| status `running` | `execution.started` | `running` | 有新鲜心跳或可验证执行证据 |
+| status `waiting_input` | `human.escalation_required` 或保持 | `running` 或 `needs_human` | 有授权自动回答源则保持运行；否则需人工输入 |
+| status `completed` + `get_result` 可取 | `execution.completed` | `verifying` | 绝不直接 `succeeded` |
+| status `failed` | `execution.failed` | `failed` | 明确失败且已停止；是否重试由 T65/T70 决定 |
+| status `stopped` + `stop_confirmed` | `execution.stopped` | `cancelled` | 仍需对账副作用 |
+| status `timed_out` + `stop_confirmed` | `execution.timed_out` | `timed_out` | 未确认停止时保持 `unknown` |
+| status `unknown` / `not_found` / 查询超时 | `execution.lost` | `unknown` | 先对账，不重发创建请求 |
+| cancel `requested` | `task.cancel_requested` | `cancel_requested` | 不是停止 |
+| cancel `already_terminal` | 按结果走 `execution.completed` / 对应终态 | `verifying` / 终态 | 按结果对账，不得丢弃已完成结果 |
+| submit `rejected` | `dispatch.rejected` | `failed` | 确认无副作用；不自动重试 |
+| submit `unsupported` | `dispatch.unsupported` | `needs_human` | 记录能力缺口，不自动重试 |
+| submit `timeout` | `dispatch.timeout` | `unknown` | 先 `find_by_idempotency_key` |
+| submit `unknown` | `dispatch.unknown` | `unknown` | 先查询，不猜测 |
 
-同一个外部状态在不同运行时可能含义不同；Adapter 必须按本表显式映射，不能把供应商状态字符串直接透传给核心。
+同一个外部状态在不同运行时可能含义不同；Adapter 必须按本表显式映射，不能把供应商状态字符串直接透传给核心。Adapter 的 `get_status.state` 与 `get_result.outcome` 枚举必须与本节及状态机一致；新增枚举值必须升次版本并同步 fixtures。
 
 ## 5. 超时、重试与幂等
 
@@ -311,10 +385,11 @@ Adapter 把外部状态映射为内部事实；核心再映射到 [task-state-ma
 提交超时后：
 
 1. **禁止盲目重发创建请求。**
-2. 先调用 `get_status`（若已获得 `runtime_task_id`）或按 `idempotency_key` 查询。
-3. 找到任务：采用该任务，状态按实际事实更新。
-4. 明确不存在且运行时保证无副作用：可安全重试，受重试预算约束。
+2. 先调用 `find_by_idempotency_key(task_id, grant_id, idempotency_key)`；若已获得 `runtime_task_id`，同时调用 `get_status`。
+3. 找到任务：采用该任务，按实际事实更新；即使 payload 相同也不得再创建第二个执行任务。
+4. 明确不存在且执行边界保证无副作用：才可按重试预算重新评估并提交。
 5. 无法确定：状态 `unknown`，进入有界对账；超过阈值转 `needs_human`。
+6. 同键不同 payload：`conflict`，进入 `needs_human` 对账，不得覆盖或重发。
 
 ### 5.2 查询与事件失败
 
@@ -328,6 +403,7 @@ Adapter 把外部状态映射为内部事实；核心再映射到 [task-state-ma
 - 业务工具 handlers 必须幂等或提供唯一约束；重复请求返回同一结果或明确冲突。
 - 运行时重启、Worker 租约过期或网络重试不得产生第二次不可逆副作用。
 - 无法证明幂等的动作不得自动重试；必须 `needs_human`。
+- `find_by_idempotency_key` 必须能在 Adapter 重启后返回同一 `runtime_task_id`；查询结果与提交时的 `payload_hash` 一起持久化。
 
 ### 5.4 取消竞态
 
@@ -365,16 +441,19 @@ Adapter 把外部状态映射为内部事实；核心再映射到 [task-state-ma
 
 Adapter 验收必须包含：
 
-1. **提交幂等**：重复 `submit_task` 只创建一个运行时任务；同键不同 payload 冲突。
-2. **提交超时**：模拟超时后查询到已创建任务，核心采用而非重发；查询不到且确认无副作用时才允许重试。
-3. **状态映射**：每个外部状态映射到本文枚举；未知状态返回 `unknown`。
-4. **取消语义**：`requested` 不产生 `cancelled`；只有 `stop_confirmed` 才允许。
-5. **结果验证**：运行时声称完成但证据不足时不得进入 `succeeded`。
-6. **输入幂等**：重复/错配 `input_request_id` 被拒绝。
-7. **权限负向**：越权任务、跨任务结果、未授权取消全部拒绝。
-8. **隔离负向**：读取其他任务目录、未授权网络、访问宿主凭据全部失败（Managed Execution）。
-9. **凭据与日志**：日志/事件/错误中无令牌、密码、API Key、完整个人数据。
-10. **健康降级**：运行时不可用时不再提交新任务，已提交任务进入 `unknown` 对账。
+1. **提交幂等**：重复 `submit_task` 只创建一个运行时任务并返回同一句柄；同键不同 payload 返回 `conflict`。
+2. **提交超时**：模拟超时后用 `find_by_idempotency_key` 查到已创建任务，核心采用而非重发；查询不到且确认无副作用时才允许重试。
+3. **状态映射**：每个外部状态映射到本文枚举与状态机事件；未知状态返回 `unknown`；`succeeded` 绝不直接进入核心 `succeeded`。
+4. **结果映射**：`cancelled`/`timed_out`/`needs_human`/`unknown` 按 §3.8 表映射，`stop_confirmed` 缺失时不得进入 `cancelled`/`timed_out`。
+5. **取消语义**：`requested` 不产生 `cancelled`；只有 `stop_confirmed` 才允许。
+6. **结果验证**：运行时声称完成但证据不足时不得进入 `succeeded`。
+7. **输入幂等**：重复/错配 `input_request_id` 被拒绝。
+8. **权限负向**：越权任务、跨任务结果、未授权取消全部拒绝。
+9. **模式负向**：提交的 `execution_mode`/capabilities/scope 与 Grant 不一致时拒绝；Advisory/Governed 任务不得被要求具备运行时能力。
+10. **未知字段**：请求/响应中的未知字段被拒绝，不得静默忽略。
+11. **隔离负向**：读取其他任务目录、未授权网络、访问宿主凭据全部失败（Managed Execution）。
+12. **凭据与日志**：日志/事件/错误中无令牌、密码、API Key、完整个人数据。
+13. **健康降级**：运行时不可用时不再提交新任务，已提交任务进入 `unknown` 对账。
 
 Mock 测试只能证明 Adapter 与契约映射，不得作为运行时兼容性证据；真实运行时证据必须单独记录。
 

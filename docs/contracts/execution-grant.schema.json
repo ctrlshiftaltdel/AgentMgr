@@ -1,15 +1,18 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://schemas.example.com/agentmgr/execution-grant/1.0.0",
+  "$comment": "$id uses the reserved example.com namespace as an offline placeholder. Implementations must not resolve it over the network and must pin the contract bundle SHA-256 instead of fetching the schema.",
   "title": "AgentMgr Execution Grant",
-  "description": "任务执行授权快照，契约版本 1.0.0。Grant 绑定任务、主体、能力、资源范围、策略版本、工具契约版本、有效期、预算/调用上限、确认/审批引用与撤销状态。每次敏感调用都必须重新验证 Grant（未过期、未撤销、未消费、范围未扩大、版本匹配）；缺失、过期、撤销、消费后重用或任一绑定不匹配时必须 fail closed。Grant 由服务端签发，客户端或模型不得自行构造或扩写。注意：JSON Schema 只能校验结构与格式；当前时间比较、payload hash 与规范化 payload 的相等性、以及跨字段预算一致性必须由 PEP 在每次调用时执行，不能因为实例通过本 Schema 就认为 Grant 可用。",
+  "description": "任务执行授权快照，契约版本 1.0.0（尚未冻结发布的候选版本）。Grant 必须由授权型 PDP 决策（allow / managed_execution_required）签发，并绑定 decision_id、decision_revision、decision_hash、task_id、task_revision、主体、执行模式、能力、资源范围、策略版本、工具契约版本、有效期、预算/调用上限、确认/审批引用与撤销状态。每次敏感调用都必须重新验证 Grant；缺失、过期、撤销、消费后重用、Grant 晚于决策过期、模式/范围/预算超出决策等任一情况都必须 fail closed。Grant 由服务端签发，客户端或模型不得自行构造或扩写。注意：JSON Schema 只能校验结构与格式；当前时间比较、payload hash 相等性、以及“Grant 是决策的子集”等跨字段断言由服务端在签发与每次调用时计算并复核，不能因为实例通过本 Schema 就认为 Grant 可用。",
   "type": "object",
   "additionalProperties": false,
   "required": [
     "schema_version",
     "grant_id",
+    "correlation_id",
     "task_ref",
     "subject",
+    "execution_mode",
     "capabilities",
     "resource_scope",
     "policy_version",
@@ -27,6 +30,9 @@
     "revocation",
     "consumption",
     "revalidation",
+    "binding",
+    "decision",
+    "attempt",
     "issued_by"
   ],
   "properties": {
@@ -38,11 +44,21 @@
       "pattern": "^grnt_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$",
       "description": "服务端签发的 Grant ID；一次性消费与撤销均以其为准。"
     },
+    "correlation_id": {
+      "type": "string",
+      "pattern": "^corr_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$",
+      "description": "必填关联 ID，与签发决策的 correlation_id 相同。活动 Grant 不允许缺少审计关联链。"
+    },
     "task_ref": {
       "$ref": "#/$defs/taskRef"
     },
     "subject": {
       "$ref": "#/$defs/grantSubject"
+    },
+    "execution_mode": {
+      "type": "string",
+      "enum": ["advisory", "governed_resource_access", "managed_execution"],
+      "description": "必填执行模式，必须与签发决策和任务记录完全一致；不得在 Grant 中静默升级模式。"
     },
     "capabilities": {
       "$ref": "#/$defs/capabilities"
@@ -60,7 +76,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["confirmation_required", "approval_required"],
-      "description": "执行前的确认/审批门禁。为 true 时对应引用必须已满足；否则 Grant 非法。",
+      "description": "执行前的确认/审批门禁。为 true 时对应引用必须存在且状态为 satisfied/approved；否则 Grant 非法。",
       "properties": {
         "confirmation_required": {
           "type": "boolean"
@@ -71,13 +87,11 @@
       }
     },
     "issued_at": {
-      "type": "string",
-      "format": "date-time"
+      "$ref": "#/$defs/dateTime"
     },
     "expires_at": {
-      "type": "string",
-      "format": "date-time",
-      "description": "绝对过期时间。PEP 必须在每次调用时与当前时间比较；JSON Schema 只描述格式，无法判断“已过期”。只要 expires_at 已过、或 expires_at <= issued_at，即 fail closed。"
+      "$ref": "#/$defs/dateTime",
+      "description": "绝对过期时间。必须 <= decision.expires_at；PEP 必须在每次调用时与当前时间比较。expires_at 已过、或 expires_at <= issued_at，即 fail closed。"
     },
     "ttl_seconds": {
       "type": "integer",
@@ -92,71 +106,18 @@
       "$ref": "#/$defs/usage"
     },
     "confirmation_ref": {
-      "type": ["object", "null"],
-      "additionalProperties": false,
-      "required": [
-        "confirmation_id",
-        "payload_hash",
-        "satisfied_at",
-        "expires_at",
-        "single_use"
+      "oneOf": [
+        {"$ref": "#/$defs/confirmationRef"},
+        {"type": "null"}
       ],
-      "description": "已满足的确认引用。payload_hash 必须覆盖本次调用的规范化 payload；不匹配即拒绝。",
-      "properties": {
-        "confirmation_id": {
-          "type": "string",
-          "pattern": "^conf_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
-        },
-        "payload_hash": {
-          "type": "string",
-          "pattern": "^sha256:[a-f0-9]{64}$"
-        },
-        "satisfied_at": {
-          "type": "string",
-          "format": "date-time"
-        },
-        "expires_at": {
-          "type": "string",
-          "format": "date-time"
-        },
-        "single_use": {
-          "const": true
-        }
-      }
+      "description": "已满足的确认引用。活动 Grant 引用时必须是 status=satisfied、consumed_at=null；首次授权调用原子消费确认。引用 consumed/expired/rejected 确认的 Grant 非法。"
     },
     "approval_ref": {
-      "type": ["object", "null"],
-      "additionalProperties": false,
-      "required": [
-        "approval_id",
-        "approver_principal_id",
-        "payload_hash",
-        "decided_at",
-        "expires_at"
+      "oneOf": [
+        {"$ref": "#/$defs/approvalRef"},
+        {"type": "null"}
       ],
-      "description": "已满足的审批引用。approver 必须独立于 requester/executor，且 payload_hash 必须与当前执行 payload 一致。",
-      "properties": {
-        "approval_id": {
-          "type": "string",
-          "pattern": "^appr_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
-        },
-        "approver_principal_id": {
-          "type": "string",
-          "pattern": "^prin_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
-        },
-        "payload_hash": {
-          "type": "string",
-          "pattern": "^sha256:[a-f0-9]{64}$"
-        },
-        "decided_at": {
-          "type": "string",
-          "format": "date-time"
-        },
-        "expires_at": {
-          "type": "string",
-          "format": "date-time"
-        }
-      }
+      "description": "已满足的审批引用。必须是 decision=approved、separation_check=passed、decided_at/expires_at 非空；引用 rejected/expired/revoked 审批的 Grant 非法。"
     },
     "status": {
       "type": "string",
@@ -176,27 +137,30 @@
     "revalidation": {
       "$ref": "#/$defs/revalidation"
     },
+    "binding": {
+      "$ref": "#/$defs/binding"
+    },
+    "decision": {
+      "$ref": "#/$defs/decision"
+    },
+    "attempt": {
+      "$ref": "#/$defs/attempt"
+    },
     "issued_by": {
       "$ref": "#/$defs/issuedBy"
-    },
-    "audit": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["decision_id", "correlation_id"],
-      "properties": {
-        "decision_id": {
-          "type": "string",
-          "pattern": "^gdec_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
-        },
-        "correlation_id": {
-          "type": "string",
-          "pattern": "^corr_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
-        }
-      },
-      "description": "签发 Grant 所依据的决策与关联链；审计必须能还原授权来源。"
     }
   },
   "$defs": {
+    "dateTime": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+      "description": "RFC 3339 UTC 时间，必须以 Z 结尾。验证器必须启用 format 断言；固定 UTC 使字典序与时间序一致。"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
     "taskRef": {
       "type": "object",
       "additionalProperties": false,
@@ -213,7 +177,7 @@
         },
         "task_revision": {
           "type": "integer",
-          "minimum": 0
+          "minimum": 1
         }
       }
     },
@@ -231,7 +195,7 @@
       "properties": {
         "principal_id": {
           "type": "string",
-          "pattern": "^(prin|rt)_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
+          "pattern": "^(prin|rt|svc|role|queue)_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
         },
         "principal_type": {
           "type": "string",
@@ -252,11 +216,15 @@
         }
       }
     },
+    "capability": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*@[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
     "capabilities": {
       "type": "object",
       "additionalProperties": false,
       "required": ["allowed", "denied"],
-      "description": "允许与显式禁止的能力。denied 永远优先；allowed 为空时不能执行任何有副作用动作。",
+      "description": "允许与显式禁止的能力。denied 永远优先；allowed 必须是签发决策 allowed_capabilities 的子集。",
       "properties": {
         "allowed": {
           "type": "array",
@@ -289,15 +257,11 @@
         }
       }
     },
-    "capability": {
-      "type": "string",
-      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*@[0-9]+\\.[0-9]+\\.[0-9]+$"
-    },
     "resourceScope": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["scope_type", "resource_ids", "data_classifications"],
-      "description": "授权资源范围。范围扩大、scope_type 改变或新增未列出资源都必须拒绝并要求重新签发。",
+      "required": ["scope_type", "resource_ids", "connector_ids", "data_classifications", "exclude_resource_ids"],
+      "description": "授权资源范围。必须是签发决策范围的子集；范围扩大、scope_type 改变或新增未列出资源都必须拒绝并要求重新签发。空集合表示“没有该类别资源”，不表示“全部”。",
       "properties": {
         "scope_type": {
           "type": "string",
@@ -305,6 +269,7 @@
             "none",
             "self",
             "department",
+            "company",
             "approval_chain",
             "project",
             "record_set",
@@ -332,6 +297,7 @@
         "data_classifications": {
           "type": "array",
           "uniqueItems": true,
+          "minItems": 1,
           "items": {
             "type": "string",
             "enum": ["public", "internal", "confidential", "restricted"]
@@ -363,8 +329,7 @@
           "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
         },
         "content_hash": {
-          "type": "string",
-          "pattern": "^sha256:[a-f0-9]{64}$"
+          "$ref": "#/$defs/sha256"
         }
       }
     },
@@ -383,8 +348,7 @@
           "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
         },
         "content_hash": {
-          "type": "string",
-          "pattern": "^sha256:[a-f0-9]{64}$"
+          "$ref": "#/$defs/sha256"
         },
         "tool_versions": {
           "type": "object",
@@ -403,7 +367,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["max_calls", "max_cost_units", "max_runtime_seconds", "currency"],
-      "description": "调用与资源预算。每次调用前必须检查剩余预算；耗尽后 Grant 不得继续使用。",
+      "description": "调用与资源预算，必须是签发决策预算的子集。每次调用前必须检查剩余预算；耗尽后 Grant 不得继续使用。",
       "properties": {
         "max_calls": {
           "type": "integer",
@@ -418,11 +382,12 @@
         "max_runtime_seconds": {
           "type": ["integer", "null"],
           "minimum": 1,
-          "maximum": 86400
+          "maximum": 86400,
+          "description": "最长运行时间。Grant 的 TTL 必须覆盖该时间，否则运行中会过期；binding.runtime_within_grant_ttl 必须为 true。"
         },
         "currency": {
-          "type": ["string", "null"],
-          "enum": ["CNY", "USD", "NONE", null]
+          "type": "string",
+          "enum": ["CNY", "USD", "NONE"]
         }
       }
     },
@@ -430,7 +395,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["calls_consumed", "cost_consumed", "last_call_at", "concurrent_calls"],
-      "description": "已消耗预算。服务端在每次调用前以原子方式检查并递增，防止并发超用。",
+      "description": "已消耗预算。服务端在每次调用前以原子方式检查并递增，防止并发超用；calls_consumed 不得超过 budget.max_calls，cost_consumed 不得超过 budget.max_cost_units。",
       "properties": {
         "calls_consumed": {
           "type": "integer",
@@ -443,8 +408,7 @@
           "maximum": 100000000
         },
         "last_call_at": {
-          "type": ["string", "null"],
-          "format": "date-time"
+          "oneOf": [{"$ref": "#/$defs/dateTime"}, {"type": "null"}]
         },
         "concurrent_calls": {
           "type": "integer",
@@ -463,8 +427,7 @@
           "type": "boolean"
         },
         "revoked_at": {
-          "type": ["string", "null"],
-          "format": "date-time"
+          "oneOf": [{"$ref": "#/$defs/dateTime"}, {"type": "null"}]
         },
         "reason_code": {
           "type": ["string", "null"],
@@ -481,7 +444,7 @@
         },
         "revoked_by_principal_id": {
           "type": ["string", "null"],
-          "pattern": "^prin_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
+          "pattern": "^(prin|rt|svc|role)_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
         }
       }
     },
@@ -489,15 +452,14 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["mode", "consumed_at", "consumed_by_call_id", "remaining_calls"],
-      "description": "一次性/多次消费语义。single_use 的 Grant 在首次成功授权后即标记 consumed，任何重用都必须拒绝。",
+      "description": "一次性/多次消费语义。single_use 的 Grant 只允许一次授权调用（budget.max_calls 必须为 1），首次成功后即标记 consumed；任何重用都必须拒绝。服务端必须原子维护 remaining_calls = budget.max_calls - usage.calls_consumed；active 状态不得与 0 剩余调用、已消费时间或已撤销状态并存。",
       "properties": {
         "mode": {
           "type": "string",
           "enum": ["single_use", "multi_use"]
         },
         "consumed_at": {
-          "type": ["string", "null"],
-          "format": "date-time"
+          "oneOf": [{"$ref": "#/$defs/dateTime"}, {"type": "null"}]
         },
         "consumed_by_call_id": {
           "type": ["string", "null"],
@@ -519,27 +481,287 @@
         "policy_version_bound",
         "tool_version_bound",
         "subject_bound",
-        "resource_scope_bound"
+        "resource_scope_bound",
+        "decision_bound",
+        "task_revision_bound",
+        "confirmation_bound",
+        "approval_bound",
+        "budget_bound",
+        "execution_mode_bound"
       ],
       "description": "每次敏感调用的重验要求。任何一项为 false 的 Grant 都不得用于执行。",
       "properties": {
-        "required": {
+        "required": {"const": true},
+        "at": {"const": "each_call"},
+        "policy_version_bound": {"const": true},
+        "tool_version_bound": {"const": true},
+        "subject_bound": {"const": true},
+        "resource_scope_bound": {"const": true},
+        "decision_bound": {"const": true},
+        "task_revision_bound": {"const": true},
+        "confirmation_bound": {"const": true},
+        "approval_bound": {"const": true},
+        "budget_bound": {"const": true},
+        "execution_mode_bound": {"const": true}
+      }
+    },
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "task_revision_bound",
+        "capabilities_subset_of_decision",
+        "scope_subset_of_decision",
+        "ttl_within_decision",
+        "budget_within_decision",
+        "expires_within_decision",
+        "execution_mode_matches_decision",
+        "decision_hash_bound",
+        "gates_match_decision",
+        "runtime_within_grant_ttl"
+      ],
+      "description": "服务端在签发时计算并在每次调用时复核的子集/绑定断言。全部必须为 true；false 表示 Grant 与决策不一致，必须拒绝。JSON Schema 无法比较两个字段的值，因此这些断言是显式契约字段，而不是可由客户端填写的说明。",
+      "properties": {
+        "task_revision_bound": {"const": true},
+        "capabilities_subset_of_decision": {"const": true},
+        "scope_subset_of_decision": {"const": true},
+        "ttl_within_decision": {"const": true},
+        "budget_within_decision": {"const": true},
+        "expires_within_decision": {"const": true},
+        "execution_mode_matches_decision": {"const": true},
+        "decision_hash_bound": {"const": true},
+        "gates_match_decision": {"const": true},
+        "runtime_within_grant_ttl": {"const": true}
+      }
+    },
+    "decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "decision_id",
+        "decision_revision",
+        "decision_hash",
+        "decision_type",
+        "decision_purpose",
+        "freshness",
+        "canonicalization",
+        "evaluated_at",
+        "expires_at",
+        "execution_mode",
+        "policy_version",
+        "correlation_id"
+      ],
+      "description": "签发本 Grant 的 PDP 决策来源。每次签发（包括重试）都必须来自新的 PDP 评估；1.0.0 不允许复用旧决策或无新决策重签 Grant。",
+      "properties": {
+        "decision_id": {
+          "type": "string",
+          "pattern": "^gdec_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
+        },
+        "decision_revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "decision_hash": {
+          "$ref": "#/$defs/sha256",
+          "description": "被引用决策的 RFC 8785 JCS 规范化哈希（不含 decision_hash 字段本身）。"
+        },
+        "decision_type": {
+          "type": "string",
+          "enum": ["allow", "managed_execution_required"]
+        },
+        "decision_purpose": {
+          "type": "string",
+          "enum": ["initial_execution", "retry"]
+        },
+        "freshness": {
+          "const": "fresh_evaluation",
+          "description": "1.0.0 只允许新鲜评估。未来若引入受审计的决策复用，必须升主版本并增加 expiry/version 守卫字段。"
+        },
+        "canonicalization": {
+          "const": "rfc8785_jcs"
+        },
+        "evaluated_at": {
+          "$ref": "#/$defs/dateTime"
+        },
+        "expires_at": {
+          "$ref": "#/$defs/dateTime",
+          "description": "决策过期时间。Grant.expires_at 必须不晚于本值。"
+        },
+        "execution_mode": {
+          "type": "string",
+          "enum": ["advisory", "governed_resource_access", "managed_execution"]
+        },
+        "policy_version": {
+          "$ref": "#/$defs/policyVersion"
+        },
+        "correlation_id": {
+          "type": "string",
+          "pattern": "^corr_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
+        }
+      }
+    },
+    "attempt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "number",
+        "max_attempts",
+        "is_retry",
+        "retry_of_attempt",
+        "retry_decision_id",
+        "retry_budget_remaining"
+      ],
+      "description": "执行尝试与重试预算。failed 是尝试终态；只有 attempt < max_attempts 且 retry_budget_remaining > 0 时才允许 T65 重试，重试必须携带新的决策与新的 Grant。",
+      "properties": {
+        "number": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "max_attempts": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "is_retry": {
+          "type": "boolean"
+        },
+        "retry_of_attempt": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "maximum": 100
+        },
+        "retry_decision_id": {
+          "type": ["string", "null"],
+          "pattern": "^gdec_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
+        },
+        "retry_budget_remaining": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        }
+      }
+    },
+    "confirmationRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "confirmation_id",
+        "payload_hash",
+        "canonicalization",
+        "confirmed_by_principal_id",
+        "status",
+        "satisfied_at",
+        "expires_at",
+        "consumed_at",
+        "consumed_by_call_id",
+        "single_use"
+      ],
+      "description": "与 governance-decision 和 task-envelope 完全一致的确认引用形状。活动 Grant 只能引用 satisfied 且未消费的确认。",
+      "properties": {
+        "confirmation_id": {
+          "type": "string",
+          "pattern": "^conf_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
+        },
+        "payload_hash": {
+          "$ref": "#/$defs/sha256"
+        },
+        "canonicalization": {
+          "const": "rfc8785_jcs"
+        },
+        "purpose": {
+          "type": "string",
+          "enum": [
+            "high_impact_action",
+            "data_release",
+            "irreversible_action",
+            "payload_change",
+            "manual_override"
+          ]
+        },
+        "confirmed_by_principal_id": {
+          "type": ["string", "null"],
+          "pattern": "^(prin|rt|svc)_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "satisfied", "consumed", "expired", "rejected"]
+        },
+        "satisfied_at": {
+          "oneOf": [{"$ref": "#/$defs/dateTime"}, {"type": "null"}]
+        },
+        "expires_at": {
+          "$ref": "#/$defs/dateTime"
+        },
+        "consumed_at": {
+          "oneOf": [{"$ref": "#/$defs/dateTime"}, {"type": "null"}]
+        },
+        "consumed_by_call_id": {
+          "type": ["string", "null"],
+          "pattern": "^call_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
+        },
+        "single_use": {
           "const": true
         },
-        "at": {
-          "const": "each_call"
+        "channel_binding": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["channel", "channel_identity_ref"],
+          "properties": {
+            "channel": {
+              "type": "string",
+              "enum": ["mcp", "rest", "web", "wechat", "other"]
+            },
+            "channel_identity_ref": {
+              "type": ["string", "null"],
+              "pattern": "^chan_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
+            }
+          }
+        }
+      }
+    },
+    "approvalRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "approval_id",
+        "approver_principal_id",
+        "payload_hash",
+        "canonicalization",
+        "decision",
+        "separation_check",
+        "decided_at",
+        "expires_at"
+      ],
+      "description": "与 governance-decision 和 task-envelope 完全一致的审批引用形状。活动 Grant 只能引用已批准、职责分离通过、未过期的审批。",
+      "properties": {
+        "approval_id": {
+          "type": "string",
+          "pattern": "^appr_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
         },
-        "policy_version_bound": {
-          "const": true
+        "approver_principal_id": {
+          "type": "string",
+          "pattern": "^(prin|role)_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
         },
-        "tool_version_bound": {
-          "const": true
+        "payload_hash": {
+          "$ref": "#/$defs/sha256"
         },
-        "subject_bound": {
-          "const": true
+        "canonicalization": {
+          "const": "rfc8785_jcs"
         },
-        "resource_scope_bound": {
-          "const": true
+        "decision": {
+          "type": "string",
+          "enum": ["pending", "approved", "rejected", "expired", "revoked"]
+        },
+        "separation_check": {
+          "type": "string",
+          "enum": ["passed", "failed", "not_required"]
+        },
+        "decided_at": {
+          "oneOf": [{"$ref": "#/$defs/dateTime"}, {"type": "null"}]
+        },
+        "expires_at": {
+          "oneOf": [{"$ref": "#/$defs/dateTime"}, {"type": "null"}]
         }
       }
     },
@@ -568,16 +790,37 @@
       "then": {
         "properties": {
           "usable": {"const": true},
+          "subject": {"properties": {"account_status": {"const": "active"}}},
           "revocation": {
             "properties": {
               "revoked": {"const": false},
               "revoked_at": {"const": null},
-              "reason_code": {"const": null}
+              "reason_code": {"const": null},
+              "revoked_by_principal_id": {"const": null}
             }
           },
           "consumption": {
             "properties": {
-              "consumed_at": {"const": null}
+              "consumed_at": {"const": null},
+              "consumed_by_call_id": {"const": null},
+              "remaining_calls": {"minimum": 1}
+            }
+          },
+          "confirmation_ref": {
+            "properties": {
+              "status": {"const": "satisfied"},
+              "consumed_at": {"const": null},
+              "consumed_by_call_id": {"const": null},
+              "satisfied_at": {"type": "string"},
+              "confirmed_by_principal_id": {"type": "string"}
+            }
+          },
+          "approval_ref": {
+            "properties": {
+              "decision": {"const": "approved"},
+              "separation_check": {"const": "passed"},
+              "decided_at": {"type": "string"},
+              "expires_at": {"type": "string"}
             }
           }
         }
@@ -605,9 +848,22 @@
             "properties": {
               "revoked": {"const": true},
               "revoked_at": {"type": "string"},
-              "reason_code": {"type": "string"}
+              "reason_code": {"type": "string"},
+              "revoked_by_principal_id": {"type": "string"}
             }
           }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"revocation": {"properties": {"revoked": {"const": true}}, "required": ["revoked"]}},
+        "required": ["revocation"]
+      },
+      "then": {
+        "properties": {
+          "status": {"const": "revoked"},
+          "usable": {"const": false}
         }
       }
     },
@@ -630,16 +886,21 @@
     },
     {
       "if": {
-        "properties": {
-          "consumption": {"properties": {"mode": {"const": "single_use"}}}
-        },
-        "required": ["consumption"]
+        "properties": {"status": {"const": "expired"}},
+        "required": ["status"]
       },
       "then": {
         "properties": {
+          "revocation": {
+            "properties": {
+              "revoked": {"const": false},
+              "revoked_at": {"const": null},
+              "reason_code": {"const": null}
+            }
+          },
           "consumption": {
             "properties": {
-              "remaining_calls": {"maximum": 1}
+              "consumed_at": {"const": null}
             }
           }
         }
@@ -647,9 +908,39 @@
     },
     {
       "if": {
+        "properties": {"consumption": {"properties": {"mode": {"const": "single_use"}}, "required": ["mode"]}},
+        "required": ["consumption"]
+      },
+      "then": {
         "properties": {
-          "gates": {"properties": {"confirmation_required": {"const": true}}}
-        },
+          "budget": {"properties": {"max_calls": {"const": 1}}},
+          "consumption": {
+            "properties": {
+              "remaining_calls": {"maximum": 1}
+            }
+          },
+          "usage": {
+            "properties": {
+              "calls_consumed": {"maximum": 1}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"consumption": {"properties": {"mode": {"const": "multi_use"}}, "required": ["mode"]}},
+        "required": ["consumption"]
+      },
+      "then": {
+        "properties": {
+          "budget": {"properties": {"max_calls": {"minimum": 2}}}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"gates": {"properties": {"confirmation_required": {"const": true}}, "required": ["confirmation_required"]}},
         "required": ["gates"]
       },
       "then": {
@@ -660,9 +951,18 @@
     },
     {
       "if": {
+        "properties": {"gates": {"properties": {"confirmation_required": {"const": false}}, "required": ["confirmation_required"]}},
+        "required": ["gates"]
+      },
+      "then": {
         "properties": {
-          "gates": {"properties": {"approval_required": {"const": true}}}
-        },
+          "confirmation_ref": {"const": null}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"gates": {"properties": {"approval_required": {"const": true}}, "required": ["approval_required"]}},
         "required": ["gates"]
       },
       "then": {
@@ -673,9 +973,53 @@
     },
     {
       "if": {
+        "properties": {"gates": {"properties": {"approval_required": {"const": false}}, "required": ["approval_required"]}},
+        "required": ["gates"]
+      },
+      "then": {
         "properties": {
-          "resource_scope": {"properties": {"scope_type": {"const": "none"}}}
-        },
+          "approval_ref": {"const": null}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"confirmation_ref": {"type": "object"}},
+        "required": ["confirmation_ref"]
+      },
+      "then": {
+        "properties": {
+          "consumption": {"properties": {"mode": {"const": "single_use"}}}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"budget": {"properties": {"max_cost_units": {"const": null}}, "required": ["max_cost_units"]}},
+        "required": ["budget"]
+      },
+      "then": {
+        "properties": {
+          "budget": {"properties": {"currency": {"const": "NONE"}}},
+          "usage": {"properties": {"cost_consumed": {"const": null}}}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"budget": {"properties": {"max_cost_units": {"type": "number"}}, "required": ["max_cost_units"]}},
+        "required": ["budget"]
+      },
+      "then": {
+        "properties": {
+          "budget": {"properties": {"currency": {"enum": ["CNY", "USD"]}}},
+          "usage": {"properties": {"cost_consumed": {"type": "number"}}}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"resource_scope": {"properties": {"scope_type": {"const": "none"}}, "required": ["scope_type"]}},
         "required": ["resource_scope"]
       },
       "then": {
@@ -693,14 +1037,71 @@
     },
     {
       "if": {
-        "properties": {
-          "subject": {"properties": {"account_status": {"enum": ["disabled", "unbound"]}}}
-        },
-        "required": ["subject"]
+        "properties": {"resource_scope": {"properties": {"scope_type": {"enum": ["department", "company", "approval_chain", "project", "record_set", "connector"]}}, "required": ["scope_type"]}},
+        "required": ["resource_scope"]
       },
       "then": {
         "properties": {
-          "status": {"const": "revoked"}
+          "resource_scope": {
+            "anyOf": [
+              {"properties": {"resource_ids": {"minItems": 1}}},
+              {"properties": {"connector_ids": {"minItems": 1}}}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"attempt": {"properties": {"is_retry": {"const": true}}, "required": ["is_retry"]}},
+        "required": ["attempt"]
+      },
+      "then": {
+        "properties": {
+          "decision": {"properties": {"decision_purpose": {"const": "retry"}}},
+          "attempt": {
+            "properties": {
+              "retry_of_attempt": {"type": "integer"},
+              "retry_decision_id": {"type": "string"}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"attempt": {"properties": {"is_retry": {"const": false}}, "required": ["is_retry"]}},
+        "required": ["attempt"]
+      },
+      "then": {
+        "properties": {
+          "decision": {"properties": {"decision_purpose": {"const": "initial_execution"}}},
+          "attempt": {
+            "properties": {
+              "retry_of_attempt": {"const": null},
+              "retry_decision_id": {"const": null}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"attempt": {"properties": {"number": {"const": 1}}, "required": ["number"]}},
+        "required": ["attempt"]
+      },
+      "then": {
+        "properties": {
+          "attempt": {"properties": {"is_retry": {"const": false}}}
+        }
+      }
+    },
+    {
+      "properties": {
+        "decision": {
+          "properties": {
+            "execution_mode": {"enum": ["advisory", "governed_resource_access", "managed_execution"]}
+          }
         }
       }
     }
