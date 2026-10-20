@@ -510,12 +510,19 @@ def test_in_memory_mutation_cannot_expand_persisted_decision(session, org, polic
     else:  # pragma: no cover
         raise AssertionError("forged in-memory constraints must not expand a grant")
 
-    # A normal issue derives the original constraints, not the forged ones.
-    grant = _issue(session, org, persisted)
+    # The forged in-memory values were never flushed.  A fresh read must still
+    # show the original decision, and issuing from it derives the original
+    # constraints, not the forged ones.
+    session.expire_all()
+    fresh = session.query(GovernanceDecisionRecord).filter_by(
+        decision_id=decision.decision_id
+    ).one()
+    assert fresh.constraints["allowed_capabilities"] == ["expense.read@1.0.0"]
+    grant = _issue(session, org, fresh)
     assert grant.capabilities == ["expense.read@1.0.0"]
     assert grant.resource_scope["scope_type"] == "self"
     assert grant.budget["max_calls"] == 1
-    assert grant.decision_hash == persisted.decision_hash
+    assert grant.decision_hash == fresh.decision_hash
 
 
 # ---------------------------------------------------------------------------
