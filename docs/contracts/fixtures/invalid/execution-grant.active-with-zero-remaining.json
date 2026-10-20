@@ -109,6 +109,7 @@
     "execution_mode_matches_decision": true,
     "decision_hash_bound": true,
     "gates_match_decision": true,
+    "confirmation_payload_hash_bound": true,
     "runtime_within_grant_ttl": true
   },
   "decision": {

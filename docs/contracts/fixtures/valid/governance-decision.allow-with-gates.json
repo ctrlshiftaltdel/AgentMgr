@@ -1,6 +1,6 @@
 {
   "schema_version": "1.0.0",
-  "decision_id": "gdec_allow_0001",
+  "decision_id": "gdec_allow_gates_0001",
   "decision_revision": 1,
   "decision_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
   "canonicalization": "rfc8785_jcs",

@@ -69,7 +69,7 @@
     "completion_criteria": [
       {
         "criterion_id": "crit_expense_state_0001",
-        "type": "artifact_hash",
+        "type": "business_state_equals",
         "verifier": {
           "verifier_id": "ver_expense_state_0001",
           "version": "1.0.0"
@@ -77,7 +77,7 @@
         "resource_ref": "res_expense_0001",
         "expected": "submitted",
         "evidence_ref": "evidence:expense_state_0001",
-        "evidence_hash": null
+        "evidence_hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
       }
     ],
     "required_inputs": [
@@ -132,8 +132,38 @@
     "max_runtime_seconds": 600,
     "max_cost_units": 0
   },
-  "confirmations": [],
-  "approvals": [],
+  "confirmations": [
+    {
+      "confirmation_id": "conf_expense_0001",
+      "payload_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "canonicalization": "rfc8785_jcs",
+      "purpose": "data_release",
+      "confirmed_by_principal_id": "prin_user_0001",
+      "status": "satisfied",
+      "satisfied_at": "2026-10-20T02:05:00Z",
+      "expires_at": "2026-10-20T02:30:00Z",
+      "consumed_at": null,
+      "consumed_by_call_id": null,
+      "single_use": true,
+      "channel_binding": {
+        "channel": "mcp",
+        "channel_identity_ref": "chan_user_session_0001"
+      },
+      "issued_at": "2026-10-20T02:03:00Z"
+    }
+  ],
+  "approvals": [
+    {
+      "approval_id": "appr_expense_0001",
+      "approver_principal_id": "prin_approver_0001",
+      "payload_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "canonicalization": "rfc8785_jcs",
+      "decision": "approved",
+      "separation_check": "passed",
+      "decided_at": "2026-10-20T02:10:00Z",
+      "expires_at": "2026-10-21T02:10:00Z"
+    }
+  ],
   "limitations": [],
   "result": {
     "outcome": "none",
@@ -156,16 +186,16 @@
     "last_event_at": "2026-10-20T02:10:00Z"
   },
   "status": {
-    "state": "queued",
-    "state_revision": 5,
-    "last_event_id": "evt_queued_0001",
-    "attempt": 1,
+    "state": "denied",
+    "state_revision": 4,
+    "last_event_id": "evt_denied_0001",
+    "attempt": 0,
     "max_attempts": 3,
     "retry_budget_remaining": 2
   },
   "linkage": {
-    "grant_id": "grnt_expense_0001",
-    "grant_status": "active",
+    "grant_id": null,
+    "grant_status": null,
     "runtime_task_id": null,
     "execution_ref": null,
     "parent_task_id": null,
@@ -173,10 +203,14 @@
     "correlation_id": "corr_expense_0001"
   },
   "decision": {
-    "decision_id": "gdec_allow_0001",
-    "decision_type": "allow",
+    "decision_id": "gdec_deny_0001",
+    "decision_type": "deny",
     "decision_revision": 1,
     "decided_at": "2026-10-20T02:00:00Z"
+  },
+  "record_completeness": {
+    "completeness": "complete",
+    "incomplete_reason": null
   },
   "labels": {
     "fixture": "synthetic"

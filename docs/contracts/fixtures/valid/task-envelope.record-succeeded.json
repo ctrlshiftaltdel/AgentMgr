@@ -212,6 +212,10 @@
     "decision_revision": 1,
     "decided_at": "2026-10-20T02:00:00Z"
   },
+  "record_completeness": {
+    "completeness": "complete",
+    "incomplete_reason": null
+  },
   "labels": {
     "fixture": "synthetic"
   }

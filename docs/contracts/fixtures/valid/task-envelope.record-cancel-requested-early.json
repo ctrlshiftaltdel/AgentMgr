@@ -1,0 +1,156 @@
+{
+  "schema_version": "1.0.0",
+  "envelope_kind": "record",
+  "task_id": "task_expense_0001",
+  "idempotency_key": "idem_expense_0001",
+  "client_task_ref": "cref_client_0001",
+  "requester": {
+    "principal_id": "prin_user_0001",
+    "principal_type": "person",
+    "resolution": "server_resolved",
+    "account_status": "active",
+    "identity_assurance": "verified_session",
+    "role_ids": [],
+    "department_id": "dept_finance_0001",
+    "service_identity_id": null,
+    "delegation_ref": null
+  },
+  "accountable_owner": {
+    "principal_id": null,
+    "principal_type": "role",
+    "resolution": "pending",
+    "account_status": "unknown",
+    "identity_assurance": "unverified",
+    "role_ids": [],
+    "department_id": null,
+    "service_identity_id": null,
+    "delegation_ref": null
+  },
+  "assignee": {
+    "principal_id": null,
+    "principal_type": "queue",
+    "resolution": "pending",
+    "account_status": "unknown",
+    "identity_assurance": "unverified",
+    "role_ids": [],
+    "department_id": null,
+    "service_identity_id": null,
+    "delegation_ref": null
+  },
+  "executor": {
+    "principal_id": null,
+    "principal_type": "agent_instance",
+    "resolution": "pending",
+    "account_status": "unknown",
+    "identity_assurance": "unverified",
+    "role_ids": [],
+    "department_id": null,
+    "service_identity_id": null,
+    "delegation_ref": null
+  },
+  "approver": {
+    "principal_id": null,
+    "principal_type": "role",
+    "resolution": "pending",
+    "account_status": "unknown",
+    "identity_assurance": "unverified",
+    "role_ids": [],
+    "department_id": null,
+    "service_identity_id": null,
+    "delegation_ref": null
+  },
+  "delegations": [],
+  "goal": null,
+  "priority": {
+    "requested_level": "high",
+    "effective_level": "high",
+    "authority_effect": "scheduling_only",
+    "rationale": "Synthetic deadline."
+  },
+  "due_at": "2026-10-27T09:00:00Z",
+  "sla": {
+    "response_by": "2026-10-21T09:00:00Z",
+    "complete_by": "2026-10-27T09:00:00Z",
+    "escalation_after_minutes": 240
+  },
+  "execution_mode": "undetermined",
+  "requested_capabilities": [
+    "expense.submit@1.0.0",
+    "expense.read@1.0.0"
+  ],
+  "resource_scope": {
+    "scope_type": "undetermined",
+    "resource_ids": [],
+    "connector_ids": [],
+    "data_classifications": [],
+    "exclude_resource_ids": []
+  },
+  "policy_version": {
+    "policy_set_id": "polset_default_0001",
+    "version": "1.0.0",
+    "content_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "risk": {
+    "level": "medium",
+    "score": 40,
+    "source": "server_policy"
+  },
+  "requested_limits": {
+    "max_calls": 20,
+    "max_runtime_seconds": 600,
+    "max_cost_units": 0
+  },
+  "confirmations": [],
+  "approvals": [],
+  "limitations": [],
+  "result": {
+    "outcome": "none",
+    "result_ref": null,
+    "evidence_refs": [],
+    "stop_confirmed": false,
+    "verification": {
+      "result": "pending",
+      "verifier_id": null,
+      "verified_at": null,
+      "evidence_refs": []
+    },
+    "completed_at": null
+  },
+  "timestamps": {
+    "created_at": "2026-10-20T01:55:00Z",
+    "updated_at": "2026-10-20T01:55:00Z",
+    "submitted_at": null,
+    "evaluated_at": "2026-10-20T02:00:00Z",
+    "last_event_at": "2026-10-20T01:55:00Z"
+  },
+  "status": {
+    "state": "cancel_requested",
+    "state_revision": 3,
+    "last_event_id": "evt_cancel_requested_early_0001",
+    "attempt": 0,
+    "max_attempts": 3,
+    "retry_budget_remaining": 2
+  },
+  "linkage": {
+    "grant_id": null,
+    "grant_status": null,
+    "runtime_task_id": null,
+    "execution_ref": null,
+    "parent_task_id": null,
+    "supersedes_task_id": null,
+    "correlation_id": "corr_expense_0001"
+  },
+  "decision": {
+    "decision_id": "gdec_clarify_0001",
+    "decision_type": "needs_clarification",
+    "decision_revision": 1,
+    "decided_at": "2026-10-20T02:00:00Z"
+  },
+  "record_completeness": {
+    "completeness": "pre_execution_incomplete",
+    "incomplete_reason": "multiple_incomplete_fields"
+  },
+  "labels": {
+    "fixture": "synthetic"
+  }
+}

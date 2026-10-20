@@ -141,6 +141,10 @@
     "correlation_id": "corr_expense_0001"
   },
   "decision": null,
+  "record_completeness": {
+    "completeness": "pre_execution_incomplete",
+    "incomplete_reason": "multiple_incomplete_fields"
+  },
   "labels": {
     "fixture": "synthetic"
   }

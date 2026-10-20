@@ -59,7 +59,11 @@ AgentMgr **不负责**：
 
 **失败是尝试终态。** `failed` 不是任务终态；重试必须重新执行 PDP、签发新决策与新 Grant，并受 `max_attempts`/`retry_budget_remaining` 约束。禁止复用过期决策或旧 Grant。
 
-**默认禁止自审。** 1.0.0 冻结 `Accountable Owner ≠ Approver`；不存在策略例外。未来若要允许例外，必须升主版本并增加例外引用、理由、策略版本与审计字段。
+**默认禁止自审。** 1.0.0 冻结 `Accountable Owner ≠ Approver`；不存在策略例外。未来若要允许例外，必须升主版本并增加例外引用、理由、策略版本与审计字段。职责分离按 **principal 身份**判定：同一 principal 不得审批自己的任务，同一组织角色下的不同人员可以审批；`separation_check` 由服务端计算，不接受客户端提交值。
+
+**早期退出必须显式标注不完整。** 任务在 `draft`/`awaiting_clarification`，或在该阶段被 `denied`/`cancelled`/`needs_human`、登记为执行前 `cancel_requested`（以及由这些状态产生的 `failed`）时，允许 `goal=null`、`accountable_owner` 未解析、`execution_mode`/`scope_type=undetermined`，但记录必须标记 `record_completeness.completeness=pre_execution_incomplete` 并说明 `incomplete_reason`，且不得关联任何 Grant。执行开始（`attempt>=1`）后与执行后状态必须是完整记录。
+
+**终态必须使 Grant 失效。** 任务或尝试进入 `succeeded`/`partial_success`/`failed`/`cancelled`/`timed_out`/`denied`（以及 `unknown`）时，Grant 必须为 `revoked` 或 `consumed`；PEP 除校验 Grant 外还必须读取当前任务状态，终态任务上的 active Grant 一律拒绝。
 
 ### 2.3 信任边界
 
@@ -76,7 +80,7 @@ AgentMgr **不负责**：
 
 关键不变量：
 
-- **认证一次不等于授权一次。** B1 的会话只证明“谁在调用”；B2/B3 的每次敏感动作必须重新检查任务绑定、Grant、策略版本、工具版本、资源范围和预算。
+- **认证一次不等于授权一次。** B1 的会话只证明“谁在调用”；B2/B3 的每次敏感动作必须重新检查任务绑定、Grant、策略版本、工具版本、资源范围和预算，以及**当前任务状态**（终态或 `unknown` 任务不得放行 active Grant）。
 - **服务身份不是超级用户。** B2/B3 的非人身份只代表连接器/运行时的最小权限，不得用于绕过员工职权、审批或数据范围。
 - **管理面与业务面隔离。** B4 不得直接签发 Grant、代替审批或调用运行时控制接口；确需运维操作时必须走单独审计流程。
 - **凭据按边界与任务拆分。** 不存在一个“什么都能做”的共享管理员 token。
@@ -115,14 +119,16 @@ AgentMgr **不负责**：
 | 前缀 | 用途 | 允许的角色 |
 |---|---|---|
 | `prin_` | 人员或 `agent_instance` 主体 | Requester、Accountable Owner、Assignee、Executor、Approver |
-| `rt_` | 运行时主体 | Executor（Managed） |
+| `rt_` | 运行时主体 | `execution-grant.subject` / `governance-decision.subject`（运行时身份）；**不是** `task-envelope.executor` 的合法类型 |
 | `svc_` | 服务身份 | Requester（服务调用）、连接器身份 |
 | `role_` | 组织角色 | Accountable Owner、Assignee、Approver |
 | `queue_` | 工作队列 | Assignee |
 | `rtask_` | 运行时任务句柄（不是主体） | `linkage.runtime_task_id` |
 | `exec_` | Advisory/Governed 执行句柄（不是主体） | `linkage.execution_ref` |
 
-`accountable_owner` 与 `approver` 只能是 `person` 或 `role`，不得是 `agent_instance`、运行时或队列。`resolution=server_resolved` 时 `principal_id` 必须非空；`pending` 只允许出现在 `draft`/`awaiting_clarification`/`denied`。
+`accountable_owner` 与 `approver` 只能是 `person` 或 `role`，不得是 `agent_instance`、运行时或队列。`resolution=server_resolved` 时 `principal_id` 必须非空；`pending` 只允许出现在 `record_completeness.completeness=pre_execution_incomplete` 的记录中，即 `draft`、`awaiting_clarification`、`decision_type=needs_clarification` 的 `evaluated`，以及执行前退出的 `denied`/`cancelled`/`needs_human`/`failed`。
+
+主体前缀与类型必须一致，并由 Schema 与服务端同时校验：`prin_`↔person/agent_instance、`rt_`↔runtime、`svc_`↔service、`role_`↔role、`queue_`↔queue。`role_`/`queue_` 不是可认证主体，不得出现在决策 subject 或 Grant subject 中。
 
 ### 2.6 优先级不提升权限
 
@@ -196,10 +202,10 @@ MVP 在**一个可独立部署的服务**内按领域分层：身份、策略、
 本 ADR 的契约由以下可执行证据支撑（Phase 0 仅验证文档/契约，不声称产品能力已实现）：
 
 - 三个 JSON Schema 通过 JSON Schema 2020-12 元 schema 校验，且每个 schema 的合法/非法 fixtures 全部可验证；
-- 状态机逐条列出 71 条允许转换与 F01–F33 禁止转换；
+- 状态机逐条列出 72 条允许转换与 F01–F36 禁止转换，并给出 Schema 无法表达的 S-01–S-13 服务端断言矩阵；
 - 威胁模型至少 15 项（本版 30 项），覆盖身份、越权、审批、Grant、决策重放、模式混淆、完成检查、取消、绕行、凭据、审计等；
 - Runtime 能力以 `verified / partially_verified / unverified` 标注，并保留证据引用字段；
-- 契约包哈希包含三个 Schema、四份文档与全部 fixtures；候选必须固定完整哈希；
+- 契约包哈希包含三个 Schema、五份文档与全部 fixtures；候选必须固定完整哈希；
 - 产品负责人确认 Phase 0 契约前，不启动依赖这些契约的并行产品实现。
 
 本 ADR 不声称任何运行时、PEP、隔离环境或端到端链路已经验证。
@@ -231,7 +237,7 @@ MVP 在**一个可独立部署的服务**内按领域分层：身份、策略、
 1. **高风险阈值留在版本化策略层。** 付款、删除、不可撤回外发的确认/审批阈值不在 schema 中写死，由 `policy_version` 管理。
 2. **Advisory 不宣称本地强制治理。** 任何对外表述必须包含“无法强制约束客户端本地工具”；Advisory 任务必须记录 `client_local_tools_uncontrolled`。
 3. **Managed Execution 暂不宣称已受控。** 在 Phase 5 隔离、任务级凭据与出口限制负向测试通过前，能力状态保持 `unverified`，不得对外宣称“受控执行”已商用。
-4. **候选固定完整契约包哈希。** 哈希包含三个 Schema、四份文档与全部 valid/invalid fixtures；不接受 schema-only 哈希或本地私有 fixture。
+4. **候选固定完整契约包哈希。** 哈希包含三个 Schema、五份文档（Runtime Adapter、状态机、本 ADR、威胁模型、并行规则）与全部 valid/invalid fixtures；不接受 schema-only 哈希或本地私有 fixture。
 5. **`pre_evaluation` 仅用于任务创建前评估。** 它不得签发 Grant，且 `task_id`/`task_revision` 必须为 null。
 6. **1.0.0 版本状态。** 1.0.0 尚未被接受或发布；本轮修复产生 1.0.0 候选。冻结后任何破坏性变更必须升主版本。
 

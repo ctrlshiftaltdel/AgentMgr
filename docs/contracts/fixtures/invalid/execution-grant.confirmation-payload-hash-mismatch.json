@@ -71,7 +71,7 @@
   },
   "confirmation_ref": {
     "confirmation_id": "conf_expense_0001",
-    "payload_hash": "sha256:not-a-valid-payload-hash",
+    "payload_hash": "sha256:1decdbfffaafb454911d751efd460c23afe6e3cab47230c2d567211c993a5d94",
     "canonicalization": "rfc8785_jcs",
     "purpose": "data_release",
     "confirmed_by_principal_id": "prin_user_0001",
@@ -125,7 +125,9 @@
     "execution_mode_matches_decision": true,
     "decision_hash_bound": true,
     "gates_match_decision": true,
-    "runtime_within_grant_ttl": true
+    "confirmation_payload_hash_bound": false,
+    "runtime_within_grant_ttl": true,
+    "confirmation_bound": true
   },
   "decision": {
     "decision_id": "gdec_allow_0001",

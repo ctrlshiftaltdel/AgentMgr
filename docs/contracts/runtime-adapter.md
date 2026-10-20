@@ -94,7 +94,7 @@ Adapter 至少声明以下能力名（版本随契约升级）：
 
 ## 3. 方法与语义
 
-所有方法都是 Adapter 内部契约；输入/输出使用 JSON 对象，未知字段必须拒绝或忽略并在审计中记录，不得静默改变语义。所有写方法必须带幂等键或稳定请求 ID。
+所有方法都是 Adapter 内部契约；输入/输出使用 JSON 对象，**未知字段必须拒绝**（`invalid_request`），不得静默忽略或静默改变语义；拒绝时记录字段名与调用者。所有写方法必须带幂等键或稳定请求 ID。
 
 ### 3.1 `submit_task(task, grant)`
 
@@ -180,7 +180,7 @@ Adapter 至少声明以下能力名（版本随契约升级）：
 | 值 | 语义 | 核心动作 |
 |---|---|---|
 | `found` | 同一幂等键已有执行任务 | 采用该 `runtime_task_id`，按实际状态走 T29/T31/T41 等；禁止重发 |
-| `not_found` | 查询明确不存在 | 只有在执行边界保证无副作用且查询窗口结束后，才可按预算重试（T33/T66） |
+| `not_found` | 查询明确不存在 | 不等于可重试：有界窗口结束且 Adapter 出具无副作用保证 → T71 `reconcile.not_found` → `queued`（新决策 + 新 Grant）；无法出具保证 → T55 `failed` → T65 |
 | `conflict` | 同键但 payload hash 不同 | 拒绝重试；`conflict`，进入 `needs_human` 对账 |
 | `unknown` | 查询超时/不可解析 | `unknown`，有界对账；不得重发 |
 
@@ -220,7 +220,7 @@ Adapter 至少声明以下能力名（版本随契约升级）：
 | `stopped` | 已确认停止，且不再产生副作用 |
 | `timed_out` | 运行时确认超时并已停止 |
 | `unknown` | 无法查询、响应不可解析、心跳丢失或状态矛盾 |
-| `not_found` | 查询明确返回不存在；核心按 `unknown` 处理并进入对账，不得直接判定成功或失败 |
+| `not_found` | 查询明确返回不存在；核心按 `unknown` 处理并进入对账（T71 或 T55），不得直接判定成功、失败或可重派 |
 
 `stop_confirmed=true` 只能由 Adapter 在获得运行时停止证据后设置；`cancel` 被受理不等于已停止。
 
@@ -357,7 +357,7 @@ Adapter 至少声明以下能力名（版本随契约升级）：
 
 ## 4. 状态映射
 
-Adapter 把外部状态映射为内部事实；核心再把这些事实映射为模式中立的 `execution.*` 事件并写入 [task-state-machine](../architecture/task-state-machine.md)。本表只适用于 **Managed Execution / B3**；Advisory（B1）与 Governed（B2）由受控调用/PEP 产生同名 `execution.*` 事件。
+Adapter 把外部状态映射为内部事实；核心再把这些事实映射为模式中立的 `dispatch.*` / `execution.*` 事件并写入 [task-state-machine](../architecture/task-state-machine.md)。本表只适用于 **Managed Execution / B3**；Advisory（B1）与 Governed（B2）由受控调用/PEP 产生同名 `dispatch.*` / `execution.*` 事件。受理事件的唯一规范名称是 `dispatch.accepted`（不存在 `execution.accepted`）；本表中 `dispatch.accepted` 的 B3 产生者是 Worker/Adapter，B1/B2 的对应产生者分别是 B1 PEP 与 B2 PEP。
 
 | Adapter 事实 | 核心事件 | 核心状态 | 说明 |
 |---|---|---|---|
@@ -387,7 +387,7 @@ Adapter 把外部状态映射为内部事实；核心再把这些事实映射为
 1. **禁止盲目重发创建请求。**
 2. 先调用 `find_by_idempotency_key(task_id, grant_id, idempotency_key)`；若已获得 `runtime_task_id`，同时调用 `get_status`。
 3. 找到任务：采用该任务，按实际事实更新；即使 payload 相同也不得再创建第二个执行任务。
-4. 明确不存在且执行边界保证无副作用：才可按重试预算重新评估并提交。
+4. 明确不存在且执行边界出具无副作用保证：只能经 T71（`reconcile.not_found` → `queued`）重新执行 PDP、签发新决策与新 Grant 后提交；不得直接重发。无法取得该保证时经 T55 进入 `failed`，再由 T65 决定是否重试。
 5. 无法确定：状态 `unknown`，进入有界对账；超过阈值转 `needs_human`。
 6. 同键不同 payload：`conflict`，进入 `needs_human` 对账，不得覆盖或重发。
 
@@ -454,6 +454,7 @@ Adapter 验收必须包含：
 11. **隔离负向**：读取其他任务目录、未授权网络、访问宿主凭据全部失败（Managed Execution）。
 12. **凭据与日志**：日志/事件/错误中无令牌、密码、API Key、完整个人数据。
 13. **健康降级**：运行时不可用时不再提交新任务，已提交任务进入 `unknown` 对账。
+14. **终态 Grant**：任务已进入终态或 `unknown` 后，用同一 `grant_id` 继续提交/调用必须被拒绝；Adapter 只报告事实，由核心撤销 Grant 并拒绝放行。
 
 Mock 测试只能证明 Adapter 与契约映射，不得作为运行时兼容性证据；真实运行时证据必须单独记录。
 

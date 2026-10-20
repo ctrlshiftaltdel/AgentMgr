@@ -17,13 +17,15 @@
   "execution_mode": "governed_resource_access",
   "capabilities": {
     "allowed": [
-      "expense.read@1.0.0"
+      "expense.read@1.0.0",
+      "expense.approve@1.0.0"
     ],
     "denied": [
       "expense.delete@1.0.0"
     ],
     "max_calls_per_capability": {
-      "expense.read@1.0.0": 1
+      "expense.read@1.0.0": 1,
+      "expense.approve@1.0.0": 1
     }
   },
   "resource_scope": {
@@ -109,6 +111,7 @@
     "execution_mode_matches_decision": true,
     "decision_hash_bound": true,
     "gates_match_decision": true,
+    "confirmation_payload_hash_bound": true,
     "runtime_within_grant_ttl": true
   },
   "decision": {

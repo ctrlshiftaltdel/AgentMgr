@@ -137,12 +137,12 @@
     {
       "approval_id": "appr_expense_0001",
       "approver_principal_id": "prin_approver_0001",
-      "payload_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "payload_hash": "sha256:187e8c992233a586b5b581356c758f5f43bd649aa7ae5d9e3c6dd654cd41810f",
       "canonicalization": "rfc8785_jcs",
-      "decision": "approved",
-      "separation_check": "failed",
+      "decision": "revoked",
       "decided_at": "2026-10-20T02:10:00Z",
-      "expires_at": "2026-10-21T02:10:00Z"
+      "expires_at": "2026-10-20T02:20:00Z",
+      "separation_check": "failed"
     }
   ],
   "limitations": [],
@@ -167,16 +167,16 @@
     "last_event_at": "2026-10-20T02:10:00Z"
   },
   "status": {
-    "state": "queued",
-    "state_revision": 5,
-    "last_event_id": "evt_queued_0001",
-    "attempt": 1,
+    "state": "awaiting_approval",
+    "state_revision": 4,
+    "last_event_id": "evt_approval_required_0001",
+    "attempt": 0,
     "max_attempts": 3,
     "retry_budget_remaining": 2
   },
   "linkage": {
-    "grant_id": "grnt_expense_0001",
-    "grant_status": "active",
+    "grant_id": null,
+    "grant_status": null,
     "runtime_task_id": null,
     "execution_ref": null,
     "parent_task_id": null,
@@ -184,10 +184,14 @@
     "correlation_id": "corr_expense_0001"
   },
   "decision": {
-    "decision_id": "gdec_allow_0001",
-    "decision_type": "allow",
+    "decision_id": "gdec_approval_0001",
+    "decision_type": "needs_approval",
     "decision_revision": 1,
     "decided_at": "2026-10-20T02:00:00Z"
+  },
+  "record_completeness": {
+    "completeness": "complete",
+    "incomplete_reason": null
   },
   "labels": {
     "fixture": "synthetic"

@@ -138,7 +138,7 @@ Phase 0 冻结后，把实现拆成**路径不重叠的垂直工作包**，例�
 
 以下共享面必须由**单个任务独占**，不得并行修改：
 
-- Phase 0 契约包（三个 Schema、Runtime Adapter、状态机、ADR、威胁模型、fixtures）；
+- Phase 0 契约包（三个 Schema、Runtime Adapter、状态机、ADR、威胁模型、并行规则文档与全部 fixtures）；
 - 数据库迁移链（`migrations/`）与 schema 变更；
 - 依赖清单与锁文件（`pyproject.toml`、`uv.lock`、`.python-version`）；
 - 安全核心（Principal 解析、PDP/PEP、Grant 校验、审批/确认门禁、审计写入）；

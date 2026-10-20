@@ -17,14 +17,10 @@
   "execution_mode": "governed_resource_access",
   "capabilities": {
     "allowed": [
-      "expense.read@1.0.0"
+      "shell.exec"
     ],
-    "denied": [
-      "expense.delete@1.0.0"
-    ],
-    "max_calls_per_capability": {
-      "expense.read@1.0.0": 1
-    }
+    "denied": [],
+    "max_calls_per_capability": {}
   },
   "resource_scope": {
     "scope_type": "self",
@@ -44,7 +40,7 @@
   },
   "tool_contract": {
     "catalog_id": "cat_finance_0001",
-    "version": "1.0",
+    "version": "1.0.0",
     "content_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
     "tool_versions": {
       "expense.read": "1.0.0"
@@ -109,6 +105,7 @@
     "execution_mode_matches_decision": true,
     "decision_hash_bound": true,
     "gates_match_decision": true,
+    "confirmation_payload_hash_bound": true,
     "runtime_within_grant_ttl": true
   },
   "decision": {

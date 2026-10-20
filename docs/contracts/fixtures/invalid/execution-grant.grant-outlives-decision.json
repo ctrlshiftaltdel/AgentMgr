@@ -55,8 +55,8 @@
     "approval_required": false
   },
   "issued_at": "2026-10-20T02:00:00Z",
-  "expires_at": "2026-10-20T02:10:00Z",
-  "ttl_seconds": 600,
+  "expires_at": "2026-10-20T02:20:00Z",
+  "ttl_seconds": 1200,
   "budget": {
     "max_calls": 1,
     "max_cost_units": null,
@@ -109,6 +109,7 @@
     "execution_mode_matches_decision": true,
     "decision_hash_bound": true,
     "gates_match_decision": true,
+    "confirmation_payload_hash_bound": true,
     "runtime_within_grant_ttl": true
   },
   "decision": {

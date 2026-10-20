@@ -3,7 +3,7 @@
   "$id": "https://schemas.example.com/agentmgr/task-envelope/1.0.0",
   "$comment": "$id uses the reserved example.com namespace as an offline placeholder. Implementations must not resolve it over the network and must pin the contract bundle SHA-256 instead of fetching the schema.",
   "title": "AgentMgr Task Envelope",
-  "description": "任务请求与任务记录的统一契约，契约版本 1.0.0（尚未冻结发布的候选版本）。本文件用 oneOf 区分两个形状：clientTaskRequest 只包含客户端可提供的字段；taskRecord 只包含服务端权威字段。客户端无法构造合法记录，服务端也不接受客户端自报的身份、责任、审批、授权或状态。priority 只影响调度，不提升权限。完成定义必须是结构化、可机器判定的标准；payload 哈希使用 RFC 8785 JCS（见 task-state-machine.md §14）。",
+  "description": "任务请求与任务记录的统一契约，契约版本 1.0.0（尚未冻结发布的候选版本）。本文件用 oneOf 区分两个形状：clientTaskRequest 只包含客户端可提供的字段；taskRecord 只包含服务端权威字段。客户端无法构造合法记录，服务端也不接受客户端自报的身份、责任、审批、授权或状态。priority 只影响调度，不提升权限。完成定义必须是结构化、可机器判定的标准；payload 哈希使用 RFC 8785 JCS（见 task-state-machine.md §16）。记录完整性由 record_completeness 显式标记：只有执行前退出（draft/awaiting_clarification 或 early denied/cancelled/needs_human/failed）可以是 pre_execution_incomplete，且不得关联 Grant；执行开始与执行后状态必须完整。任务终态与 unknown 不得保留可用 Grant。",
   "oneOf": [
     {"$ref": "#/$defs/clientTaskRequest"},
     {"$ref": "#/$defs/taskRecord"}
@@ -12,8 +12,8 @@
     "dateTime": {
       "type": "string",
       "format": "date-time",
-      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
-      "description": "RFC 3339 UTC 时间，必须以 Z 结尾。验证器必须启用 format 断言。"
+      "pattern": "^[0-9]{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12][0-9]|3[01])|(?:0[469]|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-9]))T(?:[01][0-9]|2[0-3]):[0-5][0-9]:(?:[0-5][0-9]|60)(\\.[0-9]{1,9})?Z$",
+      "description": "RFC 3339 UTC 时间，必须以 Z 结尾并保留至秒或更高精度。pattern 已限制月份天数区间（2 月最多 29 日、30 天月份最多 30 日）与 00-23/00-59/00-60 时分秒，因此 2026-02-30 这类日期在结构层即被拒绝；闰年（2 月 29 日仅闰年合法）与闰秒的最终判定由服务端按 RFC 3339 复核。验证器必须启用 format 断言（jsonschema FormatChecker 或等价实现），不得把 format 仅当作注释。固定 UTC 使字典序与时间序一致。"
     },
     "sha256": {
       "type": "string",
@@ -33,7 +33,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["principal_id", "principal_type", "resolution", "account_status", "identity_assurance"],
-      "description": "服务端主体引用。resolution=server_resolved 时 principal_id 必须非空；pending 时 principal_id 必须为 null，且只能出现在 draft/awaiting_clarification。",
+      "description": "服务端主体引用。resolution=server_resolved 时 principal_id 必须非空；pending 时 principal_id 必须为 null，且只能出现在 pre_execution_incomplete 记录中。principal_id 前缀与 principal_type 必须一致（prin_→person/agent_instance、rt_→runtime、svc_→service、role_→role、queue_→queue），由 Schema 与服务端同时校验。",
       "properties": {
         "principal_id": {
           "type": ["string", "null"],
@@ -82,7 +82,69 @@
           "type": ["string", "null"],
           "pattern": "^dlg_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"principal_id": {"type": "string", "pattern": "^prin_"}}, "required": ["principal_id"]},
+          "then": {"properties": {"principal_type": {"enum": ["person", "agent_instance"]}}},
+          "description": "prin_ = 人员或 agent_instance；prefix 与 principal_type 必须一致。"
+        },
+        {
+          "if": {"properties": {"principal_id": {"type": "string", "pattern": "^rt_"}}, "required": ["principal_id"]},
+          "then": {"properties": {"principal_type": {"const": "runtime"}}},
+          "description": "rt_ = 运行时主体；它不能充当 Requester/Owner/Approver/Executor 的人员或 agent_instance 身份。"
+        },
+        {
+          "if": {"properties": {"principal_id": {"type": "string", "pattern": "^svc_"}}, "required": ["principal_id"]},
+          "then": {"properties": {"principal_type": {"const": "service"}}},
+          "description": "svc_ = 服务身份。"
+        },
+        {
+          "if": {"properties": {"principal_id": {"type": "string", "pattern": "^role_"}}, "required": ["principal_id"]},
+          "then": {"properties": {"principal_type": {"const": "role"}}},
+          "description": "role_ = 组织角色。"
+        },
+        {
+          "if": {"properties": {"principal_id": {"type": "string", "pattern": "^queue_"}}, "required": ["principal_id"]},
+          "then": {"properties": {"principal_type": {"const": "queue"}}},
+          "description": "queue_ = 工作队列。"
+        }
+      ]
+    },
+    "recordCompleteness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["completeness", "incomplete_reason"],
+      "description": "记录完整性标记。只有 `pre_execution_incomplete` 记录允许缺少 goal、未解析责任人、`execution_mode=undetermined` 与 `scope_type=undetermined`，且必须说明原因、不得关联任何 Grant。执行开始（attempt>=1）与所有执行后状态必须是 `complete`。",
+      "properties": {
+        "completeness": {
+          "type": "string",
+          "enum": ["complete", "pre_execution_incomplete"]
+        },
+        "incomplete_reason": {
+          "type": ["string", "null"],
+          "enum": [
+            null,
+            "goal_missing",
+            "completion_criteria_missing",
+            "owner_unresolved",
+            "scope_undetermined",
+            "execution_mode_undetermined",
+            "evaluation_unresolved",
+            "multiple_incomplete_fields"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"completeness": {"const": "complete"}}, "required": ["completeness"]},
+          "then": {"properties": {"incomplete_reason": {"const": null}}}
+        },
+        {
+          "if": {"properties": {"completeness": {"const": "pre_execution_incomplete"}}, "required": ["completeness"]},
+          "then": {"properties": {"incomplete_reason": {"type": "string"}}}
+        }
+      ]
     },
     "delegation": {
       "type": "object",
@@ -128,7 +190,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["scope_type", "resource_ids", "connector_ids", "data_classifications", "exclude_resource_ids"],
-      "description": "服务端解析的资源范围。空集合表示“没有该类别资源”，不表示“全部”。undetermined 只允许出现在 draft/awaiting_clarification，或 decision_type=needs_clarification 的 evaluated 记录。",
+      "description": "服务端解析的资源范围。空集合表示“没有该类别资源”，不表示“全部”。undetermined 只允许出现在 pre_execution_incomplete 记录（draft/awaiting_clarification/denied/cancelled/needs_human/failed）或 decision_type=needs_clarification 的 evaluated 记录。",
       "properties": {
         "scope_type": {
           "type": "string",
@@ -627,7 +689,8 @@
           "items": {
             "type": "string",
             "pattern": "^evidence:[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$"
-          }
+          },
+          "description": "结构化证据引用。verifying/succeeded/partial_success 至少一条；failed/cancelled/timed_out 同样至少一条（失败与停止证据）。"
         },
         "stop_confirmed": {
           "type": "boolean",
@@ -710,7 +773,7 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 100,
-          "description": "已开始的执行尝试次数；running/verifying/succeeded/failed/timed_out 时必须 >=1，且不得超过 max_attempts（跨字段比较由服务端执行）。"
+          "description": "已开始的执行尝试次数；running/verifying/succeeded/partial_success 时必须 >=1。failed/timed_out/cancelled 可因从未开始执行而为 0（此时记录通常为 pre_execution_incomplete 或来自 queued 的队列超时）。不得超过 max_attempts（跨字段比较由服务端执行）。"
         },
         "max_attempts": {
           "type": "integer",
@@ -777,7 +840,7 @@
         "grant_status": {
           "type": ["string", "null"],
           "enum": ["active", "consumed", "revoked", "expired", null],
-          "description": "Grant 在最近一次状态写入时的快照。queued/dispatched 必须 active；running/verifying 允许 active 或（由本尝试消费的）consumed；revoked/expired 永远不得继续执行。"
+          "description": "Grant 在最近一次状态写入时的快照。queued/dispatched 必须 active；running/verifying 允许 active 或（已由本尝试消费的）consumed；任务终态（succeeded/partial_success/failed/cancelled/timed_out/denied）以及 unknown 必须为 revoked 或 consumed；revoked/expired 永远不得继续执行。PEP 每次调用还必须读取当前任务状态，active Grant + 终态任务一律拒绝。"
         },
         "runtime_task_id": {
           "type": ["string", "null"],
@@ -893,7 +956,11 @@
           }
         },
         "requested_limits": {
-          "$ref": "#/$defs/limits"
+          "oneOf": [
+            {"$ref": "#/$defs/limits"},
+            {"type": "null"}
+          ],
+          "description": "请求的预算上限。completeness=incomplete 且 missing_fields 含 requested_limits 时必须为 null。"
         },
         "accountable_owner_hint": {
           "type": ["string", "null"],
@@ -947,6 +1014,7 @@
         "status",
         "linkage",
         "decision",
+        "record_completeness",
         "labels"
       ],
       "description": "服务端权威任务记录。客户端提交的同名字段必须忽略或拒绝；状态只能由服务端按状态机写入。",
@@ -1089,6 +1157,9 @@
             {"type": "null"}
           ]
         },
+        "record_completeness": {
+          "$ref": "#/$defs/recordCompleteness"
+        },
         "labels": {
           "type": "object",
           "additionalProperties": {
@@ -1124,6 +1195,15 @@
                 "missing_fields": {"minItems": 1}
               }
             }
+          },
+          {
+            "if": {
+              "properties": {"missing_fields": {"contains": {"const": "requested_limits"}}},
+              "required": ["missing_fields"]
+            },
+            "then": {"properties": {"requested_limits": {"type": "null"}}},
+            "else": {"properties": {"requested_limits": {"type": "object"}}},
+            "description": "requested_limits 只有在缺失清单中列出时才可为 null，否则必须是完整对象。"
           }
         ]
       }
@@ -1154,37 +1234,58 @@
       },
       "then": {
         "properties": {
+          "record_completeness": {"properties": {"completeness": {"const": "pre_execution_incomplete"}}},
           "accountable_owner": {
             "oneOf": [
               {"properties": {"resolution": {"const": "server_resolved"}, "principal_id": {"type": "string"}}},
               {"properties": {"resolution": {"const": "pending"}, "principal_id": {"const": null}}}
             ]
           }
-        }
-      },
-      "else": {
-        "properties": {
-          "execution_mode": {"enum": ["advisory", "governed_resource_access", "managed_execution", "undetermined"]}
-        }
+        },
+        "description": "needs_clarification 的 evaluated 记录与 awaiting_clarification 等价：允许缺字段，但必须标记 pre_execution_incomplete。"
       }
     },
     {
       "if": {
         "properties": {
           "envelope_kind": {"const": "record"},
-          "status": {"properties": {"state": {"enum": ["queued", "dispatched", "running", "verifying", "succeeded", "partial_success", "cancel_requested", "cancelled", "failed", "timed_out", "needs_human", "unknown", "awaiting_confirmation", "awaiting_approval"]}}, "required": ["state"]}
+          "status": {"properties": {"state": {"enum": ["queued", "dispatched", "running", "verifying", "succeeded", "partial_success", "timed_out", "unknown", "awaiting_confirmation", "awaiting_approval"]}}, "required": ["state"]}
         },
         "required": ["envelope_kind", "status"]
       },
       "then": {
         "properties": {
+          "record_completeness": {"properties": {"completeness": {"const": "complete"}}}
+        },
+        "description": "执行前等待门禁、执行中、执行后与对账状态必须是完整记录。"
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "envelope_kind": {"const": "record"},
+          "record_completeness": {"properties": {"completeness": {"const": "complete"}}, "required": ["completeness"]}
+        },
+        "required": ["envelope_kind", "record_completeness"]
+      },
+      "then": {
+        "properties": {
+          "goal": {"type": "object"},
+          "accountable_owner": {
+            "properties": {
+              "resolution": {"const": "server_resolved"},
+              "principal_id": {"type": "string"},
+              "account_status": {"const": "active"}
+            }
+          },
           "execution_mode": {"enum": ["advisory", "governed_resource_access", "managed_execution"]},
           "resource_scope": {
             "properties": {
               "scope_type": {"enum": ["none", "self", "department", "company", "approval_chain", "project", "record_set", "connector"]}
             }
           }
-        }
+        },
+        "description": "complete 记录必须资料齐全：结构化目标、已解析责任人、已确定执行模式与资源范围。"
       }
     },
     {
@@ -1268,28 +1369,26 @@
       "if": {
         "properties": {
           "envelope_kind": {"const": "record"},
-          "status": {"properties": {"state": {"enum": ["draft", "evaluated", "awaiting_clarification", "denied"]}}, "required": ["state"]}
+          "record_completeness": {"properties": {"completeness": {"const": "pre_execution_incomplete"}}, "required": ["completeness"]}
         },
-        "required": ["envelope_kind", "status"]
+        "required": ["envelope_kind", "record_completeness"]
       },
       "then": {
         "properties": {
-          "accountable_owner": {
-            "if": {"properties": {"resolution": {"const": "pending"}}, "required": ["resolution"]},
-            "then": {"properties": {"principal_id": {"const": null}}}
-          }
-        }
-      },
-      "else": {
-        "properties": {
-          "accountable_owner": {
+          "status": {
             "properties": {
-              "resolution": {"const": "server_resolved"},
-              "principal_id": {"type": "string"},
-              "account_status": {"const": "active"}
+              "state": {"enum": ["cancel_requested", "draft", "evaluated", "awaiting_clarification", "denied", "cancelled", "needs_human", "failed"]},
+              "attempt": {"const": 0}
+            }
+          },
+          "linkage": {
+            "properties": {
+              "grant_id": {"const": null},
+              "grant_status": {"const": null}
             }
           }
-        }
+        },
+        "description": "pre_execution_incomplete 只允许出现在执行前状态（draft/awaiting_clarification、decision_type=needs_clarification 的 evaluated、执行前的 cancel_requested，以及执行前退出的 denied/cancelled/needs_human/failed），且不得关联任何 Grant；attempt 必须为 0。"
       }
     },
     {
@@ -1377,7 +1476,7 @@
       "if": {
         "properties": {
           "envelope_kind": {"const": "record"},
-          "status": {"properties": {"state": {"enum": ["running", "verifying", "succeeded", "partial_success", "failed", "timed_out"]}}, "required": ["state"]}
+          "status": {"properties": {"state": {"enum": ["running", "verifying", "succeeded", "partial_success"]}}, "required": ["state"]}
         },
         "required": ["envelope_kind", "status"]
       },
@@ -1478,10 +1577,13 @@
         "properties": {
           "result": {
             "properties": {
-              "outcome": {"const": "failed"}
+              "outcome": {"const": "failed"},
+              "evidence_refs": {"minItems": 1},
+              "stop_confirmed": {"const": true}
             }
           }
-        }
+        },
+        "description": "failed 是尝试终态：必须有失败/停止证据，且停止已确认（无法确认停止时必须停留在 unknown）。"
       }
     },
     {
@@ -1496,10 +1598,12 @@
         "properties": {
           "result": {
             "properties": {
-              "stop_confirmed": {"const": true}
+              "stop_confirmed": {"const": true},
+              "evidence_refs": {"minItems": 1}
             }
           }
-        }
+        },
+        "description": "cancelled/timed_out 必须有停止证据与至少一条 evidence_ref；从未 dispatch 的任务以“确认未开始”作为停止证据。"
       }
     },
     {
@@ -1595,7 +1699,18 @@
                   "then": {"properties": {"confirmed_by_principal_id": {"type": "string"}, "satisfied_at": {"type": "string"}, "consumed_at": {"type": "string"}, "consumed_by_call_id": {"type": "string"}}}
                 },
                 {
-                  "if": {"properties": {"status": {"enum": ["expired", "rejected"]}}, "required": ["status"]},
+                  "if": {"properties": {"status": {"const": "rejected"}}, "required": ["status"]},
+                  "then": {
+                    "properties": {
+                      "satisfied_at": {"const": null},
+                      "consumed_at": {"const": null},
+                      "consumed_by_call_id": {"const": null}
+                    }
+                  },
+                  "description": "被拒绝的确认从未生效：satisfied_at 必须为 null。"
+                },
+                {
+                  "if": {"properties": {"status": {"const": "expired"}}, "required": ["status"]},
                   "then": {"properties": {"consumed_at": {"const": null}, "consumed_by_call_id": {"const": null}}}
                 }
               ]
@@ -1613,8 +1728,19 @@
                   "then": {"properties": {"decided_at": {"type": "string"}, "expires_at": {"type": "string"}, "separation_check": {"const": "passed"}}}
                 },
                 {
-                  "if": {"properties": {"decision": {"enum": ["rejected", "expired", "revoked"]}}, "required": ["decision"]},
+                  "if": {"properties": {"decision": {"const": "rejected"}}, "required": ["decision"]},
                   "then": {"properties": {"decided_at": {"type": "string"}}}
+                },
+                {
+                  "if": {"properties": {"decision": {"enum": ["expired", "revoked"]}}, "required": ["decision"]},
+                  "then": {
+                    "properties": {
+                      "decided_at": {"type": "string"},
+                      "expires_at": {"type": "string"},
+                      "separation_check": {"const": "passed"}
+                    }
+                  },
+                  "description": "过期或撤销只能作用于已通过职责分离的批准；分离检查失败的审批只能停留在 rejected。"
                 }
               ]
             }
@@ -1722,8 +1848,169 @@
       },
       "then": {
         "properties": {
-          "status": {"properties": {"state": {"enum": ["draft", "evaluated", "awaiting_clarification"]}}}
+          "record_completeness": {"properties": {"completeness": {"const": "pre_execution_incomplete"}}}
+        },
+        "description": "goal=null 只能出现在 pre_execution_incomplete 记录中。"
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "envelope_kind": {"const": "record"},
+          "status": {"properties": {"state": {"enum": ["draft", "awaiting_clarification"]}}, "required": ["state"]}
+        },
+        "required": ["envelope_kind", "status"]
+      },
+      "then": {
+        "properties": {
+          "record_completeness": {"properties": {"completeness": {"const": "pre_execution_incomplete"}}}
+        },
+        "description": "draft 与 awaiting_clarification 必须是 pre_execution_incomplete，并带 incomplete_reason。"
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "envelope_kind": {"const": "record"},
+          "status": {"properties": {"attempt": {"minimum": 1}}, "required": ["attempt"]}
+        },
+        "required": ["envelope_kind", "status"]
+      },
+      "then": {
+        "properties": {
+          "record_completeness": {"properties": {"completeness": {"const": "complete"}}}
+        },
+        "description": "一旦开始执行（attempt>=1），记录必须是完整记录。"
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "envelope_kind": {"const": "record"},
+          "status": {"properties": {"state": {"const": "draft"}}, "required": ["state"]}
+        },
+        "required": ["envelope_kind", "status"]
+      },
+      "then": {
+        "properties": {
+          "decision": {"const": null},
+          "linkage": {"properties": {"grant_id": {"const": null}, "grant_status": {"const": null}}}
+        },
+        "description": "draft 没有任何决策或 Grant。"
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "envelope_kind": {"const": "record"},
+          "status": {"properties": {"state": {"const": "evaluated"}}, "required": ["state"]}
+        },
+        "required": ["envelope_kind", "status"]
+      },
+      "then": {
+        "properties": {
+          "decision": {"type": "object"}
+        },
+        "description": "evaluated 必须携带 PDP 决策；没有决策的记录只能停留在 draft。"
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "envelope_kind": {"const": "record"},
+          "status": {"properties": {"state": {"enum": ["succeeded", "partial_success", "failed", "cancelled", "timed_out", "denied", "unknown"]}}, "required": ["state"]}
+        },
+        "required": ["envelope_kind", "status"]
+      },
+      "then": {
+        "properties": {
+          "linkage": {
+            "if": {"properties": {"grant_id": {"type": "string"}}, "required": ["grant_id"]},
+            "then": {"properties": {"grant_status": {"enum": ["revoked", "consumed"]}}}
+          }
+        },
+        "description": "任何任务终态或 unknown 都不得保留可用 Grant：有 grant_id 时 grant_status 必须是 revoked 或 consumed（撤销原因 attempt_failed/task_terminal）；PEP 还必须按当前任务状态复核。"
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "envelope_kind": {"const": "record"},
+          "status": {"properties": {"state": {"const": "denied"}}, "required": ["state"]}
+        },
+        "required": ["envelope_kind", "status"]
+      },
+      "then": {
+        "properties": {
+          "result": {"properties": {"outcome": {"enum": ["none", "needs_human", "unknown", "failed"]}}}
+        },
+        "description": "denied 不得携带成功结果。"
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "envelope_kind": {"const": "record"},
+          "status": {"properties": {"state": {"const": "unknown"}}, "required": ["state"]}
+        },
+        "required": ["envelope_kind", "status"]
+      },
+      "then": {
+        "properties": {
+          "result": {"properties": {"outcome": {"const": "unknown"}}}
+        },
+        "description": "unknown 只能报告 unknown 结果，不得猜测成功或失败。"
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "envelope_kind": {"const": "record"},
+          "status": {"properties": {"state": {"const": "verifying"}}, "required": ["state"]}
+        },
+        "required": ["envelope_kind", "status"]
+      },
+      "then": {
+        "properties": {
+          "result": {"properties": {"outcome": {"enum": ["succeeded", "partial_success", "failed", "needs_human", "unknown"]}}}
         }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "envelope_kind": {"const": "record"},
+          "status": {"properties": {"state": {"const": "cancel_requested"}}, "required": ["state"]}
+        },
+        "required": ["envelope_kind", "status"]
+      },
+      "then": {
+        "properties": {
+          "result": {"properties": {"outcome": {"enum": ["none", "succeeded", "partial_success", "failed", "needs_human", "unknown"]}}}
+        },
+        "description": "cancel_requested 不得声明已取消或已超时：停止尚未确认。"
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "envelope_kind": {"const": "record"},
+          "status": {"properties": {"state": {"const": "succeeded"}}, "required": ["state"]},
+          "approvals": {"minItems": 1}
+        },
+        "required": ["envelope_kind", "status", "approvals"]
+      },
+      "then": {
+        "properties": {
+          "approver": {
+            "properties": {
+              "resolution": {"const": "server_resolved"},
+              "principal_id": {"type": "string"},
+              "account_status": {"const": "active"}
+            }
+          }
+        },
+        "description": "带审批的成功任务必须记录已解析的审批主体。"
       }
     }
   ]
