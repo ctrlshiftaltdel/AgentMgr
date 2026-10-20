@@ -1,9 +1,9 @@
 {
   "schema_version": "1.0.0",
   "envelope_kind": "record",
-  "task_id": "task_expense_0002",
-  "idempotency_key": "idem_expense_0002",
-  "client_task_ref": "cref_client_0002",
+  "task_id": "task_expense_0001",
+  "idempotency_key": "idem_expense_0001",
+  "client_task_ref": "cref_client_0001",
   "requester": {
     "principal_id": "prin_user_0001",
     "principal_type": "person",

@@ -186,6 +186,6 @@
   },
   "labels": {
     "fixture": "synthetic",
-    "path": "micro-fix item5: failed with attempt=0 is schema-invalid without a revoked/consumed grant_id; the F39/S-15 server vector is in task-state-machine.md §19.1"
+    "path": "F39/S-15: attempt=0 failed without revoked/consumed grant_id; schema-invalid by design"
   }
 }

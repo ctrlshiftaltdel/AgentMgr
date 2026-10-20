@@ -1273,7 +1273,8 @@
           "decision_revision": {"minimum": 2},
           "supersedes_decision_id": {"type": "string"}
         },
-        "description": "retry 决策必须是新评估（revision>=2）并明确替代旧决策；不得把 revision=1 或未替代任何决策的记录当作重试授权。"
+        "required": ["supersedes_decision_id"],
+        "description": "retry 决策必须是新评估（revision>=2）并明确替代旧决策；supersedes_decision_id 为必填且必须指向被替代的旧决策，不得把 revision=1 或未替代任何决策的记录当作重试授权。"
       }
     },
     {

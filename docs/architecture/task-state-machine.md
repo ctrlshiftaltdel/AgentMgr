@@ -230,7 +230,7 @@ T66–T69 与 Adapter 提交结果一一对应：`rejected → T66`、`unsupport
 | T30 | `dispatched` → `failed` | `execution.failed` | 执行边界明确失败且确认已停止；记录错误码；无未对账副作用 |
 | T31 | `dispatched` → `unknown` | `execution.lost` | 查询超阈值或状态矛盾；进入对账，不得重发 |
 | T32 | `dispatched` → `cancel_requested` | `task.cancel_requested` | 取消请求已登记；未确认停止 |
-| T33 | `dispatched` → `queued` | `worker.lease_expired` | 查询确认执行边界未受理、无副作用；幂等键已记录；**本次受理作废**：`attempt` 回退 1（该次受理从未开始执行，回到受理前的值），`retry_budget_remaining` 不递减，原 Grant 保持有效（其 `attempt.number` 仍等于回退后的 `attempt + 1`）。`attempt` 回退只允许发生在 T33，且必须记录作废事件与证据 |
+| T33 | `dispatched` → `queued` | `worker.lease_expired` | 查询确认执行边界未受理、无副作用；幂等键已记录；**本次受理作废**：`attempt` 回退 1（该次受理从未开始执行，回到受理前的值），`retry_budget_remaining` 不递减，原 Grant 保持有效（其 `attempt.number` 仍等于回退后的 `attempt + 1`）。`attempt` 回退只允许发生在 T33，且必须记录作废事件与证据。回退后 `attempt>=1` 时仍须保留更早尝试的停止证据（即 `result.stop_confirmed=true`）；只有回退到 0 时才不需要停止证据 |
 | T34 | `dispatched` → `timed_out` | `dispatch.deadline_exceeded` | 提交窗口截止，且查询明确无执行任务/无副作用；否则走 T31 |
 | T35 | `dispatched` → `needs_human` | `human.escalation_required` | 能力不支持或受理结果互相矛盾，无法自动判定 |
 
@@ -288,14 +288,14 @@ T66–T69 与 Adapter 提交结果一一对应：`rejected → T66`、`unsupport
 
 | ID | From → To | 事件 | 守卫 |
 |---|---|---|---|
-| T59 | `needs_human` → `running` | `human.takeover.running` | 人工确认任务确实在运行；**仅当当前 Grant 仍为 `active`，或已由本尝试消费（`consumed`），且执行证据证明同一尝试仍在运行时可用**；来自 `unknown` 的 `needs_human`（Grant 已 `revoked`）不得走 T59（F41）。记录操作者与证据；不新增能力 |
-| T60 | `needs_human` → `verifying` | `human.result_submitted` | 人工提交结构化结果与证据；**仅当该尝试已结束且 Grant 为 `active`/本尝试 `consumed` 时可用**；来自 `unknown` 的 `needs_human`（Grant 已 `revoked`）不得走 T60（F41）。仍需走验证，不得直接成功 |
+| T59 | `needs_human` → `running` | `human.takeover.running` | 人工确认任务确实在运行；**仅当 `attempt>=1` 且当前 Grant 仍为 `active`，或已由本尝试消费（`consumed`），且执行证据证明同一尝试仍在运行时可用**；来自 `unknown`（T57/T72/T73）的 Grant 已 `revoked`，来自 `failed`（T70）的尝试已处于尝试终态；两者都**不得走 T59（F41）**。记录操作者与证据；不新增能力 |
+| T60 | `needs_human` → `verifying` | `human.result_submitted` | 人工提交结构化结果与证据；**仅当 `attempt>=1`、该尝试刚结束待验证且 Grant 为 `active`/本尝试 `consumed` 时可用**；来自 `unknown`（T57/T72/T73）的 Grant 已 `revoked`，来自 `failed`（T70）的尝试已是尝试终态；两者都**不得走 T60（F41）**。仍需走验证，不得直接成功 |
 | T61 | `needs_human` → `queued` | `human.redispatch` | 已决定重派；**不得存在未对账的 active attempt**：要么 `stop_confirmed=true`（已关闭该尝试），要么 `attempt=0` 且能证明从未 `dispatch.accepted`（从未开始）。`attempt>=1` 且无停止证据时 T61 禁止。**必须重新执行 PDP 并签发新决策与新 Grant**（新 `decision_id`/`grant_id`，`decision_revision` 递增；旧 Grant 不得复用）；`task_revision`、确认、审批全部重验；`retry_budget_remaining > 0`（T61 不执行 T65 的自动递减）；无未对账副作用 |
-| T62 | `needs_human` → `denied` | `human.authorization_revoked` | 人工/策略撤销授权；记录原因码与审计 |
+| T62 | `needs_human` → `denied` | `human.authorization_revoked` | 人工/策略撤销授权；记录原因码与审计；**不得存在未对账的 active attempt**：必须 `result.stop_confirmed=true`（已关闭该尝试）或 `attempt=0`（从未 `dispatch.accepted`）。`attempt>=1` 且无停止证据时 T62 禁止（Schema 已拒绝 `denied` + `attempt>=1` + `stop_confirmed=false`，见 S-20） |
 | T63 | `needs_human` → `cancelled` | `human.stop_confirmed` | 人工确认已停止且无新副作用；`stop_confirmed=true`；这是关闭仍打开尝试的人工路径 |
 | T64 | `needs_human` → `failed` | `human.declared_failed` | 人工判定失败且不再重试；记录证据；**要求 `attempt>=1`**。`attempt=0` 的人工失败不得进入 `failed`，只能登记为 `cancelled`（T63）或 `denied`（T62），避免 T64/T70 的空转循环 |
 
-**`needs_human` 的可达性按进入来源区分。** T40/T45/T52/T35/T26/T10/T14/T18/T22/T69 在任务仍有有效授权或从未执行时保留 T59/T60 的可能；但 **T57/T72/T73（来自 `unknown`）进入的 `needs_human` 一定带有已 `revoked` 的 Grant**：`running`/`verifying` 均要求 Grant 为 `active` 或本尝试 `consumed`，因此 **T59/T60 对该来源不可达，禁止实现（F41）**。这类记录只能：T61（必须已有停止证据或从未开始 + 新决策/新 Grant）、T62、T63、T64、T70。T73 本身仍可达（`unknown → needs_human`），但它的结果不得直接进入验证或执行。
+**`needs_human` 的可达性与出口按进入来源区分。** T59/T60 只在 `attempt>=1` 且当前 Grant 为 `active` 或由本尝试 `consumed` 时可用，并分别需要“同一尝试仍在运行”/“该尝试刚结束待验证”的执行证据：T40/T45/T52/T35 进入的 `needs_human` 保留 T59 或 T60 的可能（按证据二选一）。T10/T14/T18/T22/T26/T69 是 `attempt=0` 的执行前/预派发来源，没有可接管的运行尝试，T59/T60 不可用。**T57/T72/T73（来自 `unknown`）的 Grant 已 `revoked`（T72 时尝试可能仍在运行），不满足 T59/T60 的 `active`/本尝试 `consumed` 条件，禁止实现（F41）。T70（来自 `failed`）的尝试已处于尝试终态且 Grant 已失效：T59 要求同一尝试仍在运行、T60 要求该尝试刚结束待验证，两者都不成立，同样禁止（F41）。** `needs_human` 的可执行出口是 **T61**（停止证据或 `attempt=0` + 新决策/新 Grant）、**T62**（同样要求 `stop_confirmed=true` 或 `attempt=0`）、**T63**、**T64**。**T70 不是 `needs_human` 的出边**：它是 `failed → needs_human` 的入边（预派发失败或重试耗尽后转人工），列在 §6.14；把 T64（`needs_human → failed`）后再经 T70 回到 `needs_human` 视为 T64/T70 循环，不得作为退出路径。T73 本身仍可达（`unknown → needs_human`），但它的结果不得直接进入验证或执行。
 
 ### 6.14 从 `failed`
 
@@ -354,7 +354,7 @@ T66–T69 与 Adapter 提交结果一一对应：`rejected → T66`、`unsupport
 | F38 | `unknown` → `verifying`（原 T54） | **R1**：对账结果不得绕过停止确认与重新授权直接进入验证；经 T73 转人工裁决 |
 | F39 | `attempt=0` 的人工“失败”经 `human.declared_failed` 进入 `failed` 后再走 T64/T70 循环 | **R3**：从未开始执行的失败必须登记为 `cancelled`/`denied`；`failed` 需要已开始的尝试或预派发失败事件 |
 | F40 | 将被 `revoked` 的 Grant 改回 `active`、复活或复用于 T71/T65 | Grant 撤销是终态；恢复必须签发新 `grant_id` + 新决策 |
-| F41 | 由 `unknown` 进入的 `needs_human`（Grant 已 `revoked`）经 T59/T60 恢复 `running`/`verifying` | T61：撤销后的 Grant 不得授权执行或验证；该来源只能 T61/T62/T63/T64/T70，且 T61 仍需停止证据与全新授权 |
+| F41 | 由 `unknown`（T57/T72/T73）或 `failed`（T70）进入的 `needs_human` 经 T59/T60 恢复 `running`/`verifying` | 撤销后的 Grant 不得授权执行或验证，且 T70 来源的尝试已是尝试终态；`unknown` 来源只能 T61/T62/T63/T64（T70 不是 `needs_human` 的出边），T61 仍需停止证据与全新授权 |
 
 ## 8. 确认与审批生命周期
 
@@ -451,7 +451,7 @@ T66–T69 与 Adapter 提交结果一一对应：`rejected → T66`、`unsupport
 4. **可执行恢复路径（都必须重新授权）：**
    - **(a) `reconcile.not_found` → `queued`（T71）**：仅当 `attempt=0`（从未 `dispatch.accepted`）。有界查询窗口结束时，执行边界按幂等键**显式保证从未受理且无副作用**（`no_side_effect` 证据，含查询次数、窗口起止、边界标识）；核心必须重新执行 PDP、签发新决策与新 Grant（新 `decision_id`/`grant_id`），旧 Grant 必须已 `revoked`/`consumed`/`expired`。缺少无副作用证据或 `attempt>=1` 时不得走本路径。重复的重新入队受对账窗口与队列 SLA 约束，超限转 T57，不得无限循环。
    - **(b) `reconcile.failed` → `failed`（T55）→ T65**：`attempt>=1` 时先进入 `failed`（尝试终态），再由 T65 在有界预算内重新评估并签发新决策/新 Grant；`attempt=0` 时只能 T70 转人工。
-   - **(c) 对账取得结果（`reconcile.completed`，T73）或仍在运行（`reconcile.running`，T72）→ `needs_human`**：不得直接进入 `verifying`/`succeeded`；由人工裁决是否新建任务、重新授权或补证。该来源的 Grant 已 `revoked`，因此 T59/T60 不可用（F41）；若仍需继续，只能先取得 `stop_confirmed=true`（或证明从未开始）再走 T61 的新决策/新 Grant，或 T62/T63/T64/T70 终止。
+   - **(c) 对账取得结果（`reconcile.completed`，T73）或仍在运行（`reconcile.running`，T72）→ `needs_human`**：不得直接进入 `verifying`/`succeeded`；由人工裁决是否新建任务、重新授权或补证。该来源的 Grant 已 `revoked`，因此 T59/T60 不可用（F41）；若仍需继续，只能先取得 `stop_confirmed=true`（或证明从未开始）再走 T61 的新决策/新 Grant，或 T62/T63/T64 终止（T70 不是 `needs_human` 的出边，见 §6.13）。
    - **(d) `reconcile.stopped` → `cancelled`（T56）、`reconcile.timed_out` → `timed_out`（T58）、`reconcile.unresolved` → `needs_human`（T57）**：终止或人工接管，不再执行。
    禁止把 `not_found` 直接视为可入队或可重派；T71 与 T65 的前置条件一致（新决策 + 新 Grant + 无未对账副作用）。
 5. 状态查询超时/心跳丢失 → `unknown`；按退避策略对账（次数与总时长有上限）。
@@ -472,9 +472,9 @@ T66–T69 与 Adapter 提交结果一一对应：`rejected → T66`、`unsupport
 - **`attempt` 的定义。** `attempt` 是**已开始的执行尝试次数**：首次 `queued` 为 0，只在 `dispatch.accepted`（T23）递增。`dispatched`/`running`/`verifying`/`succeeded`/`partial_success` 必须 `attempt>=1`；`failed`/`cancelled`/`timed_out` 可因从未开始而为 0。
 - **尝试何时打开、何时关闭。** 尝试在 `dispatch.accepted` 打开；只有在取得关闭证据时关闭（`execution.stopped`/`execution.failed`/`execution.timed_out` 且 `stop_confirmed=true`，或 `reconcile.stopped`/`failed`/`timed_out`/`not_found`，或 `verifying` 中的 `verification.failed`）。`unknown`、`needs_human`、`cancel_requested` 都**不关闭**尝试；进入 `unknown` 只撤销 Grant。未关闭且无 `not_found` 无副作用证据的尝试称为**未对账的 active attempt**：它阻止 T61，直到取得 `stop_confirmed=true` 或证明该次执行从未开始。
 - **`needs_human → queued`（T61）的额外守卫。** T61 要求：`attempt=0`（从未 `dispatch.accepted`，即证明从未开始），或 `attempt>=1` 且 `result.stop_confirmed=true`（尝试已关闭）；不得存在未对账的 active attempt。T61 必须重新执行 PDP、签发新决策与新 Grant，`retry_budget_remaining>0`，但不执行 T65 的自动递减。T59/T60 对来自 `unknown` 的 `needs_human` 不可达（F41）。
-- **预派发失败不消耗重试预算。** `queued → failed`（T28/T66）不消耗 `retry_budget_remaining`，且 `attempt=0` 的 `failed` 只能经 T70 转人工。`dispatched → queued`（T33）作废一次从未开始执行的受理：`attempt` 回退 1、预算不变、原 Grant 继续有效；这是唯一允许 `attempt` 回退的转换，且必须有作废证据。
+- **预派发失败不消耗重试预算。** `queued → failed`（T28/T66）不消耗 `retry_budget_remaining`，且 `attempt=0` 的 `failed` 只能经 T70 转人工。`dispatched → queued`（T33）作废一次从未开始执行的受理：`attempt` 回退 1、预算不变、原 Grant 继续有效；回退后 `attempt>=1` 时仍须保留更早尝试的停止证据（`result.stop_confirmed=true`），回退到 0 时不需要。这是唯一允许 `attempt` 回退的转换，且必须有作废证据。
 - **`failed` 只在有界条件下经 T65 重试。** 必须 `attempt>=1` 且 `attempt < max_attempts` 且 `retry_budget_remaining>0`（**递减前**）；**进入 T65 时递减 `retry_budget_remaining`（减 1）**，递减后的余额可为 0（最后一次允许的重试）。`attempt=0` 的失败不得走 T65。`denied`、`cancelled`、`timed_out`、`partial_success` 不得自动重试。`unknown` 必须先经 T71 或 T55 才能重新进入队列。
-- **重试必须有新决策与新 Grant。** `decision_revision` 递增且 >=2、PDP 决策 `decision_purpose=retry`（并写入 Grant 的 `decision.decision_purpose`）；不得复用旧决策或旧 Grant。Grant 的 `attempt.retry_decision_id` 必须指向该新决策，`attempt.number = status.attempt + 1`，`retry_of_attempt = status.attempt`，`attempt.retry_budget_remaining` 是 T65 递减后的余额。
+- **重试必须有新决策与新 Grant。** `decision_revision` 递增且 >=2、PDP 决策 `decision_purpose=retry`（并写入 Grant 的 `decision.decision_purpose`）、`supersedes_decision_id` 必填并指向被替代的旧决策；不得复用旧决策或旧 Grant。Grant 的 `attempt.retry_decision_id` 必须指向该新决策，`attempt.number = status.attempt + 1`，`retry_of_attempt = status.attempt`，`attempt.retry_budget_remaining` 是 T65 递减后的余额。
 - **`attempt.number>=2` 与 `is_retry=true` 必须同时成立**；`is_retry=true` 必须 `retry_decision_id` 非空；`retry_budget_remaining` 是授权后的余额，允许为 0（最后一次重试）。同时检查 `max_attempts`；耗尽时走 T70（`attempt.number<=max_attempts` 由服务端比较）。
 - **人工在 `attempt=0` 宣告失败**必须登记为 `cancelled`（T63）或 `denied`（T62），不得进入 `failed` 后再走 T64/T70 循环。
 - 重试不得扩大 capability、resource scope、TTL 或预算；确认/审批必须按新 payload 重新检查。
@@ -490,6 +490,7 @@ T66–T69 与 Adapter 提交结果一一对应：`rejected → T66`、`unsupport
 - 人工停止仍需停止证据；无法确认时保持 `unknown`/`needs_human`。
 - 人工重派（T61）必须重新评估，不能复用人工判断作为授权；必须已有停止证据或证明从未开始，且不得存在未对账的 active attempt。
 - 人工不能通过 T59/T60 把 `unknown` 来源的 `needs_human` 直接恢复执行或验证：其 Grant 已撤销（F41），只能重新授权（T61）或终止。
+- 人工撤销授权（T62）同样必须先关闭仍打开的尝试：`attempt>=1` 时要求 `stop_confirmed=true`，或 `attempt=0` 证明从未开始；未取得停止证据时只能保持 `needs_human` 并继续对账（S-20）。
 
 ## 15. 完成定义、结果与证据
 
@@ -502,6 +503,7 @@ T66–T69 与 Adapter 提交结果一一对应：`rejected → T66`、`unsupport
   - **提交/执行失败**（T28/T30/T37/T55/T66/T64）：`verification.result` 保持 `pending`（或 `inconclusive`），**不得**伪造成 `failed`；表示没有可验证结果。
   - 两条路径都要求 `result.evidence_refs` 至少一条，且 `stop_confirmed=true`。无法确认停止时必须停留在 `unknown`（或 `needs_human`），不得声明 `failed`。
 - `cancelled` 与 `timed_out` 要求 `stop_confirmed=true` 与至少一条停止证据；从未 dispatch 的 `cancelled` 以“确认未开始”作为停止证据（`stop_confirmed=true` 表示确认未开始执行）。
+- `denied` 且 `attempt>=1`（T62，从 `needs_human` 撤销授权）同样要求 `result.stop_confirmed=true` 与至少一条停止证据；`attempt=0` 的执行前拒绝不需要停止证据。Schema 直接拒绝 `denied` + `attempt>=1` + `stop_confirmed=false`，S-20 另行断言不存在未对账的 active attempt。
 - 运行时或客户端的 `succeeded` 只是输入；核心验证器必须独立重算完成条件，不得直接复制运行时结论。
 
 ## 16. 规范化与哈希（RFC 8785 JCS）
@@ -596,9 +598,9 @@ P2 sha256:    sha256:1decdbfffaafb454911d751efd460c23afe6e3cab47230c2d567211c993
 ## 18. 验收要点
 
 - 每个状态至少有一个允许入边和一个允许出边（终态除外）。
-- 72 条有效允许转换（T00–T73，其中 T53/T54 已撤销）必须各有事件、守卫和测试用例；F01–F41 必须各有拒绝用例。
+- 72 条有效允许转换（T00–T73，其中 T53/T54 已撤销）必须各有事件、守卫和测试用例；F01–F41 必须各有拒绝用例（F41 的拒绝用例见 §19.1 V3）。
 - 每条负向测试必须断言“状态未变 + 安全事件已记录”，而不仅是返回错误。
-- 状态机测试必须覆盖并发 revision、重复事件、取消竞态、提交超时、幂等重取、对账恢复（T55–T58、T71–T73，含撤销 Grant 后禁止 running/verifying）、三种模式的能力守卫、重试新决策与新 Grant、attempt 记账（首次 queued=0、T65 递减预算且最后一次重试余额为 0、attempt=0 不走 T65）、T61 停止证据与未对账 active attempt、Owner 停用升级（终态可带 disabled Owner + `owner_escalation`）、终态 Grant 失效。
+- 状态机测试必须覆盖并发 revision、重复事件、取消竞态、提交超时、幂等重取、对账恢复（T55–T58、T71–T73，含撤销 Grant 后禁止 running/verifying）、三种模式的能力守卫、重试新决策与新 Grant（`supersedes_decision_id` 必填）、attempt 记账（首次 queued=0、T65 递减预算且最后一次重试余额为 0、attempt=0 不走 T65）、T61/T62 停止证据与未对账 active attempt、Owner 停用升级（终态可带 disabled Owner + `owner_escalation`）、终态 Grant 失效。
 - 未实现的转换不得注册为可调用 API；不得用文档承诺替代测试。
 
 ## 19. 服务端强制断言矩阵（Schema 无法表达）
@@ -626,14 +628,15 @@ JSON Schema 只能校验单实例结构与格式。下表断言必须在服务�
 | S-17 | 闰年/闰秒与 RFC 3339 合法性由服务端复核（`2026-02-29` 能通过正则）；`format` 未启用时不得把结构校验当作日期合法证明 | §16.1、TH-26 |
 | S-18 | `queued`/`dispatched`/`running`/`verifying`/`awaiting_confirmation`/`awaiting_approval` 的 Owner 必须已解析且 active，且不得带 `owner_escalation`；终态/历史记录（含 `succeeded`/`partial_success`）的 disabled/unbound/unknown Owner 必须带完整 `owner_escalation`；`awaiting_clarification` 按 A1 可暂未解析 | R4、TH-02、TH-22 |
 | S-19 | T61 必须满足：`attempt=0`（从未 `dispatch.accepted`）或 `result.stop_confirmed=true`；不得存在未对账的 active attempt（无关闭证据）；并携带新决策与新 `grant_id`、`retry_budget_remaining>0`。不满足即拒绝入队 | T61、F41、TH-02/TH-26 |
+| S-20 | T62 必须满足：`attempt=0`（从未 `dispatch.accepted`）或 `result.stop_confirmed=true` 且至少一条停止证据；不得存在未对账的 active attempt。`denied` 且 `attempt>=1` 时 `stop_confirmed=false` 由 Schema 直接拒绝；跨对象部分（停止证据是否真实关闭该尝试）由本断言拒绝 | T62、§13、§15 |
 
 ### 19.1 服务端断言测试向量（完整记录，Schema-valid，必须被服务端断言拒绝）
 
-以下两个向量都是**完整的 `task-envelope` 记录**（含全部必填字段），可以通过 JSON Schema 2020-12 校验；它们必须被服务端断言 S-01/S-14 与 S-15/F39 拒绝。它们**不得**放入 `fixtures/invalid/`：该目录的约定是“Schema 可判定为非法”，而这两个向量只能由服务端跨字段/跨对象比较发现。两个向量的结构合法性由契约包校验器逐条确认（见 PR 验证证据）。
+以下三个向量都是**完整的 `task-envelope` 记录**（含全部必填字段），可以通过 JSON Schema 2020-12 校验；它们必须被服务端断言 **S-01**、**S-15/F39** 与 **F41** 拒绝。它们**不得**放入 `fixtures/invalid/`：该目录的约定是“Schema 可判定为非法”，而这些向量只能由服务端跨字段/跨对象比较或状态转换检查发现。三个向量的结构合法性由契约包校验器逐条确认（见 PR 验证证据）。
 
-#### V1 — owner == 实际审批人（S-01/S-14，`queued`）
+#### V1 — owner == 实际审批人（S-01，`queued`）
 
-`accountable_owner`、任务级 `approver` 与 `approvals[]` 的实际 `approver_principal_id` 都是 `prin_owner_0001`；Grant `grnt_self_0001` 的 `approval_ref.approval_id` 必须指向 `appr_self_0001`。Schema 允许该结构（字段类型与取值都合法），但 S-01/S-14 必须 fail closed：不写 `queued`、不签发/不放行 Grant、记录 `self_approval_forbidden` 安全事件，任务保持 `awaiting_approval` 或转 `denied`。
+`accountable_owner`、任务级 `approver` 与 `approvals[]` 的实际 `approver_principal_id` 都是 `prin_owner_0001`；Grant `grnt_self_0001` 的 `approval_ref.approval_id` 必须指向 `appr_self_0001`。Schema 允许该结构（字段类型与取值都合法），但 **S-01** 必须 fail closed：不写 `queued`、不签发/不放行 Grant、记录 `self_approval_forbidden` 安全事件，任务保持 `awaiting_approval` 或转 `denied`。该向量中任务级 `approver` 与实际审批人相同，因此 **S-14 通过**；S-14 的负向向量是本节末段的任务级/实际审批人不一致用例。
 
 ```json
 {
@@ -852,7 +855,7 @@ JSON Schema 只能校验单实例结构与格式。下表断言必须在服务�
   },
   "labels": {
     "fixture": "synthetic",
-    "path": "§19.1 S-01/S-14: owner == actual approver (schema-valid, server must reject)"
+    "path": "§19.1 S-01: owner == actual approver; S-14 passes because task-level approver equals actual approver"
   }
 }
 ```
@@ -1057,6 +1060,234 @@ JSON Schema 只能校验单实例结构与格式。下表断言必须在服务�
   "labels": {
     "fixture": "synthetic",
     "path": "§19.1 S-15/F39: attempt=0 human-declared failed with revoked grant (schema-valid, server must reject)"
+  }
+}
+```
+
+#### V3 — `unknown` 来源的 `needs_human` 禁止 T59/T60（F41，`needs_human`）
+
+该记录由 T73（`reconcile.completed`）或 T72（`reconcile.running`）进入 `needs_human`：`status.state=needs_human`、`status.attempt=1`、`status.last_event_id` 对应 `reconcile.completed`，Grant `grnt_expense_lost_0001` 已 `revoked`（`execution_evidence_lost`），`result.stop_confirmed=false`。Schema 允许该结构（`needs_human` 不要求停止证据，Grant 终态也已满足终态失效规则），但服务端必须拒绝把同一记录按 `human.takeover.running`（T59）映射为 `running` 或按 `human.result_submitted`（T60）映射为 `verifying`（F41）：Grant 已撤销，不能授权执行或验证。该来源只能先 `cancel_task` 取得 `stop_confirmed=true` 后走 T61 的新决策/新 Grant，或走 T62/T63/T64 终止；T70 是 `failed → needs_human` 的入边，不是本状态的出口。
+
+```json
+{
+  "schema_version": "1.0.0",
+  "envelope_kind": "record",
+  "task_id": "task_expense_0001",
+  "idempotency_key": "idem_expense_0001",
+  "client_task_ref": "cref_client_0001",
+  "requester": {
+    "principal_id": "prin_user_0001",
+    "principal_type": "person",
+    "resolution": "server_resolved",
+    "account_status": "active",
+    "identity_assurance": "verified_session",
+    "role_ids": [],
+    "department_id": "dept_finance_0001",
+    "service_identity_id": null,
+    "delegation_ref": null
+  },
+  "accountable_owner": {
+    "principal_id": "prin_owner_0001",
+    "principal_type": "person",
+    "resolution": "server_resolved",
+    "account_status": "active",
+    "identity_assurance": "verified_session",
+    "role_ids": [
+      "role_manager_0001"
+    ],
+    "department_id": "dept_finance_0001",
+    "service_identity_id": null,
+    "delegation_ref": null
+  },
+  "assignee": {
+    "principal_id": "prin_agent_0001",
+    "principal_type": "agent_instance",
+    "resolution": "server_resolved",
+    "account_status": "active",
+    "identity_assurance": "verified_session",
+    "role_ids": [],
+    "department_id": "dept_finance_0001",
+    "service_identity_id": null,
+    "delegation_ref": null
+  },
+  "executor": {
+    "principal_id": "prin_agent_0001",
+    "principal_type": "agent_instance",
+    "resolution": "server_resolved",
+    "account_status": "active",
+    "identity_assurance": "verified_session",
+    "role_ids": [],
+    "department_id": "dept_finance_0001",
+    "service_identity_id": null,
+    "delegation_ref": null
+  },
+  "approver": {
+    "principal_id": "prin_approver_0001",
+    "principal_type": "person",
+    "resolution": "server_resolved",
+    "account_status": "active",
+    "identity_assurance": "verified_session",
+    "role_ids": [
+      "role_manager_0001"
+    ],
+    "department_id": "dept_finance_0001",
+    "service_identity_id": null,
+    "delegation_ref": null
+  },
+  "delegations": [],
+  "goal": {
+    "summary": "Submit a synthetic expense report for review.",
+    "completion_criteria": [
+      {
+        "criterion_id": "crit_expense_state_0001",
+        "type": "business_state_equals",
+        "verifier": {
+          "verifier_id": "ver_expense_state_0001",
+          "version": "1.0.0"
+        },
+        "resource_ref": "res_expense_0001",
+        "expected": "submitted",
+        "evidence_ref": "evidence:expense_state_0001",
+        "evidence_hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+      }
+    ],
+    "required_inputs": [
+      "synthetic receipt reference"
+    ],
+    "out_of_scope": [
+      "No payment execution."
+    ]
+  },
+  "priority": {
+    "requested_level": "high",
+    "effective_level": "high",
+    "authority_effect": "scheduling_only",
+    "rationale": "Synthetic deadline."
+  },
+  "due_at": "2026-10-27T09:00:00Z",
+  "sla": {
+    "response_by": "2026-10-21T09:00:00Z",
+    "complete_by": "2026-10-27T09:00:00Z",
+    "escalation_after_minutes": 240
+  },
+  "execution_mode": "governed_resource_access",
+  "requested_capabilities": [
+    "expense.submit@1.0.0",
+    "expense.read@1.0.0"
+  ],
+  "resource_scope": {
+    "scope_type": "record_set",
+    "resource_ids": [
+      "res_expense_0001"
+    ],
+    "connector_ids": [
+      "conn_finance_0001"
+    ],
+    "data_classifications": [
+      "internal"
+    ],
+    "exclude_resource_ids": []
+  },
+  "policy_version": {
+    "policy_set_id": "polset_default_0001",
+    "version": "1.0.0",
+    "content_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "risk": {
+    "level": "medium",
+    "score": 40,
+    "source": "server_policy"
+  },
+  "requested_limits": {
+    "max_calls": 20,
+    "max_runtime_seconds": 600,
+    "max_cost_units": 0
+  },
+  "confirmations": [
+    {
+      "confirmation_id": "conf_expense_0001",
+      "payload_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "canonicalization": "rfc8785_jcs",
+      "purpose": "data_release",
+      "confirmed_by_principal_id": "prin_user_0001",
+      "status": "satisfied",
+      "satisfied_at": "2026-10-20T02:05:00Z",
+      "expires_at": "2026-10-20T02:30:00Z",
+      "consumed_at": null,
+      "consumed_by_call_id": null,
+      "single_use": true,
+      "channel_binding": {
+        "channel": "mcp",
+        "channel_identity_ref": "chan_user_session_0001"
+      },
+      "issued_at": "2026-10-20T02:03:00Z"
+    }
+  ],
+  "approvals": [
+    {
+      "approval_id": "appr_expense_0001",
+      "approver_principal_id": "prin_approver_0001",
+      "payload_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "canonicalization": "rfc8785_jcs",
+      "decision": "approved",
+      "separation_check": "passed",
+      "decided_at": "2026-10-20T02:10:00Z",
+      "expires_at": "2026-10-21T02:10:00Z"
+    }
+  ],
+  "limitations": [],
+  "result": {
+    "outcome": "unknown",
+    "result_ref": null,
+    "evidence_refs": [
+      "evidence:reconcile_completed_0001"
+    ],
+    "stop_confirmed": false,
+    "verification": {
+      "result": "pending",
+      "verifier_id": null,
+      "verified_at": null,
+      "evidence_refs": []
+    },
+    "completed_at": null
+  },
+  "timestamps": {
+    "created_at": "2026-10-20T01:55:00Z",
+    "updated_at": "2026-10-20T02:35:00Z",
+    "submitted_at": "2026-10-20T01:56:00Z",
+    "evaluated_at": "2026-10-20T02:00:00Z",
+    "last_event_at": "2026-10-20T02:35:00Z"
+  },
+  "status": {
+    "state": "needs_human",
+    "state_revision": 10,
+    "last_event_id": "evt_reconcile_completed_0001",
+    "attempt": 1,
+    "max_attempts": 3,
+    "retry_budget_remaining": 2
+  },
+  "linkage": {
+    "grant_id": "grnt_expense_lost_0001",
+    "grant_status": "revoked",
+    "runtime_task_id": null,
+    "execution_ref": "exec_governed_0001",
+    "parent_task_id": null,
+    "supersedes_task_id": null,
+    "correlation_id": "corr_expense_0001"
+  },
+  "decision": {
+    "decision_id": "gdec_allow_0001",
+    "decision_type": "allow",
+    "decision_revision": 1,
+    "decided_at": "2026-10-20T02:00:00Z"
+  },
+  "record_completeness": {
+    "completeness": "complete",
+    "incomplete_reason": null
+  },
+  "labels": {
+    "fixture": "synthetic",
+    "path": "§19.1 F41: needs_human from unknown with revoked Grant; T59/T60 forbidden (schema-valid)"
   }
 }
 ```
