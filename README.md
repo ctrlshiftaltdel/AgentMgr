@@ -1,6 +1,6 @@
 # AgentMgr
 
-面向企业的 **独立 Agent 治理与企业决策服务**。AgentMgr 管理任务必要性、优先级、责任归属、职权、可执行/禁止能力、确认与审批、执行边界及审计；WorkBuddy、Hermes、Rakazo、Codex、OpenCode 等已有 Agent 工具链由各自运行时提供，AgentMgr 不重复造轮子。项目继续承载现有企业业务模块（首期业务为报销），通过 MCP / REST 对外提供受控接口；Hermes 是现有兼容实现与首个候选 Runtime Adapter；完整适配能力待 Phase 4 真实验证，不再是产品硬依赖。
+面向企业的 **独立 Agent 治理与企业决策服务**。AgentMgr 管理任务必要性、优先级、责任归属、职权、可执行/禁止能力、确认与审批、执行边界及审计；WorkBuddy、Hermes、Rakazo、Codex、OpenCode 等已有 Agent 工具链由各自运行时提供，AgentMgr 不重复造轮子。项目继续承载现有企业业务模块（首期业务为报销），当前通过 REST 对外提供受控接口；MCP 为 Phase 3 目标（未验证）；Hermes 是现有兼容实现与首个候选 Runtime Adapter；完整适配能力待 Phase 4 真实验证，不再是产品硬依赖。
 
 ## 现状
 

@@ -22,7 +22,7 @@
 本文件是早期的业务工具治理与财务导出整合计划。自 2026-10-20 起，产品定位、信任边界、运行时无关架构、任务治理和阶段路线以 [docs/AGENTMGR_STANDALONE_PLATFORM_PLAN.md](AGENTMGR_STANDALONE_PLATFORM_PLAN.md) 为准。本文件中未冲突的业务工具契约、权限校验、确认持久化、审计与 Track D 导出要求仍可作为设计参考；与新计划冲突的旧表述视为历史决策，不得当作当前实现前提。
 
 特别是：
-- AgentMgr 不再以 Hermes 为唯一或原生必需运行时；Hermes 是第一个待验证/兼容的 Runtime Adapter。
+- AgentMgr 不再以 Hermes 为唯一或原生必需运行时；Hermes 是第一个待验证的候选 Runtime Adapter（兼容现有实现）。
 - “Agent 侧选工具”仅表示不在 AgentMgr 重复实现自然语言意图路由，并不削弱 AgentMgr 对任务必要性、优先级、责任、职权、允许/禁止能力、执行授权和审批门禁的确定性控制。
 - 客户端 MCP/REST、服务端 Agent 业务工具 MCP、Runtime Adapter 控制接口属于不同信任边界；不得共用无限制管理员凭据。
 - 提示词和工具描述不能强制拦截客户端本地 Shell、文件、浏览器或自有凭据。强制治理必须通过 PEP、企业资源访问控制或受控执行环境实现。
@@ -51,6 +51,8 @@
 | `templates/PLAN.md` | **未改**（受保护路径）；其中 35 处金蝶引用与 §5.4「第三期：金蝶连接」需单独 Issue 处理 |
 | `README.md`、`HANDOVER.md`、`ORCHESTRATION-PROJECT.md` | **未改**（受保护路径）；一句话定位与 BLOCKED 队列需单独 Issue 处理 |
 | `docs/research/W0-5-security-compliance.md` | 仅 O2 引用一行，随章程变更失效，无需改正文 |
+
+> 快照说明：上表为 **2026-10-17 快照**；README、章程、PLAN、ORCHESTRATION-PROJECT 已于 **2026-10-20** 按新定位更新，上表「未改/已改 v1.1」的描述仅反映当时状态。
 
 ### 0.5 不变的边界
 

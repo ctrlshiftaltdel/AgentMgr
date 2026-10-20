@@ -11,7 +11,9 @@
 
 > **架构定位修订声明（2026-10-20）**：本文件保留既有业务域（报销、工作流、财务导出等）的实施背景。目标架构和新能力必须遵循 docs/AGENTMGR_STANDALONE_PLATFORM_PLAN.md：AgentMgr 负责企业治理、权限、责任、任务优先级/必要性、审批、执行边界与审计；不重复构建 Agent 已有工具链。凡旧内容把 Hermes Profile 或 Hermes 内部 API 规定为所有部署的永久前提，均视为兼容实现/迁移阶段说明，不再是产品核心约束。
 
-> **兼容/迁移材料（2026-10-20）**：以下内容描述**现有 Hermes 兼容/迁移实现**，不是新部署的要求：§2（总体架构）、§2.1/§2.2（Profile 路由与隔离）、§3（Agent 选型行）、§5.1、§8（`agent_profiles`）、§10/§12/§13，以及所有 Hermes/Profile 负载测试与检查清单条目。新部署必须以 `docs/AGENTMGR_STANDALONE_PLATFORM_PLAN.md` 为准。
+> **兼容/迁移材料（2026-10-20，范围收窄）**：以下**具体条目**描述**现有 Hermes 兼容/迁移实现**，不是新部署的要求：§2 中的 Hermes Profile 运行时节点；§2.1/§2.2 的 Profile 路由与隔离措辞；§3 的 Hermes Agent 行与微信行；§5.1 的 Profile 生命周期条目；§8 的 `agent_profiles` 与 `agent_profile_services`；§10 的第 2/3 项及 20-Profile 阶段一验收；§12 的 Profile 小节与检查清单条目；§13 第 2 项。新部署以 `docs/AGENTMGR_STANDALONE_PLATFORM_PLAN.md` 为准。
+>
+> 本声明**不使任何业务域内容失效**：报销、工作流、财务导出、发票查验、RBAC 与审计等业务域要求仍然有效，且不因本节收窄而改变。
 
 
 ## 1. 项目定位
@@ -103,7 +105,7 @@
 | 层 | 推荐选型 | 原则 |
 |---|---|---|
 | Agent | 可替换 Agent Runtime（当前 Hermes Profile 为兼容实现） | 固定经过验证的版本；逐主体/任务配置与运行 |
-| 微信 | Hermes Weixin/iLink 适配器 + 自建身份路由 | 先验证真实多员工场景、主动通知与账号限制 |
+| 微信 | Hermes Weixin/iLink 适配器 + 自建身份路由（现有 Hermes 兼容实现；新部署见独立计划） | 先验证真实多员工场景、主动通知与账号限制 |
 | 未来渠道 | 独立 Channel Adapter 插件 | 渠道变化不能影响报销/库存域服务 |
 | 业务 API | Python + FastAPI | 模块化单体，按领域划分接口 |
 | 数据校验 | Pydantic 等 schema 校验 | 所有模型输出与外部输入先做结构校验 |
@@ -168,7 +170,7 @@
 
 1. 员工 Agent 创建业务草稿并请求提交。
 2. 后端创建审批任务，按部门、额度和规则确定审批人。
-3. 路由服务向审批人的个人 Profile/已绑定渠道发送带任务编号的通知。
+3. 路由服务向审批人的已绑定渠道（如所选运行时使用 Profile，则为该 Profile 的通知渠道）发送带任务编号的通知。
 4. 主管 Agent 读取授权范围内的任务内容，提示主管批准、拒绝或要求补充资料。
 5. 后端验证实际操作人的权限与工作流当前状态后执行转换。
 6. 结果写入审计和通知队列，再反馈给申请人。
@@ -292,7 +294,7 @@ Agent 间可共享的是授权业务记录与任务信息，不是各自的私�
 - `agent_profiles(id, employee_id, profile_name, runtime_status, config_version, status)` —— Hermes 兼容模型；目标模型使用 `runtime_instances`（见独立计划 §7）
 - `roles(id, name)`、`permissions(id, resource, action, scope)`
 - `employee_roles(employee_id, role_id)`、`role_permissions(role_id, permission_id)`
-- `agent_profile_services(profile_id, service_name, service_identity_ref, status)`
+- `agent_profile_services(profile_id, service_name, service_identity_ref, status)` —— Hermes 兼容模型
 
 ### 工作流、收件和文件
 
@@ -369,7 +371,7 @@ Agent 间可共享的是授权业务记录与任务信息，不是各自的私�
 - 员工不能审批自己的报销；高风险付款实行职责分离。
 - Agent 不能通过向其他 Agent 发消息来提升权限。
 - 不向一般业务 Agent 开放任意 SQL、任意 shell 或整台服务器的文件访问。
-- Profile 目录只允许该服务身份及受控运维账号访问；共享公司文件通过带权限验证的文件 API 读取。
+- 运行时实例目录（如 Hermes Profile）只允许该服务身份及受控运维账号访问；共享公司文件通过带权限验证的文件 API 读取。
 - 重要操作需二次确认或独立审批；审批记录关联实际人员而非模型名字。
 
 ## 10. 分阶段实施与验收
