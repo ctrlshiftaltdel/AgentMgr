@@ -150,6 +150,10 @@ def _resolve_decision(
             )
         if decision_id is None:
             decision_id = decision.decision_id
+        # Drop any local mutations without flushing them.  Decisions are
+        # immutable; the caller's in-memory copy is not authority and must not
+        # be laundered into the database by a later autoflush.
+        session.expire(decision)
     elif decision is not None:
         if decision_id is None:
             decision_id = decision.decision_id
