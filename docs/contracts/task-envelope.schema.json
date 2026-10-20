@@ -710,13 +710,13 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 100,
-          "description": "已开始的执行尝试次数；running/verifying/succeeded/failed/timed_out 时必须 >=1。"
+          "description": "已开始的执行尝试次数；running/verifying/succeeded/failed/timed_out 时必须 >=1，且不得超过 max_attempts（跨字段比较由服务端执行）。"
         },
         "max_attempts": {
           "type": "integer",
           "minimum": 1,
           "maximum": 100,
-          "description": "策略固定的尝试上限；达到后 failed 只能经 T70 转 needs_human，不得继续自动重试。"
+          "description": "策略固定的尝试上限；必须 >= status.attempt，达到后 failed 只能经 T70 转 needs_human，不得继续自动重试。"
         },
         "retry_budget_remaining": {
           "type": "integer",

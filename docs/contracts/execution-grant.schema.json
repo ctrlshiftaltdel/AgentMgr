@@ -616,7 +616,8 @@
         "number": {
           "type": "integer",
           "minimum": 1,
-          "maximum": 100
+          "maximum": 100,
+          "description": "本次 Grant 对应的尝试序号；必须 <= max_attempts（跨字段比较由服务端执行）。"
         },
         "max_attempts": {
           "type": "integer",
