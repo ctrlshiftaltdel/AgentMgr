@@ -1,0 +1,76 @@
+{
+  "schema_version": "1.0.0",
+  "decision_id": "gdec_allow_0001",
+  "decision_revision": 1,
+  "decision_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "canonicalization": "rfc8785_jcs",
+  "decision_type": "defer",
+  "reason_codes": [
+    "policy_allowed"
+  ],
+  "policy_version": {
+    "policy_set_id": "polset_default_0001",
+    "version": "1.0.0",
+    "content_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "subject": {
+    "principal_id": "prin_user_0001",
+    "principal_type": "person",
+    "account_status": "active",
+    "identity_assurance": "verified_session",
+    "resolution": "server_resolved",
+    "role_ids": [
+      "role_employee_0001"
+    ],
+    "department_id": "dept_finance_0001",
+    "service_identity_id": null,
+    "delegation_ref": null
+  },
+  "task_ref": {
+    "task_id": "task_expense_0001",
+    "idempotency_key": "idem_expense_0001",
+    "task_revision": 3
+  },
+  "evaluated_at": "2026-10-20T02:00:00Z",
+  "expires_at": "2026-10-20T02:15:00Z",
+  "fail_closed": true,
+  "constraints": {
+    "execution_mode": "governed_resource_access",
+    "allowed_capabilities": [
+      "expense.read@1.0.0"
+    ],
+    "denied_capabilities": [
+      "expense.delete@1.0.0"
+    ],
+    "resource_scope": {
+      "scope_type": "self",
+      "resource_ids": [
+        "res_expense_0001"
+      ],
+      "connector_ids": [],
+      "data_classifications": [
+        "internal"
+      ],
+      "exclude_resource_ids": []
+    },
+    "ttl_seconds": 900,
+    "max_calls": 20,
+    "max_cost_units": 0,
+    "max_runtime_seconds": 600,
+    "required_confirmation": false,
+    "required_approval": false,
+    "confirmation_ref": null,
+    "approval_ref": null
+  },
+  "obligations": [
+    "audit_decision",
+    "revalidate_each_call"
+  ],
+  "supersedes_decision_id": null,
+  "correlation_id": "corr_expense_0001",
+  "service_identity": {
+    "service_identity_id": "svc_agentmgr_core",
+    "authentication_method": "internal_workload_identity"
+  },
+  "explanation": "Synthetic fixture: employee may read own expense record."
+}

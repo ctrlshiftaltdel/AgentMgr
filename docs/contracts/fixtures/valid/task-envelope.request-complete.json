@@ -1,0 +1,49 @@
+{
+  "schema_version": "1.0.0",
+  "envelope_kind": "request",
+  "client_task_ref": "cref_client_0001",
+  "idempotency_key": "idem_expense_0001",
+  "completeness": "complete",
+  "goal": {
+    "summary": "Submit a synthetic expense report for review.",
+    "completion_criteria": [
+      {
+        "criterion_id": "crit_expense_state_0001",
+        "type": "business_state_equals",
+        "verifier": {
+          "verifier_id": "ver_expense_state_0001",
+          "version": "1.0.0"
+        },
+        "resource_ref": "res_expense_0001",
+        "expected": "submitted",
+        "evidence_ref": "evidence:expense_state_0001",
+        "evidence_hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+      }
+    ],
+    "required_inputs": [
+      "synthetic receipt reference"
+    ],
+    "out_of_scope": [
+      "No payment execution."
+    ]
+  },
+  "missing_fields": [],
+  "requested_priority": "high",
+  "priority_rationale": "Synthetic deadline.",
+  "due_at": "2026-10-27T09:00:00Z",
+  "requested_execution_mode": "governed_resource_access",
+  "requested_capabilities": [
+    "expense.submit@1.0.0",
+    "expense.read@1.0.0"
+  ],
+  "requested_limits": {
+    "max_calls": 20,
+    "max_runtime_seconds": 600,
+    "max_cost_units": 0
+  },
+  "accountable_owner_hint": "prin_owner_0001",
+  "assignee_hint": "queue_finance_ops_0001",
+  "labels": {
+    "fixture": "synthetic"
+  }
+}

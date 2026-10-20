@@ -1,0 +1,25 @@
+{
+  "schema_version": "1.0.0",
+  "envelope_kind": "request",
+  "client_task_ref": "cref_client_0001",
+  "idempotency_key": "idem_expense_0001",
+  "completeness": "incomplete",
+  "goal": null,
+  "missing_fields": [
+    "goal_summary",
+    "completion_criteria",
+    "accountable_owner",
+    "requested_limits"
+  ],
+  "requested_priority": "high",
+  "priority_rationale": "Synthetic deadline.",
+  "due_at": "2026-10-27T09:00:00Z",
+  "requested_execution_mode": null,
+  "requested_capabilities": [],
+  "requested_limits": null,
+  "accountable_owner_hint": null,
+  "assignee_hint": null,
+  "labels": {
+    "fixture": "synthetic"
+  }
+}

@@ -1,0 +1,1286 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.example.com/agentmgr/governance-decision/1.0.0",
+  "$comment": "$id uses the reserved example.com namespace as an offline placeholder. Implementations must not resolve it over the network and must pin the contract bundle SHA-256 instead of fetching the schema.",
+  "title": "AgentMgr Governance Decision",
+  "description": "PDP（Policy Decision Point）输出的机器可判定治理决策。契约版本 1.0.0（尚未冻结发布的候选版本）。所有身份、角色、责任、策略和授权字段均由服务端可信解析；客户端或模型自报的身份、角色、审批结果或权限不得写入本对象。任何授权型决策（allow / managed_execution_required）必须绑定非空 task_id 与 task_revision；任务创建前只能返回 deny / needs_* / pre_evaluation。失败关闭（fail closed）：字段缺失、版本不符、哈希不匹配、服务不可用或无法验证时，调用方必须按 deny 处理。规范化哈希使用 RFC 8785 JCS（见 task-state-machine.md §16）。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "decision_id",
+    "decision_revision",
+    "decision_hash",
+    "canonicalization",
+    "decision_type",
+    "reason_codes",
+    "policy_version",
+    "subject",
+    "task_ref",
+    "evaluated_at",
+    "expires_at",
+    "fail_closed",
+    "constraints",
+    "correlation_id"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0.0",
+      "description": "本契约的主版本。破坏性变更必须升主版本，不得在本字段下静默改变语义。"
+    },
+    "decision_id": {
+      "type": "string",
+      "pattern": "^gdec_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$",
+      "description": "服务端生成的决策 ID，用于审计与幂等关联。Grant 必须引用该 ID。"
+    },
+    "decision_revision": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "同一任务决策链的单调递增版本。Grant 绑定的 revision 低于当前版本时必须拒绝复用。"
+    },
+    "decision_hash": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$",
+      "description": "本决策规范化内容的 SHA-256。计算输入为 RFC 8785 JCS 规范化后的决策对象，计算前必须移除 decision_hash 字段本身。Grant 必须携带同一哈希。"
+    },
+    "canonicalization": {
+      "const": "rfc8785_jcs",
+      "description": "哈希与 payload 规范化算法。1.0.0 只允许 RFC 8785 JCS；其他算法必须升主版本。"
+    },
+    "decision_type": {
+      "type": "string",
+      "enum": [
+        "allow",
+        "deny",
+        "needs_clarification",
+        "needs_confirmation",
+        "needs_approval",
+        "managed_execution_required",
+        "pre_evaluation"
+      ],
+      "description": "冻结的七种决策类型。allow / managed_execution_required 是授权型决策，必须绑定已存在任务；pre_evaluation 是任务创建前的非授权评估，不得签发 Grant；其余类型均不得直接执行有副作用的动作。"
+    },
+    "decision_purpose": {
+      "type": "string",
+      "enum": ["initial_execution", "retry"],
+      "description": "授权目的。授权型决策（allow / managed_execution_required）必须声明：首次授权为 initial_execution，T65 有界重试为 retry。retry 决策必须 decision_revision>=2 且 supersedes_decision_id 非空；Grant 的 decision.decision_purpose 必须与本字段一致（S-08）。"
+    },
+    "reason_codes": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/reasonCode"
+      },
+      "description": "稳定、可程序判定的原因码。自然语言解释只能作为附注，不得替代原因码。"
+    },
+    "policy_version": {
+      "$ref": "#/$defs/policyVersion"
+    },
+    "subject": {
+      "$ref": "#/$defs/subject"
+    },
+    "task_ref": {
+      "$ref": "#/$defs/taskRef"
+    },
+    "evaluated_at": {
+      "$ref": "#/$defs/dateTime",
+      "description": "服务端评估时间（RFC 3339 UTC）。"
+    },
+    "expires_at": {
+      "$ref": "#/$defs/dateTime",
+      "description": "本决策的有效期截止时间。过期后调用方必须重新评估，不得复用旧决策；Grant 的 expires_at 不得晚于本值。"
+    },
+    "fail_closed": {
+      "const": true,
+      "description": "固定为 true：任何消费方在字段缺失、版本不符、服务不可用或无法验证时都必须按 deny 处理。"
+    },
+    "constraints": {
+      "$ref": "#/$defs/constraints"
+    },
+    "obligations": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": [
+          "audit_decision",
+          "revalidate_each_call",
+          "record_evidence",
+          "notify_owner",
+          "require_managed_execution"
+        ]
+      },
+      "description": "决策附带的强制义务，由 PEP、Worker 和审计层执行。"
+    },
+    "supersedes_decision_id": {
+      "type": ["string", "null"],
+      "pattern": "^gdec_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$",
+      "description": "若本决策替代先前决策，填写被替代的 decision_id；不得删除历史决策。重试必须产生新决策而不是复用旧决策。"
+    },
+    "correlation_id": {
+      "type": "string",
+      "pattern": "^corr_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$",
+      "description": "跨 MCP/REST/Worker/审计的关联 ID。Grant 必须携带同一关联链。"
+    },
+    "service_identity": {
+      "$ref": "#/$defs/serviceIdentity"
+    },
+    "explanation": {
+      "type": ["string", "null"],
+      "maxLength": 2000,
+      "description": "可选的人类可读说明。不得包含凭据、令牌、完整个人数据或受保护业务字段；不得作为授权依据。"
+    }
+  },
+  "$defs": {
+    "dateTime": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12][0-9]|3[01])|(?:0[469]|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-9]))T(?:[01][0-9]|2[0-3]):[0-5][0-9]:(?:[0-5][0-9]|60)(\\.[0-9]{1,9})?Z$",
+      "description": "RFC 3339 UTC 时间，必须以 Z 结尾并保留至秒或更高精度。pattern 已限制月份天数区间（2 月最多 29 日、30 天月份最多 30 日）与 00-23/00-59/00-60 时分秒，因此 2026-02-30 这类日期在结构层即被拒绝；闰年（2 月 29 日仅闰年合法）与闰秒的最终判定由服务端按 RFC 3339 复核。验证器必须启用 format 断言（jsonschema FormatChecker 或等价实现），不得把 format 仅当作注释。固定 UTC 使字典序与时间序一致。"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "reasonCode": {
+      "type": "string",
+      "enum": [
+        "policy_allowed",
+        "delegated_authority_valid",
+        "approval_satisfied",
+        "confirmation_satisfied",
+        "managed_execution_boundary_verified",
+        "pre_evaluation_only",
+        "task_not_created",
+        "identity_unverified",
+        "principal_disabled",
+        "principal_unbound",
+        "delegation_expired",
+        "capability_not_granted",
+        "resource_scope_denied",
+        "data_classification_denied",
+        "policy_denied",
+        "policy_unavailable",
+        "policy_version_invalid",
+        "tool_contract_mismatch",
+        "separation_of_duties_violation",
+        "self_approval_forbidden",
+        "accountable_owner_missing",
+        "approval_missing",
+        "confirmation_missing",
+        "grant_missing",
+        "grant_expired",
+        "grant_revoked",
+        "grant_consumed",
+        "grant_scope_mismatch",
+        "grant_outlives_decision",
+        "budget_exceeded",
+        "payload_hash_mismatch",
+        "replay_detected",
+        "decision_expired",
+        "decision_revision_stale",
+        "execution_mode_mismatch",
+        "priority_cannot_override_deny",
+        "unsupported_execution_mode",
+        "runtime_capability_unverified",
+        "retry_budget_exhausted",
+        "risk_above_ceiling",
+        "goal_missing",
+        "required_input_missing",
+        "resource_scope_ambiguous",
+        "accountable_owner_unresolved",
+        "due_date_ambiguous",
+        "capability_ambiguous",
+        "confirmation_required",
+        "payload_changed",
+        "high_impact_action",
+        "approval_required",
+        "risk_threshold_exceeded",
+        "amount_threshold_exceeded",
+        "separation_of_duties_required",
+        "client_local_control_insufficient",
+        "managed_execution_required",
+        "capability_requires_pep",
+        "runtime_isolation_required",
+        "evidence_missing",
+        "stop_not_confirmed"
+      ],
+      "description": "首版稳定原因码集合。新增原因码属于向后兼容的次版本变更；删除或改义属于主版本变更。"
+    },
+    "policyVersion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy_set_id", "version", "content_hash"],
+      "description": "服务端解析并签发的策略版本。客户端或模型提供的版本字符串不得直接采信。",
+      "properties": {
+        "policy_set_id": {
+          "type": "string",
+          "pattern": "^polset_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
+        },
+        "version": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+          "description": "语义化策略版本。"
+        },
+        "content_hash": {
+          "$ref": "#/$defs/sha256",
+          "description": "规范化策略内容的 SHA-256，用于检测版本与内容不一致。"
+        },
+        "effective_at": {
+          "$ref": "#/$defs/dateTime"
+        }
+      }
+    },
+    "principalId": {
+      "type": "string",
+      "pattern": "^(prin|rt|svc|role|queue)_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$",
+      "description": "统一主体 ID 命名：prin_=人员或 agent_instance 主体；rt_=运行时主体；svc_=服务身份；role_=组织角色；queue_=工作队列。运行任务句柄使用 rtask_，不得与 rt_ 主体混淆。"
+    },
+    "subject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "principal_id",
+        "principal_type",
+        "account_status",
+        "identity_assurance",
+        "resolution"
+      ],
+      "description": "服务端信任边界解析出的主体。principal_id 来自认证会话、mTLS 或签名令牌，绝不来自模型参数。identity_assurance=unverified/none 时只能产生 deny(identity_unverified)。",
+      "properties": {
+        "principal_id": {
+          "type": ["string", "null"],
+          "pattern": "^(prin|rt|svc)_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$",
+          "description": "未验证来源可以为 null；server_resolved 时必须非空。role_/queue_ 不是可认证主体，不得作为 subject；审批角色通过 approval_ref.approver_principal_id 表达。"
+        },
+        "principal_type": {
+          "type": "string",
+          "enum": ["person", "service", "runtime", "agent_instance", "unverified"]
+        },
+        "account_status": {
+          "type": "string",
+          "enum": ["active", "disabled", "unbound", "unknown"],
+          "description": "服务端身份目录中的状态；disabled/unbound/unknown 不得产生授权型决策。"
+        },
+        "identity_assurance": {
+          "type": "string",
+          "enum": [
+            "verified_session",
+            "verified_mtls",
+            "verified_signed_token",
+            "unverified",
+            "none"
+          ],
+          "description": "认证强度。unverified/none 只能用于 deny(identity_unverified)；不得用于任何授权型决策。"
+        },
+        "resolution": {
+          "type": "string",
+          "enum": ["server_resolved", "unverified"],
+          "description": "server_resolved 表示来自可信身份目录；unverified 表示无法解析主体，只能 deny。"
+        },
+        "role_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "maxItems": 32,
+          "items": {
+            "type": "string",
+            "pattern": "^role_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
+          },
+          "description": "服务端授权的角色集合；角色是职权来源，不由模型声明。"
+        },
+        "department_id": {
+          "type": ["string", "null"],
+          "pattern": "^dept_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
+        },
+        "service_identity_id": {
+          "type": ["string", "null"],
+          "pattern": "^svc_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$",
+          "description": "服务身份仅代表连接器/运行时的最小权限身份，不得充当管理员绕过员工职权。"
+        },
+        "delegation_ref": {
+          "type": ["string", "null"],
+          "pattern": "^dlg_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$",
+          "description": "有范围、有期限、可撤销的委派引用；过期或撤销的委派不得支撑授权型决策。"
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"principal_id": {"type": "string", "pattern": "^prin_"}}, "required": ["principal_id"]},
+          "then": {"properties": {"principal_type": {"enum": ["person", "agent_instance"]}}}
+        },
+        {
+          "if": {"properties": {"principal_id": {"type": "string", "pattern": "^rt_"}}, "required": ["principal_id"]},
+          "then": {"properties": {"principal_type": {"const": "runtime"}}}
+        },
+        {
+          "if": {"properties": {"principal_id": {"type": "string", "pattern": "^svc_"}}, "required": ["principal_id"]},
+          "then": {"properties": {"principal_type": {"const": "service"}}}
+        }
+      ]
+    },
+    "taskRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["task_id", "idempotency_key", "task_revision"],
+      "description": "任务引用。allow / managed_execution_required 必须绑定非空 task_id 与 task_revision；只有 deny / needs_* / pre_evaluation 允许 null。",
+      "properties": {
+        "task_id": {
+          "type": ["string", "null"],
+          "pattern": "^task_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$",
+          "description": "服务端生成的任务 ID；客户端提供的任务 ID 不得作为权威引用。"
+        },
+        "idempotency_key": {
+          "type": "string",
+          "pattern": "^idem_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$",
+          "description": "提交幂等键；作用域由服务端按主体与操作绑定。"
+        },
+        "task_revision": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "决策所针对的任务状态版本，用于拒绝基于过期状态的授权。授权型决策必须为非空整数。"
+        }
+      }
+    },
+    "resourceScope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope_type", "resource_ids", "connector_ids", "data_classifications", "exclude_resource_ids"],
+      "description": "服务端解析的资源范围。空集合永远表示“没有该类别资源”，不表示“全部”。scope_type 定义成员域，resource_ids/connector_ids 必须至少列出一个成员（none/undetermined 除外），最终集合由服务端按成员域过滤后固定写入 Grant。",
+      "properties": {
+        "scope_type": {
+          "type": "string",
+          "enum": [
+            "undetermined",
+            "none",
+            "self",
+            "department",
+            "company",
+            "approval_chain",
+            "project",
+            "record_set",
+            "connector"
+          ]
+        },
+        "resource_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "maxItems": 1000,
+          "items": {
+            "type": "string",
+            "pattern": "^res_[A-Za-z0-9][A-Za-z0-9_-]{2,95}$"
+          }
+        },
+        "connector_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "maxItems": 32,
+          "items": {
+            "type": "string",
+            "pattern": "^conn_[A-Za-z0-9][A-Za-z0-9_-]{2,63}$"
+          }
+        },
+        "data_classifications": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": ["public", "internal", "confidential", "restricted"]
+          },
+          "description": "允许处理的数据分类上限；空集合表示不允许任何分类，不是“全部”。"
+        },
+        "exclude_resource_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "maxItems": 1000,
+          "items": {
+            "type": "string",
+            "pattern": "^res_[A-Za-z0-9][A-Za-z0-9_-]{2,95}$"
+          }
+        }
+      }
+    },
+    "constraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "execution_mode",
+        "allowed_capabilities",
+        "denied_capabilities",
+        "resource_scope",
+        "ttl_seconds",
+        "max_calls",
+        "max_cost_units",
+        "max_runtime_seconds",
+        "required_confirmation",
+        "required_approval",
+        "confirmation_ref",
+        "approval_ref"
+      ],
+      "description": "决策约束。allowed_capabilities 是候选授权范围，只有授权型决策且 Grant 签发后才成为可执行权限。授权型决策必须完整携带 Grant 可校验的 capabilities/scope/TTL/预算/门禁。",
+      "properties": {
+        "execution_mode": {
+          "type": "string",
+          "enum": [
+            "advisory",
+            "governed_resource_access",
+            "managed_execution",
+            "none"
+          ],
+          "description": "none 表示不允许任何执行；其余三种对应产品定义的 Advisory/BYOA、Governed Resource Access、Managed Execution。"
+        },
+        "allowed_capabilities": {
+          "type": "array",
+          "uniqueItems": true,
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/capability"
+          }
+        },
+        "denied_capabilities": {
+          "type": "array",
+          "uniqueItems": true,
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/capability"
+          },
+          "description": "显式禁止的能力；denied 优先于 allowed，且不得被优先级或调度参数覆盖。"
+        },
+        "resource_scope": {
+          "$ref": "#/$defs/resourceScope"
+        },
+        "ttl_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 86400,
+          "description": "决策/Grant 建议存活时间上限；授权型决策必须 >=1，超过策略硬上限时必须拒绝而非截断。"
+        },
+        "max_calls": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100000,
+          "description": "允许的工具调用次数预算；授权型决策必须 >=1。"
+        },
+        "max_cost_units": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 100000000
+        },
+        "max_runtime_seconds": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "maximum": 86400,
+          "description": "允许的最长运行时间；Grant 的预算不得超过本值。"
+        },
+        "required_confirmation": {
+          "type": "boolean"
+        },
+        "required_approval": {
+          "type": "boolean"
+        },
+        "confirmation_ref": {
+          "oneOf": [
+            {"$ref": "#/$defs/confirmationRef"},
+            {"type": "null"}
+          ],
+          "description": "已满足的确认引用。为 null 表示尚无确认；required_confirmation=true 的授权型决策必须填写本字段。"
+        },
+        "approval_ref": {
+          "oneOf": [
+            {"$ref": "#/$defs/approvalRef"},
+            {"type": "null"}
+          ],
+          "description": "已满足的审批引用。为 null 表示尚无审批；required_approval=true 的授权型决策必须填写本字段。"
+        }
+      }
+    },
+    "confirmationRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "confirmation_id",
+        "payload_hash",
+        "canonicalization",
+        "purpose",
+        "confirmed_by_principal_id",
+        "status",
+        "satisfied_at",
+        "expires_at",
+        "consumed_at",
+        "consumed_by_call_id",
+        "single_use"
+      ],
+      "description": "与 execution-grant 和 task-envelope 完全一致的确认引用形状。status 与时间字段必须自洽：satisfied 时 satisfied_at 非空且 consumed_at 为空；consumed 时 consumed_at 非空。channel_binding 保留现有 tool_confirmations 的渠道绑定语义。",
+      "properties": {
+        "confirmation_id": {
+          "type": "string",
+          "pattern": "^conf_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
+        },
+        "payload_hash": {
+          "$ref": "#/$defs/sha256"
+        },
+        "canonicalization": {
+          "const": "rfc8785_jcs"
+        },
+        "purpose": {
+          "type": "string",
+          "enum": [
+            "high_impact_action",
+            "data_release",
+            "irreversible_action",
+            "payload_change",
+            "manual_override"
+          ]
+        },
+        "confirmed_by_principal_id": {
+          "type": ["string", "null"],
+          "pattern": "^(prin|rt|svc)_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "satisfied", "consumed", "expired", "rejected"]
+        },
+        "satisfied_at": {
+          "oneOf": [{"$ref": "#/$defs/dateTime"}, {"type": "null"}]
+        },
+        "expires_at": {
+          "$ref": "#/$defs/dateTime"
+        },
+        "consumed_at": {
+          "oneOf": [{"$ref": "#/$defs/dateTime"}, {"type": "null"}]
+        },
+        "consumed_by_call_id": {
+          "type": ["string", "null"],
+          "pattern": "^call_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
+        },
+        "single_use": {
+          "const": true
+        },
+        "channel_binding": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["channel", "channel_identity_ref"],
+          "description": "确认渠道绑定。现有 tool_confirmations 的渠道字段映射到本对象；跨渠道消费默认拒绝。",
+          "properties": {
+            "channel": {
+              "type": "string",
+              "enum": ["mcp", "rest", "web", "wechat", "other"]
+            },
+            "channel_identity_ref": {
+              "type": ["string", "null"],
+              "pattern": "^chan_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"status": {"const": "pending"}}, "required": ["status"]},
+          "then": {"properties": {"confirmed_by_principal_id": {"const": null}, "satisfied_at": {"const": null}, "consumed_at": {"const": null}, "consumed_by_call_id": {"const": null}}}
+        },
+        {
+          "if": {"properties": {"status": {"const": "satisfied"}}, "required": ["status"]},
+          "then": {"properties": {"confirmed_by_principal_id": {"type": "string"}, "satisfied_at": {"type": "string"}, "consumed_at": {"const": null}, "consumed_by_call_id": {"const": null}}}
+        },
+        {
+          "if": {"properties": {"status": {"const": "consumed"}}, "required": ["status"]},
+          "then": {"properties": {"confirmed_by_principal_id": {"type": "string"}, "satisfied_at": {"type": "string"}, "consumed_at": {"type": "string"}, "consumed_by_call_id": {"type": "string"}}}
+        },
+        {
+          "if": {"properties": {"status": {"const": "rejected"}}, "required": ["status"]},
+          "then": {"properties": {"satisfied_at": {"const": null}, "consumed_at": {"const": null}, "consumed_by_call_id": {"const": null}}}
+        },
+        {
+          "if": {"properties": {"status": {"const": "expired"}}, "required": ["status"]},
+          "then": {"properties": {"consumed_at": {"const": null}, "consumed_by_call_id": {"const": null}}}
+        }
+      ]
+    },
+    "approvalRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "approval_id",
+        "approver_principal_id",
+        "payload_hash",
+        "canonicalization",
+        "decision",
+        "separation_check",
+        "decided_at",
+        "expires_at"
+      ],
+      "description": "与 execution-grant 和 task-envelope 完全一致的审批引用形状。授权型决策与 Grant 只能引用 decision=approved、separation_check=passed、decided_at/expires_at 非空的审批；approved 不得由 Accountable Owner 本人作出（1.0.0 无策略例外）。",
+      "properties": {
+        "approval_id": {
+          "type": "string",
+          "pattern": "^appr_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
+        },
+        "approver_principal_id": {
+          "type": "string",
+          "pattern": "^(prin|role)_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$",
+          "description": "审批人只能是人员或组织角色主体，不得是 agent_instance、运行时或队列。"
+        },
+        "payload_hash": {
+          "$ref": "#/$defs/sha256"
+        },
+        "canonicalization": {
+          "const": "rfc8785_jcs"
+        },
+        "decision": {
+          "type": "string",
+          "enum": ["pending", "approved", "rejected", "expired", "revoked"]
+        },
+        "separation_check": {
+          "type": "string",
+          "enum": ["passed", "failed", "not_required"]
+        },
+        "decided_at": {
+          "oneOf": [{"$ref": "#/$defs/dateTime"}, {"type": "null"}]
+        },
+        "expires_at": {
+          "oneOf": [{"$ref": "#/$defs/dateTime"}, {"type": "null"}]
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"decision": {"const": "pending"}}, "required": ["decision"]},
+          "then": {"properties": {"decided_at": {"const": null}, "separation_check": {"const": "not_required"}}}
+        },
+        {
+          "if": {"properties": {"decision": {"const": "approved"}}, "required": ["decision"]},
+          "then": {"properties": {"decided_at": {"type": "string"}, "expires_at": {"type": "string"}, "separation_check": {"const": "passed"}}}
+        },
+        {
+          "if": {"properties": {"decision": {"const": "rejected"}}, "required": ["decision"]},
+          "then": {"properties": {"decided_at": {"type": "string"}}}
+        },
+        {
+          "if": {"properties": {"decision": {"enum": ["expired", "revoked"]}}, "required": ["decision"]},
+          "then": {
+            "properties": {
+              "decided_at": {"type": "string"},
+              "expires_at": {"type": "string"},
+              "separation_check": {"const": "passed"}
+            }
+          }
+        }
+      ]
+    },
+    "capability": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*@[0-9]+\\.[0-9]+\\.[0-9]+$",
+      "description": "能力标识必须包含名称与契约版本，例如 expense.read@1.0.0。现有整数工具版本必须由目录显式映射为语义化版本，不得隐式补零。"
+    },
+    "serviceIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["service_identity_id", "authentication_method"],
+      "description": "签发决策的 AgentMgr 服务身份；与请求主体、审批人和运行时服务身份分离。",
+      "properties": {
+        "service_identity_id": {
+          "type": "string",
+          "pattern": "^svc_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
+        },
+        "authentication_method": {
+          "type": "string",
+          "enum": ["mtls", "signed_token", "internal_workload_identity"]
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"decision_type": {"const": "allow"}},
+        "required": ["decision_type"]
+      },
+      "then": {
+        "properties": {
+          "reason_codes": {
+            "items": {
+              "enum": [
+                "policy_allowed",
+                "delegated_authority_valid",
+                "approval_satisfied",
+                "confirmation_satisfied",
+                "managed_execution_boundary_verified"
+              ]
+            }
+          },
+          "subject": {
+            "properties": {
+              "account_status": {"const": "active"},
+              "identity_assurance": {
+                "enum": ["verified_session", "verified_mtls", "verified_signed_token"]
+              },
+              "resolution": {"const": "server_resolved"},
+              "principal_id": {"type": "string"}
+            }
+          },
+          "task_ref": {
+            "properties": {
+              "task_id": {"type": "string"},
+              "task_revision": {"type": "integer", "minimum": 1}
+            }
+          },
+          "constraints": {
+            "properties": {
+              "execution_mode": {
+                "enum": ["advisory", "governed_resource_access", "managed_execution"]
+              },
+              "allowed_capabilities": {"minItems": 1},
+              "ttl_seconds": {"minimum": 1},
+              "max_calls": {"minimum": 1},
+              "resource_scope": {
+                "properties": {
+                  "scope_type": {"enum": ["self", "department", "company", "approval_chain", "project", "record_set", "connector"]},
+                  "data_classifications": {"minItems": 1}
+                }
+              }
+            }
+          }
+        },
+        "description": "授权型 allow 必须绑定非空 task_id/task_revision、已解析的 active 主体、至少一项能力与至少一个数据分类。scope_type=none（不涉及任何资源）不构成资源访问授权，因此不是合法 allow；这类动作应使用 deny/needs_* 或不需要资源授权的非授权评估。"
+      }
+    },
+    {
+      "if": {
+        "properties": {"decision_type": {"const": "managed_execution_required"}},
+        "required": ["decision_type"]
+      },
+      "then": {
+        "properties": {
+          "reason_codes": {
+            "items": {
+              "enum": [
+                "client_local_control_insufficient",
+                "managed_execution_required",
+                "capability_requires_pep",
+                "runtime_isolation_required",
+                "managed_execution_boundary_verified"
+              ]
+            }
+          },
+          "subject": {
+            "properties": {
+              "account_status": {"const": "active"},
+              "identity_assurance": {
+                "enum": ["verified_session", "verified_mtls", "verified_signed_token"]
+              },
+              "resolution": {"const": "server_resolved"},
+              "principal_id": {"type": "string"}
+            }
+          },
+          "task_ref": {
+            "properties": {
+              "task_id": {"type": "string"},
+              "task_revision": {"type": "integer", "minimum": 1}
+            }
+          },
+          "constraints": {
+            "properties": {
+              "execution_mode": {"const": "managed_execution"},
+              "allowed_capabilities": {"minItems": 1},
+              "ttl_seconds": {"minimum": 1},
+              "max_calls": {"minimum": 1},
+              "resource_scope": {
+                "properties": {
+                  "scope_type": {"enum": ["self", "department", "company", "approval_chain", "project", "record_set", "connector"]},
+                  "data_classifications": {"minItems": 1}
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"decision_type": {"const": "deny"}},
+        "required": ["decision_type"]
+      },
+      "then": {
+        "properties": {
+          "reason_codes": {
+            "items": {
+              "enum": [
+                "identity_unverified",
+                "principal_disabled",
+                "principal_unbound",
+                "delegation_expired",
+                "capability_not_granted",
+                "resource_scope_denied",
+                "data_classification_denied",
+                "policy_denied",
+                "policy_unavailable",
+                "policy_version_invalid",
+                "tool_contract_mismatch",
+                "separation_of_duties_violation",
+                "self_approval_forbidden",
+                "accountable_owner_missing",
+                "approval_missing",
+                "confirmation_missing",
+                "grant_missing",
+                "grant_expired",
+                "grant_revoked",
+                "grant_consumed",
+                "grant_scope_mismatch",
+                "grant_outlives_decision",
+                "budget_exceeded",
+                "payload_hash_mismatch",
+                "replay_detected",
+                "decision_expired",
+                "decision_revision_stale",
+                "execution_mode_mismatch",
+                "priority_cannot_override_deny",
+                "unsupported_execution_mode",
+                "runtime_capability_unverified",
+                "retry_budget_exhausted",
+                "risk_above_ceiling",
+                "evidence_missing",
+                "stop_not_confirmed"
+              ]
+            }
+          },
+          "constraints": {
+            "properties": {
+              "execution_mode": {"const": "none"},
+              "allowed_capabilities": {"maxItems": 0},
+              "ttl_seconds": {"const": 0},
+              "max_calls": {"const": 0},
+              "required_confirmation": {"const": false},
+              "required_approval": {"const": false},
+              "confirmation_ref": {"const": null},
+              "approval_ref": {"const": null}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"decision_type": {"const": "needs_clarification"}},
+        "required": ["decision_type"]
+      },
+      "then": {
+        "properties": {
+          "reason_codes": {
+            "items": {
+              "enum": [
+                "goal_missing",
+                "required_input_missing",
+                "resource_scope_ambiguous",
+                "accountable_owner_unresolved",
+                "due_date_ambiguous",
+                "capability_ambiguous"
+              ]
+            }
+          },
+          "constraints": {
+            "properties": {
+              "execution_mode": {"const": "none"},
+              "allowed_capabilities": {"maxItems": 0},
+              "ttl_seconds": {"const": 0},
+              "max_calls": {"const": 0},
+              "required_confirmation": {"const": false},
+              "required_approval": {"const": false}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"decision_type": {"const": "needs_confirmation"}},
+        "required": ["decision_type"]
+      },
+      "then": {
+        "properties": {
+          "reason_codes": {
+            "items": {
+              "enum": [
+                "confirmation_required",
+                "payload_changed",
+                "high_impact_action"
+              ]
+            }
+          },
+          "constraints": {
+            "properties": {
+              "required_confirmation": {"const": true},
+              "confirmation_ref": {"const": null},
+              "allowed_capabilities": {"maxItems": 0}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"decision_type": {"const": "needs_approval"}},
+        "required": ["decision_type"]
+      },
+      "then": {
+        "properties": {
+          "reason_codes": {
+            "items": {
+              "enum": [
+                "approval_required",
+                "risk_threshold_exceeded",
+                "amount_threshold_exceeded",
+                "separation_of_duties_required"
+              ]
+            }
+          },
+          "constraints": {
+            "properties": {
+              "required_approval": {"const": true},
+              "approval_ref": {"const": null},
+              "allowed_capabilities": {"maxItems": 0}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"decision_type": {"const": "pre_evaluation"}},
+        "required": ["decision_type"]
+      },
+      "then": {
+        "properties": {
+          "reason_codes": {
+            "items": {
+              "enum": [
+                "pre_evaluation_only",
+                "task_not_created",
+                "policy_denied",
+                "required_input_missing",
+                "client_local_control_insufficient"
+              ]
+            }
+          },
+          "task_ref": {
+            "properties": {
+              "task_id": {"const": null},
+              "task_revision": {"const": null}
+            }
+          },
+          "constraints": {
+            "properties": {
+              "execution_mode": {"const": "none"},
+              "allowed_capabilities": {"maxItems": 0},
+              "ttl_seconds": {"const": 0},
+              "max_calls": {"const": 0},
+              "required_confirmation": {"const": false},
+              "required_approval": {"const": false},
+              "confirmation_ref": {"const": null},
+              "approval_ref": {"const": null}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"subject": {"properties": {"identity_assurance": {"enum": ["unverified", "none"]}}}},
+        "required": ["subject"]
+      },
+      "then": {
+        "properties": {
+          "decision_type": {"const": "deny"},
+          "reason_codes": {"contains": {"const": "identity_unverified"}},
+          "subject": {
+            "properties": {
+              "principal_id": {"const": null},
+              "principal_type": {"const": "unverified"},
+              "account_status": {"const": "unknown"},
+              "resolution": {"const": "unverified"}
+            }
+          },
+          "constraints": {
+            "properties": {
+              "execution_mode": {"const": "none"},
+              "allowed_capabilities": {"maxItems": 0},
+              "ttl_seconds": {"const": 0},
+              "max_calls": {"const": 0},
+              "required_confirmation": {"const": false},
+              "required_approval": {"const": false},
+              "confirmation_ref": {"const": null},
+              "approval_ref": {"const": null}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "constraints": {
+            "properties": {"required_confirmation": {"const": false}},
+            "required": ["required_confirmation"]
+          }
+        },
+        "required": ["constraints"]
+      },
+      "then": {
+        "properties": {
+          "constraints": {
+            "properties": {
+              "confirmation_ref": {"const": null}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "constraints": {
+            "properties": {"required_approval": {"const": false}},
+            "required": ["required_approval"]
+          }
+        },
+        "required": ["constraints"]
+      },
+      "then": {
+        "properties": {
+          "constraints": {
+            "properties": {
+              "approval_ref": {"const": null}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "decision_type": {"enum": ["allow", "managed_execution_required"]},
+          "constraints": {
+            "properties": {"required_confirmation": {"const": true}},
+            "required": ["required_confirmation"]
+          }
+        },
+        "required": ["decision_type", "constraints"]
+      },
+      "then": {
+        "properties": {
+          "constraints": {
+            "properties": {
+              "confirmation_ref": {"type": "object"}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "decision_type": {"enum": ["allow", "managed_execution_required"]},
+          "constraints": {
+            "properties": {"required_approval": {"const": true}},
+            "required": ["required_approval"]
+          }
+        },
+        "required": ["decision_type", "constraints"]
+      },
+      "then": {
+        "properties": {
+          "constraints": {
+            "properties": {
+              "approval_ref": {"type": "object"}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "constraints": {
+            "properties": {"required_confirmation": {"const": true}},
+            "required": ["required_confirmation"]
+          }
+        },
+        "required": ["constraints"]
+      },
+      "then": {
+        "properties": {
+          "decision_type": {"enum": ["allow", "managed_execution_required", "needs_confirmation", "needs_approval"]},
+          "constraints": {
+            "properties": {
+              "confirmation_ref": {
+                "properties": {
+                  "status": {"const": "satisfied"},
+                  "satisfied_at": {"type": "string"},
+                  "consumed_at": {"const": null},
+                  "consumed_by_call_id": {"const": null},
+                  "confirmed_by_principal_id": {"type": "string"}
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "constraints": {
+            "properties": {"required_approval": {"const": true}},
+            "required": ["required_approval"]
+          }
+        },
+        "required": ["constraints"]
+      },
+      "then": {
+        "properties": {
+          "decision_type": {"enum": ["allow", "managed_execution_required", "needs_confirmation", "needs_approval"]},
+          "constraints": {
+            "properties": {
+              "approval_ref": {
+                "properties": {
+                  "decision": {"const": "approved"},
+                  "separation_check": {"const": "passed"},
+                  "decided_at": {"type": "string"},
+                  "expires_at": {"type": "string"}
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "constraints": {
+            "properties": {"execution_mode": {"const": "none"}}
+          }
+        },
+        "required": ["constraints"]
+      },
+      "then": {
+        "properties": {
+          "decision_type": {"enum": ["deny", "needs_clarification", "needs_confirmation", "needs_approval", "pre_evaluation"]}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "constraints": {
+            "properties": {"resource_scope": {"properties": {"scope_type": {"enum": ["none", "undetermined"]}}}}
+          }
+        },
+        "required": ["constraints"]
+      },
+      "then": {
+        "properties": {
+          "constraints": {
+            "properties": {
+              "resource_scope": {
+                "properties": {
+                  "resource_ids": {"maxItems": 0},
+                  "connector_ids": {"maxItems": 0},
+                  "data_classifications": {"maxItems": 0},
+                  "exclude_resource_ids": {"maxItems": 0}
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "constraints": {
+            "properties": {
+              "resource_scope": {
+                "properties": {
+                  "scope_type": {"enum": ["self", "department", "company", "approval_chain", "project", "record_set", "connector"]}
+                }
+              }
+            }
+          }
+        },
+        "required": ["constraints"]
+      },
+      "then": {
+        "properties": {
+          "constraints": {
+            "properties": {
+              "resource_scope": {
+                "properties": {
+                  "data_classifications": {"minItems": 1}
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "constraints": {
+            "properties": {
+              "resource_scope": {
+                "properties": {
+                  "scope_type": {"enum": ["department", "company", "approval_chain", "project", "record_set", "connector"]}
+                }
+              }
+            }
+          }
+        },
+        "required": ["constraints"]
+      },
+      "then": {
+        "properties": {
+          "constraints": {
+            "properties": {
+              "resource_scope": {
+                "anyOf": [
+                  {"properties": {"resource_ids": {"minItems": 1}}},
+                  {"properties": {"connector_ids": {"minItems": 1}}}
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"decision_type": {"enum": ["allow", "managed_execution_required"]}},
+        "required": ["decision_type"]
+      },
+      "then": {
+        "required": ["decision_purpose"]
+      },
+      "description": "授权型决策必须声明 decision_purpose，供 T65 重试验证与审计区分首次执行与重试。"
+    },
+    {
+      "if": {
+        "properties": {"decision_purpose": {"const": "retry"}},
+        "required": ["decision_purpose"]
+      },
+      "then": {
+        "properties": {
+          "decision_revision": {"minimum": 2},
+          "supersedes_decision_id": {"type": "string"}
+        },
+        "required": ["supersedes_decision_id"],
+        "description": "retry 决策必须是新评估（revision>=2）并明确替代旧决策；supersedes_decision_id 为必填且必须指向被替代的旧决策，不得把 revision=1 或未替代任何决策的记录当作重试授权。"
+      }
+    },
+    {
+      "properties": {
+        "decision_revision": {"minimum": 1}
+      }
+    }
+  ]
+}

@@ -1,0 +1,104 @@
+{
+  "schema_version": "1.0.0",
+  "decision_id": "gdec_allow_gates_0001",
+  "decision_revision": 1,
+  "decision_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "canonicalization": "rfc8785_jcs",
+  "decision_type": "allow",
+  "decision_purpose": "initial_execution",
+  "reason_codes": [
+    "policy_allowed",
+    "confirmation_satisfied",
+    "approval_satisfied"
+  ],
+  "policy_version": {
+    "policy_set_id": "polset_default_0001",
+    "version": "1.0.0",
+    "content_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "subject": {
+    "principal_id": "prin_user_0001",
+    "principal_type": "person",
+    "account_status": "active",
+    "identity_assurance": "verified_session",
+    "resolution": "server_resolved",
+    "role_ids": [
+      "role_employee_0001"
+    ],
+    "department_id": "dept_finance_0001",
+    "service_identity_id": null,
+    "delegation_ref": null
+  },
+  "task_ref": {
+    "task_id": "task_expense_0001",
+    "idempotency_key": "idem_expense_0001",
+    "task_revision": 3
+  },
+  "evaluated_at": "2026-10-20T02:00:00Z",
+  "expires_at": "2026-10-20T02:15:00Z",
+  "fail_closed": true,
+  "constraints": {
+    "execution_mode": "managed_execution",
+    "allowed_capabilities": [
+      "expense.submit@1.0.0"
+    ],
+    "denied_capabilities": [
+      "expense.delete@1.0.0"
+    ],
+    "resource_scope": {
+      "scope_type": "self",
+      "resource_ids": [
+        "res_expense_0001"
+      ],
+      "connector_ids": [],
+      "data_classifications": [
+        "internal"
+      ],
+      "exclude_resource_ids": []
+    },
+    "ttl_seconds": 900,
+    "max_calls": 20,
+    "max_cost_units": 0,
+    "max_runtime_seconds": 600,
+    "required_confirmation": true,
+    "required_approval": true,
+    "confirmation_ref": {
+      "confirmation_id": "conf_expense_0001",
+      "payload_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "canonicalization": "rfc8785_jcs",
+      "purpose": "data_release",
+      "confirmed_by_principal_id": "prin_user_0001",
+      "status": "satisfied",
+      "satisfied_at": "2026-10-20T02:05:00Z",
+      "expires_at": "2026-10-20T02:30:00Z",
+      "consumed_at": null,
+      "consumed_by_call_id": null,
+      "single_use": true,
+      "channel_binding": {
+        "channel": "mcp",
+        "channel_identity_ref": "chan_user_session_0001"
+      }
+    },
+    "approval_ref": {
+      "approval_id": "appr_expense_0001",
+      "approver_principal_id": "prin_approver_0001",
+      "payload_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "canonicalization": "rfc8785_jcs",
+      "decision": "approved",
+      "separation_check": "passed",
+      "decided_at": "2026-10-20T02:10:00Z",
+      "expires_at": "2026-10-21T02:10:00Z"
+    }
+  },
+  "obligations": [
+    "audit_decision",
+    "revalidate_each_call"
+  ],
+  "supersedes_decision_id": null,
+  "correlation_id": "corr_expense_0001",
+  "service_identity": {
+    "service_identity_id": "svc_agentmgr_core",
+    "authentication_method": "internal_workload_identity"
+  },
+  "explanation": "Synthetic fixture: employee may read own expense record."
+}

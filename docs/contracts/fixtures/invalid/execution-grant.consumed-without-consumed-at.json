@@ -1,0 +1,145 @@
+{
+  "schema_version": "1.0.0",
+  "grant_id": "grnt_expense_0001",
+  "correlation_id": "corr_expense_0001",
+  "task_ref": {
+    "task_id": "task_expense_0001",
+    "idempotency_key": "idem_expense_0001",
+    "task_revision": 3
+  },
+  "subject": {
+    "principal_id": "prin_agent_0001",
+    "principal_type": "agent_instance",
+    "service_identity_id": "svc_runtime_0001",
+    "delegation_ref": null,
+    "account_status": "active"
+  },
+  "execution_mode": "governed_resource_access",
+  "capabilities": {
+    "allowed": [
+      "expense.read@1.0.0"
+    ],
+    "denied": [
+      "expense.delete@1.0.0"
+    ],
+    "max_calls_per_capability": {
+      "expense.read@1.0.0": 1
+    }
+  },
+  "resource_scope": {
+    "scope_type": "self",
+    "resource_ids": [
+      "res_expense_0001"
+    ],
+    "connector_ids": [],
+    "data_classifications": [
+      "internal"
+    ],
+    "exclude_resource_ids": []
+  },
+  "policy_version": {
+    "policy_set_id": "polset_default_0001",
+    "version": "1.0.0",
+    "content_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "tool_contract": {
+    "catalog_id": "cat_finance_0001",
+    "version": "1.0.0",
+    "content_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "tool_versions": {
+      "expense.read": "1.0.0"
+    }
+  },
+  "gates": {
+    "confirmation_required": false,
+    "approval_required": false
+  },
+  "issued_at": "2026-10-20T02:00:00Z",
+  "expires_at": "2026-10-20T02:10:00Z",
+  "ttl_seconds": 600,
+  "budget": {
+    "max_calls": 1,
+    "max_cost_units": null,
+    "max_runtime_seconds": 600,
+    "currency": "NONE"
+  },
+  "usage": {
+    "calls_consumed": 0,
+    "cost_consumed": null,
+    "last_call_at": null,
+    "concurrent_calls": 0
+  },
+  "confirmation_ref": null,
+  "approval_ref": null,
+  "status": "consumed",
+  "usable": false,
+  "revocation": {
+    "revoked": false,
+    "revoked_at": null,
+    "reason_code": null,
+    "revoked_by_principal_id": null
+  },
+  "consumption": {
+    "mode": "single_use",
+    "consumed_at": null,
+    "consumed_by_call_id": null,
+    "remaining_calls": 0
+  },
+  "revalidation": {
+    "required": true,
+    "at": "each_call",
+    "policy_version_bound": true,
+    "tool_version_bound": true,
+    "subject_bound": true,
+    "resource_scope_bound": true,
+    "decision_bound": true,
+    "task_revision_bound": true,
+    "confirmation_bound": true,
+    "approval_bound": true,
+    "budget_bound": true,
+    "execution_mode_bound": true
+  },
+  "binding": {
+    "task_revision_bound": true,
+    "capabilities_subset_of_decision": true,
+    "scope_subset_of_decision": true,
+    "ttl_within_decision": true,
+    "budget_within_decision": true,
+    "expires_within_decision": true,
+    "execution_mode_matches_decision": true,
+    "decision_hash_bound": true,
+    "gates_match_decision": true,
+    "confirmation_payload_hash_bound": true,
+    "runtime_within_grant_ttl": true
+  },
+  "decision": {
+    "decision_id": "gdec_allow_0001",
+    "decision_revision": 1,
+    "decision_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "decision_type": "allow",
+    "decision_purpose": "initial_execution",
+    "freshness": "fresh_evaluation",
+    "canonicalization": "rfc8785_jcs",
+    "evaluated_at": "2026-10-20T02:00:00Z",
+    "expires_at": "2026-10-20T02:15:00Z",
+    "execution_mode": "governed_resource_access",
+    "policy_version": {
+      "policy_set_id": "polset_default_0001",
+      "version": "1.0.0",
+      "content_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "correlation_id": "corr_expense_0001"
+  },
+  "attempt": {
+    "number": 1,
+    "max_attempts": 3,
+    "is_retry": false,
+    "retry_of_attempt": null,
+    "retry_decision_id": null,
+    "retry_budget_remaining": 2
+  },
+  "issued_by": {
+    "service_identity_id": "svc_agentmgr_core",
+    "authentication_method": "internal_workload_identity"
+  }
+}
