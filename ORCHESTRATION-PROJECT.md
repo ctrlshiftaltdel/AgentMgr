@@ -6,9 +6,19 @@
 
 - Repository: `ctrlshiftaltdel/AgentMgr`（https://github.com/ctrlshiftaltdel/AgentMgr ，public）
 - Default branch: `main`
-- Product goal / one-sentence summary: 面向中国大陆 20–100 人企业的 Hermes Agent 原生管理系统，首期交付报销闭环；以 AI 对话/语音/图片/文件为主要工作入口，不接入金蝶等特定第三方财务系统，对外账务交接采用模板驱动的 Excel 导出（远期自研财务/ERP）。
+- Product goal / one-sentence summary: 面向企业的独立 Agent 治理与企业决策服务；管理任务必要性、优先级、责任归属、职权、允许/禁止能力、审批、可强制执行边界与审计；不重复构建 WorkBuddy/Hermes/Rakazo 等 Agent 已有工具链。通过 MCP/REST 接入客户端，通过可替换 Runtime Adapter 接入服务器端 Agent。继续维护现有报销等企业业务模块；Hermes 是兼容运行时之一，不是产品硬依赖。
 - Existing repository / new repository: 已有仓库（含完整开发历史；起源于单机离线版规则包，2026-10-16 切换为 GitHub 版规则并首次推送）。
-- Primary design/spec files: `docs/PROJECT-CHARTER.md`（项目章程）、`templates/PLAN.md`（实施方案 v2.0）、`docs/DEPLOYMENT-REQUIREMENTS.md`（部署要求）、`docs/research/`（W0-1/W0-2/W0-4/W0-5/W0-7 调研报告）。
+- Primary design/spec files: `docs/AGENTMGR_STANDALONE_PLATFORM_PLAN.md`（新目标架构与执行计划）、`docs/PROJECT-CHARTER.md`（项目章程）、`templates/PLAN.md`（既有业务模块实施方案）、`docs/DEPLOYMENT-REQUIREMENTS.md`（部署与安全要求）、`docs/research/`（历史调研证据）。
+
+
+
+## Architecture direction (2026-10-20)
+
+- AgentMgr is an independent Agent governance and enterprise decision service, not a Hermes-only product.
+- Reuse existing Agent runtime tools; do not build parallel shell/browser/file/connector infrastructure.
+- Client MCP/REST, server-side Agent business tools, and runtime control adapters are separate trust boundaries.
+- Mandatory governance requires PEP or a managed execution environment; prompts alone cannot enforce restrictions on local client tools.
+- Keep the current codebase as a modular monolith until demonstrated needs justify service extraction. Runtime capabilities require real compatibility evidence before being described as supported.
 
 ## Permissions
 
