@@ -118,6 +118,11 @@ def _load_decision(session: Session, decision_id: str) -> GovernanceDecisionReco
             .where(GovernanceDecisionRecord.decision_id == decision_id)
             .execution_options(populate_existing=True)
         )
+        if row is not None and sa_inspect(row).modified:
+            # Decisions are immutable.  If a caller mutated the identity-map
+            # object, force a database refresh rather than trusting (or
+            # flushing) those local values.
+            session.refresh(row)
     if row is None:
         raise GovernanceError("grant_missing", context={"decision_id": decision_id})
     verify_decision_document(row)
@@ -655,7 +660,10 @@ def get_grant(
     if for_update:
         stmt = stmt.with_for_update()
     with session.no_autoflush:
-        return session.scalar(stmt)
+        row = session.scalar(stmt)
+        if row is not None and sa_inspect(row).modified:
+            session.refresh(row, with_for_update=for_update)
+        return row
 
 
 def grant_remaining_calls(grant: ExecutionGrant) -> int:

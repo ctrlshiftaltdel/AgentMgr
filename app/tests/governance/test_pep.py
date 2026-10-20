@@ -68,7 +68,7 @@ def _enforce(session, org, grant, **overrides):
         "principal": _principal(session, org),
         "task_id": TASK_ID,
         "task_revision": 1,
-        "task_idempotency_key": grant.task_idempotency_key,
+        "task_idempotency_key": getattr(grant, "task_idempotency_key", None),
         "capability": "expense.read@1.0.0",
         "call_id": "call_gov_pep_0001",
         "resource_scope": scope(),
