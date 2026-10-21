@@ -2574,12 +2574,14 @@ def start_attempt(
     # ``attempt_within_max`` compares the number of *opened* attempts
     # (``attempt < max_attempts``) and the final authorised attempt is allowed.
     # T65 keeps the same guard semantics: a retry needs ``attempt < max``.
-    with session.no_autoflush:
-        ctx = _base_context(session, task, actor, now=timestamp)
-    task.attempt = next_attempt_number
+    # The execution handle is bound before the context so ``execution_handle_bound``
+    # sees the submission that was just accepted.
     task.runtime_task_id = runtime_ref
     task.execution_ref = execution_ref
     attempt.attempt_number = next_attempt_number
+    with session.no_autoflush:
+        ctx = _base_context(session, task, actor, now=timestamp)
+    task.attempt = next_attempt_number
 
     def _restore() -> None:
         task.attempt = previous_attempt

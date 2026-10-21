@@ -19,6 +19,7 @@ from app.tasks.errors import OwnerError, TaskError
 from app.tasks.models import Task
 from app.tasks.service import (
     complete_task,
+    confirm_task,
     recheck_execution,
     start_attempt,
     submit_task,

@@ -458,7 +458,12 @@ def test_redispatch_refuses_when_max_attempts_is_reached(
 def test_authorization_revocation_and_declared_failure_close_attempts(
     session: Session, world: TaskWorld
 ) -> None:
-    denied = submit_read(session, world, key="idem_c5_t62")
+    denied = submit_read(
+        session,
+        world,
+        key="idem_c5_t62",
+        goal=goal(summary="Revoked synthetic read"),
+    )
     session.commit()
     dispatch_and_run(session, world, denied)
     escalate_task(
@@ -484,7 +489,12 @@ def test_authorization_revocation_and_declared_failure_close_attempts(
     assert denied_attempt.ended_at is not None
     assert denied_attempt.stop_confirmed is True
 
-    failed = submit_read(session, world, key="idem_c5_t64")
+    failed = submit_read(
+        session,
+        world,
+        key="idem_c5_t64",
+        goal=goal(summary="Declared-failed synthetic read"),
+    )
     session.commit()
     dispatch_and_run(session, world, failed)
     escalate_task(
@@ -859,7 +869,13 @@ def test_escalation_edges_reach_needs_human(
     session.flush()
     assert gated.state == "needs_human"
 
-    queued = submit_read(session, world, key="idem_edge_queued", priority="low")
+    queued = submit_read(
+        session,
+        world,
+        key="idem_edge_queued",
+        priority="low",
+        goal=goal(summary="Queued synthetic read"),
+    )
     session.commit()
     escalate_task(
         session,
@@ -870,7 +886,13 @@ def test_escalation_edges_reach_needs_human(
     session.flush()
     assert queued.state == "needs_human"
 
-    running = submit_read(session, world, key="idem_edge_running", priority="high")
+    running = submit_read(
+        session,
+        world,
+        key="idem_edge_running",
+        priority="high",
+        goal=goal(summary="Running synthetic read"),
+    )
     session.commit()
     dispatch_and_run(session, world, running)
     escalate_task(
@@ -888,7 +910,11 @@ def test_remaining_escalation_edges_reach_needs_human(
 ) -> None:
     # T14 awaiting_clarification
     clarification = submit_read(
-        session, world, key="idem_edge_t14", resource_scope=None
+        session,
+        world,
+        key="idem_edge_t14",
+        resource_scope=None,
+        goal=goal(summary="Clarification synthetic read"),
     )
     session.commit()
     escalate_task(
@@ -923,7 +949,12 @@ def test_remaining_escalation_edges_reach_needs_human(
     # T52 cancel_requested
     from app.tasks.service import request_cancel
 
-    cancel = submit_read(session, world, key="idem_edge_t52")
+    cancel = submit_read(
+        session,
+        world,
+        key="idem_edge_t52",
+        goal=goal(summary="Cancel synthetic read"),
+    )
     session.commit()
     dispatch_and_run(session, world, cancel)
     request_cancel(session, task_id=cancel.task_id, actor=world.actors.requester)
@@ -941,10 +972,15 @@ def test_remaining_escalation_edges_reach_needs_human(
     # T10 evaluated: a queue guard failure leaves the task evaluated; a human
     # escalation is then the only legal exit.
     employee = world.org.manager
-    employee.status = "disabled"
+    employee.status = "inactive"
     session.flush()
     with pytest.raises(TaskError):
-        submit_read(session, world, key="idem_edge_t10")
+        submit_read(
+            session,
+            world,
+            key="idem_edge_t10",
+            goal=goal(summary="Evaluated synthetic read"),
+        )
     evaluated = session.scalar(
         select(Task).where(Task.state == "evaluated").limit(1)
     )
@@ -962,7 +998,12 @@ def test_remaining_escalation_edges_reach_needs_human(
 def test_dispatch_deadline_and_evidence_unavailable_edges(
     session: Session, world: TaskWorld
 ) -> None:
-    dispatched = submit_read(session, world, key="idem_edge_dispatch")
+    dispatched = submit_read(
+        session,
+        world,
+        key="idem_edge_dispatch",
+        goal=goal(summary="Dispatched synthetic read"),
+    )
     session.commit()
     claim(session, world, worker_id="worker-edge-1")
     start_attempt(
@@ -984,7 +1025,12 @@ def test_dispatch_deadline_and_evidence_unavailable_edges(
     assert dispatched.state == "timed_out"
     assert dispatched.stop_confirmed is True
 
-    verifying = submit_read(session, world, key="idem_edge_verifying")
+    verifying = submit_read(
+        session,
+        world,
+        key="idem_edge_verifying",
+        goal=goal(summary="Verifying synthetic read"),
+    )
     session.commit()
     move_to_verifying(session, world, verifying)
     evidence_unavailable(
@@ -1135,7 +1181,7 @@ def test_claim_escalates_a_disabled_owner(session: Session, world: TaskWorld) ->
     task = submit_read(session, world)
     session.commit()
     employee = world.org.manager
-    employee.status = "disabled"
+    employee.status = "inactive"
     session.flush()
 
     claimed = worker.claim_task(session, worker_id="worker-owner", actor=world.actors.executor)
@@ -1228,7 +1274,7 @@ def test_failed_queue_guard_revokes_the_orphan_grant(
     session: Session, world: TaskWorld
 ) -> None:
     employee = world.org.manager
-    employee.status = "disabled"
+    employee.status = "inactive"
     session.flush()
     task = None
     with pytest.raises(TaskError):
