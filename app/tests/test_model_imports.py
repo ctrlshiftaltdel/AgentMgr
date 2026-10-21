@@ -42,6 +42,7 @@ MODEL_MODULES: tuple[str, ...] = (
     "app.db.models.organization",
     "app.documents.models",
     "app.expense.models",
+    "app.governance.models",
     "app.identity.models",
     "app.intake.models",
     "app.integrations.models",

@@ -20,6 +20,8 @@ dependencies = [
 dev = [
     "pytest",
     "httpx",
+    # Contract-schema tests use JSON Schema Draft 2020-12 + FormatChecker.
+    "jsonschema",
 ]
 
 [tool.pytest.ini_options]

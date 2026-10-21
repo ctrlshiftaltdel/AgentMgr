@@ -24,6 +24,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from sqlalchemy import select
@@ -36,7 +37,9 @@ __all__ = [
     "Principal",
     "can_approve",
     "effective_permissions",
+    "effective_permissions_for_role_ids",
     "has_permission",
+    "role_ids_for_employee",
     "visible_employee_ids",
 ]
 
@@ -64,6 +67,44 @@ class Principal:
     company_id: int
 
 
+def role_ids_for_employee(session: Session, employee_id: int) -> tuple[int, ...]:
+    """Return the employee's role IDs in deterministic order.
+
+    This is the shared primitive used by both employee and service-identity
+    principals in :mod:`app.governance.principal`.  It reuses the existing
+    ``employee_roles`` table; no second RBAC store is introduced.
+    """
+    rows = session.scalars(
+        select(EmployeeRole.role_id)
+        .where(EmployeeRole.employee_id == employee_id)
+        .order_by(EmployeeRole.role_id)
+    ).all()
+    return tuple(rows)
+
+
+def effective_permissions_for_role_ids(
+    session: Session, role_ids: Iterable[int]
+) -> frozenset[tuple[str, str, str]]:
+    """Return the union of permissions granted by the supplied role IDs.
+
+    An empty iterable yields an empty set (deny by default).  Service identities
+    use this with their ``service_identity_roles`` rows; employee principals use
+    it with :func:`role_ids_for_employee`.
+    """
+    ids = tuple(sorted(set(role_ids)))
+    if not ids:
+        return frozenset()
+    stmt = (
+        select(Permission.resource, Permission.action, Permission.scope)
+        .join(RolePermission, RolePermission.permission_id == Permission.id)
+        .where(RolePermission.role_id.in_(ids))
+    )
+    return frozenset(
+        (resource, action, scope)
+        for resource, action, scope in session.execute(stmt)
+    )
+
+
 def effective_permissions(
     session: Session, employee_id: int
 ) -> frozenset[tuple[str, str, str]]:
@@ -73,15 +114,8 @@ def effective_permissions(
     可以有多个角色，任一角色授予即算拥有。**无角色时返回空集**（默认拒绝的前置
     事实）。返回值是 ``frozenset``，天然去重且不可变。
     """
-    stmt = (
-        select(Permission.resource, Permission.action, Permission.scope)
-        .join(RolePermission, RolePermission.permission_id == Permission.id)
-        .join(EmployeeRole, EmployeeRole.role_id == RolePermission.role_id)
-        .where(EmployeeRole.employee_id == employee_id)
-    )
-    return frozenset(
-        (resource, action, scope)
-        for resource, action, scope in session.execute(stmt)
+    return effective_permissions_for_role_ids(
+        session, role_ids_for_employee(session, employee_id)
     )
 
 

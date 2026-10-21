@@ -49,13 +49,19 @@ from sqlalchemy.orm import Session  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-#: Every business table created by migrations ``0001``..``0011``, listed children
-#: first.  ``alembic_version`` is deliberately excluded -- it must survive a reset
-#: so the schema stays at head.  ``invoice_verifications`` (0010) is not part of
-#: this reset: the modules that create verification rows clean them up per test
-#: (``app/tests/integrations`` and ``app/tests/api``).
+#: Every business table created by migrations ``0001``..``0013``, listed
+#: children first.  ``alembic_version`` is deliberately excluded -- it must
+#: survive a reset so the schema stays at head.  ``invoice_verifications``
+#: (0010) is not part of this reset: the modules that create verification rows
+#: clean them up per test (``app/tests/integrations`` and ``app/tests/api``).
 BUSINESS_TABLES: tuple[str, ...] = (
     "audit_events",
+    "execution_grants",
+    "governance_decisions",
+    "governance_delegations",
+    "governance_policy_versions",
+    "service_identity_roles",
+    "service_identities",
     "notifications",
     "outbox_events",
     "approval_steps",
