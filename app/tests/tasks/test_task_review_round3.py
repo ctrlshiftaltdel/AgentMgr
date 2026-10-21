@@ -646,6 +646,7 @@ def test_refused_retry_restores_the_narrowed_budget_fields(
         "requires_human": True,
     }
     session.flush()
+    before = (task.max_calls, task.max_runtime_seconds, task.max_cost_units)
 
     with pytest.raises(TaskError) as excinfo:
         retry_task(session, task_id=task.task_id, actor=world.actors.owner)
@@ -653,8 +654,9 @@ def test_refused_retry_restores_the_narrowed_budget_fields(
     session.commit()
     session.refresh(task)
     assert task.state == "failed"
+    # The clamp (which would narrow 500 -> 300) never reached the row.
+    assert (task.max_calls, task.max_runtime_seconds, task.max_cost_units) == before
     assert task.max_runtime_seconds == 500
-    assert task.max_calls == 5
     assert _active_grants(session, task.task_id) == 0
 
 
