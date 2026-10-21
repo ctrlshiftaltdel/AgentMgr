@@ -15,7 +15,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.governance.grants import get_grant
-from app.governance.models import GovernanceDecisionRecord
+from app.governance.models import ExecutionGrant, GovernanceDecisionRecord
 from app.governance.principal import resolve_employee_principal, resolve_service_principal
 from app.tasks import worker
 from app.tasks.errors import ConfirmationError, TaskError
@@ -327,6 +327,8 @@ def test_confirm_stop_from_unknown_persists_and_closes(
     assert task.state == "cancelled"
     assert task.stop_confirmed is True
     assert task.result["stop_evidence_refs"] == ["evidence:c4_stopped"]
+    # No explicit reconciliation: the persisted fact must stay honest, not True.
+    assert task.result["side_effects_reconciled"] is False
 
 
 def test_confirm_stop_from_needs_human_persists(
@@ -354,6 +356,9 @@ def test_confirm_stop_from_needs_human_persists(
     session.refresh(task)
     assert task.state == "cancelled"
     assert task.stop_confirmed is True
+    # needs_human -> cancelled (T63) does not need reconciliation, and the
+    # absent fact is persisted honestly rather than defaulted to True.
+    assert task.result["side_effects_reconciled"] is False
 
 
 def test_outsider_cannot_confirm_a_stop(session: Session, world: TaskWorld) -> None:
@@ -408,6 +413,7 @@ def test_redispatch_closes_attempt_then_dispatches(session: Session, world: Task
         actor=world.actors.owner,
         action="redispatch",
         evidence_refs=["evidence:c5_stopped"],
+        side_effects_reconciled=True,
     )
     session.commit()
     session.refresh(attempt)
@@ -696,6 +702,14 @@ def test_concurrent_equivalent_goals_create_one_task(
                 select(func.count())
                 .select_from(GovernanceDecisionRecord)
                 .where(GovernanceDecisionRecord.task_id == task_id)
+            )
+            == 1
+        )
+        assert (
+            check.scalar(
+                select(func.count())
+                .select_from(ExecutionGrant)
+                .where(ExecutionGrant.task_id == task_id)
             )
             == 1
         )
@@ -1018,8 +1032,9 @@ def test_dispatch_deadline_and_evidence_unavailable_edges(
     dispatch_deadline_exceeded(
         session,
         task_id=dispatched.task_id,
-        actor=world.actors.owner,
+        actor=world.actors.executor,
         evidence_refs=["evidence:edge_deadline"],
+        no_side_effects_evidence=True,
     )
     session.flush()
     assert dispatched.state == "timed_out"
@@ -1282,8 +1297,10 @@ def test_failed_queue_guard_revokes_the_orphan_grant(
     session.commit()
     stored = session.scalar(select(Task).where(Task.state == "evaluated"))
     assert stored is not None
-    assert stored.grant_id is not None
-    assert get_grant(session, stored.grant_id).status == "revoked"
+    # The guard is now previewed before issuance, so a refused queue leaves no
+    # grant at all.  If a grant was ever issued it must not be active.
+    if stored.grant_id is not None:
+        assert get_grant(session, stored.grant_id).status == "revoked"
 
 
 def test_rejected_partial_records_a_failed_verification_shape(

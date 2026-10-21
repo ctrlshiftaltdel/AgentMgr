@@ -8,6 +8,7 @@ so a missing rule is visible rather than silently untested).
 
 from __future__ import annotations
 
+import sys
 from dataclasses import replace
 
 import pytest
@@ -56,6 +57,7 @@ PURE_RULES = [
     ("F12", "failed", "verification.passed", "succeeded"),
     ("F13", "partial_success", "verification.passed", "succeeded"),
     ("F14", "succeeded", "task.cancelled", "cancelled"),
+    ("F14", "succeeded", "made.up", "queued"),
     ("F20", "unknown", "execution.stopped", "cancelled"),
     ("F37", "unknown", "execution.started", "running"),
     ("F38", "unknown", "execution.completed", "verifying"),
@@ -107,6 +109,23 @@ COVERAGE: dict[str, str] = {
 }
 
 
+def test_every_forbidden_rule_has_a_real_assertion() -> None:
+    """F01-F41 must each be checked, not merely listed."""
+    expected = {f"F{number:02d}" for number in range(1, 42)}
+    assert set(COVERAGE) == expected
+    module = sys.modules[__name__]
+    pure_rules = {rule for rule, *_rest in PURE_RULES}
+    for rule, location in COVERAGE.items():
+        if location == "pure table":
+            assert rule in pure_rules, f"{rule} claims pure coverage but is absent"
+        else:
+            assert callable(getattr(module, location, None)), (
+                f"{rule} points at missing test {location!r}"
+            )
+    # Every pure-table case must map to a declared coverage entry.
+    assert pure_rules <= set(COVERAGE)
+
+
 @pytest.mark.parametrize(("rule", "source", "event", "target"), PURE_RULES)
 def test_forbidden_state_edges(
     rule: str, source: str, event: str, target: str
@@ -115,7 +134,10 @@ def test_forbidden_state_edges(
     with pytest.raises(TaskError) as excinfo:
         state_machine.check_transition(source, event, target, ctx)
     error = excinfo.value
-    assert getattr(error, "rule", None) == rule or error.reason_code
+    # Assert the *actual* forbidden rule.  A bare ``or error.reason_code`` is a
+    # tautology: every rejection has a truthy reason code, so it would pass for
+    # the wrong rule (or for a plain invalid edge).
+    assert error.context.get("rule") == rule, error.context
 
 
 def test_f07_cancel_request_is_not_a_stop() -> None:

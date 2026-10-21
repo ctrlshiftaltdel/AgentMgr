@@ -19,7 +19,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, Protocol
 
-from sqlalchemy import func, select
+from sqlalchemy import DateTime, cast, func, select
 from sqlalchemy.orm import Session
 
 from app.audit.service import record_event
@@ -491,19 +491,22 @@ def recover_expired_leases(
                 continue
 
         if task.state == "dispatched" and outcome == "failed" and stop_confirmed:
+            recovery_actor, recovery_worker, recovery_token, recovery_lease = (
+                _recovery_writer(session, task, actor=actor, now=timestamp)
+            )
             service.fail_task(
                 session,
                 task_id=task.task_id,
-                actor=actor or _service_principal(),
+                actor=recovery_actor,
                 reason="lease_expired_failed",
                 evidence_refs=["evidence:worker_lease_expired_failed"],
                 stop_confirmed=True,
                 error_code="execution_failed",
-                worker_id=lease.worker_id,
-                fencing_token=lease.fencing_token,
-                allow_expired_lease=True,
+                worker_id=recovery_worker,
+                fencing_token=recovery_token,
                 now=timestamp,
             )
+            _release_recovery_lease(recovery_lease, now=timestamp)
             results.append(
                 LeaseRecovery(
                     task_id=task.task_id,
@@ -515,17 +518,20 @@ def recover_expired_leases(
             continue
 
         if task.state in {"dispatched", "running"}:
+            recovery_actor, recovery_worker, recovery_token, recovery_lease = (
+                _recovery_writer(session, task, actor=actor, now=timestamp)
+            )
             service.record_attempt_result(
                 session,
                 task_id=task.task_id,
-                actor=actor or _service_principal(),
+                actor=recovery_actor,
                 outcome="lost",
                 evidence_refs=["evidence:worker_lease_expired_lost"],
-                worker_id=lease.worker_id,
-                fencing_token=lease.fencing_token,
-                allow_expired_lease=True,
+                worker_id=recovery_worker,
+                fencing_token=recovery_token,
                 now=timestamp,
             )
+            _release_recovery_lease(recovery_lease, now=timestamp)
             _audit(
                 session,
                 actor=actor,
@@ -592,6 +598,46 @@ def recover_expired_leases(
     return results
 
 
+def _recovery_writer(
+    session: Session,
+    task: Task,
+    *,
+    actor: GovernancePrincipal | None,
+    now: datetime,
+) -> tuple[GovernancePrincipal, str | None, int | None, TaskLease | None]:
+    """Return the actor/lease a recovery fact write may use.
+
+    Managed Execution facts require the *current* lease and fencing token, so
+    the recovery path acquires a fresh lease (higher token) instead of reusing
+    the expired one.  The old worker's token is therefore stale immediately.
+    """
+    resolved = actor or _service_principal()
+    if task.execution_mode != "managed_execution":
+        return resolved, None, None, None
+    if resolved.principal_type not in {"service", "runtime"}:
+        resolved = _service_principal()
+    highest = session.scalar(
+        select(func.max(TaskLease.fencing_token)).where(
+            TaskLease.task_id == task.task_id
+        )
+    )
+    lease = TaskLease(
+        task_id=task.task_id,
+        worker_id=f"recovery-{uuid.uuid4().hex[:12]}",
+        fencing_token=int(highest or 0) + 1,
+        acquired_at=now,
+        lease_expires_at=now + timedelta(seconds=DEFAULT_LEASE_SECONDS),
+    )
+    session.add(lease)
+    session.flush()
+    return resolved, lease.worker_id, lease.fencing_token, lease
+
+
+def _release_recovery_lease(lease: TaskLease | None, *, now: datetime) -> None:
+    if lease is not None and lease.released_at is None:
+        lease.released_at = now
+
+
 def escalate_overdue_tasks(
     session: Session,
     *,
@@ -610,11 +656,19 @@ def escalate_overdue_tasks(
     """
     timestamp = now or _utcnow()
     resolved_actor = actor or _service_principal()
+    # A response_by-only row (no due_at) must not be starved behind every row
+    # that has a due date.  Order by the *earliest* of the two deadlines;
+    # PostgreSQL ``LEAST`` ignores NULLs, so a row with only one deadline still
+    # sorts by it.
+    response_deadline = cast(
+        Task.sla["response_by"].astext, DateTime(timezone=True)
+    )
+    earliest_deadline = func.least(Task.due_at, response_deadline)
     rows = list(
         session.scalars(
             select(Task)
             .where(Task.state.in_(("queued", "dispatched", "running")))
-            .order_by(Task.due_at.asc().nulls_last(), Task.created_at)
+            .order_by(earliest_deadline.asc().nulls_last(), Task.created_at)
             .limit(limit)
             .with_for_update(skip_locked=True)
         )
@@ -678,6 +732,7 @@ def escalate_overdue_tasks(
                         task_id=task.task_id,
                         actor=resolved_actor,
                         evidence_refs=["evidence:dispatch_deadline_exceeded"],
+                        no_side_effects_evidence=True,
                         now=timestamp,
                     )
                     results.append(
