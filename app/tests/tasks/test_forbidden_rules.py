@@ -138,7 +138,7 @@ RULE_COVERAGE: dict[str, RuleCoverage] = {
     ),
     "F24": RuleCoverage(
         "test_f24_state_is_only_written_by_the_machine",
-        codes=("task_invalid_transition",),
+        codes=("task_forbidden_transition",),
     ),
     "F25": RuleCoverage(
         "test_f15_revoked_grant_cannot_dispatch", codes=("grant_revoked",)
@@ -497,8 +497,11 @@ def test_f24_state_is_only_written_by_the_machine() -> None:
     assert not hasattr(service, "set_state")
     ctx = TransitionContext.permissive()
     with pytest.raises(TaskError) as excinfo:
+        # An undeclared write from ``queued`` is refused as a forbidden family
+        # (F02) before it can ever reach the state column.
         state_machine.check_transition("queued", "made.up", "succeeded", ctx)
-    assert excinfo.value.reason_code == "task_invalid_transition"
+    assert excinfo.value.reason_code == "task_forbidden_transition"
+    assert excinfo.value.context.get("rule") == "F02"
 
 
 def test_f26_mode_is_bound_to_the_decision(

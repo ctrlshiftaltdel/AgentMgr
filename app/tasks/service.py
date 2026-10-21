@@ -4298,8 +4298,9 @@ def _fresh_retry_decision(
     )
     # The decision and grant are returned rather than bound here: the task is
     # still in ``failed`` (or ``unknown``), where an *active* grant is forbidden
-    # by the database invariant.  The caller binds them after the transition.
-    return decision, grant, new_record
+    # by the database invariant.  The caller binds them (and applies the budget
+    # clamp) after the transition.
+    return decision, grant, new_record, clamp
 
 
 def retry_task(
