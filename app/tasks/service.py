@@ -3315,6 +3315,24 @@ def record_dispatch_failure(
         expected_revision=expected_revision,
     )
 
+    # Invalidate the old authority first: its flush is safe while the task is
+    # still queued.  The stop/result facts are written afterwards and reach the
+    # database in the same UPDATE as the state change, so a requeued task is
+    # never persisted as ``queued`` with ``stop_confirmed=false``.
+    if target in TASK_TERMINAL_STATES or target in {
+        "unknown",
+        "failed",
+        "needs_human",
+    }:
+        _invalidate_grant(
+            session,
+            task,
+            actor,
+            reason_code=(
+                "execution_evidence_lost" if target == "unknown" else "task_terminal"
+            ),
+            now=timestamp,
+        )
     result: dict[str, Any] = {
         **dict(task.result or {}),
         "outcome": outcome,
@@ -3339,22 +3357,6 @@ def record_dispatch_failure(
         result.update(stop_confirmed=False, stop_evidence_refs=[])
     task.stop_confirmed = stop_confirmed
     task.result = result
-    session.flush()
-
-    if target in TASK_TERMINAL_STATES or target in {
-        "unknown",
-        "failed",
-        "needs_human",
-    }:
-        _invalidate_grant(
-            session,
-            task,
-            actor,
-            reason_code=(
-                "execution_evidence_lost" if target == "unknown" else "task_terminal"
-            ),
-            now=timestamp,
-        )
     _perform_transition(
         session,
         task,
@@ -3770,7 +3772,14 @@ def complete_task(
         )
     _close_attempt(
         _current_attempt(session, task),
-        state="succeeded" if outcome.result in {"passed", "partial"} else "failed",
+        # The attempt outcome must match the applied task state: a rejected
+        # partial is a failed verification even though the raw verifier result
+        # was ``partial``.
+        state=(
+            "succeeded"
+            if task.state in {"succeeded", "partial_success"}
+            else "failed"
+        ),
         now=timestamp,
         stop_confirmed=True,
         result_ref=result_ref,
