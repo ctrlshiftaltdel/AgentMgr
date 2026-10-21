@@ -983,8 +983,8 @@ def test_remaining_escalation_edges_reach_needs_human(
     session.flush()
     assert cancel.state == "needs_human"
 
-    # T10 evaluated: a queue guard failure leaves the task evaluated; a human
-    # escalation is then the only legal exit.
+    # T10 evaluated: a queue guard failure has no worker path, so the service
+    # escalates it to a human instead of stranding it in ``evaluated``.
     employee = world.org.manager
     employee.status = "inactive"
     session.flush()
@@ -996,17 +996,12 @@ def test_remaining_escalation_edges_reach_needs_human(
             goal=goal(summary="Evaluated synthetic read"),
         )
     evaluated = session.scalar(
-        select(Task).where(Task.state == "evaluated").limit(1)
+        select(Task).where(Task.idempotency_key == "idem_edge_t10")
     )
     assert evaluated is not None
-    escalate_task(
-        session,
-        task_id=evaluated.task_id,
-        actor=world.actors.requester,
-        reason_code="responsibility_conflict",
-    )
-    session.flush()
     assert evaluated.state == "needs_human"
+    assert evaluated.needs_human_origin == "evaluated"
+    assert evaluated.owner_escalation is not None
 
 
 def test_dispatch_deadline_and_evidence_unavailable_edges(
@@ -1285,7 +1280,7 @@ def test_revoked_approval_cannot_queue_the_task(
     assert task.state == "denied"
 
 
-def test_failed_queue_guard_revokes_the_orphan_grant(
+def test_failed_queue_guard_leaves_no_grant_and_escalates(
     session: Session, world: TaskWorld
 ) -> None:
     employee = world.org.manager
@@ -1295,10 +1290,15 @@ def test_failed_queue_guard_revokes_the_orphan_grant(
     with pytest.raises(TaskError):
         task = submit_read(session, world)
     session.commit()
-    stored = session.scalar(select(Task).where(Task.state == "evaluated"))
+    stored = session.scalar(
+        select(Task).where(Task.idempotency_key == "idem_task_read_0001")
+    )
     assert stored is not None
-    # The guard is now previewed before issuance, so a refused queue leaves no
-    # grant at all.  If a grant was ever issued it must not be active.
+    # The guard is previewed before issuance, so a refused queue leaves no grant
+    # at all; the task is escalated instead of being stranded in ``evaluated``.
+    assert stored.state == "needs_human"
+    assert stored.grant_id is None
+    assert stored.needs_human_origin == "evaluated"
     if stored.grant_id is not None:
         assert get_grant(session, stored.grant_id).status == "revoked"
 

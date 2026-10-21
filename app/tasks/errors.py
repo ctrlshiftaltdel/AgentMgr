@@ -87,6 +87,7 @@ TASK_OPERATION_CODES: frozenset[str] = frozenset(
         "task_completion_evidence_incomplete",
         "task_lease_not_held",
         "task_lease_expired",
+        "task_lease_active",
         "task_fencing_token_stale",
         "task_worker_mismatch",
         "task_mode_capability_missing",

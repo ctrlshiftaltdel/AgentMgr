@@ -226,6 +226,24 @@ def claim_task(
             task.owner_account_status = status
         if service.dependency_blockers(session, task.task_id):
             continue
+        if service._requeue_would_exceed_runtime(  # noqa: SLF001 - same domain
+            session,
+            task,
+            max_runtime_seconds=int(task.max_runtime_seconds),
+            now=timestamp,
+        ) is not None:
+            # The task runtime cap is cumulative across attempts.  A queued row
+            # that already spent it can never be dispatched, so claiming it
+            # would only burn leases forever; hand it to a human instead.
+            if actor is not None:
+                service.escalate_task(
+                    session,
+                    task_id=task.task_id,
+                    actor=actor,
+                    reason_code="budget_exceeded",
+                    now=timestamp,
+                )
+            continue
         admissible.append(task)
     if not admissible:
         session.flush()
@@ -704,7 +722,10 @@ def escalate_overdue_tasks(
                     results.append(
                         SlaEscalation(
                             task_id=task.task_id,
-                            action="timed_out",
+                            # Honest label: T27 closes a never-dispatched task as
+                            # ``timed_out``; a requeued (attempt >= 1) task has no
+                            # attempt=0 edge and escalates to ``needs_human``.
+                            action=task.state,
                             state=task.state,
                             reason_code="task_deadline_exceeded",
                         )
@@ -720,25 +741,75 @@ def escalate_overdue_tasks(
                     results.append(
                         SlaEscalation(
                             task_id=task.task_id,
-                            action="needs_human",
+                            action=task.state,
                             state=task.state,
                             reason_code="response_deadline_exceeded",
                         )
                     )
             elif task.state == "dispatched":
                 if due_passed and dispatched_no_side_effect_evidence:
-                    service.dispatch_deadline_exceeded(
-                        session,
-                        task_id=task.task_id,
-                        actor=resolved_actor,
-                        evidence_refs=["evidence:dispatch_deadline_exceeded"],
-                        no_side_effects_evidence=True,
-                        now=timestamp,
-                    )
+                    recovery_lease = None
+                    try:
+                        if task.execution_mode == "managed_execution":
+                            # T34 for Managed Execution is authorised by the
+                            # current lease/fencing token, never by a caller
+                            # boolean.  The pass holds no worker lease, so it
+                            # takes a privileged recovery lease first.
+                            recovery_lease = service.acquire_recovery_lease(
+                                session,
+                                task_id=task.task_id,
+                                actor=resolved_actor,
+                                now=timestamp,
+                            )
+                        service.dispatch_deadline_exceeded(
+                            session,
+                            task_id=task.task_id,
+                            actor=resolved_actor,
+                            evidence_refs=["evidence:dispatch_deadline_exceeded"],
+                            no_side_effects_evidence=True,
+                            worker_id=(
+                                recovery_lease.worker_id
+                                if recovery_lease is not None
+                                else None
+                            ),
+                            fencing_token=(
+                                recovery_lease.fencing_token
+                                if recovery_lease is not None
+                                else None
+                            ),
+                            now=timestamp,
+                        )
+                    except TaskError:
+                        if (
+                            recovery_lease is not None
+                            and recovery_lease.released_at is None
+                        ):
+                            recovery_lease.released_at = timestamp
+                        # A still-live managed lease means the submission window
+                        # cannot be declared closed; escalate instead of
+                        # silently doing nothing.
+                        service.escalate_task(
+                            session,
+                            task_id=task.task_id,
+                            actor=resolved_actor,
+                            reason_code="dispatch_acceptance_unreconciled",
+                            now=timestamp,
+                        )
+                        results.append(
+                            SlaEscalation(
+                                task_id=task.task_id,
+                                action=task.state,
+                                state=task.state,
+                                reason_code="dispatch_acceptance_unreconciled",
+                            )
+                        )
+                        continue
+                    if recovery_lease is not None:
+                        recovery_lease.released_at = timestamp
                     results.append(
                         SlaEscalation(
                             task_id=task.task_id,
-                            action="timed_out",
+                            action=task.state,
                             state=task.state,
                             reason_code="dispatch_deadline_exceeded",
                         )
@@ -754,7 +825,7 @@ def escalate_overdue_tasks(
                     results.append(
                         SlaEscalation(
                             task_id=task.task_id,
-                            action="needs_human",
+                            action=task.state,
                             state=task.state,
                             reason_code="dispatch_acceptance_unreconciled",
                         )
@@ -770,7 +841,7 @@ def escalate_overdue_tasks(
                 results.append(
                     SlaEscalation(
                         task_id=task.task_id,
-                        action="needs_human",
+                        action=task.state,
                         state=task.state,
                         reason_code="execution_deadline_exceeded",
                     )

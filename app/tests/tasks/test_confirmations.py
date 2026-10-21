@@ -17,10 +17,12 @@ from app.tasks.service import (
     create_confirmation,
     record_approval,
     recheck_execution,
+    start_attempt,
 )
 from app.tests.tasks.conftest import TaskWorld
 from app.tests.tasks.helpers import (
     EVIDENCE_REF,
+    claim,
     goal,
     pending_confirmation,
     submit_gated,
@@ -280,6 +282,22 @@ def test_revoked_grant_blocks_execution(
     )
     session.commit()
     assert task.state == "queued"
+
+    # A controlled call needs an accepted submission: dispatch first, then the
+    # PEP sees the revoked grant (a queued call is refused by the PEP before it
+    # could consume a single-use grant).
+    lease = claim(session, world, worker_id="worker-conf-revoked")
+    session.flush()
+    start_attempt(
+        session,
+        task_id=task.task_id,
+        actor=world.actors.executor,
+        worker_id="worker-conf-revoked",
+        fencing_token=lease.lease.fencing_token,
+        execution_ref="exec_conf_revoked_0001",
+    )
+    session.flush()
+    assert task.state == "dispatched"
 
     revoke_grant(
         session,

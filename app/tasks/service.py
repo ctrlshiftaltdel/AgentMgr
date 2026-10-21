@@ -98,6 +98,7 @@ __all__ = [
     "DEFAULT_LEASE_SECONDS",
     "NecessityResult",
     "TaskEvidenceVerifier",
+    "acquire_recovery_lease",
     "add_dependency",
     "assign_task",
     "classify_necessity",
@@ -340,6 +341,13 @@ def _assert_managed_lease(
     a stale worker must never write an execution or stop fact (F23/C9).  There
     is deliberately no "expired lease is still mine" escape hatch: an expired
     or released lease can never authorise a fact write.
+
+    After a crash the task has no live worker, so a service/runtime recovery
+    writer first calls :func:`acquire_recovery_lease` (a fresh, higher-token
+    lease) and passes its ``worker_id``/``fencing_token`` here.  The human
+    T63/T64 path (``takeover_task``) is deliberately lease-free: it is a person
+    acting on ``needs_human`` with owner/identity authority, not a boundary
+    producer claiming a managed fact.
     """
     if task.execution_mode != "managed_execution":
         return
@@ -358,9 +366,23 @@ def _assert_managed_lease(
     )
 
 
-def _clamped_task_budget(
-    task: Task, record: GovernanceDecisionRecord | None
-) -> tuple[dict[str, Any], str]:
+@dataclass(frozen=True)
+class _BudgetClamp:
+    """The intersection of the task caps and the persisted policy ceiling.
+
+    Computed without touching the task row, so a caller can first prove that a
+    requeue is actually dispatchable (and, on refusal, restore nothing) before
+    narrowing the persisted caps.
+    """
+
+    budget: dict[str, Any]
+    consumption_mode: str
+    max_calls: int
+    max_runtime_seconds: int
+    max_cost_units: float | None
+
+
+def _clamp_budget(task: Task, record: GovernanceDecisionRecord | None) -> _BudgetClamp:
     """Return the grant budget and consumption mode for a task.
 
     The task-level caps are the caller's *ceiling*; the persisted decision is
@@ -370,6 +392,10 @@ def _clamped_task_budget(
     always exactly one call; a multi-call task uses ``multi_use`` so
     ``max_calls > 1`` is representable instead of being refused by the grant
     issuer.
+
+    The task row is deliberately **not** mutated here: ``retry_task`` and the
+    human redispatch paths must be able to refuse a requeue (an exhausted task
+    runtime, a rejected guard) without leaving narrowed budget fields behind.
     """
     constraints = dict(record.constraints) if record is not None else {}
     policy_calls = constraints.get("max_calls")
@@ -393,7 +419,15 @@ def _clamped_task_budget(
         }
         if task.max_cost_units is not None:
             budget["max_cost_units"] = float(task.max_cost_units)
-        return budget, mode
+        return _BudgetClamp(
+            budget=budget,
+            consumption_mode=mode,
+            max_calls=int(task.max_calls),
+            max_runtime_seconds=int(task.max_runtime_seconds),
+            max_cost_units=(
+                None if task.max_cost_units is None else float(task.max_cost_units)
+            ),
+        )
 
     calls = max(1, min(int(task.max_calls), policy_calls))
     if bool(constraints.get("required_confirmation")):
@@ -419,11 +453,71 @@ def _clamped_task_budget(
     if cost is not None:
         budget["max_cost_units"] = cost
 
-    task.max_calls = calls
-    if runtime is not None:
-        task.max_runtime_seconds = runtime
-    task.max_cost_units = cost
-    return budget, ("single_use" if calls == 1 else "multi_use")
+    return _BudgetClamp(
+        budget=budget,
+        consumption_mode="single_use" if calls == 1 else "multi_use",
+        max_calls=calls,
+        max_runtime_seconds=(
+            int(task.max_runtime_seconds) if runtime is None else runtime
+        ),
+        max_cost_units=cost,
+    )
+
+
+def _apply_budget_clamp(task: Task, clamp: _BudgetClamp) -> None:
+    """Persist the narrowed caps (only after the transition is proven)."""
+    task.max_calls = clamp.max_calls
+    task.max_runtime_seconds = clamp.max_runtime_seconds
+    task.max_cost_units = clamp.max_cost_units
+
+
+def _clamped_task_budget(
+    task: Task, record: GovernanceDecisionRecord | None
+) -> tuple[dict[str, Any], str]:
+    """Narrow the task caps to the policy ceiling and return the grant budget."""
+    clamp = _clamp_budget(task, record)
+    _apply_budget_clamp(task, clamp)
+    return clamp.budget, clamp.consumption_mode
+
+
+def _attempt_runtime_elapsed(
+    session: Session, task: Task, *, now: datetime
+) -> timedelta | None:
+    """Total task runtime, measured from the first opened attempt.
+
+    ``None`` means no attempt was ever opened, so no runtime was consumed.
+    """
+    started_at = session.scalar(
+        select(func.min(TaskAttempt.started_at)).where(
+            TaskAttempt.task_id == task.task_id
+        )
+    )
+    if started_at is None:
+        return None
+    return now - _to_utc(started_at)  # type: ignore[operator]
+
+
+def _requeue_would_exceed_runtime(
+    session: Session,
+    task: Task,
+    *,
+    max_runtime_seconds: int,
+    now: datetime,
+) -> int | None:
+    """Return the elapsed seconds when a requeue could never be dispatched.
+
+    The task runtime cap is **cumulative** across attempts (see
+    :func:`_assert_task_budget`).  A requeue that already exceeds it would sit
+    in ``queued`` forever, because ``start_attempt`` refuses the dispatch while
+    no worker may claim the row away.  Callers therefore escalate (T70) or fail
+    closed instead of requeueing.
+    """
+    elapsed = _attempt_runtime_elapsed(session, task, now=now)
+    if elapsed is None:
+        return None
+    if elapsed > timedelta(seconds=max(1, int(max_runtime_seconds))):
+        return int(elapsed.total_seconds())
+    return None
 
 
 def _assert_task_budget(
@@ -431,10 +525,13 @@ def _assert_task_budget(
 ) -> None:
     """Enforce the persisted task budget at dispatch and the PEP boundary.
 
-    Beyond the per-grant ceiling, a task has a total runtime budget measured
-    from its first opened attempt.  ``now`` is therefore authoritative: a
-    worker whose attempt outlived the task's runtime cap can never dispatch or
-    execute another call, even if its individual grant is still live.
+    Beyond the per-grant ceiling, a task has a total (cumulative) runtime budget
+    measured from its first opened attempt and shared by every attempt.  ``now``
+    is therefore authoritative: a worker whose attempt outlived the task's
+    runtime cap can never dispatch or execute another call, even if its
+    individual grant is still live.  Because the cap is cumulative, every
+    requeue path must prove the task can still be dispatched
+    (:func:`_requeue_would_exceed_runtime`) rather than narrowing the cap.
     """
     if grant is None:
         return
@@ -470,13 +567,8 @@ def _assert_task_budget(
                 "task_max_cost_units": task.max_cost_units,
             },
         )
-    started_at = session.scalar(
-        select(func.min(TaskAttempt.started_at)).where(
-            TaskAttempt.task_id == task.task_id
-        )
-    )
-    if started_at is not None:
-        elapsed = now - _to_utc(started_at)  # type: ignore[operator]
+    elapsed = _attempt_runtime_elapsed(session, task, now=now)
+    if elapsed is not None:
         if elapsed > timedelta(seconds=int(task.max_runtime_seconds)):
             raise TaskError(
                 "budget_exceeded",
@@ -2243,6 +2335,55 @@ def _open_approval(
     return instance
 
 
+def _escalate_after_queue_rejection(
+    session: Session,
+    task: Task,
+    actor: GovernancePrincipal,
+    *,
+    reason_code: str,
+    now: datetime,
+) -> bool:
+    """Hand a task whose queue guard failed to a human (T10).
+
+    ``claim_task`` only claims ``queued`` rows, so a task left in ``evaluated``
+    has no worker path at all.  A queue-guard rejection (including a guard that
+    only fails after the grant was issued) therefore escalates through T10 so
+    the task stays recoverable; the original rejection is still reported to the
+    caller.  Returns ``False`` when the state has no such edge, in which case
+    the caller simply re-raises.
+    """
+    if task.state != "evaluated":
+        return False
+    try:
+        with session.no_autoflush:
+            ctx = replace(
+                _base_context(session, task, actor, now=now),
+                escalation_justified=True,
+            )
+        _perform_transition(
+            session,
+            task,
+            actor,
+            event="human.escalation_required",
+            target="needs_human",
+            ctx=ctx,
+            reason_code=reason_code,
+            now=now,
+        )
+    except TaskError:
+        return False
+    task.needs_human_origin = "evaluated"
+    if task.owner_account_status != "active" and task.owner_escalation is None:
+        task.owner_escalation = _owner_escalation_document(
+            task,
+            status=task.owner_account_status,
+            now=now,
+            reason_code=reason_code,
+        )
+    session.flush()
+    return True
+
+
 def _issue_grant_and_queue(
     session: Session,
     task: Task,
@@ -2268,30 +2409,47 @@ def _issue_grant_and_queue(
     approval_ref = _approval_document(task)
 
     # Validate every non-grant guard *before* issuing authority.  A rejection
-    # here must not leave a decision/grant behind for a task that never queued.
+    # here must not leave a decision/grant behind for a task that never queued,
+    # and it must not strand the task in ``evaluated`` (no worker path): the
+    # rejection escalates through T10 for the caller to keep or roll back.
     ctx = _base_context(session, task, actor, now=now)
     if (
         task.execution_mode == "managed_execution"
         and not runtime_capabilities_verified
     ):
         ctx = replace(ctx, mode_capabilities_ok=False)
-    _preview_transition(
-        task,
-        event="task.queued",
-        target="queued",
-        ctx=replace(
-            ctx,
-            grant_id="grant_preview",
-            grant_status="active",
-            grant_unexpired=True,
-            grant_task_matches=True,
-            grant_revision_matches=True,
-            grant_decision_matches=True,
-            grant_scope_ok=True,
-        ),
-    )
+    try:
+        _preview_transition(
+            task,
+            event="task.queued",
+            target="queued",
+            ctx=replace(
+                ctx,
+                grant_id="grant_preview",
+                grant_status="active",
+                grant_unexpired=True,
+                grant_task_matches=True,
+                grant_revision_matches=True,
+                grant_decision_matches=True,
+                grant_scope_ok=True,
+            ),
+        )
+    except TaskStateConflict:
+        # A concurrent writer won the revision; the caller retries with a fresh
+        # revision instead of escalating a task that may queue next time.
+        raise
+    except TaskError as exc:
+        _escalate_after_queue_rejection(
+            session, task, actor, reason_code=exc.reason_code, now=now
+        )
+        raise
 
-    budget, consumption_mode = _clamped_task_budget(task, record)
+    clamp = _clamp_budget(task, record)
+    previous_budget = (
+        task.max_calls,
+        task.max_runtime_seconds,
+        task.max_cost_units,
+    )
     executor = resolve_principal(
         session,
         task.executor_principal_id or "",
@@ -2307,8 +2465,8 @@ def _issue_grant_and_queue(
             execution_mode=task.execution_mode,
             capabilities=list(task.requested_capabilities),
             resource_scope=task.resource_scope,
-            budget=budget,
-            consumption_mode=consumption_mode,
+            budget=clamp.budget,
+            consumption_mode=clamp.consumption_mode,
             confirmation_ref=confirmation_ref,
             approval_ref=approval_ref,
             tool_contract_version="1.0.0",
@@ -2321,6 +2479,7 @@ def _issue_grant_and_queue(
             context=exc.context,
         ) from exc
 
+    _apply_budget_clamp(task, clamp)
     task.grant_id = grant.grant_id
     task.grant_status = grant.status
     session.flush()
@@ -2342,12 +2501,22 @@ def _issue_grant_and_queue(
             reason_code="policy_allowed",
             now=now,
         )
-    except TaskError:
+    except TaskError as exc:
         # Important 11: never leave an orphan active grant when a queue guard
         # rejects the task.  Revoke it in the same transaction so a caller that
         # catches the error and commits does not leak authority.
+        task.max_calls, task.max_runtime_seconds, task.max_cost_units = (
+            previous_budget
+        )
         _invalidate_grant(
             session, task, actor, reason_code="task_terminal", now=now
+        )
+        # F7: an ``evaluated`` task has no worker path (``claim_task`` only
+        # claims ``queued``), so a queue-guard rejection would strand it.  Hand
+        # it to a human (T10) so the caller still has a recoverable task, then
+        # report the rejection honestly.
+        _escalate_after_queue_rejection(
+            session, task, actor, reason_code=exc.reason_code, now=now
         )
         raise
 
@@ -2666,6 +2835,94 @@ def _assert_lease(
     return lease
 
 
+def acquire_recovery_lease(
+    session: Session,
+    *,
+    task_id: str,
+    actor: GovernancePrincipal,
+    lease_seconds: int = DEFAULT_LEASE_SECONDS,
+    now: datetime | None = None,
+) -> TaskLease:
+    """Acquire a privileged, fresh lease for a non-queued (recovery) task.
+
+    Managed Execution facts and stops require the *current* lease and fencing
+    token, but a crash leaves the task in ``dispatched``/``running`` ->
+    ``unknown`` (or ``needs_human``) with no live worker at all.  Without this
+    path such a task could never be reconciled or stopped: no lease exists, so
+    every managed writer refuses.  A trusted service/runtime principal (or an
+    identity manager) therefore acquires a new lease with a **higher** fencing
+    token, which immediately stales the crashed worker.
+
+    ``queued`` tasks are excluded: they are claimed through
+    :func:`app.tasks.worker.claim_task` (fair ordering, owner refresh), never
+    through a recovery lease.
+    """
+    timestamp = now or _utcnow()
+    _require_actor(actor)
+    task = _load_task(session, task_id, for_update=True)
+    if not _is_privileged(actor) and actor.principal_type not in {
+        "service",
+        "runtime",
+    }:
+        raise TaskError(
+            "task_unauthorized_actor",
+            "only a trusted service/runtime recovery writer may take a recovery lease",
+            context={"actor": actor.principal_id},
+        )
+    if task.state == "queued":
+        raise TaskError(
+            "task_invalid_transition",
+            "a queued task is claimed by the worker, not by a recovery lease",
+            context={"state": task.state},
+        )
+    current = session.scalar(
+        select(TaskLease)
+        .where(TaskLease.task_id == task.task_id, TaskLease.released_at.is_(None))
+        .order_by(TaskLease.id.desc())
+        .limit(1)
+        .with_for_update()
+    )
+    if current is not None:
+        if _to_utc(current.lease_expires_at) > timestamp:  # type: ignore[operator]
+            raise TaskError(
+                "task_lease_active",
+                "another worker still holds a live lease on this task",
+                context={
+                    "task_id": task.task_id,
+                    "worker_id": current.worker_id,
+                },
+            )
+        current.released_at = timestamp
+        session.flush()
+    highest = session.scalar(
+        select(func.max(TaskLease.fencing_token)).where(
+            TaskLease.task_id == task.task_id
+        )
+    )
+    lease = TaskLease(
+        task_id=task.task_id,
+        worker_id=f"recovery-{uuid.uuid4().hex[:12]}",
+        fencing_token=int(highest or 0) + 1,
+        acquired_at=timestamp,
+        lease_expires_at=timestamp + timedelta(seconds=max(1, lease_seconds)),
+    )
+    session.add(lease)
+    session.flush()
+    _audit(
+        session,
+        actor=actor,
+        action="task.lease.recovered",
+        task=task,
+        details={
+            "lease_id": lease.id,
+            "worker_id": lease.worker_id,
+            "fencing_token": lease.fencing_token,
+            "state": task.state,
+        },
+    )
+    return lease
+
+
 def start_attempt(
     session: Session,
     *,
@@ -2915,13 +3172,12 @@ def mark_running(
         now=timestamp,
     )
     attempt = _current_attempt(session, task)
-    if attempt is not None:
-        attempt.state = "running"
-        session.flush()
     ctx = replace(
         _base_context(session, task, actor, now=timestamp),
         running_evidence=True,
     )
+    # Validate before mutating: a rejected transition must not leave the
+    # attempt row at ``running`` while the task is still ``dispatched``.
     _perform_transition(
         session,
         task,
@@ -2933,6 +3189,9 @@ def mark_running(
         extra={"evidence_ref": evidence_ref} if evidence_ref else None,
         now=timestamp,
     )
+    if attempt is not None:
+        attempt.state = "running"
+        session.flush()
     return task
 
 
@@ -3000,26 +3259,11 @@ def record_attempt_result(
         # Important 3: T36 must not accept a completed run on a revoked,
         # expired or otherwise invalid grant/gate.
         _assert_completion_authority(session, task, now=timestamp)
-    result = {
-        **dict(task.result or {}),
-        "outcome": outcome,
-        "result_ref": result_ref,
-        "evidence_refs": list(refs),
-        "stop_confirmed": stop_confirmed,
-        "stop_evidence_refs": list(refs) if stop_confirmed else [],
-        "side_effects_reconciled": side_effects_reconciled,
-        "error_code": error_code,
-        "verification": {
-            "result": "pending",
-            "verifier_id": None,
-            "verified_at": None,
-            "evidence_refs": [],
-        },
-    }
-    task.result = result
-    task.stop_confirmed = bool(stop_confirmed)
-    session.flush()
 
+    # Validate the target edge *before* any write.  The guard facts
+    # (``result_present``/``evidence_present``/``loss_evidence``/stop evidence)
+    # are supplied explicitly below, so the context does not depend on the
+    # result document being staged first.
     ctx = replace(
         _base_context(session, task, actor, now=timestamp),
         result_present=bool(result_ref),
@@ -3030,7 +3274,6 @@ def record_attempt_result(
         loss_evidence=(outcome == "lost"),
         running_evidence=True,
     )
-
     state = task.state
     if outcome == "lost":
         if state not in {"dispatched", "running", "cancel_requested"}:
@@ -3039,80 +3282,97 @@ def record_attempt_result(
                 "execution can only be lost from dispatched/running/cancel_requested",
                 context={"state": state},
             )
-        event = "execution.lost"
-        _invalidate_grant(
-            session, task, actor, reason_code="execution_evidence_lost", now=timestamp
-        )
-        _perform_transition(
-            session, task, actor, event=event, target="unknown", ctx=ctx,
-            expected_revision=expected_revision, reason_code="stop_not_confirmed",
-            now=timestamp,
-        )
-        return task
-
-    if outcome == "completed":
+        event, target = "execution.lost", "unknown"
+        grant_reason = "execution_evidence_lost"
+    elif outcome == "completed":
         if state not in {"running", "cancel_requested"}:
             raise TaskError(
                 "task_invalid_transition",
                 "completion can only be reported from running/cancel_requested",
                 context={"state": state},
             )
-        event = "execution.completed"
-        _perform_transition(
-            session, task, actor, event=event, target="verifying", ctx=ctx,
-            expected_revision=expected_revision, now=timestamp,
-        )
-        _close_attempt(
-            attempt, state="verifying", now=timestamp, stop_confirmed=False,
-            result_ref=result_ref, evidence_refs=refs,
-        )
-        session.flush()
-        return task
-
-    if outcome == "stopped":
+        event, target = "execution.completed", "verifying"
+        grant_reason = None
+    elif outcome == "stopped":
         if state != "cancel_requested":
             raise TaskError(
                 "task_invalid_transition",
                 "a stop is only a terminal fact after a cancel request",
                 context={"state": state},
             )
-        ctx = replace(ctx, side_effects_reconciled=side_effects_reconciled)
-        _invalidate_grant(
-            session, task, actor, reason_code="task_cancelled", now=timestamp
-        )
+        event, target = "execution.stopped", "cancelled"
+        grant_reason = "task_cancelled"
+    else:  # failed / timed_out
+        if state not in {"dispatched", "running"}:
+            raise TaskError(
+                "task_invalid_transition",
+                f"{outcome} can only be reported from dispatched/running",
+                context={"state": state},
+            )
+        event = "execution.failed" if outcome == "failed" else "execution.timed_out"
+        target = "failed" if outcome == "failed" else "timed_out"
+        grant_reason = "attempt_failed"
+
+    _preview_transition(
+        task, event=event, target=target, ctx=ctx,
+        expected_revision=expected_revision,
+    )
+
+    previous_result = dict(task.result or {})
+    previous_stop = task.stop_confirmed
+    try:
+        task.result = {
+            **dict(task.result or {}),
+            "outcome": outcome,
+            "result_ref": result_ref,
+            "evidence_refs": list(refs),
+            "stop_confirmed": stop_confirmed,
+            "stop_evidence_refs": list(refs) if stop_confirmed else [],
+            "side_effects_reconciled": side_effects_reconciled,
+            "error_code": error_code,
+            "verification": {
+                "result": "pending",
+                "verifier_id": None,
+                "verified_at": None,
+                "evidence_refs": [],
+            },
+        }
+        task.stop_confirmed = bool(stop_confirmed)
+        if grant_reason is not None:
+            # Must reach the database in the same UPDATE as the state change:
+            # terminal/unknown rows may not keep an ``active`` grant.
+            _invalidate_grant(
+                session, task, actor, reason_code=grant_reason, now=timestamp
+            )
         _perform_transition(
-            session, task, actor, event="execution.stopped", target="cancelled",
-            ctx=ctx, expected_revision=expected_revision, now=timestamp,
+            session, task, actor, event=event, target=target, ctx=ctx,
+            expected_revision=expected_revision,
+            reason_code="stop_not_confirmed" if outcome == "lost" else error_code,
+            now=timestamp,
         )
+    except TaskError:
+        task.result = previous_result
+        task.stop_confirmed = previous_stop
+        raise
+
+    if outcome == "completed":
+        _close_attempt(
+            attempt, state="verifying", now=timestamp, stop_confirmed=False,
+            result_ref=result_ref, evidence_refs=refs,
+        )
+    elif outcome == "stopped":
         _close_attempt(
             attempt, state="cancelled", now=timestamp, stop_confirmed=True,
             result_ref=result_ref, evidence_refs=refs, reason=reason,
         )
-        session.flush()
+    elif outcome == "lost":
         return task
-
-    # failed / timed_out
-    if state not in {"dispatched", "running"}:
-        raise TaskError(
-            "task_invalid_transition",
-            f"{outcome} can only be reported from dispatched/running",
-            context={"state": state},
+    else:
+        _close_attempt(
+            attempt, state=outcome, now=timestamp, stop_confirmed=True,
+            result_ref=result_ref, evidence_refs=refs, error_code=error_code,
+            reason=reason,
         )
-    event = "execution.failed" if outcome == "failed" else "execution.timed_out"
-    target = "failed" if outcome == "failed" else "timed_out"
-    _invalidate_grant(
-        session, task, actor, reason_code="attempt_failed", now=timestamp
-    )
-    _perform_transition(
-        session, task, actor, event=event, target=target, ctx=ctx,
-        expected_revision=expected_revision, reason_code=error_code,
-        now=timestamp,
-    )
-    _close_attempt(
-        attempt, state=outcome, now=timestamp, stop_confirmed=True,
-        result_ref=result_ref, evidence_refs=refs, error_code=error_code,
-        reason=reason,
-    )
     session.flush()
     return task
 
@@ -3688,6 +3948,54 @@ def complete_task(
         "verified_at": _rfc3339(timestamp),
         "evidence_refs": list(evidence_tuple),
     }
+
+    if outcome.result == "passed":
+        event, target = "verification.passed", "succeeded"
+    elif outcome.result == "partial" and owner_accepted_partial:
+        event, target = "verification.partial", "partial_success"
+    elif outcome.result == "inconclusive":
+        event, target = "verification.inconclusive", "needs_human"
+    else:
+        # A rejected partial/failed verification is a ``verification.failed``
+        # edge; the persisted shape must say so even when the raw outcome was
+        # ``partial`` (Important 12).
+        event, target = "verification.failed", "failed"
+        verification_doc = {**verification_doc, "result": "failed"}
+
+    extra: dict[str, Any] | None = None
+    if target == "succeeded":
+        extra = {"verifier": verification_doc["verifier_id"]}
+    elif target == "partial_success":
+        extra = {"failed_criteria": list(outcome.failed_criteria)}
+    reason_code = (
+        "evidence_missing"
+        if target == "needs_human"
+        else outcome.reason_code
+        if target == "failed"
+        else None
+    )
+
+    previous_result = dict(task.result or {})
+    # Build every guard fact explicitly, then prove the edge *before* staging
+    # the result: ``_base_context`` issues queries, and an autoflush there would
+    # persist the staged result before the guards ran.
+    ctx = replace(
+        _base_context(session, task, actor, now=timestamp),
+        result_present=bool(result_ref),
+        evidence_present=bool(evidence_tuple),
+        verification_result=(
+            "failed" if target == "failed" else outcome.result
+        ),
+        verification_passed=outcome.result == "passed",
+        verification_partial_allowed=bool(allow_partial),
+        verification_inconclusive=target == "needs_human",
+        owner_accepted_partial=bool(owner_accepted_partial),
+        all_criteria_passed=outcome.result == "passed",
+    )
+    _preview_transition(
+        task, event=event, target=target, ctx=ctx,
+        expected_revision=expected_revision,
+    )
     task.result = {
         **dict(task.result or {}),
         "outcome": outcome.result,
@@ -3700,37 +4008,23 @@ def complete_task(
         "failed_criteria": list(outcome.failed_criteria),
         "verified_at": _rfc3339(timestamp),
     }
-    session.flush()
-    ctx = _base_context(session, task, actor, now=timestamp)
-
-    if outcome.result == "passed":
-        _invalidate_grant(
-            session, task, actor, reason_code="task_terminal", now=timestamp
-        )
+    try:
+        if target in {"succeeded", "partial_success", "failed"}:
+            # Terminal targets may not keep an ``active`` grant; the revocation
+            # must share the UPDATE with the state change.
+            _invalidate_grant(
+                session, task, actor, reason_code="task_terminal", now=timestamp
+            )
         _perform_transition(
-            session, task, actor, event="verification.passed", target="succeeded",
+            session, task, actor, event=event, target=target,
             ctx=ctx, expected_revision=expected_revision,
-            extra={"verifier": verification_doc["verifier_id"]}, now=timestamp,
+            reason_code=reason_code, extra=extra, now=timestamp,
         )
-    elif outcome.result == "partial" and owner_accepted_partial:
-        _invalidate_grant(
-            session, task, actor, reason_code="task_terminal", now=timestamp
-        )
-        _perform_transition(
-            session, task, actor, event="verification.partial",
-            target="partial_success", ctx=ctx,
-            expected_revision=expected_revision,
-            extra={"failed_criteria": list(outcome.failed_criteria)},
-            now=timestamp,
-        )
-    elif outcome.result == "inconclusive":
-        ctx = replace(ctx, verification_inconclusive=True)
-        _perform_transition(
-            session, task, actor, event="verification.inconclusive",
-            target="needs_human", ctx=ctx,
-            expected_revision=expected_revision,
-            reason_code="evidence_missing", now=timestamp,
-        )
+    except TaskError:
+        task.result = previous_result
+        raise
+
+    if target == "needs_human":
         # T45: the attempt has ended and its result is pending a human
         # verification (T60 becomes the only resumable origin).
         task.needs_human_origin = "verifying"
@@ -3748,28 +4042,6 @@ def complete_task(
         )
         session.flush()
         return task
-    else:
-        # A rejected partial/failed verification is a ``verification.failed``
-        # edge; the persisted shape must say so even when the raw outcome was
-        # ``partial`` (Important 12).
-        verification_doc = {**verification_doc, "result": "failed"}
-        task.result = {
-            **dict(task.result or {}),
-            "verification": verification_doc,
-        }
-        session.flush()
-        ctx = replace(
-            _base_context(session, task, actor, now=timestamp),
-            verification_result="failed",
-        )
-        _invalidate_grant(
-            session, task, actor, reason_code="task_terminal", now=timestamp
-        )
-        _perform_transition(
-            session, task, actor, event="verification.failed", target="failed",
-            ctx=ctx, expected_revision=expected_revision,
-            reason_code=outcome.reason_code, now=timestamp,
-        )
     _close_attempt(
         _current_attempt(session, task),
         # The attempt outcome must match the applied task state: a rejected
@@ -3946,13 +4218,16 @@ def _fresh_retry_decision(
     actor: GovernancePrincipal,
     now: datetime,
     capability: str | None = None,
-) -> tuple[GovernanceDecision, ExecutionGrant, GovernanceDecisionRecord | None]:
+) -> tuple[GovernanceDecision, ExecutionGrant, GovernanceDecisionRecord | None, _BudgetClamp]:
     """Evaluate a retry decision (revision >= 2, purpose=retry) and grant it.
 
     The task is deliberately **not** mutated: a caller must first prove the
-    transition guards, then bind the returned decision/grant.  A guard failure
-    therefore cannot leave ``task.decision_id``/``grant_id`` pointing at an
-    unapplied decision, and the orphan grant is revoked by the caller.
+    transition guards (and that the task runtime budget still allows a
+    dispatch), then bind the returned decision/grant and apply the returned
+    budget clamp.  A guard failure therefore cannot leave
+    ``task.decision_id``/``grant_id`` pointing at an unapplied decision, an
+    orphan active grant, or narrowed caps on a task that never requeued; the
+    orphan grant is revoked by the caller.
     """
     record = _decision_record(session, task)
     capability = capability or (task.requested_capabilities or [None])[0]
@@ -4002,7 +4277,7 @@ def _fresh_retry_decision(
             GovernanceDecisionRecord.decision_id == decision.decision_id
         )
     )
-    budget, consumption_mode = _clamped_task_budget(task, new_record)
+    clamp = _clamp_budget(task, new_record)
     grant = issue_grant(
         session,
         principal=executor,
@@ -4014,8 +4289,8 @@ def _fresh_retry_decision(
         execution_mode=task.execution_mode,
         capabilities=list(task.requested_capabilities),
         resource_scope=task.resource_scope,
-        budget=budget,
-        consumption_mode=consumption_mode,
+        budget=clamp.budget,
+        consumption_mode=clamp.consumption_mode,
         confirmation_ref=_live_confirmation_ref(session, task, now=now),
         approval_ref=_live_approval_ref(task, now=now),
         tool_contract_version="1.0.0",
@@ -4117,7 +4392,7 @@ def retry_task(
         return task
 
     try:
-        decision, grant, rule = _fresh_retry_decision(
+        decision, grant, rule, clamp = _fresh_retry_decision(
             session, task, actor=actor, now=timestamp, capability=capability
         )
     except GovernanceError as exc:
@@ -4126,7 +4401,43 @@ def retry_task(
             context=exc.context,
         ) from exc
 
+    # F1: the task runtime cap is cumulative.  A requeue that already exceeds
+    # the (still narrower of task/policy) cap could never be dispatched, so
+    # escalate to a human instead of leaving an undispatachable queued row.
+    exhausted = _requeue_would_exceed_runtime(
+        session,
+        task,
+        max_runtime_seconds=clamp.max_runtime_seconds,
+        now=timestamp,
+    )
+    if exhausted is not None:
+        _revoke_unbound_grant(
+            session, grant, reason_code="task_terminal", now=timestamp
+        )
+        ctx = replace(
+            _base_context(session, task, actor, now=timestamp),
+            retry_exhausted=True,
+            escalation_justified=True,
+        )
+        _perform_transition(
+            session, task, actor, event="task.retry_exhausted",
+            target="needs_human", ctx=ctx, expected_revision=expected_revision,
+            reason_code="budget_exceeded",
+            extra={
+                "task_max_runtime_seconds": clamp.max_runtime_seconds,
+                "elapsed_seconds": exhausted,
+            },
+            now=timestamp,
+        )
+        task.needs_human_origin = "failed"
+        session.flush()
+        return task
+
     budget_before = task.retry_budget_remaining
+    # C7 derivation: the retry gate above already required persisted
+    # no-side-effect/reconciliation evidence, so the stored reconciliation fact
+    # is derived from it instead of being asserted unconditionally.
+    reconciled = bool(base_ctx.side_effects_reconciled) or bool(base_ctx.no_side_effects)
     ctx = replace(
         _base_context(session, task, actor, now=timestamp),
         decision_purpose="retry",
@@ -4179,8 +4490,12 @@ def retry_task(
         task.grant_id,
         task.grant_status,
         task.retry_budget_remaining,
+        task.max_calls,
+        task.max_runtime_seconds,
+        task.max_cost_units,
         dict(task.result or {}),
     )
+    _apply_budget_clamp(task, clamp)
     task.decision_id = decision.decision_id
     task.decision_revision = decision.decision_revision
     task.decision_type = decision.decision_type
@@ -4195,8 +4510,8 @@ def retry_task(
     task.result = {
         **dict(task.result or {}),
         "outcome": "none",
-        "no_side_effects": False,
-        "side_effects_reconciled": True,
+        "no_side_effects": bool(base_ctx.no_side_effects),
+        "side_effects_reconciled": reconciled,
     }
     # No flush here: binding an active grant while the task is still ``failed``
     # would violate terminal_state_grant_invalidated.  The state change and the
@@ -4210,10 +4525,9 @@ def retry_task(
             now=timestamp,
         )
     except TaskError:
-        _revoke_unbound_grant(
-            session, grant, reason_code="task_terminal",
-            now=timestamp,
-        )
+        # Restore *before* revoking: ``revoke_grant`` flushes, and a still-
+        # ``failed`` row bound to the new grant would violate
+        # terminal_state_grant_invalidated.
         (
             task.decision_id,
             task.decision_revision,
@@ -4225,10 +4539,17 @@ def retry_task(
             task.grant_id,
             task.grant_status,
             task.retry_budget_remaining,
+            task.max_calls,
+            task.max_runtime_seconds,
+            task.max_cost_units,
             previous_result,
         ) = previous_decision
         task.result = previous_result
         session.flush()
+        _revoke_unbound_grant(
+            session, grant, reason_code="task_terminal",
+            now=timestamp,
+        )
         raise
     return task
 
@@ -4334,9 +4655,30 @@ def reconcile_task(
             task, event="reconcile.not_found", target="queued", ctx=ctx,
             expected_revision=expected_revision,
         )
-        decision, grant, rule = _fresh_retry_decision(
+        decision, grant, rule, clamp = _fresh_retry_decision(
             session, task, actor=actor, now=timestamp, capability=capability
         )
+        # F1: a rolled-back attempt (T33) leaves attempt=0 but still consumes
+        # cumulative task runtime.  Never requeue a task that could not be
+        # dispatched again; fail closed in ``unknown`` for a human instead.
+        exhausted = _requeue_would_exceed_runtime(
+            session,
+            task,
+            max_runtime_seconds=clamp.max_runtime_seconds,
+            now=timestamp,
+        )
+        if exhausted is not None:
+            _revoke_unbound_grant(
+                session, grant, reason_code="task_terminal", now=timestamp
+            )
+            raise TaskError(
+                "budget_exceeded",
+                "the task runtime budget is exhausted; reconciliation cannot requeue",
+                context={
+                    "task_max_runtime_seconds": clamp.max_runtime_seconds,
+                    "elapsed_seconds": exhausted,
+                },
+            )
         ctx = replace(
             ctx,
             grant_id=grant.grant_id,
@@ -4369,8 +4711,12 @@ def reconcile_task(
             task.policy_content_hash,
             task.grant_id,
             task.grant_status,
+            task.max_calls,
+            task.max_runtime_seconds,
+            task.max_cost_units,
             dict(task.result or {}),
         )
+        _apply_budget_clamp(task, clamp)
         task.decision_id = decision.decision_id
         task.decision_revision = decision.decision_revision
         task.decision_type = decision.decision_type
@@ -4385,7 +4731,9 @@ def reconcile_task(
             **dict(task.result or {}),
             "outcome": "none",
             "no_side_effect_evidence": True,
-            "side_effects_reconciled": True,
+            # T71 only proceeds on explicit no-side-effect evidence, so the
+            # reconciliation fact is derived from that evidence.
+            "side_effects_reconciled": bool(no_side_effect_evidence),
         }
         # Bind and transition in one flush: an active grant on ``unknown`` is
         # forbidden by unknown_state_grant_revoked.
@@ -4396,10 +4744,9 @@ def reconcile_task(
                 extra={"decision_id": decision.decision_id}, now=timestamp,
             )
         except TaskError:
-            _revoke_unbound_grant(
-                session, grant, reason_code="task_terminal",
-                now=timestamp,
-            )
+            # Restore before revoking: ``revoke_grant`` flushes, and an
+            # ``unknown`` row bound to the new active grant would violate
+            # unknown_state_grant_revoked.
             (
                 task.decision_id,
                 task.decision_revision,
@@ -4410,10 +4757,17 @@ def reconcile_task(
                 task.policy_content_hash,
                 task.grant_id,
                 task.grant_status,
+                task.max_calls,
+                task.max_runtime_seconds,
+                task.max_cost_units,
                 previous_result,
             ) = previous_authority
             task.result = previous_result
             session.flush()
+            _revoke_unbound_grant(
+                session, grant, reason_code="task_terminal",
+                now=timestamp,
+            )
             raise
         return task
 
@@ -4632,9 +4986,30 @@ def takeover_task(
                 "the open attempt must be stopped with reconciled side effects",
                 context={"attempt": task.attempt},
             )
-        _decision, grant, rule = _fresh_retry_decision(
+        _decision, grant, rule, clamp = _fresh_retry_decision(
             session, task, actor=actor, now=timestamp, capability=capability
         )
+        # F1: T61 must not requeue a task whose cumulative runtime already
+        # exceeds the narrower of task/policy runtime -- it could never be
+        # dispatched.  Fail closed in ``needs_human`` instead.
+        exhausted = _requeue_would_exceed_runtime(
+            session,
+            task,
+            max_runtime_seconds=clamp.max_runtime_seconds,
+            now=timestamp,
+        )
+        if exhausted is not None:
+            _revoke_unbound_grant(
+                session, grant, reason_code="task_terminal", now=timestamp
+            )
+            raise TaskError(
+                "budget_exceeded",
+                "the task runtime budget is exhausted; redispatch is refused",
+                context={
+                    "task_max_runtime_seconds": clamp.max_runtime_seconds,
+                    "elapsed_seconds": exhausted,
+                },
+            )
         preview = replace(
             base,
             stop_confirmed=bool(refs) or task.attempt == 0,
@@ -4705,7 +5080,11 @@ def takeover_task(
             task.policy_content_hash,
             task.grant_id,
             task.grant_status,
+            task.max_calls,
+            task.max_runtime_seconds,
+            task.max_cost_units,
         )
+        _apply_budget_clamp(task, clamp)
         task.decision_id = _decision.decision_id
         task.decision_revision = _decision.decision_revision
         task.decision_type = _decision.decision_type
@@ -4722,11 +5101,8 @@ def takeover_task(
                 ctx=preview, expected_revision=expected_revision, now=timestamp,
             )
         except TaskError:
-            _revoke_unbound_grant(
-                session, grant,
-                reason_code="task_terminal",
-                now=timestamp,
-            )
+            # Restore before revoking: ``revoke_grant`` flushes, and a
+            # ``needs_human`` row bound to the new active grant is an orphan.
             (
                 task.decision_id,
                 task.decision_revision,
@@ -4737,8 +5113,16 @@ def takeover_task(
                 task.policy_content_hash,
                 task.grant_id,
                 task.grant_status,
+                task.max_calls,
+                task.max_runtime_seconds,
+                task.max_cost_units,
             ) = previous_authority
             session.flush()
+            _revoke_unbound_grant(
+                session, grant,
+                reason_code="task_terminal",
+                now=timestamp,
+            )
             raise
         task.result = {
             **dict(task.result or {}),
@@ -5046,10 +5430,17 @@ def deny_task(
     actor: GovernancePrincipal,
     reason_code: str,
     evidence_refs: Sequence[str] = (),
+    side_effects_reconciled: bool | None = None,
     expected_revision: int | None = None,
     now: datetime | None = None,
 ) -> Task:
-    """T12/T25: withdraw authority for an awaiting-clarification or queued task."""
+    """T12/T25: withdraw authority for an awaiting-clarification or queued task.
+
+    ``side_effects_reconciled`` is never asserted by the service: it is derived
+    from persisted reconciliation evidence, an explicit caller fact, or the
+    structural "no attempt was ever opened" proof.  A denial therefore cannot
+    fabricate a clean boundary.
+    """
     timestamp = now or _utcnow()
     task = _load_task(session, task_id, for_update=True)
     _require_task_authority(actor, task)
@@ -5068,36 +5459,59 @@ def deny_task(
     refs = tuple(evidence_refs)
     if refs:
         verification.validate_result_refs(None, refs, require_result=False)
-    task.stop_confirmed = True
-    task.result = {
-        **dict(task.result or {}),
-        "outcome": "none",
-        "stop_confirmed": True,
-        "stop_evidence_refs": list(refs) or [_EVIDENCE_NEVER_STARTED],
-        "no_side_effects": True,
-        "side_effects_reconciled": True,
-    }
-    session.flush()
-    previous = task.state
+    previous_state = task.state
+    persisted = dict(task.result or {})
+    never_started = task.attempt == 0 and not _has_open_attempt(session, task)
+    reconciled = bool(
+        side_effects_reconciled is True
+        or persisted.get("side_effects_reconciled")
+        or persisted.get("no_side_effects")
+        or never_started
+    )
     ctx = _base_context(session, task, actor, now=timestamp)
-    if previous == "awaiting_clarification":
+    if previous_state == "awaiting_clarification":
         ctx = replace(ctx, decision_type="deny")
     else:
         ctx = replace(ctx, decision_invalidated=True)
-    _invalidate_grant(
-        session, task, actor, reason_code="task_terminal", now=timestamp
-    )
-    _perform_transition(
-        session,
-        task,
-        actor,
-        event="governance.denied",
-        target="denied",
-        ctx=ctx,
+    # Validate the edge before mutating: a denial rejection must not leave
+    # ``stop_confirmed``/result facts (or a revoked grant) behind.
+    _preview_transition(
+        task, event="governance.denied", target="denied", ctx=ctx,
         expected_revision=expected_revision,
-        reason_code=reason_code,
-        now=timestamp,
     )
+    previous_result = dict(task.result or {})
+    previous_stop = task.stop_confirmed
+    try:
+        # A denial withdraws the task's authority, which is a confirmed stop of
+        # the *task* (the database requires it for denied-after-attempt).  The
+        # side-effect fact stays honest.
+        task.stop_confirmed = True
+        task.result = {
+            **dict(task.result or {}),
+            "outcome": "none",
+            "stop_confirmed": True,
+            "stop_evidence_refs": list(refs) or [_EVIDENCE_NEVER_STARTED],
+            "no_side_effects": bool(reconciled),
+            "side_effects_reconciled": bool(reconciled),
+        }
+        _invalidate_grant(
+            session, task, actor, reason_code="task_terminal", now=timestamp
+        )
+        _perform_transition(
+            session,
+            task,
+            actor,
+            event="governance.denied",
+            target="denied",
+            ctx=ctx,
+            expected_revision=expected_revision,
+            reason_code=reason_code,
+            now=timestamp,
+        )
+    except TaskError:
+        task.result = previous_result
+        task.stop_confirmed = previous_stop
+        raise
     return task
 
 
@@ -5108,15 +5522,23 @@ def dispatch_deadline_exceeded(
     actor: GovernancePrincipal,
     evidence_refs: Sequence[str],
     no_side_effects_evidence: bool = False,
+    worker_id: str | None = None,
+    fencing_token: int | None = None,
     expected_revision: int | None = None,
     now: datetime | None = None,
 ) -> Task:
     """T34: a dispatched submission window closed with verified no side effects.
 
-    T34 is a "nothing was accepted" claim.  It is only allowed when the
-    execution boundary supplies an explicit no-side-effect proof **and** the
-    caller is the bound execution producer or a privileged/service principal;
-    an arbitrary participant can never assert it on someone else's behalf.
+    T34 is a "nothing was accepted" claim, so its authority is never a boolean a
+    caller may simply assert:
+
+    * **Managed Execution** is inside the runtime adapter.  Only the producer
+      that holds the *current* lease and fencing token (or a privileged
+      recovery writer that acquired a fresh one) may declare the submission
+      window closed without acceptance -- a stale worker is refused;
+    * **Advisory/Governed** execution is client/PEP-driven and has no worker
+      lease, so the bound execution producer (or service/runtime) must supply
+      explicit ``no_side_effects_evidence``.
     """
     timestamp = now or _utcnow()
     task = _load_task(session, task_id, for_update=True)
@@ -5132,7 +5554,19 @@ def dispatch_deadline_exceeded(
             "dispatch deadline expiry requires the dispatched state",
             context={"state": task.state},
         )
-    if no_side_effects_evidence is not True:
+    if task.execution_mode == "managed_execution":
+        # The current lease/fencing token *is* the no-side-effect authority for
+        # a managed submission: it proves this producer owned the accepted
+        # submission and observed the window close without acceptance.
+        _assert_managed_lease(
+            session,
+            task,
+            actor=actor,
+            worker_id=worker_id,
+            fencing_token=fencing_token,
+            now=timestamp,
+        )
+    elif no_side_effects_evidence is not True:
         raise TaskError(
             "task_reconcile_evidence_missing",
             "a dispatch deadline needs verified no-side-effect evidence",
@@ -5207,31 +5641,41 @@ def evidence_unavailable(
     refs = tuple(evidence_refs)
     if refs:
         verification.validate_result_refs(None, refs, require_result=False)
-    task.result = {
-        **dict(task.result or {}),
-        "evidence_unavailable": True,
-        "evidence_refs": list(refs),
-    }
-    session.flush()
     ctx = replace(
         _base_context(session, task, actor, now=timestamp),
         evidence_unavailable=True,
     )
-    _invalidate_grant(
-        session, task, actor, reason_code="execution_evidence_lost", now=timestamp
+    # Validate before mutating: a rejected T46 must leave no partial evidence
+    # fact behind (a caller that catches and commits would otherwise keep it).
+    _preview_transition(
+        task, event="verification.evidence_unavailable", target="unknown",
+        ctx=ctx, expected_revision=expected_revision,
     )
-    _perform_transition(
-        session,
-        task,
-        actor,
-        event="verification.evidence_unavailable",
-        target="unknown",
-        ctx=ctx,
-        expected_revision=expected_revision,
-        reason_code="evidence_missing",
-        extra={"evidence_refs": list(refs)} if refs else None,
-        now=timestamp,
-    )
+    previous_result = dict(task.result or {})
+    try:
+        task.result = {
+            **dict(task.result or {}),
+            "evidence_unavailable": True,
+            "evidence_refs": list(refs),
+        }
+        _invalidate_grant(
+            session, task, actor, reason_code="execution_evidence_lost", now=timestamp
+        )
+        _perform_transition(
+            session,
+            task,
+            actor,
+            event="verification.evidence_unavailable",
+            target="unknown",
+            ctx=ctx,
+            expected_revision=expected_revision,
+            reason_code="evidence_missing",
+            extra={"evidence_refs": list(refs)} if refs else None,
+            now=timestamp,
+        )
+    except TaskError:
+        task.result = previous_result
+        raise
     return task
 
 
@@ -5327,6 +5771,31 @@ def escalate_owner_account(
     timestamp = now or _utcnow()
     task = _load_task(session, task_id, for_update=True)
     _require_task_authority(actor, task)
+    if is_terminal(task.state) or task.state not in _ESCALATABLE_STATES:
+        raise TaskError(
+            "task_invalid_transition",
+            f"owner escalation is not a defined edge from {task.state!r}",
+            context={"state": task.state},
+        )
+    if status not in {"active", "disabled", "unbound", "unknown"}:
+        # ``_owner_status`` reports a missing employee as ``unresolved``; the
+        # persisted vocabulary is the DB-checked ``unknown``.
+        status = "unknown"
+    previous = task.state
+    # The active-state owner constraint is satisfied only when the snapshot
+    # write and the ``needs_human`` transition share the same UPDATE, so the
+    # edge is proven first and nothing is written on a rejection.
+    with session.no_autoflush:
+        ctx = replace(
+            _base_context(session, task, actor, now=timestamp),
+            escalation_justified=True,
+            owner_active=False,
+            owner_escalation_present=True,
+        )
+    _preview_transition(
+        task, event="human.escalation_required", target="needs_human", ctx=ctx,
+        expected_revision=expected_revision,
+    )
     if task.state in {"queued", "dispatched", "running"}:
         _invalidate_grant(
             session, task, actor, reason_code=reason_code, now=timestamp
@@ -5335,14 +5804,6 @@ def escalate_owner_account(
     task.owner_escalation = _owner_escalation_document(
         task, status=status, now=timestamp, reason_code=reason_code
     )
-    with session.no_autoflush:
-        ctx = replace(
-            _base_context(session, task, actor, now=timestamp),
-            escalation_justified=True,
-            owner_active=False,
-            owner_escalation_present=True,
-        )
-    previous = task.state
     _perform_transition(
         session,
         task,
@@ -5416,7 +5877,7 @@ def resolve_owner_escalation(
     base = _base_context(session, task, actor, now=timestamp)
     capability = (task.requested_capabilities or [None])[0]
     try:
-        decision, grant, rule = _fresh_retry_decision(
+        decision, grant, rule, clamp = _fresh_retry_decision(
             session, task, actor=actor, now=timestamp, capability=capability
         )
     except GovernanceError as exc:
@@ -5425,6 +5886,26 @@ def resolve_owner_escalation(
             f"retry authorisation refused: {exc.reason_code}",
             context=exc.context,
         ) from exc
+    # F1: a T61 requeue must be dispatchable; answer the escalation by hand
+    # (still needs_human) rather than queueing a task the worker can never run.
+    exhausted = _requeue_would_exceed_runtime(
+        session,
+        task,
+        max_runtime_seconds=clamp.max_runtime_seconds,
+        now=timestamp,
+    )
+    if exhausted is not None:
+        _revoke_unbound_grant(
+            session, grant, reason_code="task_terminal", now=timestamp
+        )
+        raise TaskError(
+            "budget_exceeded",
+            "the task runtime budget is exhausted; the escalation cannot requeue",
+            context={
+                "task_max_runtime_seconds": clamp.max_runtime_seconds,
+                "elapsed_seconds": exhausted,
+            },
+        )
     ctx = replace(
         base,
         owner_resolved=True,
@@ -5482,12 +5963,16 @@ def resolve_owner_escalation(
         task.policy_content_hash,
         task.grant_id,
         task.grant_status,
+        task.max_calls,
+        task.max_runtime_seconds,
+        task.max_cost_units,
         dict(task.result or {}),
     )
     task.owner_principal_id = owner.principal_id
     task.owner_employee_id = owner.employee_id
     task.owner_account_status = owner_status
     task.owner_escalation = None
+    _apply_budget_clamp(task, clamp)
     task.decision_id = decision.decision_id
     task.decision_revision = decision.decision_revision
     task.decision_type = decision.decision_type
@@ -5505,11 +5990,8 @@ def resolve_owner_escalation(
             ctx=ctx, expected_revision=expected_revision, now=timestamp,
         )
     except TaskError:
-        _revoke_unbound_grant(
-            session, grant,
-            reason_code="task_terminal",
-            now=timestamp,
-        )
+        # Restore before revoking: ``revoke_grant`` flushes, and a
+        # ``needs_human`` row bound to the new active grant is an orphan.
         (
             task.owner_principal_id,
             task.owner_employee_id,
@@ -5526,10 +6008,18 @@ def resolve_owner_escalation(
             task.policy_content_hash,
             task.grant_id,
             task.grant_status,
+            task.max_calls,
+            task.max_runtime_seconds,
+            task.max_cost_units,
             previous_result,
         ) = previous_authority
         task.result = previous_result
         session.flush()
+        _revoke_unbound_grant(
+            session, grant,
+            reason_code="task_terminal",
+            now=timestamp,
+        )
         raise
     session.flush()
     return task
@@ -6253,11 +6743,18 @@ def recheck_execution(
             "a terminal/unknown task cannot execute",
             context={"state": task.state},
         )
-    if task.state not in {"queued", "dispatched", "running"}:
+    if task.state not in {"dispatched", "running"}:
+        # A ``queued`` task has no accepted submission yet: letting the PEP
+        # consume a single-use grant (or a bound confirmation) here would strand
+        # the task, because T23 then refuses ``grant_consumed`` forever.  The
+        # caller must dispatch first (``start_attempt``).
         raise TaskError(
             "task_invalid_transition",
-            "controlled calls are only allowed while an execution attempt is live",
-            context={"state": task.state},
+            "controlled calls require a dispatched or running task",
+            context={
+                "state": task.state,
+                "required_state": ["dispatched", "running"],
+            },
         )
     if not task.grant_id:
         raise TaskError(

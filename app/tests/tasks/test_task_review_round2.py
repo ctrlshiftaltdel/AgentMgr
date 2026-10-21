@@ -1219,8 +1219,15 @@ def test_refused_queue_guard_leaves_no_active_grant(
     with pytest.raises(TaskError):
         submit_read(session, world, key="idem_round2_queue_guard")
     session.commit()
-    stored = session.scalar(select(Task).where(Task.state == "evaluated"))
+    stored = session.scalar(
+        select(Task).where(Task.idempotency_key == "idem_round2_queue_guard")
+    )
     assert stored is not None
     # The queue guards are previewed before issuance, so no grant is created.
     assert stored.grant_id is None
     assert _active_grants(session, stored.task_id) == 0
+    # An ``evaluated`` task has no worker path (round 3 / F11): the refusal
+    # escalates to a human instead of stranding it.
+    assert stored.state == "needs_human"
+    assert stored.needs_human_origin == "evaluated"
+    assert stored.owner_escalation is not None
