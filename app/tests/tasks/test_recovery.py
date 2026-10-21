@@ -49,6 +49,7 @@ def _failed_attempt(session: Session, world: TaskWorld, **submit_overrides):
         outcome="failed",
         evidence_refs=["evidence:execution_failed_0001"],
         stop_confirmed=True,
+        side_effects_reconciled=True,
         error_code="runtime_error",
     )
     session.commit()

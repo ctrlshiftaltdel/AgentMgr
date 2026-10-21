@@ -45,6 +45,7 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -195,6 +196,12 @@ _ACTIVE_STATE_SQL = ", ".join(
 _HISTORY_STATE_SQL = ", ".join(
     f"'{state}'" for state in sorted(TASK_HISTORY_STATES)
 )
+#: ``classify_necessity`` treats a task as "live" unless it is terminal or
+#: ``failed``; the partial unique index mirrors that definition exactly.
+_NON_LIVE_STATE_SQL = (
+    "'succeeded', 'partial_success', 'denied', 'cancelled', 'timed_out', "
+    "'failed'"
+)
 
 
 class Task(TimestampMixin, Base):
@@ -310,6 +317,17 @@ class Task(TimestampMixin, Base):
     #: Unsafe actions escalate to a human instead of being replayed (F... §13).
     retry_safe: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("true")
+    )
+    #: Task-level execution budget.  It narrows (never widens) the budget the
+    #: PDP allows and is re-checked at dispatch and at the PEP boundary.
+    max_calls: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("1")
+    )
+    max_runtime_seconds: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("300")
+    )
+    max_cost_units: Mapped[float | None] = mapped_column(
+        Float, nullable=True
     )
 
     # -- lifecycle -------------------------------------------------------
@@ -483,6 +501,17 @@ class Task(TimestampMixin, Base):
             name="retry_budget_bounds",
         ),
         CheckConstraint(
+            "max_calls >= 1 AND max_calls <= 1000", name="max_calls_bounds"
+        ),
+        CheckConstraint(
+            "max_runtime_seconds >= 1 AND max_runtime_seconds <= 86400",
+            name="max_runtime_seconds_bounds",
+        ),
+        CheckConstraint(
+            "max_cost_units IS NULL OR max_cost_units >= 0",
+            name="max_cost_units_non_negative",
+        ),
+        CheckConstraint(
             "attempt <= max_attempts", name="attempt_within_max_attempts"
         ),
         # F27: a running fact requires at least one opened attempt.
@@ -519,7 +548,8 @@ class Task(TimestampMixin, Base):
             name="terminal_state_grant_invalidated",
         ),
         CheckConstraint(
-            "state <> 'unknown' OR grant_id IS NULL OR grant_status = 'revoked'",
+            "state <> 'unknown' OR grant_id IS NULL OR "
+            "grant_status IN ('revoked', 'consumed')",
             name="unknown_state_grant_revoked",
         ),
         # F30: no unconfirmed stop as a terminal fact.
@@ -555,6 +585,18 @@ class Task(TimestampMixin, Base):
         Index("ix_tasks_decision_id", "decision_id"),
         Index("ix_tasks_grant_id", "grant_id"),
         Index("ix_tasks_goal_hash", "goal_hash"),
+        # C8: two concurrent equivalent submissions with different
+        # idempotency keys cannot both create a live task.  The database
+        # serialises them; the service resolves the loser to ``task_duplicate``.
+        Index(
+            "uq_tasks_live_requester_goal",
+            "requester_principal_id",
+            "goal_hash",
+            unique=True,
+            postgresql_where=text(
+                f"goal_hash IS NOT NULL AND state NOT IN ({_NON_LIVE_STATE_SQL})"
+            ),
+        ),
         Index("ix_tasks_created_at", "created_at"),
     )
 

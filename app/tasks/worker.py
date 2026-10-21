@@ -23,6 +23,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.audit.service import record_event
+from app.db.models.organization import Employee
 from app.governance.principal import GovernancePrincipal, audit_actor_id
 from app.tasks import priority as scheduling
 from app.tasks import service
@@ -35,15 +36,29 @@ __all__ = [
     "LeaseClaim",
     "LeaseRecovery",
     "RecoveryChecker",
+    "SlaEscalation",
     "claim_task",
+    "escalate_overdue_tasks",
     "release_lease",
     "recover_expired_leases",
     "renew_lease",
     "retry_or_escalate",
 ]
 
-#: How many queued rows a claim pass inspects before ordering by priority.
-CLAIM_SCAN_LIMIT = 50
+#: How many queued rows one claim pass inspects before applying the bounded
+#: fair/ageing order.  A larger window is required so an urgent arrival cannot
+#: be hidden behind a burst of older low-priority rows.
+CLAIM_SCAN_LIMIT = 500
+
+
+@dataclass(frozen=True)
+class SlaEscalation:
+    """One deadline/escalation action taken by the SLA worker pass."""
+
+    task_id: str
+    action: str
+    state: str
+    reason_code: str = ""
 
 BoundaryOutcome = Literal[
     "not_accepted", "running", "completed", "failed", "unknown"
@@ -128,6 +143,20 @@ def _audit(
     )
 
 
+def _owner_status(session: Session, task: Task) -> str:
+    """Re-read the accountable owner's live account status (Important 5)."""
+    if task.owner_employee_id is not None:
+        employee = session.get(Employee, task.owner_employee_id)
+        if employee is None:
+            return "unresolved"
+        return "active" if employee.status == "active" else "disabled"
+    if task.owner_principal_id and str(task.owner_principal_id).startswith("role_"):
+        # Role-owner resolution is an explicit Phase 0 deferral; treat it as
+        # resolved for scheduling.
+        return "active"
+    return "unbound"
+
+
 def claim_task(
     session: Session,
     *,
@@ -138,9 +167,11 @@ def claim_task(
 ) -> LeaseClaim | None:
     """Claim the highest-priority admissible task, or return ``None``.
 
-    Ordering is deterministic (bounded ageing, then due date, creation time and
-    id).  Tasks with an unsatisfied ``blocks`` dependency are skipped, as are
-    tasks whose owner is no longer active.
+    Ordering uses the bounded ageing score plus :func:`fair_order`, so one
+    owner or a burst of older rows cannot starve an urgent task.  Tasks with an
+    unsatisfied ``blocks`` dependency are skipped.  Owner account status is
+    re-read from the directory: a disabled/unbound owner is never claimed, it
+    is escalated to ``needs_human`` with ``owner_escalation``.
     """
     timestamp = now or _utcnow()
     if not worker_id:
@@ -169,16 +200,37 @@ def claim_task(
             )
         )
     )
-    admissible = [
-        task
-        for task in candidates
-        if task.task_id not in leased
-        and task.owner_account_status == "active"
-        and not service.dependency_blockers(session, task.task_id)
-    ]
+    admissible: list[Task] = []
+    for task in candidates:
+        if task.task_id in leased:
+            continue
+        status = _owner_status(session, task)
+        if status != "active":
+            # Escalate instead of claiming: the database forbids an active
+            # state with a disabled/unbound owner.
+            if actor is not None:
+                service.escalate_owner_account(
+                    session,
+                    task_id=task.task_id,
+                    actor=actor,
+                    status=status,
+                    reason_code=(
+                        "accountable_owner_missing"
+                        if status == "unbound"
+                        else "accountable_owner_inactive"
+                    ),
+                    now=timestamp,
+                )
+            continue
+        if task.owner_account_status != status:
+            task.owner_account_status = status
+        if service.dependency_blockers(session, task.task_id):
+            continue
+        admissible.append(task)
     if not admissible:
+        session.flush()
         return None
-    ordered = scheduling.order_queue(
+    ordered = scheduling.fair_order(
         [_schedulable(task) for task in admissible], now=timestamp
     )
     chosen_id = ordered[0].task_id
@@ -447,6 +499,9 @@ def recover_expired_leases(
                 evidence_refs=["evidence:worker_lease_expired_failed"],
                 stop_confirmed=True,
                 error_code="execution_failed",
+                worker_id=lease.worker_id,
+                fencing_token=lease.fencing_token,
+                allow_expired_lease=True,
                 now=timestamp,
             )
             results.append(
@@ -466,6 +521,9 @@ def recover_expired_leases(
                 actor=actor or _service_principal(),
                 outcome="lost",
                 evidence_refs=["evidence:worker_lease_expired_lost"],
+                worker_id=lease.worker_id,
+                fencing_token=lease.fencing_token,
+                allow_expired_lease=True,
                 now=timestamp,
             )
             _audit(
@@ -480,6 +538,33 @@ def recover_expired_leases(
                     task_id=task.task_id,
                     previous_lease_id=lease.id,
                     action="entered_unknown",
+                    state=task.state,
+                )
+            )
+            continue
+
+        if task.state == "verifying":
+            # The attempt ended; an expired lease only means the evidence
+            # source is no longer reachable.  Never replay it (T46).
+            service.evidence_unavailable(
+                session,
+                task_id=task.task_id,
+                actor=actor or _service_principal(),
+                evidence_refs=["evidence:worker_lease_expired_evidence_unavailable"],
+                now=timestamp,
+            )
+            _audit(
+                session,
+                actor=actor,
+                action="task.worker.lease_expired",
+                task=task,
+                details={"lease_id": lease.id, "action": "verifying_unknown"},
+            )
+            results.append(
+                LeaseRecovery(
+                    task_id=task.task_id,
+                    previous_lease_id=lease.id,
+                    action="verifying_unknown",
                     state=task.state,
                 )
             )
@@ -504,6 +589,139 @@ def recover_expired_leases(
                 state=task.state,
             )
         )
+    return results
+
+
+def escalate_overdue_tasks(
+    session: Session,
+    *,
+    actor: GovernancePrincipal | None = None,
+    now: datetime | None = None,
+    limit: int = 100,
+    dispatched_no_side_effect_evidence: bool = False,
+) -> list[SlaEscalation]:
+    """Deadline/SLA worker pass for T26/T27/T34/T40 (Important 4).
+
+    * ``queued`` past ``due_at``/``complete_by`` -> T27 ``timed_out`` (nothing
+      was dispatched); past ``response_by`` -> T26 ``needs_human``.
+    * ``dispatched`` past deadline -> T34 only with explicit no-side-effect
+      evidence; otherwise T35 ``needs_human`` (never claim a stop).
+    * ``running`` past deadline -> T40 ``needs_human`` (stop not confirmed).
+    """
+    timestamp = now or _utcnow()
+    resolved_actor = actor or _service_principal()
+    rows = list(
+        session.scalars(
+            select(Task)
+            .where(Task.state.in_(("queued", "dispatched", "running")))
+            .order_by(Task.due_at.asc().nulls_last(), Task.created_at)
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        )
+    )
+    results: list[SlaEscalation] = []
+    for task in rows:
+        due = _to_utc(task.due_at) if task.due_at is not None else None
+        raw_response = (task.sla or {}).get("response_by")
+        response_by = None
+        if isinstance(raw_response, str):
+            try:
+                response_by = _to_utc(
+                    datetime.fromisoformat(raw_response.replace("Z", "+00:00"))
+                )
+            except ValueError:
+                response_by = None
+        due_passed = due is not None and due <= timestamp
+        response_passed = response_by is not None and response_by <= timestamp
+        if not (due_passed or response_passed):
+            continue
+        try:
+            if task.state == "queued":
+                if due_passed:
+                    service.record_dispatch_failure(
+                        session,
+                        task_id=task.task_id,
+                        actor=resolved_actor,
+                        outcome="deadline_exceeded",
+                        evidence_refs=["evidence:sla_deadline_exceeded"],
+                        reason="task_deadline_exceeded",
+                        now=timestamp,
+                    )
+                    results.append(
+                        SlaEscalation(
+                            task_id=task.task_id,
+                            action="timed_out",
+                            state=task.state,
+                            reason_code="task_deadline_exceeded",
+                        )
+                    )
+                else:
+                    service.escalate_task(
+                        session,
+                        task_id=task.task_id,
+                        actor=resolved_actor,
+                        reason_code="response_deadline_exceeded",
+                        now=timestamp,
+                    )
+                    results.append(
+                        SlaEscalation(
+                            task_id=task.task_id,
+                            action="needs_human",
+                            state=task.state,
+                            reason_code="response_deadline_exceeded",
+                        )
+                    )
+            elif task.state == "dispatched":
+                if due_passed and dispatched_no_side_effect_evidence:
+                    service.dispatch_deadline_exceeded(
+                        session,
+                        task_id=task.task_id,
+                        actor=resolved_actor,
+                        evidence_refs=["evidence:dispatch_deadline_exceeded"],
+                        now=timestamp,
+                    )
+                    results.append(
+                        SlaEscalation(
+                            task_id=task.task_id,
+                            action="timed_out",
+                            state=task.state,
+                            reason_code="dispatch_deadline_exceeded",
+                        )
+                    )
+                else:
+                    service.escalate_task(
+                        session,
+                        task_id=task.task_id,
+                        actor=resolved_actor,
+                        reason_code="dispatch_acceptance_unreconciled",
+                        now=timestamp,
+                    )
+                    results.append(
+                        SlaEscalation(
+                            task_id=task.task_id,
+                            action="needs_human",
+                            state=task.state,
+                            reason_code="dispatch_acceptance_unreconciled",
+                        )
+                    )
+            else:  # running
+                service.escalate_task(
+                    session,
+                    task_id=task.task_id,
+                    actor=resolved_actor,
+                    reason_code="execution_deadline_exceeded",
+                    now=timestamp,
+                )
+                results.append(
+                    SlaEscalation(
+                        task_id=task.task_id,
+                        action="needs_human",
+                        state=task.state,
+                        reason_code="execution_deadline_exceeded",
+                    )
+                )
+        except TaskError:
+            continue
     return results
 
 

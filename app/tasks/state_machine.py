@@ -341,8 +341,7 @@ GUARDS: dict[str, Guard] = {
     "cancel_authorized": _guard(
         "cancel_authorized",
         "task_unauthorized_actor",
-        lambda c: c.actor_authorized
-        and (c.actor_is_requester or c.actor_is_owner or c.actor_authorized),
+        lambda c: c.actor_authorized,
     ),
     "goal_present": _guard(
         "goal_present", "goal_missing", lambda c: c.goal_present

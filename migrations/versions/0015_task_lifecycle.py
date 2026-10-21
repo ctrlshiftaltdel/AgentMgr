@@ -83,6 +83,12 @@ _TERMINAL_OR_UNKNOWN = (
     "'succeeded', 'partial_success', 'failed', 'cancelled', 'timed_out', "
     "'denied', 'unknown'"
 )
+#: ``classify_necessity`` defines a task as live unless it is terminal or
+#: ``failed``; the partial unique index uses the same state set (C8).
+_NON_LIVE_STATES = (
+    "'succeeded', 'partial_success', 'denied', 'cancelled', 'timed_out', "
+    "'failed'"
+)
 _EVENT_TYPES = (
     "'task.created', 'task.evaluated', 'task.queued', 'task.cancel_requested', "
     "'task.cancelled', 'task.deadline_exceeded', 'task.retry_authorized', "
@@ -192,6 +198,14 @@ def upgrade() -> None:
             "retry_safe", sa.Boolean(), server_default=sa.text("true"),
             nullable=False,
         ),
+        sa.Column(
+            "max_calls", sa.Integer(), server_default=sa.text("1"), nullable=False
+        ),
+        sa.Column(
+            "max_runtime_seconds", sa.Integer(), server_default=sa.text("300"),
+            nullable=False,
+        ),
+        sa.Column("max_cost_units", sa.Float(), nullable=True),
         sa.Column(
             "state", sa.Text(), server_default=sa.text("'draft'"), nullable=False
         ),
@@ -368,6 +382,17 @@ def upgrade() -> None:
             name="retry_budget_bounds",
         ),
         sa.CheckConstraint(
+            "max_calls >= 1 AND max_calls <= 1000", name="max_calls_bounds"
+        ),
+        sa.CheckConstraint(
+            "max_runtime_seconds >= 1 AND max_runtime_seconds <= 86400",
+            name="max_runtime_seconds_bounds",
+        ),
+        sa.CheckConstraint(
+            "max_cost_units IS NULL OR max_cost_units >= 0",
+            name="max_cost_units_non_negative",
+        ),
+        sa.CheckConstraint(
             "attempt <= max_attempts", name="attempt_within_max_attempts"
         ),
         sa.CheckConstraint(
@@ -397,7 +422,8 @@ def upgrade() -> None:
             name="terminal_state_grant_invalidated",
         ),
         sa.CheckConstraint(
-            "state <> 'unknown' OR grant_id IS NULL OR grant_status = 'revoked'",
+            "state <> 'unknown' OR grant_id IS NULL OR "
+            "grant_status IN ('revoked', 'consumed')",
             name="unknown_state_grant_revoked",
         ),
         sa.CheckConstraint(
@@ -429,6 +455,15 @@ def upgrade() -> None:
     op.create_index("ix_tasks_decision_id", "tasks", ["decision_id"])
     op.create_index("ix_tasks_grant_id", "tasks", ["grant_id"])
     op.create_index("ix_tasks_goal_hash", "tasks", ["goal_hash"])
+    op.create_index(
+        "uq_tasks_live_requester_goal",
+        "tasks",
+        ["requester_principal_id", "goal_hash"],
+        unique=True,
+        postgresql_where=sa.text(
+            f"goal_hash IS NOT NULL AND state NOT IN ({_NON_LIVE_STATES})"
+        ),
+    )
     op.create_index("ix_tasks_created_at", "tasks", ["created_at"])
 
     op.create_table(
@@ -731,6 +766,7 @@ def downgrade() -> None:
     op.drop_table("task_events")
 
     op.drop_index("ix_tasks_created_at", table_name="tasks")
+    op.drop_index("uq_tasks_live_requester_goal", table_name="tasks")
     op.drop_index("ix_tasks_goal_hash", table_name="tasks")
     op.drop_index("ix_tasks_grant_id", table_name="tasks")
     op.drop_index("ix_tasks_decision_id", table_name="tasks")

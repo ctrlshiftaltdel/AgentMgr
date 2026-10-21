@@ -91,7 +91,9 @@ from app.workflow.service import (
 )
 
 __all__ = [
+    "APPROVAL_MAX_TTL_SECONDS",
     "APPROVAL_TTL_SECONDS",
+    "CONFIRMATION_MAX_TTL_SECONDS",
     "CONFIRMATION_TTL_SECONDS",
     "DEFAULT_LEASE_SECONDS",
     "NecessityResult",
@@ -104,9 +106,15 @@ __all__ = [
     "confirm_task",
     "consume_confirmation",
     "create_confirmation",
+    "deny_task",
     "dependency_blockers",
+    "dispatch_deadline_exceeded",
+    "escalate_owner_account",
+    "escalate_task",
+    "evidence_unavailable",
     "fail_task",
     "mark_running",
+    "provide_clarification",
     "recheck_execution",
     "reconcile_task",
     "record_approval",
@@ -114,6 +122,7 @@ __all__ = [
     "record_dispatch_failure",
     "request_cancel",
     "retry_task",
+    "revoke_approval",
     "satisfy_confirmation",
     "start_attempt",
     "submit_task",
@@ -122,6 +131,10 @@ __all__ = [
 
 CONFIRMATION_TTL_SECONDS = 900
 APPROVAL_TTL_SECONDS = 3600
+#: Hard upper bound for a gate TTL; a caller cannot mint an effectively
+#: permanent confirmation/approval.
+CONFIRMATION_MAX_TTL_SECONDS = 86400
+APPROVAL_MAX_TTL_SECONDS = 86400
 DEFAULT_LEASE_SECONDS = 300
 _EVIDENCE_NEVER_STARTED = "evidence:task_never_dispatched"
 
@@ -260,6 +273,144 @@ def _owner_status(session: Session, owner: GovernancePrincipal) -> str:
     if owner.principal_type == "person":
         return "unbound"
     return "active"
+
+
+def _is_execution_producer(actor: GovernancePrincipal, task: Task) -> bool:
+    """Only the bound execution boundary may write execution facts.
+
+    There is no B1/B2/B3 registry in Phase 0 (Issue #78 does not persist a
+    trusted producer identity), so the producer is the task's bound executor
+    (a person/agent for B1, the PEP/connector service for B2, the runtime
+    adapter service for B3) or a verified service/runtime principal.  Anything
+    else fails closed.
+    """
+    if actor.principal_type in {"service", "runtime"}:
+        return True
+    if actor.principal_id == task.executor_principal_id:
+        return True
+    # A person/agent principal resolving to the same employee is the same
+    # execution subject (agent_instance vs person for the same human).
+    return bool(
+        actor.employee_id is not None
+        and task.executor_employee_id is not None
+        and actor.employee_id == task.executor_employee_id
+    )
+
+
+def _require_execution_producer(actor: GovernancePrincipal, task: Task) -> None:
+    _require_actor(actor)
+    if not _is_execution_producer(actor, task):
+        raise TaskError(
+            "task_unauthorized_actor",
+            "only the bound executor or a trusted service may write execution facts",
+            context={"actor": actor.principal_id, "executor": task.executor_principal_id},
+        )
+
+
+def _require_task_authority(
+    actor: GovernancePrincipal, task: Task, *, allow_service: bool = True
+) -> None:
+    """Participants, privileged identities and (optionally) services only."""
+    _require_actor(actor)
+    if allow_service and actor.principal_type in {"service", "runtime"}:
+        return
+    if _is_privileged(actor) or _is_participant(actor, task):
+        return
+    raise TaskError(
+        "task_unauthorized_actor",
+        "only a participant, identity manager or trusted service may do this",
+        context={"actor": actor.principal_id},
+    )
+
+
+def _assert_managed_lease(
+    session: Session,
+    task: Task,
+    *,
+    actor: GovernancePrincipal,
+    worker_id: str | None,
+    fencing_token: int | None,
+    now: datetime,
+    allow_expired: bool = False,
+) -> None:
+    """Managed Execution writes must hold the current lease/fencing token.
+
+    Advisory/Governed boundaries are client/PEP-driven and do not necessarily
+    hold a worker lease; Managed Execution is inside the runtime adapter, where
+    a stale worker must never write an execution fact (F23/C9).
+    """
+    if task.execution_mode != "managed_execution":
+        return
+    if actor.principal_type not in {"service", "runtime"}:
+        raise TaskError(
+            "task_unauthorized_actor",
+            "Managed Execution facts require a trusted service/runtime producer",
+            context={"actor": actor.principal_id},
+        )
+    _assert_lease(
+        session,
+        task,
+        worker_id=worker_id,
+        fencing_token=fencing_token,
+        now=now,
+        allow_expired=allow_expired,
+    )
+
+
+def _assert_task_budget(
+    task: Task, grant: ExecutionGrant | None, *, now: datetime
+) -> None:
+    """Enforce the persisted task budget at dispatch and the PEP boundary."""
+    if grant is None:
+        return
+    budget = dict(grant.budget or {})
+    grant_calls = budget.get("max_calls")
+    grant_runtime = budget.get("max_runtime_seconds")
+    grant_cost = budget.get("max_cost_units")
+    if isinstance(grant_calls, int) and grant_calls > int(task.max_calls):
+        raise TaskError(
+            "budget_exceeded",
+            "the grant exceeds the task call budget",
+            context={"grant_max_calls": grant_calls, "task_max_calls": task.max_calls},
+        )
+    if isinstance(grant_runtime, int) and grant_runtime > int(task.max_runtime_seconds):
+        raise TaskError(
+            "budget_exceeded",
+            "the grant exceeds the task runtime budget",
+            context={
+                "grant_max_runtime_seconds": grant_runtime,
+                "task_max_runtime_seconds": task.max_runtime_seconds,
+            },
+        )
+    if (
+        task.max_cost_units is not None
+        and isinstance(grant_cost, (int, float))
+        and float(grant_cost) > float(task.max_cost_units)
+    ):
+        raise TaskError(
+            "budget_exceeded",
+            "the grant exceeds the task cost budget",
+            context={
+                "grant_max_cost_units": grant_cost,
+                "task_max_cost_units": task.max_cost_units,
+            },
+        )
+
+
+def _urgency_authority(principal: GovernancePrincipal) -> bool:
+    """Urgent priority needs a real management/approval authority.
+
+    Phase 0 has no dedicated ``task/prioritize`` permission, so urgency is
+    authorised by the existing identity-management permission or an existing
+    approval permission.  A caller-supplied string alone is never authority.
+    """
+    if _is_privileged(principal):
+        return True
+    return any(
+        resource == "expense_claim" and action == "approve"
+        for resource, action, _scope in principal.effective_permissions
+    )
+
 
 
 def _normalized_scope(scope: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -557,6 +708,7 @@ def _confirmation_document(row: TaskConfirmation) -> dict[str, Any]:
         "purpose": row.purpose,
         "confirmed_by_principal_id": row.confirmed_by_principal_id,
         "status": row.status,
+        "issued_at": _rfc3339(_to_utc(row.issued_at)),  # type: ignore[arg-type]
         "satisfied_at": (
             _rfc3339(_to_utc(row.satisfied_at))  # type: ignore[arg-type]
             if row.satisfied_at is not None
@@ -602,6 +754,8 @@ def _live_confirmation_ref(
 def _live_approval_ref(task: Task, *, now: datetime) -> dict[str, Any] | None:
     approval = _approval_document(task)
     if not approval or approval.get("decision") != "approved":
+        return None
+    if approval.get("revoked_at"):
         return None
     expires = approval.get("expires_at")
     if not isinstance(expires, str):
@@ -672,6 +826,7 @@ def _base_context(
     approval = task.approval_ref or {}
     approval_approved = approval.get("decision") == "approved"
     approval_separation = approval.get("separation_check") == "passed"
+    approval_revoked = bool(approval.get("revoked_at"))
     approval_unexpired = False
     approval_payload_matches = (
         approval.get("payload_hash") == task.payload_hash
@@ -688,6 +843,7 @@ def _base_context(
         and approval_separation
         and approval_unexpired
         and approval_payload_matches
+        and not approval_revoked
     )
 
     decision_task_bound = False
@@ -727,14 +883,44 @@ def _base_context(
     )
 
     open_attempt = _has_open_attempt(session, task)
+    current_attempt = session.scalar(
+        select(TaskAttempt)
+        .where(TaskAttempt.task_id == task.task_id)
+        .order_by(TaskAttempt.attempt_number.desc())
+        .limit(1)
+    )
+    result_doc = dict(task.result or {})
+    # C7: ``no_side_effects`` is never asserted by the service layer.  It is
+    # derived from persisted reconciliation facts only: an explicit no-side-
+    # effect proof, a reconciled stop, or a task that never opened an attempt.
+    no_side_effects = bool(result_doc.get("no_side_effects")) or bool(
+        result_doc.get("side_effects_reconciled")
+    )
+    if task.attempt == 0 and not open_attempt:
+        no_side_effects = no_side_effects or bool(
+            result_doc.get("stop_confirmed", task.state in TASK_TERMINAL_STATES)
+        )
     active_unreconciled = open_attempt and not bool(
-        (task.result or {}).get("no_side_effect_evidence")
+        result_doc.get("no_side_effect_evidence")
     )
 
+    # C6: both facts come from the persisted attempt row and its execution
+    # result, never from a caller-supplied default.
+    same_attempt_running_evidence = bool(
+        current_attempt is not None
+        and current_attempt.attempt_number == task.attempt
+        and current_attempt.state == "running"
+        and current_attempt.ended_at is None
+    )
     attempt_finished_pending_verification = bool(
-        task.attempt >= 1
-        and not open_attempt
-        and task.result.get("outcome") in {"completed", "succeeded"}
+        current_attempt is not None
+        and current_attempt.attempt_number == task.attempt
+        and current_attempt.ended_at is not None
+        and current_attempt.state == "verifying"
+        and (
+            result_doc.get("outcome") in {"completed", "succeeded"}
+            or result_doc.get("attempt_finished_pending_verification")
+        )
     )
 
     return TransitionContext(
@@ -828,7 +1014,7 @@ def _base_context(
         active_attempt_unreconciled=active_unreconciled,
         stop_confirmed=task.stop_confirmed,
         stop_evidence=bool((task.result or {}).get("stop_evidence_refs")),
-        no_side_effects=bool((task.result or {}).get("no_side_effects", False)),
+        no_side_effects=no_side_effects,
         side_effects_reconciled=bool(
             (task.result or {}).get("side_effects_reconciled", False)
         ),
@@ -871,14 +1057,155 @@ def _base_context(
             (task.result or {}).get("all_criteria_passed", False)
         ),
         needs_human_origin=task.needs_human_origin,
-        same_attempt_running_evidence=bool(
-            (task.result or {}).get("same_attempt_running_evidence", False)
-        ),
+        same_attempt_running_evidence=same_attempt_running_evidence,
         attempt_finished_pending_verification=attempt_finished_pending_verification,
         no_side_effect_evidence=bool(
             (task.result or {}).get("no_side_effect_evidence", False)
         ),
     )
+
+
+def _validate_evidence_refs(refs: Sequence[str]) -> tuple[str, ...]:
+    """Validate stop/reconcile evidence references before persisting them."""
+    values = tuple(refs)
+    if not values:
+        raise TaskError(
+            "evidence_missing",
+            "at least one evidence reference is required",
+            context={"field": "evidence_refs"},
+        )
+    verification.validate_result_refs(None, values, require_result=False)
+    return values
+
+
+def _close_attempt_with_stop(
+    session: Session,
+    task: Task,
+    *,
+    state: str,
+    now: datetime,
+    evidence_refs: Sequence[str],
+    result_ref: str | None = None,
+    error_code: str | None = None,
+    reason: str | None = None,
+) -> None:
+    """Close the current open attempt with stop evidence before a re-dispatch."""
+    attempt = _current_attempt(session, task)
+    if attempt is None or attempt.ended_at is not None:
+        return
+    _close_attempt(
+        attempt,
+        state=state,
+        now=now,
+        stop_confirmed=True,
+        result_ref=result_ref,
+        evidence_refs=evidence_refs,
+        error_code=error_code,
+        reason=reason,
+    )
+
+
+def _owner_escalation_document(
+    task: Task, *, status: str, now: datetime, reason_code: str
+) -> dict[str, Any]:
+    return {
+        "reason_code": reason_code,
+        "owner_principal_id": task.owner_principal_id,
+        "owner_employee_id": task.owner_employee_id,
+        "owner_account_status": status,
+        "escalated_at": _rfc3339(now),
+        "requires_human": True,
+    }
+
+
+def _assert_completion_authority(
+    session: Session, task: Task, *, now: datetime
+) -> None:
+    """Re-check the live grant and gates before declaring success.
+
+    T36/T42/T43 must never succeed on an expired, revoked or consumed-by-
+    another-attempt grant, a revoked/expired approval or a confirmation that
+    was never satisfied.  A confirmation consumed by *this* attempt is allowed
+    (that is what single-use consumption means).
+    """
+    grant = _grant_record(session, task)
+    if grant is None or not task.grant_id:
+        raise TaskError(
+            "grant_missing",
+            "completion requires the bound execution grant",
+            context={"task_id": task.task_id},
+        )
+    if grant.task_id != task.task_id:
+        raise TaskError(
+            "grant_scope_mismatch",
+            "the grant is bound to another task",
+            context={"grant_id": grant.grant_id},
+        )
+    if grant.status == "revoked":
+        raise TaskError("grant_revoked", context={"grant_id": grant.grant_id})
+    if grant.status == "expired":
+        raise TaskError("grant_expired", context={"grant_id": grant.grant_id})
+    if grant.status == "consumed" and not (task.attempt >= 1):
+        raise TaskError("grant_consumed", context={"grant_id": grant.grant_id})
+    if _to_utc(grant.expires_at) <= now:  # type: ignore[operator]
+        raise TaskError("grant_expired", context={"grant_id": grant.grant_id})
+    record = _decision_record(session, task)
+    if record is None or grant.decision_id != record.decision_id:
+        raise TaskError(
+            "grant_scope_mismatch",
+            "the grant no longer matches the persisted decision",
+            context={"grant_id": grant.grant_id},
+        )
+    _assert_task_budget(task, grant, now=now)
+
+    constraints = dict(record.constraints or {})
+    confirmation_required = bool(constraints.get("required_confirmation")) or (
+        task.decision_type == "needs_confirmation"
+    )
+    if confirmation_required:
+        row = _confirmation_row(
+            session, (task.confirmation_ref or {}).get("confirmation_id")
+        )
+        if (
+            row is None
+            or row.task_id != task.task_id
+            or row.payload_hash != task.payload_hash
+            or row.status not in {"satisfied", "consumed"}
+        ):
+            raise TaskError(
+                "confirmation_missing",
+                "the confirmed payload is no longer valid for completion",
+                context={"task_id": task.task_id},
+            )
+        if row.status == "satisfied" and _to_utc(row.expires_at) <= now:  # type: ignore[operator]
+            raise TaskError(
+                "task_confirmation_expired",
+                "the confirmation expired before completion",
+                context={"confirmation_id": row.confirmation_id},
+            )
+
+    approval_required = bool(constraints.get("required_approval")) or (
+        task.decision_type == "needs_approval"
+    )
+    if approval_required:
+        approval = task.approval_ref or {}
+        expires_raw = approval.get("expires_at")
+        expired = False
+        if isinstance(expires_raw, str):
+            parsed = datetime.fromisoformat(expires_raw.replace("Z", "+00:00"))
+            expired = _to_utc(parsed) <= now  # type: ignore[operator]
+        if (
+            approval.get("decision") != "approved"
+            or approval.get("separation_check") != "passed"
+            or approval.get("payload_hash") != task.payload_hash
+            or approval.get("revoked_at")
+            or expired
+        ):
+            raise TaskError(
+                "approval_missing",
+                "the approval is no longer valid for completion",
+                context={"task_id": task.task_id},
+            )
 
 
 def _approver_is_independent(
@@ -1002,6 +1329,9 @@ def _request_fingerprint(
     execution_mode: str,
     scope: Mapping[str, Any],
     capabilities: Sequence[str],
+    max_calls: int = 1,
+    max_runtime_seconds: int = 300,
+    max_cost_units: float | None = None,
 ) -> str:
     return payload_hash(
         {
@@ -1016,6 +1346,9 @@ def _request_fingerprint(
             "execution_mode": execution_mode,
             "scope": dict(scope),
             "capabilities": sorted(capabilities),
+            "max_calls": max_calls,
+            "max_runtime_seconds": max_runtime_seconds,
+            "max_cost_units": max_cost_units,
         }
     )
 
@@ -1048,6 +1381,9 @@ def submit_task(
     max_attempts: int = 3,
     retry_budget: int | None = None,
     retry_safe: bool = True,
+    max_calls: int = 1,
+    max_runtime_seconds: int = 300,
+    max_cost_units: float | None = None,
     client_task_ref: str | None = None,
     correlation_id: str | None = None,
     runtime_capabilities_verified: bool = False,
@@ -1113,6 +1449,44 @@ def submit_task(
         authorized_by=priority_authorized_by,
         rationale=priority_rationale,
     )
+    if level == "urgent" and authorized_by:
+        # C-urgent: a caller-supplied string is not authority.  Resolve the
+        # named principal from the directory and require a real management or
+        # approval permission.
+        try:
+            authorizer = resolve_principal(session, authorized_by)
+        except GovernanceError as exc:
+            raise TaskError(
+                "task_priority_unauthorized",
+                "the urgent authorising principal cannot be resolved",
+                context={"authorized_by": authorized_by, **exc.context},
+            ) from exc
+        if not _urgency_authority(authorizer):
+            raise TaskError(
+                "task_priority_unauthorized",
+                "the urgent authorising principal lacks urgency authority",
+                context={"authorized_by": authorizer.principal_id},
+            )
+    if max_calls < 1 or max_calls > 1000:
+        raise TaskError(
+            "required_input_missing",
+            "max_calls must be between 1 and 1000",
+            context={"field": "max_calls"},
+        )
+    if max_runtime_seconds < 1 or max_runtime_seconds > 86400:
+        raise TaskError(
+            "required_input_missing",
+            "max_runtime_seconds must be between 1 and 86400",
+            context={"field": "max_runtime_seconds"},
+        )
+    if max_cost_units is not None and (
+        isinstance(max_cost_units, bool) or float(max_cost_units) < 0
+    ):
+        raise TaskError(
+            "required_input_missing",
+            "max_cost_units must be non-negative",
+            context={"field": "max_cost_units"},
+        )
     normalized_goal = verification.validate_goal(goal)
     goal_hash = payload_hash(normalized_goal)
     scope = _normalized_scope(resource_scope)
@@ -1167,6 +1541,9 @@ def submit_task(
         execution_mode=execution_mode,
         scope=scope,
         capabilities=capabilities,
+        max_calls=max_calls,
+        max_runtime_seconds=max_runtime_seconds,
+        max_cost_units=max_cost_units,
     )
     correlation = correlation_id or _new_id("corr_")
 
@@ -1249,6 +1626,11 @@ def submit_task(
         payload=execution_payload,
         payload_hash=payload_hash_value,
         retry_safe=retry_safe,
+        max_calls=max_calls,
+        max_runtime_seconds=max_runtime_seconds,
+        max_cost_units=(
+            float(max_cost_units) if max_cost_units is not None else None
+        ),
         created_at=timestamp,
         updated_at=timestamp,
         result={
@@ -1275,13 +1657,31 @@ def submit_task(
                 Task.idempotency_key == idempotency_key,
             )
         )
-        if existing is None:
-            raise
-        if existing.request_hash != request_hash:
-            raise IdempotencyConflict(
-                existing.task_id, idempotency_key=idempotency_key
+        if existing is not None:
+            if existing.request_hash != request_hash:
+                raise IdempotencyConflict(
+                    existing.task_id, idempotency_key=idempotency_key
+                ) from None
+            return existing
+        # C8: the partial unique index serialised two equivalent goals that
+        # were submitted concurrently with different idempotency keys.  The
+        # loser is answered deterministically instead of creating a duplicate.
+        duplicate = session.scalar(
+            select(Task.task_id)
+            .where(
+                Task.requester_principal_id == requester.principal_id,
+                Task.goal_hash == goal_hash,
+                Task.state.notin_(tuple(TASK_TERMINAL_STATES) + ("failed",)),
+            )
+            .limit(1)
+        )
+        if duplicate is not None:
+            raise TaskError(
+                "task_duplicate",
+                "an equivalent task is already in flight",
+                context={"existing_task_id": duplicate},
             ) from None
-        return existing
+        raise
 
     ctx = _base_context(session, task, requester, now=timestamp)
     _perform_transition(
@@ -1314,7 +1714,7 @@ def submit_task(
             correlation_id=correlation,
         ),
         now=timestamp,
-        evidence_verifier=TaskEvidenceVerifier(session),
+        evidence_verifier=TaskEvidenceVerifier(session, task_id=task.task_id),
     )
     _apply_decision(
         session,
@@ -1398,6 +1798,81 @@ def _apply_decision(
         decision,
         now=now,
         runtime_capabilities_verified=runtime_capabilities_verified,
+    )
+
+
+def _reapply_decision_after_reassignment(
+    session: Session,
+    task: Task,
+    actor: GovernancePrincipal,
+    *,
+    now: datetime,
+) -> None:
+    """Re-evaluate an ``evaluated`` task after responsibility changed.
+
+    The old decision/grant is already invalidated by the caller.  This mirrors
+    :func:`_after_evaluated` without the ``draft -> evaluated`` edge: the task is
+    already evaluated, so only the downstream T04-T08 edge is applied.
+    """
+    record = _decision_record(session, task)
+    executor = resolve_principal(
+        session,
+        task.executor_principal_id or "",
+        principal_type=task.executor_principal_type,
+    )
+    decision = evaluate(
+        session,
+        EvaluationRequest(
+            principal=executor,
+            capability=(task.requested_capabilities or [""])[0],
+            task_id=task.task_id,
+            task_revision=task.state_revision + 1,
+            task_idempotency_key=task.idempotency_key,
+            resource_scope=task.resource_scope,
+            priority=task.priority,
+            execution_mode=task.execution_mode,
+            risk="low",
+            confirmation_ref=task.confirmation_ref,
+            approval_ref=_approval_document(task),
+            payload_hash=task.payload_hash,
+            policy_set_id=task.policy_set_id or DEFAULT_POLICY_SET_ID,
+            policy_version=task.policy_version,
+            correlation_id=task.correlation_id,
+            decision_purpose="initial_execution",
+            supersedes_decision_id=record.decision_id if record is not None else None,
+        ),
+        now=now,
+        evidence_verifier=TaskEvidenceVerifier(session, task_id=task.task_id),
+    )
+    new_record = session.scalar(
+        select(GovernanceDecisionRecord).where(
+            GovernanceDecisionRecord.decision_id == decision.decision_id
+        )
+    )
+    if new_record is None:  # pragma: no cover - the PDP always persists
+        raise TaskError(
+            "required_input_missing",
+            "the PDP decision was not persisted",
+            context={"decision_id": decision.decision_id},
+        )
+    task.decision_id = decision.decision_id
+    task.decision_revision = decision.decision_revision
+    task.decision_type = decision.decision_type
+    task.decision_purpose = decision.decision_purpose
+    task.policy_set_id = new_record.policy_set_id
+    task.policy_version = new_record.policy_version
+    task.policy_content_hash = new_record.policy_content_hash
+    task.evaluated_at = now
+    session.flush()
+    _after_evaluated(
+        session,
+        task,
+        actor,
+        decision,
+        now=now,
+        runtime_capabilities_verified=bool(
+            (task.result or {}).get("runtime_capabilities_verified", False)
+        ),
     )
 
 
@@ -1617,6 +2092,15 @@ def _issue_grant_and_queue(
             execution_mode=task.execution_mode,
             capabilities=list(task.requested_capabilities),
             resource_scope=task.resource_scope,
+            budget={
+                "max_calls": int(task.max_calls),
+                "max_runtime_seconds": int(task.max_runtime_seconds),
+                **(
+                    {"max_cost_units": float(task.max_cost_units)}
+                    if task.max_cost_units is not None
+                    else {}
+                ),
+            },
             confirmation_ref=confirmation_ref,
             approval_ref=approval_ref,
             tool_contract_version="1.0.0",
@@ -1639,16 +2123,25 @@ def _issue_grant_and_queue(
         and not runtime_capabilities_verified
     ):
         ctx = replace(ctx, mode_capabilities_ok=False)
-    _perform_transition(
-        session,
-        task,
-        actor,
-        event="task.queued",
-        target="queued",
-        ctx=ctx,
-        reason_code="policy_allowed",
-        now=now,
-    )
+    try:
+        _perform_transition(
+            session,
+            task,
+            actor,
+            event="task.queued",
+            target="queued",
+            ctx=ctx,
+            reason_code="policy_allowed",
+            now=now,
+        )
+    except TaskError:
+        # Important 11: never leave an orphan active grant when a queue guard
+        # rejects the task.  Revoke it in the same transaction so a caller that
+        # catches the error and commits does not leak authority.
+        _invalidate_grant(
+            session, task, actor, reason_code="task_terminal", now=now
+        )
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -1703,6 +2196,7 @@ def assign_task(
             "assignment is only allowed before execution",
             context={"state": task.state},
         )
+    changed = False
     if owner is not None:
         _require_actor(owner)
         if owner.principal_type != "person":
@@ -1711,18 +2205,45 @@ def assign_task(
                 "the accountable owner must be a person",
                 context={"principal_type": owner.principal_type},
             )
+        changed = changed or owner.principal_id != task.owner_principal_id
         task.owner_principal_id = owner.principal_id
         task.owner_employee_id = owner.employee_id
         task.owner_account_status = _owner_status(session, owner)
+        task.owner_escalation = None
     if assignee is not None:
         _require_actor(assignee)
+        changed = changed or assignee.principal_id != task.assignee_principal_id
         task.assignee_principal_id = assignee.principal_id
     if executor is not None:
         _require_actor(executor)
+        changed = changed or executor.principal_id != task.executor_principal_id
         task.executor_principal_id = executor.principal_id
         task.executor_principal_type = executor.principal_type
         task.executor_employee_id = executor.employee_id
+    completeness, incomplete_reason = _record_completeness(task)
+    task.record_completeness = completeness
+    task.incomplete_reason = incomplete_reason
     session.flush()
+    if changed:
+        # Important 13: stale authority must not survive a responsibility
+        # change.  Revoke the current grant, then re-evaluate an already
+        # evaluated task so the new executor/owner gets a fresh decision.
+        if task.grant_id:
+            _invalidate_grant(
+                session, task, actor, reason_code="task_terminal", now=timestamp
+            )
+            task.grant_id = None
+            task.grant_status = None
+            session.flush()
+        if task.state == "evaluated":
+            _reapply_decision_after_reassignment(
+                session, task, actor, now=timestamp
+            )
+        elif task.state in {"awaiting_confirmation", "awaiting_approval"}:
+            # The pending gate is re-evaluated by the next confirmation/
+            # approval; drop the stale snapshot so it cannot be reused.
+            task.confirmation_ref = None
+            session.flush()
     _audit(
         session,
         actor=actor,
@@ -1732,6 +2253,7 @@ def assign_task(
             "owner": task.owner_principal_id,
             "assignee": task.assignee_principal_id,
             "executor": task.executor_principal_id,
+            "record_completeness": task.record_completeness,
         },
     )
     enqueue_event(
@@ -1775,6 +2297,12 @@ def add_dependency(
             "task_unauthorized_actor",
             "only a participant may add a dependency",
             context={"actor": actor.principal_id},
+        )
+    if task.state in {"dispatched", "running", "verifying"} or is_terminal(task.state):
+        raise TaskError(
+            "task_invalid_transition",
+            "dependencies may only change before execution starts",
+            context={"state": task.state},
         )
     if _dependency_reaches(session, dependency_task.task_id, task.task_id):
         raise DependencyError(
@@ -1869,6 +2397,7 @@ def _assert_lease(
     worker_id: str | None,
     fencing_token: int | None,
     now: datetime,
+    allow_expired: bool = False,
 ) -> TaskLease:
     if worker_id is None or fencing_token is None:
         raise TaskError(
@@ -1880,8 +2409,14 @@ def _assert_lease(
         select(TaskLease)
         .where(
             TaskLease.task_id == task.task_id,
-            TaskLease.released_at.is_(None),
+            *(
+                ()
+                if allow_expired
+                else (TaskLease.released_at.is_(None),)
+            ),
         )
+        .order_by(TaskLease.id.desc())
+        .limit(1)
         .with_for_update()
     )
     if lease is None or lease.worker_id != worker_id:
@@ -1899,7 +2434,7 @@ def _assert_lease(
                 "current_token": lease.fencing_token,
             },
         )
-    if _to_utc(lease.lease_expires_at) <= now:  # type: ignore[operator]
+    if _to_utc(lease.lease_expires_at) <= now and not allow_expired:  # type: ignore[operator]
         raise TaskError(
             "task_lease_expired",
             "the lease has expired; recover it before writing execution state",
@@ -1930,6 +2465,7 @@ def start_attempt(
     timestamp = now or _utcnow()
     _require_actor(actor)
     task = _load_task(session, task_id, for_update=True)
+    _require_execution_producer(actor, task)
     if is_terminal(task.state):
         _reject_terminal(
             session, task, actor,
@@ -1939,6 +2475,15 @@ def start_attempt(
     _assert_lease(
         session, task, worker_id=worker_id, fencing_token=fencing_token, now=timestamp
     )
+    _assert_managed_lease(
+        session,
+        task,
+        actor=actor,
+        worker_id=worker_id,
+        fencing_token=fencing_token,
+        now=timestamp,
+    )
+    _assert_task_budget(task, _grant_record(session, task), now=timestamp)
     if expected_revision is not None and task.state_revision != expected_revision:
         raise TaskStateConflict(
             task.task_id, expected=expected_revision, actual=task.state_revision
@@ -1986,9 +2531,6 @@ def start_attempt(
             TaskAttempt.attempt_number == next_attempt_number,
         )
     )
-    task.attempt = next_attempt_number
-    task.runtime_task_id = runtime_ref
-    task.execution_ref = execution_ref
     if existing_attempt is not None and existing_attempt.state == "abandoned":
         # T33 voided this number; a re-dispatch reuses it instead of creating a
         # duplicate attempt number.  The voiding remains in task_events/audit.
@@ -2021,7 +2563,7 @@ def start_attempt(
         reuse_snapshot = None
         attempt = TaskAttempt(
             task_id=task.task_id,
-            attempt_number=task.attempt,
+            attempt_number=next_attempt_number,
             state="dispatched",
             started_at=timestamp,
             runtime_ref=runtime_ref,
@@ -2029,8 +2571,16 @@ def start_attempt(
             idempotency_key=idempotency_key,
         )
         session.add(attempt)
+    # C3: build the guard context **before** incrementing ``attempt`` so
+    # ``attempt_within_max`` compares the number of *opened* attempts
+    # (``attempt < max_attempts``) and the final authorised attempt is allowed.
+    # T65 keeps the same guard semantics: a retry needs ``attempt < max``.
     with session.no_autoflush:
         ctx = _base_context(session, task, actor, now=timestamp)
+    task.attempt = next_attempt_number
+    task.runtime_task_id = runtime_ref
+    task.execution_ref = execution_ref
+    attempt.attempt_number = next_attempt_number
 
     def _restore() -> None:
         task.attempt = previous_attempt
@@ -2106,10 +2656,18 @@ def mark_running(
 ) -> Task:
     """``dispatched -> running`` (T29) on fresh execution evidence."""
     timestamp = now or _utcnow()
-    _require_actor(actor)
     task = _load_task(session, task_id, for_update=True)
+    _require_execution_producer(actor, task)
     _assert_lease(
         session, task, worker_id=worker_id, fencing_token=fencing_token, now=timestamp
+    )
+    _assert_managed_lease(
+        session,
+        task,
+        actor=actor,
+        worker_id=worker_id,
+        fencing_token=fencing_token,
+        now=timestamp,
     )
     attempt = _current_attempt(session, task)
     if attempt is not None:
@@ -2139,6 +2697,9 @@ def record_attempt_result(
     task_id: str,
     actor: GovernancePrincipal,
     outcome: str,
+    worker_id: str | None = None,
+    fencing_token: int | None = None,
+    allow_expired_lease: bool = False,
     result_ref: str | None = None,
     evidence_refs: Sequence[str] = (),
     stop_confirmed: bool = False,
@@ -2156,8 +2717,17 @@ def record_attempt_result(
     to success.
     """
     timestamp = now or _utcnow()
-    _require_actor(actor)
     task = _load_task(session, task_id, for_update=True)
+    _require_execution_producer(actor, task)
+    _assert_managed_lease(
+        session,
+        task,
+        actor=actor,
+        worker_id=worker_id,
+        fencing_token=fencing_token,
+        now=timestamp,
+        allow_expired=allow_expired_lease,
+    )
     if is_terminal(task.state):
         _reject_terminal(
             session, task, actor,
@@ -2183,6 +2753,10 @@ def record_attempt_result(
         )
 
     attempt = _current_attempt(session, task)
+    if outcome == "completed":
+        # Important 3: T36 must not accept a completed run on a revoked,
+        # expired or otherwise invalid grant/gate.
+        _assert_completion_authority(session, task, now=timestamp)
     result = {
         **dict(task.result or {}),
         "outcome": outcome,
@@ -2387,6 +2961,9 @@ def record_dispatch_failure(
     task_id: str,
     actor: GovernancePrincipal,
     outcome: str,
+    worker_id: str | None = None,
+    fencing_token: int | None = None,
+    allow_expired_lease: bool = False,
     evidence_refs: Sequence[str] = (),
     reason: str | None = None,
     expected_revision: int | None = None,
@@ -2395,36 +2972,72 @@ def record_dispatch_failure(
     """Record a submission-phase result for a ``queued`` task (T27/T28/T66-T69).
 
     ``timeout``/``unknown`` never guess "not executed": they enter ``unknown``
-    and revoke the grant.  ``rejected``/``unavailable`` confirm no side effects;
-    ``unsupported`` escalates to a human without retrying.
+    with honest unknown evidence.  ``rejected``/``unavailable`` confirm no side
+    effects; ``unsupported`` escalates to a human without retrying.
     """
     timestamp = now or _utcnow()
-    _require_actor(actor)
     task = _load_task(session, task_id, for_update=True)
+    _require_execution_producer(actor, task)
+    _assert_managed_lease(
+        session,
+        task,
+        actor=actor,
+        worker_id=worker_id,
+        fencing_token=fencing_token,
+        now=timestamp,
+        allow_expired=allow_expired_lease,
+    )
     if task.state != "queued":
         raise TaskError(
             "task_invalid_transition",
             "submission results apply only to a queued task",
             context={"state": task.state},
         )
+    if outcome not in {
+        "rejected",
+        "unavailable",
+        "unsupported",
+        "timeout",
+        "unknown",
+        "deadline_exceeded",
+    }:
+        raise TaskError(
+            "required_input_missing",
+            f"unknown submission outcome {outcome!r}",
+            context={"outcome": outcome},
+        )
     refs = tuple(evidence_refs)
-    task.stop_confirmed = True
+    unknown_outcome = outcome in {"timeout", "unknown"}
+    if unknown_outcome:
+        # C10 / Important 10: do not fabricate "never dispatched" or a stop.
+        stop_confirmed = False
+        no_side_effects = False
+        side_effects_reconciled = False
+        stored_refs = list(refs)
+    else:
+        stop_confirmed = True
+        no_side_effects = True
+        side_effects_reconciled = True
+        stored_refs = list(refs) or [_EVIDENCE_NEVER_STARTED]
+    task.stop_confirmed = stop_confirmed
     task.result = {
         **dict(task.result or {}),
         "outcome": outcome,
-        "evidence_refs": list(refs) or [_EVIDENCE_NEVER_STARTED],
-        "stop_confirmed": True,
-        "stop_evidence_refs": list(refs) or [_EVIDENCE_NEVER_STARTED],
+        "evidence_refs": stored_refs,
+        "stop_confirmed": stop_confirmed,
+        "stop_evidence_refs": stored_refs if stop_confirmed else [],
+        "no_side_effects": no_side_effects,
+        "side_effects_reconciled": side_effects_reconciled,
         "error_code": reason,
-        "side_effects_reconciled": True,
     }
     session.flush()
     ctx = _base_context(session, task, actor, now=timestamp)
     ctx = replace(
         ctx,
-        stop_confirmed=True,
-        stop_evidence=True,
-        no_side_effects=True,
+        stop_confirmed=stop_confirmed,
+        stop_evidence=bool(stored_refs) if stop_confirmed else False,
+        no_side_effects=no_side_effects,
+        side_effects_reconciled=side_effects_reconciled,
     )
     if outcome == "rejected":
         event, target = "dispatch.rejected", "failed"
@@ -2439,15 +3052,9 @@ def record_dispatch_failure(
     elif outcome == "unknown":
         event, target = "dispatch.unknown", "unknown"
         ctx = replace(ctx, dispatch_outcome_unknown=True)
-    elif outcome == "deadline_exceeded":
+    else:  # deadline_exceeded
         event, target = "task.deadline_exceeded", "timed_out"
         ctx = replace(ctx, deadline_passed=True)
-    else:
-        raise TaskError(
-            "required_input_missing",
-            f"unknown submission outcome {outcome!r}",
-            context={"outcome": outcome},
-        )
     if target in TASK_TERMINAL_STATES or target in {"unknown", "failed"}:
         _invalidate_grant(
             session,
@@ -2566,6 +3173,9 @@ def confirm_stop(
     evidence_refs: Sequence[str],
     stop_confirmed: bool = True,
     side_effects_reconciled: bool = True,
+    worker_id: str | None = None,
+    fencing_token: int | None = None,
+    allow_expired_lease: bool = False,
     expected_revision: int | None = None,
     now: datetime | None = None,
 ) -> Task:
@@ -2575,11 +3185,21 @@ def confirm_stop(
     one stop evidence reference.  From ``running``/``dispatched`` the cancel
     request is registered first in the same transaction, so the audit trail
     still distinguishes "requested" from "stopped".  From ``unknown`` the
-    reconciliation path (T56) is used.
+    reconciliation path (T56) is used; from ``needs_human`` T63 is used.  Every
+    branch persists ``task.stop_confirmed`` and closes the open attempt.
     """
     timestamp = now or _utcnow()
-    _require_actor(actor)
     task = _load_task(session, task_id, for_update=True)
+    _require_task_authority(actor, task)
+    _assert_managed_lease(
+        session,
+        task,
+        actor=actor,
+        worker_id=worker_id,
+        fencing_token=fencing_token,
+        now=timestamp,
+        allow_expired=allow_expired_lease,
+    )
     if task.state == "cancelled":
         return task
     if is_terminal(task.state):
@@ -2588,23 +3208,29 @@ def confirm_stop(
             event="execution.stopped", target="cancelled",
             message="a terminal task cannot be stopped again",
         )
-    refs = tuple(evidence_refs)
+    refs = _validate_evidence_refs(evidence_refs)
     if not stop_confirmed:
         raise TaskError(
             "stop_not_confirmed",
             "a stop cannot be claimed without stop_confirmed=true",
             context={"task_id": task.task_id},
         )
-    if not refs:
-        raise TaskError(
-            "evidence_missing",
-            "a stop requires at least one evidence reference",
-            context={"field": "evidence_refs"},
-        )
     previous = task.state
     _invalidate_grant(
         session, task, actor, reason_code="task_cancelled", now=timestamp
     )
+    # Persist the stop fact for every available branch before the transition so
+    # the database backstops (terminal_stop_confirmed, denied-after-attempt)
+    # never see an inconsistent row.
+    task.stop_confirmed = True
+    task.result = {
+        **dict(task.result or {}),
+        "outcome": "cancelled",
+        "stop_confirmed": True,
+        "stop_evidence_refs": list(refs),
+        "side_effects_reconciled": side_effects_reconciled,
+    }
+    session.flush()
     if previous in {"running", "dispatched", "queued", "verifying"}:
         ctx = _base_context(session, task, actor, now=timestamp)
         _perform_transition(
@@ -2635,15 +3261,6 @@ def confirm_stop(
             ctx=ctx, expected_revision=expected_revision, now=timestamp,
         )
     elif task.state == "cancel_requested":
-        task.stop_confirmed = True
-        task.result = {
-            **dict(task.result or {}),
-            "outcome": "cancelled",
-            "stop_confirmed": True,
-            "stop_evidence_refs": list(refs),
-            "side_effects_reconciled": side_effects_reconciled,
-        }
-        session.flush()
         ctx = replace(
             _base_context(session, task, actor, now=timestamp),
             stop_confirmed=True,
@@ -2725,6 +3342,8 @@ def complete_task(
             context={"actor": actor.principal_id},
         )
     verification.validate_result_refs(result_ref, evidence_refs, require_result=True)
+    # Important 3: never declare success on an expired/revoked grant or gate.
+    _assert_completion_authority(session, task, now=timestamp)
     evidence_records = [
         item if isinstance(item, EvidenceRecord) else EvidenceRecord.from_mapping(item)
         for item in evidence
@@ -2783,10 +3402,37 @@ def complete_task(
             expected_revision=expected_revision,
             reason_code="evidence_missing", now=timestamp,
         )
-        task.needs_human_origin = "execution_boundary"
+        # T45: the attempt has ended and its result is pending a human
+        # verification (T60 becomes the only resumable origin).
+        task.needs_human_origin = "verifying"
+        task.result = {
+            **dict(task.result or {}),
+            "attempt_finished_pending_verification": True,
+        }
+        _close_attempt(
+            _current_attempt(session, task),
+            state="verifying",
+            now=timestamp,
+            stop_confirmed=False,
+            result_ref=result_ref,
+            evidence_refs=evidence_tuple,
+        )
         session.flush()
         return task
     else:
+        # A rejected partial/failed verification is a ``verification.failed``
+        # edge; the persisted shape must say so even when the raw outcome was
+        # ``partial`` (Important 12).
+        verification_doc = {**verification_doc, "result": "failed"}
+        task.result = {
+            **dict(task.result or {}),
+            "verification": verification_doc,
+        }
+        session.flush()
+        ctx = replace(
+            _base_context(session, task, actor, now=timestamp),
+            verification_result="failed",
+        )
         _invalidate_grant(
             session, task, actor, reason_code="task_terminal", now=timestamp
         )
@@ -2817,25 +3463,67 @@ def fail_task(
     stop_confirmed: bool = False,
     error_code: str | None = None,
     dispatch_outcome: str = "rejected",
+    worker_id: str | None = None,
+    fencing_token: int | None = None,
+    allow_expired_lease: bool = False,
     expected_revision: int | None = None,
     now: datetime | None = None,
 ) -> Task:
     """Record a deterministic failure without pretending a result exists.
 
     From ``queued`` only pre-dispatch failures are allowed (``attempt = 0`` and
-    no side effects).  From ``dispatched``/``running`` stop evidence is required.
-    From ``needs_human`` a human declaration requires ``attempt >= 1`` (F39).
+    no side effects); those are delegated to :func:`record_dispatch_failure` so
+    T28/T66/T69 are produced with their required context.  From
+    ``dispatched``/``running`` stop evidence is required.  From ``needs_human``
+    a human declaration requires ``attempt >= 1`` (F39).
     """
     timestamp = now or _utcnow()
-    _require_actor(actor)
     task = _load_task(session, task_id, for_update=True)
+    _require_task_authority(actor, task)
+    _assert_managed_lease(
+        session,
+        task,
+        actor=actor,
+        worker_id=worker_id,
+        fencing_token=fencing_token,
+        now=timestamp,
+        allow_expired=allow_expired_lease,
+    )
     if is_terminal(task.state):
         _reject_terminal(
             session, task, actor,
             event="execution.failed", target="failed",
             message="a terminal task cannot be failed again",
         )
+    if task.state == "queued":
+        # Important 2: the queued arm is exactly the submission-result path.
+        if task.attempt != 0:
+            raise TaskError(
+                "task_invalid_transition",
+                "a queued task with an attempt must fail through its execution boundary",
+                context={"attempt": task.attempt},
+            )
+        if dispatch_outcome not in {"rejected", "unavailable", "unsupported"}:
+            raise TaskError(
+                "required_input_missing",
+                "queued failures use dispatch.rejected/unavailable/unsupported",
+                context={"dispatch_outcome": dispatch_outcome},
+            )
+        return record_dispatch_failure(
+            session,
+            task_id=task.task_id,
+            actor=actor,
+            outcome=dispatch_outcome,
+            worker_id=worker_id,
+            fencing_token=fencing_token,
+            evidence_refs=evidence_refs,
+            reason=reason or error_code,
+            expected_revision=expected_revision,
+            now=timestamp,
+        )
     refs = tuple(evidence_refs)
+    if refs:
+        verification.validate_result_refs(None, refs, require_result=False)
     previous = task.state
     task.stop_confirmed = bool(stop_confirmed)
     task.result = {
@@ -2851,35 +3539,7 @@ def fail_task(
     session.flush()
     ctx = _base_context(session, task, actor, now=timestamp)
 
-    if previous == "queued":
-        if task.attempt != 0:
-            raise TaskError(
-                "task_invalid_transition",
-                "a queued task with an attempt must fail through its execution boundary",
-                context={"attempt": task.attempt},
-            )
-        if dispatch_outcome == "unavailable":
-            event = "dispatch.unavailable"
-        elif dispatch_outcome == "unsupported":
-            event = "dispatch.unsupported"
-            ctx = replace(ctx, runtime_supported=False)
-        else:
-            event = "dispatch.rejected"
-        target = "needs_human" if event == "dispatch.unsupported" else "failed"
-        if target == "failed":
-            _invalidate_grant(
-                session, task, actor, reason_code="attempt_failed", now=timestamp
-            )
-        _perform_transition(
-            session, task, actor, event=event, target=target, ctx=ctx,
-            expected_revision=expected_revision, reason_code=error_code,
-            now=timestamp,
-        )
-        if target == "needs_human":
-            task.needs_human_origin = "pre_execution"
-            session.flush()
-            return task
-    elif previous in {"dispatched", "running"}:
+    if previous in {"dispatched", "running"}:
         if not stop_confirmed:
             raise TaskError(
                 "stop_not_confirmed",
@@ -2988,7 +3648,7 @@ def _fresh_retry_decision(
             supersedes_decision_id=record.decision_id if record is not None else None,
         ),
         now=now,
-        evidence_verifier=TaskEvidenceVerifier(session),
+        evidence_verifier=TaskEvidenceVerifier(session, task_id=task.task_id),
     )
     if decision.decision_type not in {"allow", "managed_execution_required"}:
         raise TaskError(
@@ -3096,6 +3756,25 @@ def retry_task(
         session.flush()
         return task
 
+    # C7: only a reconciled failure may be replayed.  A failure without
+    # persisted reconciliation evidence escalates to a human instead of issuing
+    # a new decision/grant.
+    base_ctx = _base_context(session, task, actor, now=timestamp)
+    if not base_ctx.no_side_effects:
+        ctx = replace(
+            base_ctx,
+            retry_exhausted=True,
+            escalation_justified=True,
+        )
+        _perform_transition(
+            session, task, actor, event="task.retry_exhausted",
+            target="needs_human", ctx=ctx, expected_revision=expected_revision,
+            reason_code="task_reconcile_evidence_missing", now=timestamp,
+        )
+        task.needs_human_origin = "failed"
+        session.flush()
+        return task
+
     try:
         _decision, grant = _fresh_retry_decision(
             session, task, actor=actor, now=timestamp, capability=capability
@@ -3128,7 +3807,6 @@ def retry_task(
         grant_attempt_matches=True,
         grant_unexpired=True,
         grant_scope_ok=True,
-        no_side_effects=True,
         gates_satisfied=(
             _live_confirmation_ref(session, task, now=timestamp) is not None
             or not bool((rule.constraints if rule else {}).get("required_confirmation"))
@@ -3166,6 +3844,9 @@ def reconcile_task(
     stop_confirmed: bool = False,
     no_side_effect_evidence: bool = False,
     capability: str | None = None,
+    worker_id: str | None = None,
+    fencing_token: int | None = None,
+    allow_expired_lease: bool = False,
     expected_revision: int | None = None,
     now: datetime | None = None,
 ) -> Task:
@@ -3179,8 +3860,17 @@ def reconcile_task(
       ``needs_human`` -- a revoked grant never resumes running/verifying.
     """
     timestamp = now or _utcnow()
-    _require_actor(actor)
     task = _load_task(session, task_id, for_update=True)
+    _require_task_authority(actor, task)
+    _assert_managed_lease(
+        session,
+        task,
+        actor=actor,
+        worker_id=worker_id,
+        fencing_token=fencing_token,
+        now=timestamp,
+        allow_expired=allow_expired_lease,
+    )
     if task.state != "unknown":
         raise TaskError(
             "task_invalid_transition",
@@ -3188,6 +3878,8 @@ def reconcile_task(
             context={"state": task.state},
         )
     refs = tuple(evidence_refs)
+    if refs:
+        verification.validate_result_refs(None, refs, require_result=False)
     if outcome in {"failed", "stopped", "timed_out"}:
         if not stop_confirmed or not refs:
             raise TaskError(
@@ -3248,7 +3940,7 @@ def reconcile_task(
             grant_scope_ok=True,
             owner_active=True,
             record_completeness="complete",
-            retry_budget_remaining=max(1, task.retry_budget_remaining),
+            retry_budget_remaining=task.retry_budget_remaining,
             gates_satisfied=(
                 _live_confirmation_ref(session, task, now=timestamp) is not None
                 or not bool((rule.constraints if rule else {}).get("required_confirmation"))
@@ -3364,15 +4056,30 @@ def takeover_task(
             context={"actor": actor.principal_id},
         )
     refs = tuple(evidence_refs)
+    if refs:
+        verification.validate_result_refs(None, refs, require_result=False)
     ctx = _base_context(session, task, actor, now=timestamp)
 
     if action == "running":
+        # C6: only T40/T35/T52 origins may resume the same attempt, and the
+        # persisted attempt row must still be running.  Never default the
+        # evidence to true.
+        if task.needs_human_origin not in {"running", "dispatched", "cancel_requested"}:
+            raise TaskError(
+                "grant_revoked",
+                "this needs_human origin cannot resume execution",
+                context={"needs_human_origin": task.needs_human_origin},
+            )
+        if not ctx.same_attempt_running_evidence:
+            raise TaskError(
+                "evidence_missing",
+                "no persisted evidence that the same attempt is still running",
+                context={"attempt": task.attempt},
+            )
         ctx = replace(
             ctx,
             needs_human_origin=task.needs_human_origin,
-            same_attempt_running_evidence=bool(
-                (task.result or {}).get("same_attempt_running_evidence", True)
-            ),
+            same_attempt_running_evidence=True,
         )
         _perform_transition(
             session, task, actor, event="human.takeover.running", target="running",
@@ -3380,6 +4087,14 @@ def takeover_task(
         )
     elif action == "result_submitted":
         verification.validate_result_refs(result_ref, refs, require_result=True)
+        # C6: only T45 (verification inconclusive) may submit a result for an
+        # already-ended attempt.
+        if task.needs_human_origin != "verifying":
+            raise TaskError(
+                "grant_revoked",
+                "this needs_human origin cannot resume verification",
+                context={"needs_human_origin": task.needs_human_origin},
+            )
         task.result = {
             **dict(task.result or {}),
             "outcome": "completed",
@@ -3387,8 +4102,15 @@ def takeover_task(
             "evidence_refs": list(refs),
         }
         session.flush()
+        ctx = _base_context(session, task, actor, now=timestamp)
+        if not ctx.attempt_finished_pending_verification:
+            raise TaskError(
+                "evidence_missing",
+                "no persisted evidence that the attempt ended pending verification",
+                context={"attempt": task.attempt},
+            )
         ctx = replace(
-            _base_context(session, task, actor, now=timestamp),
+            ctx,
             needs_human_origin=task.needs_human_origin,
             attempt_finished_pending_verification=True,
             result_present=bool(result_ref),
@@ -3404,31 +4126,60 @@ def takeover_task(
             stop_confirmed=False, result_ref=result_ref, evidence_refs=refs,
         )
     elif action == "redispatch":
-        if not refs and task.attempt >= 1:
+        # C5/S-19: attempt>=1 needs real stop evidence; an open attempt is
+        # closed with that evidence *before* T61.  attempt=0 is the proof that
+        # nothing was dispatched.  max_attempts is enforced honestly.
+        if task.attempt >= 1 and not refs:
             raise TaskError(
                 "stop_not_confirmed",
                 "redispatch requires stop evidence (or a never-started proof)",
                 context={"attempt": task.attempt},
             )
+        if task.attempt >= task.max_attempts:
+            raise TaskError(
+                "retry_budget_exhausted",
+                "the attempt budget is exhausted",
+                context={"attempt": task.attempt, "max_attempts": task.max_attempts},
+            )
+        if refs:
+            _close_attempt_with_stop(
+                session,
+                task,
+                state="cancelled",
+                now=timestamp,
+                evidence_refs=refs,
+            )
         task.result = {
             **dict(task.result or {}),
-            "stop_confirmed": bool(refs) or task.attempt == 0,
+            "stop_confirmed": True,
             "stop_evidence_refs": list(refs),
+            "side_effects_reconciled": True,
         }
-        task.stop_confirmed = bool(refs) or task.attempt == 0
+        task.stop_confirmed = True
         session.flush()
+        _invalidate_grant(
+            session, task, actor, reason_code="task_terminal", now=timestamp
+        )
         _decision, grant = _fresh_retry_decision(
             session, task, actor=actor, now=timestamp, capability=capability
         )
         rule = _decision_record(session, task)
+        base = _base_context(session, task, actor, now=timestamp)
+        if not base.no_side_effects:
+            _invalidate_grant(
+                session, task, actor, reason_code="task_terminal", now=timestamp
+            )
+            raise TaskError(
+                "task_reconcile_evidence_missing",
+                "redispatch requires reconciled side effects",
+                context={"attempt": task.attempt},
+            )
         ctx = replace(
-            _base_context(session, task, actor, now=timestamp),
+            base,
             fresh_decision_and_grant=True,
             old_grant_invalidated=True,
             decision_purpose="retry",
             decision_revision=int(task.decision_revision or 2),
-            active_attempt_unreconciled=False,
-            no_side_effects=True,
             grant_id=grant.grant_id,
             grant_status="active",
             grant_task_matches=True,
@@ -3437,7 +4188,6 @@ def takeover_task(
             grant_attempt_matches=True,
             grant_unexpired=True,
             grant_scope_ok=True,
-            retry_budget_remaining=max(1, task.retry_budget_remaining),
             gates_satisfied=(
                 _live_confirmation_ref(session, task, now=timestamp) is not None
                 or not bool((rule.constraints if rule else {}).get("required_confirmation"))
@@ -3456,8 +4206,6 @@ def takeover_task(
         task.result = {
             **dict(task.result or {}),
             "outcome": "none",
-            "no_side_effects": False,
-            "side_effects_reconciled": True,
         }
         session.flush()
     elif action == "authorization_revoked":
@@ -3467,14 +4215,27 @@ def takeover_task(
                 "revoking authorization requires stop evidence for an opened attempt",
                 context={"attempt": task.attempt},
             )
+        if refs:
+            _close_attempt_with_stop(
+                session,
+                task,
+                state="cancelled",
+                now=timestamp,
+                evidence_refs=refs,
+            )
         ctx = replace(
-            ctx,
-            active_attempt_unreconciled=False,
+            _base_context(session, task, actor, now=timestamp),
             stop_confirmed=bool(refs) or task.attempt == 0,
             stop_evidence=bool(refs),
             authorization_revoked=True,
         )
         task.stop_confirmed = bool(refs) or task.attempt == 0
+        if refs:
+            task.result = {
+                **dict(task.result or {}),
+                "stop_confirmed": True,
+                "stop_evidence_refs": list(refs),
+            }
         session.flush()
         _invalidate_grant(
             session, task, actor, reason_code="task_terminal", now=timestamp
@@ -3485,12 +4246,7 @@ def takeover_task(
             now=timestamp,
         )
     elif action == "stop_confirmed":
-        if not refs:
-            raise TaskError(
-                "evidence_missing",
-                "stopping requires evidence references",
-                context={"field": "evidence_refs"},
-            )
+        refs = _validate_evidence_refs(refs)
         task.stop_confirmed = True
         task.result = {
             **dict(task.result or {}),
@@ -3522,6 +4278,23 @@ def takeover_task(
                 "an attempt=0 human failure must be registered as cancelled/denied",
                 context={"attempt": task.attempt},
             )
+        if refs:
+            _close_attempt_with_stop(
+                session,
+                task,
+                state="failed",
+                now=timestamp,
+                evidence_refs=refs,
+            )
+        else:
+            attempt = _current_attempt(session, task)
+            if attempt is not None and attempt.ended_at is None:
+                _close_attempt(
+                    attempt,
+                    state="failed",
+                    now=timestamp,
+                    stop_confirmed=False,
+                )
         _invalidate_grant(
             session, task, actor, reason_code="attempt_failed", now=timestamp
         )
@@ -3536,6 +4309,485 @@ def takeover_task(
             f"unknown takeover action {action!r}",
             context={"action": action},
         )
+    session.flush()
+    return task
+
+
+# ---------------------------------------------------------------------------
+# Remaining legal edges (escalation, clarification, denial, evidence loss)
+# ---------------------------------------------------------------------------
+
+_ESCALATABLE_STATES = {
+    "evaluated",
+    "awaiting_clarification",
+    "awaiting_confirmation",
+    "awaiting_approval",
+    "queued",
+    "dispatched",
+    "running",
+    "cancel_requested",
+}
+
+
+def escalate_task(
+    session: Session,
+    *,
+    task_id: str,
+    actor: GovernancePrincipal,
+    reason_code: str,
+    evidence_refs: Sequence[str] = (),
+    expected_revision: int | None = None,
+    now: datetime | None = None,
+) -> Task:
+    """T10/T14/T18/T22/T26/T35/T40/T52: hand the task to a human.
+
+    The origin is recorded exactly as the source state so T59 can later require
+    a running/dispatched/cancel_requested origin and T60 a verifying origin.
+    """
+    timestamp = now or _utcnow()
+    task = _load_task(session, task_id, for_update=True)
+    _require_task_authority(actor, task)
+    if is_terminal(task.state) or task.state not in _ESCALATABLE_STATES:
+        raise TaskError(
+            "task_invalid_transition",
+            f"escalation is not available from {task.state!r}",
+            context={"state": task.state},
+        )
+    if not reason_code:
+        raise TaskError(
+            "required_input_missing",
+            "an escalation reason code is required",
+            context={"field": "reason_code"},
+        )
+    refs = tuple(evidence_refs)
+    if refs:
+        verification.validate_result_refs(None, refs, require_result=False)
+    previous = task.state
+    # T40/T35/T52 retain the possibility of T59: the grant must stay usable
+    # (active/consumed) for the same attempt.  Pre-execution escalation has no
+    # such recovery path, so its grant is invalidated.
+    if previous in {"queued"}:
+        _invalidate_grant(
+            session, task, actor, reason_code=reason_code, now=timestamp
+        )
+    ctx = replace(
+        _base_context(session, task, actor, now=timestamp),
+        escalation_justified=True,
+    )
+    _perform_transition(
+        session,
+        task,
+        actor,
+        event="human.escalation_required",
+        target="needs_human",
+        ctx=ctx,
+        expected_revision=expected_revision,
+        reason_code=reason_code,
+        extra={"evidence_refs": list(refs)} if refs else None,
+        now=timestamp,
+    )
+    task.needs_human_origin = previous
+    session.flush()
+    return task
+
+
+def provide_clarification(
+    session: Session,
+    *,
+    task_id: str,
+    actor: GovernancePrincipal,
+    provided_inputs: Sequence[str] | None = None,
+    resource_scope: Mapping[str, Any] | None = None,
+    payload: Mapping[str, Any] | None = None,
+    expected_revision: int | None = None,
+    now: datetime | None = None,
+) -> Task:
+    """T11: the missing inputs were supplied; re-run the PDP."""
+    timestamp = now or _utcnow()
+    task = _load_task(session, task_id, for_update=True)
+    _require_task_authority(actor, task)
+    if task.state != "awaiting_clarification":
+        raise TaskError(
+            "task_invalid_transition",
+            "clarification is only accepted in awaiting_clarification",
+            context={"state": task.state},
+        )
+    required = set((task.goal or {}).get("required_inputs") or ())
+    supplied = {str(item) for item in (provided_inputs or ())}
+    missing = tuple(sorted(required - supplied))
+    if missing:
+        raise TaskError(
+            "required_input_missing",
+            "the clarification did not supply every required input",
+            context={"missing_inputs": list(missing)},
+        )
+    if resource_scope is not None:
+        scope = _normalized_scope(resource_scope)
+        task.resource_scope = scope
+        base_payload = (
+            dict(payload)
+            if payload is not None
+            else {
+                **dict(task.payload or {}),
+                "resource_scope": scope,
+            }
+        )
+        task.payload = base_payload
+        task.payload_hash = payload_hash(base_payload)
+    elif payload is not None:
+        task.payload = dict(payload)
+        task.payload_hash = payload_hash(dict(payload))
+    task.result = {
+        **dict(task.result or {}),
+        "inputs_satisfied": True,
+        "missing_inputs": [],
+    }
+    task.record_completeness, task.incomplete_reason = _record_completeness(task)
+    task.incomplete_reason = None if task.record_completeness == "complete" else task.incomplete_reason
+    session.flush()
+    record = _decision_record(session, task)
+    if record is None:
+        raise TaskError(
+            "required_input_missing",
+            "an evaluated decision is required before clarification",
+            context={"field": "decision_id"},
+        )
+    executor = resolve_principal(
+        session,
+        task.executor_principal_id or "",
+        principal_type=task.executor_principal_type,
+    )
+    decision = evaluate(
+        session,
+        EvaluationRequest(
+            principal=executor,
+            capability=(task.requested_capabilities or [""])[0],
+            task_id=task.task_id,
+            task_revision=task.state_revision + 1,
+            task_idempotency_key=task.idempotency_key,
+            resource_scope=task.resource_scope,
+            priority=task.priority,
+            execution_mode=task.execution_mode,
+            risk="low",
+            confirmation_ref=task.confirmation_ref,
+            approval_ref=_approval_document(task),
+            payload_hash=task.payload_hash,
+            policy_set_id=task.policy_set_id or DEFAULT_POLICY_SET_ID,
+            policy_version=task.policy_version,
+            correlation_id=task.correlation_id,
+            decision_purpose="initial_execution",
+            supersedes_decision_id=record.decision_id,
+        ),
+        now=timestamp,
+        evidence_verifier=TaskEvidenceVerifier(session, task_id=task.task_id),
+    )
+    _apply_decision(
+        session,
+        task,
+        actor,
+        decision,
+        from_state="awaiting_clarification",
+        now=timestamp,
+        runtime_capabilities_verified=bool(
+            (task.result or {}).get("runtime_capabilities_verified", False)
+        ),
+    )
+    return task
+
+
+def deny_task(
+    session: Session,
+    *,
+    task_id: str,
+    actor: GovernancePrincipal,
+    reason_code: str,
+    evidence_refs: Sequence[str] = (),
+    expected_revision: int | None = None,
+    now: datetime | None = None,
+) -> Task:
+    """T12/T25: withdraw authority for an awaiting-clarification or queued task."""
+    timestamp = now or _utcnow()
+    task = _load_task(session, task_id, for_update=True)
+    _require_task_authority(actor, task)
+    if task.state not in {"awaiting_clarification", "queued"}:
+        raise TaskError(
+            "task_invalid_transition",
+            f"denial is not a defined edge from {task.state!r}",
+            context={"state": task.state},
+        )
+    if not reason_code:
+        raise TaskError(
+            "required_input_missing",
+            "a denial reason code is required",
+            context={"field": "reason_code"},
+        )
+    refs = tuple(evidence_refs)
+    if refs:
+        verification.validate_result_refs(None, refs, require_result=False)
+    task.stop_confirmed = True
+    task.result = {
+        **dict(task.result or {}),
+        "outcome": "none",
+        "stop_confirmed": True,
+        "stop_evidence_refs": list(refs) or [_EVIDENCE_NEVER_STARTED],
+        "no_side_effects": True,
+        "side_effects_reconciled": True,
+    }
+    session.flush()
+    previous = task.state
+    ctx = _base_context(session, task, actor, now=timestamp)
+    if previous == "awaiting_clarification":
+        ctx = replace(ctx, decision_type="deny")
+    else:
+        ctx = replace(ctx, decision_invalidated=True)
+    _invalidate_grant(
+        session, task, actor, reason_code="task_terminal", now=timestamp
+    )
+    _perform_transition(
+        session,
+        task,
+        actor,
+        event="governance.denied",
+        target="denied",
+        ctx=ctx,
+        expected_revision=expected_revision,
+        reason_code=reason_code,
+        now=timestamp,
+    )
+    return task
+
+
+def dispatch_deadline_exceeded(
+    session: Session,
+    *,
+    task_id: str,
+    actor: GovernancePrincipal,
+    evidence_refs: Sequence[str],
+    expected_revision: int | None = None,
+    now: datetime | None = None,
+) -> Task:
+    """T34: a dispatched submission window closed with no side effects."""
+    timestamp = now or _utcnow()
+    task = _load_task(session, task_id, for_update=True)
+    _require_task_authority(actor, task)
+    if task.state != "dispatched":
+        raise TaskError(
+            "task_invalid_transition",
+            "dispatch deadline expiry requires the dispatched state",
+            context={"state": task.state},
+        )
+    refs = _validate_evidence_refs(evidence_refs)
+    task.stop_confirmed = True
+    task.result = {
+        **dict(task.result or {}),
+        "outcome": "timed_out",
+        "stop_confirmed": True,
+        "stop_evidence_refs": list(refs),
+        "no_side_effects": True,
+        "side_effects_reconciled": True,
+    }
+    session.flush()
+    ctx = replace(
+        _base_context(session, task, actor, now=timestamp),
+        deadline_passed=True,
+        no_side_effects=True,
+        stop_confirmed=True,
+        stop_evidence=True,
+    )
+    _invalidate_grant(session, task, actor, reason_code="task_terminal", now=timestamp)
+    _perform_transition(
+        session,
+        task,
+        actor,
+        event="dispatch.deadline_exceeded",
+        target="timed_out",
+        ctx=ctx,
+        expected_revision=expected_revision,
+        reason_code="dispatch_deadline_exceeded",
+        extra={"evidence_refs": list(refs)},
+        now=timestamp,
+    )
+    _close_attempt(
+        _current_attempt(session, task),
+        state="timed_out",
+        now=timestamp,
+        stop_confirmed=True,
+        evidence_refs=refs,
+    )
+    session.flush()
+    return task
+
+
+def evidence_unavailable(
+    session: Session,
+    *,
+    task_id: str,
+    actor: GovernancePrincipal,
+    evidence_refs: Sequence[str] = (),
+    expected_revision: int | None = None,
+    now: datetime | None = None,
+) -> Task:
+    """T46: the evidence source is unavailable while verifying -> unknown."""
+    timestamp = now or _utcnow()
+    task = _load_task(session, task_id, for_update=True)
+    _require_task_authority(actor, task)
+    if task.state != "verifying":
+        raise TaskError(
+            "task_invalid_transition",
+            "evidence unavailability requires the verifying state",
+            context={"state": task.state},
+        )
+    refs = tuple(evidence_refs)
+    if refs:
+        verification.validate_result_refs(None, refs, require_result=False)
+    task.result = {
+        **dict(task.result or {}),
+        "evidence_unavailable": True,
+        "evidence_refs": list(refs),
+    }
+    session.flush()
+    ctx = replace(
+        _base_context(session, task, actor, now=timestamp),
+        evidence_unavailable=True,
+    )
+    _invalidate_grant(
+        session, task, actor, reason_code="execution_evidence_lost", now=timestamp
+    )
+    _perform_transition(
+        session,
+        task,
+        actor,
+        event="verification.evidence_unavailable",
+        target="unknown",
+        ctx=ctx,
+        expected_revision=expected_revision,
+        reason_code="evidence_missing",
+        extra={"evidence_refs": list(refs)} if refs else None,
+        now=timestamp,
+    )
+    return task
+
+
+def revoke_approval(
+    session: Session,
+    *,
+    task_id: str,
+    actor: GovernancePrincipal,
+    reason_code: str,
+    expected_revision: int | None = None,
+    now: datetime | None = None,
+) -> Task:
+    """Revoke a recorded approval and re-close the gated task.
+
+    From ``awaiting_approval`` this is T20 (denied); from ``queued`` it is T25
+    (authority withdrawn before dispatch).  An approval that already authorised
+    execution cannot be silently revoked: the caller must stop/reconcile first.
+    """
+    timestamp = now or _utcnow()
+    task = _load_task(session, task_id, for_update=True)
+    _require_task_authority(actor, task)
+    if task.state not in {"awaiting_approval", "queued"}:
+        raise TaskError(
+            "task_invalid_transition",
+            "approval revocation requires awaiting_approval or queued",
+            context={"state": task.state},
+        )
+    approval = dict(task.approval_ref or {})
+    if not approval:
+        raise TaskError(
+            "approval_missing",
+            "the task has no recorded approval",
+            context={"task_id": task.task_id},
+        )
+    approval.update(
+        {
+            "decision": "revoked",
+            "revoked_at": _rfc3339(timestamp),
+            "revoked_by_principal_id": actor.principal_id,
+            "revocation_reason": reason_code,
+        }
+    )
+    task.approval_ref = approval
+    task.stop_confirmed = True
+    task.result = {
+        **dict(task.result or {}),
+        "outcome": "none",
+        "stop_confirmed": True,
+        "stop_evidence_refs": [_EVIDENCE_NEVER_STARTED],
+        "no_side_effects": True,
+        "side_effects_reconciled": True,
+    }
+    session.flush()
+    ctx = _base_context(session, task, actor, now=timestamp)
+    if task.state == "awaiting_approval":
+        ctx = replace(ctx, approval_invalid=True)
+        event = "approval.rejected"
+    else:
+        ctx = replace(ctx, decision_invalidated=True)
+        event = "governance.denied"
+    _invalidate_grant(
+        session, task, actor, reason_code="task_terminal", now=timestamp
+    )
+    _perform_transition(
+        session,
+        task,
+        actor,
+        event=event,
+        target="denied",
+        ctx=ctx,
+        expected_revision=expected_revision,
+        reason_code=reason_code,
+        now=timestamp,
+    )
+    return task
+
+
+def escalate_owner_account(
+    session: Session,
+    *,
+    task_id: str,
+    actor: GovernancePrincipal,
+    status: str,
+    reason_code: str = "accountable_owner_inactive",
+    expected_revision: int | None = None,
+    now: datetime | None = None,
+) -> Task:
+    """Record owner escalation and hand an active task to a human (T26).
+
+    The owner snapshot is written in the same UPDATE as the ``needs_human``
+    transition, so the active-state owner constraint is never violated.
+    """
+    timestamp = now or _utcnow()
+    task = _load_task(session, task_id, for_update=True)
+    _require_task_authority(actor, task)
+    if task.state in {"queued", "dispatched", "running"}:
+        _invalidate_grant(
+            session, task, actor, reason_code=reason_code, now=timestamp
+        )
+    task.owner_account_status = status
+    task.owner_escalation = _owner_escalation_document(
+        task, status=status, now=timestamp, reason_code=reason_code
+    )
+    with session.no_autoflush:
+        ctx = replace(
+            _base_context(session, task, actor, now=timestamp),
+            escalation_justified=True,
+            owner_active=False,
+            owner_escalation_present=True,
+        )
+    previous = task.state
+    _perform_transition(
+        session,
+        task,
+        actor,
+        event="human.escalation_required",
+        target="needs_human",
+        ctx=ctx,
+        expected_revision=expected_revision,
+        reason_code=reason_code,
+        now=timestamp,
+    )
+    task.needs_human_origin = previous
     session.flush()
     return task
 
@@ -3559,6 +4811,12 @@ def create_confirmation(
     """Create a pending confirmation for the task's current payload."""
     timestamp = now or _utcnow()
     _require_actor(actor)
+    if ttl_seconds < 1 or ttl_seconds > CONFIRMATION_MAX_TTL_SECONDS:
+        raise TaskError(
+            "required_input_missing",
+            "ttl_seconds is outside the allowed confirmation TTL",
+            context={"field": "ttl_seconds", "max": CONFIRMATION_MAX_TTL_SECONDS},
+        )
     task = _load_task(session, task_id, for_update=True)
     if is_terminal(task.state):
         _reject_terminal(
@@ -3805,7 +5063,7 @@ def confirm_task(
             correlation_id=task.correlation_id,
         ),
         now=timestamp,
-        evidence_verifier=TaskEvidenceVerifier(session),
+        evidence_verifier=TaskEvidenceVerifier(session, task_id=task.task_id),
     )
     _apply_decision(
         session,
@@ -3932,13 +5190,19 @@ def record_approval(
             "approval decision must be approve or reject",
             context={"field": "decision"},
         )
+    if ttl_seconds < 1 or ttl_seconds > APPROVAL_MAX_TTL_SECONDS:
+        raise TaskError(
+            "required_input_missing",
+            "ttl_seconds is outside the allowed approval TTL",
+            context={"field": "ttl_seconds", "max": APPROVAL_MAX_TTL_SECONDS},
+        )
     if task.workflow_instance_id is None:
         raise ConfirmationError(
             "task_approval_not_found",
             "the task has no workflow approval instance",
             context={"task_id": task.task_id},
         )
-    if not _approver_is_independent(actor, task) and not _is_privileged(actor):
+    if not _approver_is_independent(actor, task):
         raise OwnerError(
             "self_approval_forbidden",
             "requester/owner/executor cannot approve their own task",
@@ -4070,7 +5334,7 @@ def record_approval(
             correlation_id=task.correlation_id,
         ),
         now=timestamp,
-        evidence_verifier=TaskEvidenceVerifier(session),
+        evidence_verifier=TaskEvidenceVerifier(session, task_id=task.task_id),
     )
     _apply_decision(
         session,
@@ -4095,11 +5359,20 @@ class TaskEvidenceVerifier:
     """Trusted gate verifier backed by task confirmations/approvals.
 
     Injected into the governance PEP so a gate is satisfied only by re-reading
-    the task-owned evidence, never by a caller-asserted reference.
+    the task-owned evidence, never by a caller-asserted reference.  The verifier
+    is bound to one task: a confirmation from another task can never satisfy
+    this task, and the confirmer must be an authorised confirmer (requester or
+    accountable owner) -- not necessarily the executing principal (C1).
     """
 
-    def __init__(self, session: Session) -> None:
+    def __init__(self, session: Session, *, task_id: str | None = None) -> None:
         self.session = session
+        self.task_id = task_id
+
+    def _task(self, task_id: str | None) -> Task | None:
+        if task_id is None:
+            return None
+        return self.session.scalar(select(Task).where(Task.task_id == task_id))
 
     def verify_confirmation(
         self,
@@ -4112,6 +5385,17 @@ class TaskEvidenceVerifier:
         row = _confirmation_row(self.session, ref.get("confirmation_id"))
         if row is None:
             return False
+        if self.task_id is None or row.task_id != self.task_id:
+            return False
+        task = self._task(self.task_id)
+        if task is None or task.task_id != row.task_id:
+            return False
+        confirmer = row.confirmed_by_principal_id
+        if confirmer not in {
+            task.requester_principal_id,
+            task.owner_principal_id,
+        }:
+            return False
         return (
             row.status == "satisfied"
             and row.consumed_at is None
@@ -4119,8 +5403,9 @@ class TaskEvidenceVerifier:
             and _to_utc(row.expires_at) > now  # type: ignore[operator]
             and row.payload_hash == ref.get("payload_hash")
             and row.payload_hash == payload_hash
-            and row.confirmed_by_principal_id == principal_id
-            and row.task_id is not None
+            and row.issued_at is not None
+            and row.satisfied_at is not None
+            and (_to_utc(row.satisfied_at) or now) <= now  # type: ignore[operator]
         )
 
     def verify_approval(
@@ -4142,10 +5427,14 @@ class TaskEvidenceVerifier:
         )
         if task is None or task.approval_ref is None:
             return None
+        if self.task_id is not None and task.task_id != self.task_id:
+            return None
         stored = task.approval_ref
         if stored.get("decision") != "approved":
             return None
         if stored.get("separation_check") != "passed":
+            return None
+        if stored.get("revoked_at"):
             return None
         if stored.get("payload_hash") != payload_hash:
             return None
@@ -4220,6 +5509,7 @@ def recheck_execution(
         task.state in {"running", "verifying"} and task.attempt >= 1
     ):
         raise TaskError("grant_consumed", context={"grant_id": grant.grant_id})
+    _assert_task_budget(task, grant, now=timestamp)
 
     bound_confirmation = confirmation_id or (
         (task.confirmation_ref or {}).get("confirmation_id")
@@ -4237,7 +5527,7 @@ def recheck_execution(
             resource_scope=resource_scope or task.resource_scope,
             payload_hash=payload_hash_value or task.payload_hash,
             tool_contract_version=tool_contract_version,
-            evidence_verifier=TaskEvidenceVerifier(session),
+            evidence_verifier=TaskEvidenceVerifier(session, task_id=task.task_id),
             now=timestamp,
         )
     except GovernanceError as exc:

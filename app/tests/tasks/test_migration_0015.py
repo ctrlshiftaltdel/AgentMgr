@@ -35,6 +35,10 @@ def test_task_tables_and_indexes_exist(engine) -> None:
         index["name"] for index in inspect(engine).get_indexes("task_leases")
     }
     assert "uq_task_leases_active_task" in indexes
+    task_indexes = {
+        index["name"] for index in inspect(engine).get_indexes("tasks")
+    }
+    assert "uq_tasks_live_requester_goal" in task_indexes
     # No second approval or outbox model was introduced.
     assert "task_approvals" not in tables
     assert "task_outbox" not in tables
