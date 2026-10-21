@@ -4388,6 +4388,13 @@ def escalate_task(
         now=timestamp,
     )
     task.needs_human_origin = previous
+    if task.owner_account_status != "active" and task.owner_escalation is None:
+        task.owner_escalation = _owner_escalation_document(
+            task,
+            status=task.owner_account_status,
+            now=timestamp,
+            reason_code=reason_code,
+        )
     session.flush()
     return task
 
