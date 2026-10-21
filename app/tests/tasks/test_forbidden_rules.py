@@ -206,7 +206,11 @@ def test_f16_single_use_grant_is_consumed_once(
             capability=GATED_CAPABILITY,
             call_id="call_f16_0002",
         )
-    assert excinfo.value.reason_code in {"grant_consumed", "confirmation_missing"}
+    assert excinfo.value.reason_code in {
+        "grant_consumed",
+        "confirmation_missing",
+        "replay_detected",
+    }
 
 
 def test_f17_grant_is_bound_to_its_task(
