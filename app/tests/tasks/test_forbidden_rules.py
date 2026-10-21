@@ -20,6 +20,7 @@ from app.tasks.models import Task
 from app.tasks.service import (
     complete_task,
     confirm_task,
+    record_approval,
     recheck_execution,
     start_attempt,
     submit_task,
