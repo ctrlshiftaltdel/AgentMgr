@@ -70,6 +70,13 @@ import app.integrations.models  # noqa: E402,F401
 # references roles.
 import app.governance.models  # noqa: E402,F401
 
+# Task-domain models (tasks, events, attempts, dependencies, leases,
+# confirmations) live in their own package; importing them here registers them
+# on Base.metadata so ``alembic check`` / autogenerate can see them.  Imported
+# after governance/workflow models because tasks reference decisions, grants and
+# workflow instances.
+import app.tasks.models  # noqa: E402,F401
+
 config = context.config
 
 if config.config_file_name is not None:
