@@ -13,6 +13,7 @@ cannot over-consume a single-use or budgeted grant.
 
 from __future__ import annotations
 
+import math
 import re
 import uuid
 from collections.abc import Mapping, Sequence
@@ -787,6 +788,34 @@ def grant_remaining_calls(grant: ExecutionGrant) -> int:
     return max(0, max_calls - consumed)
 
 
+def _usage_totals(grant: ExecutionGrant) -> tuple[int, float]:
+    """Return validated ``(calls_consumed, cost_consumed)`` usage counters.
+
+    ``usage`` is a JSONB column: a tampered or corrupted row must be refused as
+    a denial, never allowed to raise ``ValueError``/``TypeError`` from ``int()``
+    or ``float()`` halfway through consumption.
+    """
+    usage = grant.usage if isinstance(grant.usage, Mapping) else None
+    if usage is None:
+        raise GovernanceError("budget_exceeded", context={"field": "usage"})
+    calls = usage.get("calls_consumed", 0)
+    cost = usage.get("cost_consumed", 0.0)
+    if isinstance(calls, bool) or not isinstance(calls, int) or calls < 0:
+        raise GovernanceError(
+            "budget_exceeded", context={"field": "usage.calls_consumed"}
+        )
+    if (
+        isinstance(cost, bool)
+        or not isinstance(cost, (int, float))
+        or not math.isfinite(cost)
+        or cost < 0
+    ):
+        raise GovernanceError(
+            "budget_exceeded", context={"field": "usage.cost_consumed"}
+        )
+    return calls, float(cost)
+
+
 def _deny_grant(
     session: Session,
     *,
@@ -991,6 +1020,17 @@ def _consume_grant(
             context={"call_id": call_id, **exc.context},
         )
 
+    try:
+        consumed_calls, consumed_cost = _usage_totals(grant)
+    except GovernanceError as exc:
+        _deny_grant(
+            session,
+            grant=grant,
+            reason_code=exc.reason_code,
+            actor_id=actor_id,
+            context={"call_id": call_id, **exc.context},
+        )
+
     if grant_remaining_calls(grant) < 1:
         _deny_grant(
             session,
@@ -1002,7 +1042,6 @@ def _consume_grant(
 
     # Cost budget: a grant with no numeric budget allows exactly zero cost.
     max_cost = grant.budget.get("max_cost_units")
-    consumed_cost = float(grant.usage.get("cost_consumed", 0.0) or 0.0)
     projected_cost = consumed_cost + float(cost_units)
     if max_cost is None:
         if projected_cost > 0:
@@ -1109,7 +1148,7 @@ def _consume_grant(
             )
 
     usage = dict(grant.usage)
-    usage["calls_consumed"] = int(usage.get("calls_consumed", 0)) + 1
+    usage["calls_consumed"] = consumed_calls + 1
     usage["cost_consumed"] = projected_cost
     usage["last_call_at"] = timestamp.isoformat(timespec="seconds").replace("+00:00", "Z")
     usage["concurrent_calls"] = 0

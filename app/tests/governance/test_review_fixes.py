@@ -12,12 +12,16 @@ Focused security tests added after the Master review of head ``df5ba0b``:
 * I-E: audit actors come from the resolved principal; resolution failures audit.
 * I-F: revocation uses the service owner; ``issued_by`` is not self-declared.
 * I-G: facade forwarding, idempotency races, denial audit de-duplication.
+* Round 3: malformed retries persist a schema-valid initial decision, partial
+  concrete scopes are recorded as ``undetermined``, gate timestamps are
+  normalized to UTC ``Z``, decision audits use the resolved actor, and tampered
+  grant usage is a denial rather than a ``ValueError``.
 """
 
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import func, select, text, update
@@ -40,7 +44,7 @@ from app.governance.grants import (
     issue_grant,
     revoke_grant,
 )
-from app.governance.models import ExecutionGrant
+from app.governance.models import ExecutionGrant, GovernanceDecisionRecord
 from app.governance.pdp import (
     EvaluationRequest,
     evaluate,
@@ -880,3 +884,332 @@ def test_single_use_grant_rejects_a_null_call_budget_in_the_database(
 
     # Sanity: the stored budget is unchanged.
     assert _issue(session, org, _allow(session, org, policy)).budget["max_calls"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Final review (round 3): malformed retries, partial scopes, gate timestamps,
+# service decision audit actor, tampered grant usage
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_type", "expected_reason"),
+    [
+        # No task: there is no retry chain to join.
+        (
+            {"task_id": None, "task_revision": None},
+            "needs_clarification",
+            "required_input_missing",
+        ),
+        # Malformed policy identifiers are rejected before a policy is loaded.
+        (
+            {"policy_set_id": 123},
+            "deny",
+            "policy_version_invalid",
+        ),
+        (
+            {"policy_version": "latest"},
+            "deny",
+            "policy_version_invalid",
+        ),
+        # A supersedes reference that is not a decision id cannot seed a chain.
+        (
+            {"supersedes_decision_id": "gdec_x"},
+            "needs_clarification",
+            "required_input_missing",
+        ),
+        # A malformed risk level is a fail-closed denial, not a retry.
+        (
+            {"risk": "extreme"},
+            "deny",
+            "risk_above_ceiling",
+        ),
+    ],
+)
+def test_malformed_retry_requests_persist_a_schema_valid_initial_decision(
+    session, org, policy, overrides, expected_type, expected_reason
+) -> None:
+    decision = _allow(
+        session, org, policy, decision_purpose="retry", **overrides
+    )
+    assert decision.decision_type == expected_type, decision.reason_codes
+    assert decision.reason_codes == (expected_reason,)
+    # A rejected request has neither a proven task nor a proven predecessor, so
+    # it must not claim to be a retry (revision>=2 + supersedes required).
+    assert decision.decision_purpose == "initial_execution"
+    assert decision.supersedes_decision_id is None
+    assert_decision_document(decision.to_document())
+
+    record = session.scalar(
+        select(GovernanceDecisionRecord).where(
+            GovernanceDecisionRecord.decision_id == decision.decision_id
+        )
+    )
+    assert record is not None
+    assert record.decision_purpose == "initial_execution"
+    assert record.supersedes_decision_id is None
+    assert record.document["decision_purpose"] == "initial_execution"
+    assert record.document["supersedes_decision_id"] is None
+    assert_decision_document(record.document)
+
+
+@pytest.mark.parametrize(
+    "incomplete_scope",
+    [
+        # ``self`` without the mandatory data classification(s).
+        {"scope_type": "self"},
+        {"scope_type": "self", "resource_ids": ["res_expense_0001"]},
+        # ``department``/``company`` without member ids.
+        {"scope_type": "department", "data_classifications": ["internal"]},
+        {"scope_type": "department"},
+        {"scope_type": "company"},
+        {"scope_type": "company", "resource_ids": ["res_expense_0001"]},
+    ],
+)
+def test_incomplete_concrete_scope_is_recorded_as_undetermined(
+    session, org, policy, incomplete_scope
+) -> None:
+    decision = _allow(session, org, policy, resource_scope=incomplete_scope)
+    # An incomplete concrete scope is ambiguous, never an implicit "all".
+    assert decision.decision_type == "needs_clarification"
+    assert decision.reason_codes == ("resource_scope_ambiguous",)
+    recorded = decision.constraints["resource_scope"]
+    assert recorded == {
+        "scope_type": "undetermined",
+        "resource_ids": [],
+        "connector_ids": [],
+        "data_classifications": [],
+        "exclude_resource_ids": [],
+    }
+    assert_decision_document(decision.to_document())
+
+
+def test_incomplete_scope_on_a_deny_branch_is_schema_valid(session, org, policy) -> None:
+    # The deny path copies the caller scope too; it must not persist a partial
+    # concrete scope either.
+    decision = _allow(
+        session,
+        org,
+        policy,
+        risk="extreme",
+        resource_scope={"scope_type": "company"},
+    )
+    assert decision.decision_type == "deny"
+    assert decision.constraints["resource_scope"]["scope_type"] == "undetermined"
+    assert_decision_document(decision.to_document())
+
+
+def test_gate_timestamps_are_normalized_to_utc_z() -> None:
+    now = datetime.now(UTC)
+    confirmation = confirmation_ref(principal_id="prin_0001")
+    # ``+00:00`` is the same instant as ``Z`` and must be stored as ``Z``.
+    plus_zero = {
+        **confirmation,
+        "satisfied_at": confirmation["satisfied_at"].replace("Z", "+00:00"),
+        "expires_at": confirmation["expires_at"].replace("Z", "+00:00"),
+    }
+    normalized = validate_confirmation_ref(plus_zero, payload_hash=PAYLOAD_HASH)
+    assert normalized["satisfied_at"].endswith("Z")
+    assert normalized["expires_at"].endswith("Z")
+
+    # A real offset is normalized to the equivalent UTC instant.
+    plus_five = timezone(timedelta(hours=5))
+    offset = {
+        **confirmation,
+        "satisfied_at": (now - timedelta(minutes=1)).astimezone(plus_five).isoformat(),
+        "expires_at": (now + timedelta(hours=1)).astimezone(plus_five).isoformat(),
+    }
+    normalized = validate_confirmation_ref(offset, payload_hash=PAYLOAD_HASH, now=now)
+    assert normalized["satisfied_at"].endswith("Z")
+    assert normalized["expires_at"].endswith("Z")
+
+    approval = approval_ref(payload_hash=PAYLOAD_HASH)
+    approval_plus_zero = {
+        **approval,
+        "decided_at": approval["decided_at"].replace("Z", "+00:00"),
+        "expires_at": approval["expires_at"].replace("Z", "+00:00"),
+    }
+    normalized = validate_approval_ref(
+        approval_plus_zero,
+        principal_id="prin_requester_0001",
+        payload_hash=PAYLOAD_HASH,
+    )
+    assert normalized["decided_at"].endswith("Z")
+    assert normalized["expires_at"].endswith("Z")
+
+
+def test_naive_gate_timestamps_are_rejected() -> None:
+    now = datetime.now(UTC)
+    confirmation = confirmation_ref(principal_id="prin_0001")
+    naive_confirmation = {
+        **confirmation,
+        "satisfied_at": (now - timedelta(minutes=1)).replace(tzinfo=None).isoformat(),
+    }
+    _expect(
+        GovernanceError,
+        "confirmation_missing",
+        lambda: validate_confirmation_ref(
+            naive_confirmation, payload_hash=PAYLOAD_HASH, now=now
+        ),
+    )
+
+    approval = approval_ref(payload_hash=PAYLOAD_HASH)
+    naive_approval = {
+        **approval,
+        "decided_at": (now - timedelta(minutes=1)).replace(tzinfo=None).isoformat(),
+    }
+    _expect(
+        GovernanceError,
+        "approval_missing",
+        lambda: validate_approval_ref(
+            naive_approval,
+            principal_id="prin_requester_0001",
+            payload_hash=PAYLOAD_HASH,
+            now=now,
+        ),
+    )
+
+
+def test_authorizing_decision_with_offset_gate_refs_is_schema_valid(
+    session, org, policy
+) -> None:
+    verifier = FakeEvidenceVerifier(
+        role_resolutions={"role_gov_approver": principal_ref("prin", org.manager.id)}
+    )
+    confirmation = confirmation_ref(
+        principal_id=principal_ref("prin", org.employee.id),
+        payload_hash=PAYLOAD_HASH,
+    )
+    confirmation["satisfied_at"] = confirmation["satisfied_at"].replace(
+        "Z", "+00:00"
+    )
+    confirmation["expires_at"] = confirmation["expires_at"].replace("Z", "+00:00")
+    approval = approval_ref(
+        approver_principal_id="role_gov_approver", payload_hash=PAYLOAD_HASH
+    )
+    approval["decided_at"] = approval["decided_at"].replace("Z", "+00:00")
+    approval["expires_at"] = approval["expires_at"].replace("Z", "+00:00")
+
+    decision = _allow(
+        session,
+        org,
+        policy,
+        capability="expense.submit@1.0.0",
+        confirmation_ref=confirmation,
+        approval_ref=approval,
+        payload_hash=PAYLOAD_HASH,
+        evidence_verifier=verifier,
+    )
+    assert decision.decision_type == "allow"
+    document = decision.to_document()
+    assert_decision_document(document)
+    stored_confirmation = document["constraints"]["confirmation_ref"]
+    stored_approval = document["constraints"]["approval_ref"]
+    assert stored_confirmation["satisfied_at"].endswith("Z")
+    assert stored_confirmation["expires_at"].endswith("Z")
+    assert stored_approval["decided_at"].endswith("Z")
+    assert stored_approval["expires_at"].endswith("Z")
+
+
+def test_naive_gate_timestamp_denies_with_a_schema_valid_decision(
+    session, org, policy
+) -> None:
+    confirmation = confirmation_ref(
+        principal_id=principal_ref("prin", org.employee.id),
+        payload_hash=PAYLOAD_HASH,
+    )
+    confirmation["satisfied_at"] = (
+        (datetime.now(UTC) - timedelta(minutes=1))
+        .replace(tzinfo=None)
+        .isoformat()
+    )
+    decision = _allow(
+        session,
+        org,
+        policy,
+        capability="expense.submit@1.0.0",
+        confirmation_ref=confirmation,
+        payload_hash=PAYLOAD_HASH,
+        evidence_verifier=FakeEvidenceVerifier(),
+    )
+    assert decision.decision_type == "deny"
+    assert decision.reason_codes == ("confirmation_missing",)
+    assert_decision_document(decision.to_document())
+
+
+def test_service_decision_audit_actor_is_the_accountable_owner(session, org, policy) -> None:
+    identity = make_service_identity(session, owner=org.finance, role_names=("employee",))
+    service = resolve_service_principal(session, service_identity_id=identity.id)
+    decision = evaluate(
+        session,
+        EvaluationRequest(
+            principal=service,
+            capability="expense.read@1.0.0",
+            task_id=TASK_ID,
+            task_revision=1,
+            resource_scope=scope(),
+            policy_set_id=policy.policy_set_id,
+        ),
+    )
+    assert decision.decision_type == "allow"
+    event = _last_audit(
+        session, "governance.allowed", resource_id=decision.decision_id
+    )
+    assert event is not None
+    # A service identity without a requester is audited as its owner, never as
+    # ``None`` or a caller-supplied id.
+    assert event.actor_id == org.finance.id
+
+
+@pytest.mark.parametrize(
+    ("usage_patch", "field"),
+    [
+        ({"calls_consumed": -1}, "usage.calls_consumed"),
+        ({"calls_consumed": "1"}, "usage.calls_consumed"),
+        ({"cost_consumed": -1.5}, "usage.cost_consumed"),
+        ({"cost_consumed": "5"}, "usage.cost_consumed"),
+    ],
+)
+def test_pep_rejects_tampered_grant_usage_as_a_denial(
+    session, org, policy, usage_patch, field
+) -> None:
+    grant = _issue(session, org, _allow(session, org, policy))
+    tampered = {**grant.usage, **usage_patch}
+    session.execute(
+        update(ExecutionGrant)
+        .where(ExecutionGrant.grant_id == grant.grant_id)
+        .values(usage=tampered)
+    )
+    session.flush()
+
+    # A corrupted counter is a governance denial, never a ValueError leaking
+    # out of int()/float().
+    _expect(
+        GovernanceError,
+        "budget_exceeded",
+        lambda: _enforce(session, org, grant),
+    )
+    event = _last_audit(session, "governance.pep.denied", resource_id=grant.grant_id)
+    assert event is not None
+    assert event.details["reason_code"] == "budget_exceeded"
+    assert event.details["field"] == field
+    assert event.details["call_id"] == "call_gov_fix_0001"
+
+
+def test_pep_rejects_non_mapping_grant_usage_as_a_denial(session, org, policy) -> None:
+    grant = _issue(session, org, _allow(session, org, policy))
+    session.execute(
+        update(ExecutionGrant)
+        .where(ExecutionGrant.grant_id == grant.grant_id)
+        .values(usage=["tampered"])
+    )
+    session.flush()
+
+    _expect(
+        GovernanceError,
+        "budget_exceeded",
+        lambda: _enforce(session, org, grant),
+    )
+    event = _last_audit(session, "governance.pep.denied", resource_id=grant.grant_id)
+    assert event is not None
+    assert event.details["field"] == "usage"

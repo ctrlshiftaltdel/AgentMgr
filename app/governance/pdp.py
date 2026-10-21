@@ -67,6 +67,7 @@ from app.governance.policies import (
 from app.governance.principal import (
     VERIFIED_ASSURANCES,
     GovernancePrincipal,
+    audit_actor_id,
     principal_ref,
 )
 from app.identity.authorization import effective_permissions
@@ -193,6 +194,25 @@ def _parse_rfc3339(value: Any) -> datetime | None:
     return parsed.astimezone(UTC)
 
 
+def _normalize_timestamp(value: Any) -> str | None:
+    """Return the contract form of a timestamp, or ``None`` when unusable.
+
+    ``$defs/dateTime`` requires a trailing ``Z``.  An offset-aware value
+    (``+00:00`` or a real offset) is converted to the same instant in UTC so
+    the persisted document stays schema-valid; a naive value has no offset and
+    is rejected instead of silently being interpreted as UTC.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return _rfc3339(parsed)
+
+
 def _new_id(prefix: str) -> str:
     return prefix + uuid.uuid4().hex[:24]
 
@@ -298,8 +318,10 @@ def validate_confirmation_ref(
 
     The shape is the frozen ``confirmationRef`` definition: every required
     field (including ``purpose`` and ``canonicalization``), RFC 3339 UTC
-    date-times and no unknown keys.  A reference that would serialize to a
-    schema-invalid decision is rejected here instead of being persisted.
+    date-times and no unknown keys.  Offset-aware timestamps are normalized to
+    the contract's UTC ``...Z`` form (a naive timestamp is rejected), so a
+    reference that would serialize to a schema-invalid decision is rejected
+    here instead of being persisted.
     """
     timestamp = now or _utcnow()
     if not isinstance(ref, Mapping):
@@ -355,10 +377,20 @@ def validate_confirmation_ref(
             "confirmation_missing", context={"field": "confirmed_by_principal_id"}
         )
     satisfied_at = _parse_rfc3339(ref.get("satisfied_at"))
-    if satisfied_at is None or satisfied_at > timestamp:
+    normalized_satisfied_at = _normalize_timestamp(ref.get("satisfied_at"))
+    if (
+        satisfied_at is None
+        or normalized_satisfied_at is None
+        or satisfied_at > timestamp
+    ):
         raise GovernanceError("confirmation_missing", context={"field": "satisfied_at"})
     expires_at = _parse_rfc3339(ref.get("expires_at"))
-    if expires_at is None or expires_at <= timestamp:
+    normalized_expires_at = _normalize_timestamp(ref.get("expires_at"))
+    if (
+        expires_at is None
+        or normalized_expires_at is None
+        or expires_at <= timestamp
+    ):
         raise GovernanceError("confirmation_missing", context={"field": "expires_at"})
     _validate_channel_binding(ref.get("channel_binding"))
     ref_hash = ref.get("payload_hash")
@@ -371,7 +403,11 @@ def validate_confirmation_ref(
         )
     if ref_hash != payload_hash:
         raise GovernanceError("payload_hash_mismatch")
-    return dict(ref)
+    document = dict(ref)
+    # Only the canonical UTC ``...Z`` form may reach a stored decision.
+    document["satisfied_at"] = normalized_satisfied_at
+    document["expires_at"] = normalized_expires_at
+    return document
 
 
 def _validate_channel_binding(binding: Any) -> None:
@@ -424,7 +460,9 @@ def validate_approval_ref(
     again after resolution.
 
     Every frozen field (including ``canonicalization``) is required, both
-    date-times must be valid RFC 3339 UTC values, and unknown keys are refused.
+    date-times must be valid RFC 3339 values, and unknown keys are refused.
+    Offset-aware timestamps are normalized to the contract's UTC ``...Z`` form;
+    a naive timestamp is rejected.
     """
     timestamp = now or _utcnow()
     if not isinstance(ref, Mapping):
@@ -474,10 +512,12 @@ def validate_approval_ref(
         raise GovernanceError("self_approval_forbidden")
 
     decided_at = _parse_rfc3339(ref.get("decided_at"))
+    normalized_decided_at = _normalize_timestamp(ref.get("decided_at"))
     expires_at = _parse_rfc3339(ref.get("expires_at"))
-    if decided_at is None or decided_at > timestamp:
+    normalized_expires_at = _normalize_timestamp(ref.get("expires_at"))
+    if decided_at is None or normalized_decided_at is None or decided_at > timestamp:
         raise GovernanceError("approval_missing", context={"field": "decided_at"})
-    if expires_at is None or expires_at <= timestamp:
+    if expires_at is None or normalized_expires_at is None or expires_at <= timestamp:
         raise GovernanceError("approval_missing", context={"field": "expires_at"})
 
     ref_hash = ref.get("payload_hash")
@@ -489,7 +529,11 @@ def validate_approval_ref(
         )
     if ref_hash != payload_hash:
         raise GovernanceError("payload_hash_mismatch")
-    return dict(ref)
+    document = dict(ref)
+    # Only the canonical UTC ``...Z`` form may reach a stored decision.
+    document["decided_at"] = normalized_decided_at
+    document["expires_at"] = normalized_expires_at
+    return document
 
 
 def _owner_principal_ids(principal: GovernancePrincipal) -> frozenset[str]:
@@ -537,17 +581,33 @@ def _verify_approval_evidence(
 # ---------------------------------------------------------------------------
 
 
+#: Shape used whenever a caller-supplied scope is not a complete, concrete one.
+#: ``undetermined`` is the only schema-valid projection of "unknown scope":
+#: concrete scope types require data classifications and, except ``self``, at
+#: least one resource or connector member.
+def _undetermined_scope() -> dict[str, Any]:
+    return {
+        "scope_type": "undetermined",
+        "resource_ids": [],
+        "connector_ids": [],
+        "data_classifications": [],
+        "exclude_resource_ids": [],
+    }
+
+
 def _safe_scope(scope: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Project caller input onto a schema-valid ``resourceScope``.
+
+    Only a scope that also passes the *authorizing* bar (``require_concrete``)
+    is copied into a decision.  A partial scope such as ``self`` without
+    classifications, or ``department`` without members, is schema-invalid in
+    the frozen contract, so it is recorded as ``undetermined`` rather than
+    persisted as an incomplete authorization range.
+    """
     try:
-        return validate_resource_scope(scope, require_concrete=False)
+        return validate_resource_scope(scope, require_concrete=True)
     except GovernanceError:
-        return {
-            "scope_type": "undetermined",
-            "resource_ids": [],
-            "connector_ids": [],
-            "data_classifications": [],
-            "exclude_resource_ids": [],
-        }
+        return _undetermined_scope()
 
 
 def _constraints(
@@ -932,7 +992,7 @@ def _persist(
             },
         ) from exc
 
-    actor_id = request.principal.employee_id
+    actor_id = audit_actor_id(request.principal)
     if decision.decision_type in {"allow", "managed_execution_required"}:
         action = "governance.allowed"
     elif decision.decision_type == "deny":
@@ -1326,6 +1386,13 @@ def evaluate(
     # 1. Malformed request shape fails closed with a schema-valid decision.
     if shape_error is not None:
         decision_type, reason_code = shape_error
+        # A malformed request can never be a link in a retry chain: the frozen
+        # schema requires revision>=2 and a supersedes reference for
+        # ``decision_purpose=retry``, and a rejected request has neither a
+        # valid task nor a proven predecessor.  Record it as the initial
+        # evaluation instead of persisting an invalid retry document.
+        decision_purpose = "initial_execution"
+        supersedes = None
         scope = (
             request.resource_scope
             if isinstance(request.resource_scope, Mapping)
