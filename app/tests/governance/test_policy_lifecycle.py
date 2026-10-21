@@ -27,8 +27,6 @@ def _draft(session, org, policy_set_id: str, version: str = "1.0.0"):
         session,
         document=policy_document(policy_set_id, version=version),
         principal=admin_principal(session, org),
-        created_by_employee_id=org.finance.id,
-        actor_id=org.finance.id,
     )
 
 
@@ -51,8 +49,6 @@ def test_publish_switches_active_version_and_audits(session, org) -> None:
         session,
         policy_version_id=draft.id,
         principal=admin_principal(session, org),
-        published_by_employee_id=org.finance.id,
-        actor_id=org.finance.id,
     )
     assert published.status == "published"
     assert published.published_at is not None
@@ -66,12 +62,12 @@ def test_publish_switches_active_version_and_audits(session, org) -> None:
 def test_publishing_new_version_retires_old_without_mutation(session, org) -> None:
     policy_set_id = unique_policy_set()
     first = _draft(session, org, policy_set_id, "1.0.0")
-    publish(session, policy_version_id=first.id, principal=admin_principal(session, org), actor_id=org.finance.id)
+    publish(session, policy_version_id=first.id, principal=admin_principal(session, org))
     first_hash = first.content_hash
     first_document = dict(first.document)
 
     second = _draft(session, org, policy_set_id, "2.0.0")
-    publish(session, policy_version_id=second.id, principal=admin_principal(session, org), actor_id=org.finance.id)
+    publish(session, policy_version_id=second.id, principal=admin_principal(session, org))
 
     session.refresh(first)
     assert first.status == "retired"
@@ -101,16 +97,15 @@ def test_publishing_new_version_retires_old_without_mutation(session, org) -> No
 def test_rollback_creates_new_version_and_preserves_history(session, org) -> None:
     policy_set_id = unique_policy_set()
     first = _draft(session, org, policy_set_id, "1.0.0")
-    publish(session, policy_version_id=first.id, principal=admin_principal(session, org), actor_id=org.finance.id)
+    publish(session, policy_version_id=first.id, principal=admin_principal(session, org))
     second = _draft(session, org, policy_set_id, "2.0.0")
-    publish(session, policy_version_id=second.id, principal=admin_principal(session, org), actor_id=org.finance.id)
+    publish(session, policy_version_id=second.id, principal=admin_principal(session, org))
 
     rolled_back = rollback(
         session,
         policy_set_id=policy_set_id,
         target_version="1.0.0",
         principal=admin_principal(session, org),
-        actor_id=org.finance.id,
     )
     assert rolled_back.status == "published"
     assert rolled_back.version == "2.0.1"
@@ -140,7 +135,7 @@ def test_publish_rejects_tampered_content_hash(session, org) -> None:
     session.flush()
 
     try:
-        publish(session, policy_version_id=draft.id, principal=admin_principal(session, org), actor_id=org.finance.id)
+        publish(session, policy_version_id=draft.id, principal=admin_principal(session, org))
     except PolicyError as exc:
         assert exc.reason_code == "policy_version_invalid"
     else:  # pragma: no cover
@@ -152,7 +147,7 @@ def test_publish_rejects_tampered_content_hash(session, org) -> None:
 def test_rollback_rejects_draft_target(session, org) -> None:
     policy_set_id = unique_policy_set()
     first = _draft(session, org, policy_set_id, "1.0.0")
-    publish(session, policy_version_id=first.id, principal=admin_principal(session, org), actor_id=org.finance.id)
+    publish(session, policy_version_id=first.id, principal=admin_principal(session, org))
     draft = _draft(session, org, policy_set_id, "2.0.0")
     assert draft.status == "draft"
 
@@ -162,7 +157,6 @@ def test_rollback_rejects_draft_target(session, org) -> None:
             policy_set_id=policy_set_id,
             target_version="2.0.0",
             principal=admin_principal(session, org),
-            actor_id=org.finance.id,
         )
     except PolicyError as exc:
         assert exc.reason_code == "policy_version_invalid"
@@ -179,7 +173,6 @@ def test_policy_management_requires_a_resolved_admin(session, org) -> None:
             session,
             document=policy_document(policy_set_id),
             principal=employee,
-            created_by_employee_id=org.employee.id,
         )
     except GovernanceError as exc:
         assert exc.reason_code == "capability_not_granted"
@@ -192,7 +185,6 @@ def test_policy_management_requires_a_resolved_admin(session, org) -> None:
             session,
             policy_version_id=draft.id,
             principal=employee,
-            published_by_employee_id=org.employee.id,
         )
     except GovernanceError as exc:
         assert exc.reason_code == "capability_not_granted"
@@ -206,7 +198,7 @@ def test_policy_document_validation_fails_closed(session, org) -> None:
     bad["default_effect"] = "allow"
 
     try:
-        create_draft(session, document=bad, principal=admin_principal(session, org), created_by_employee_id=org.finance.id)
+        create_draft(session, document=bad, principal=admin_principal(session, org))
     except PolicyError as exc:
         assert exc.reason_code == "policy_version_invalid"
     else:  # pragma: no cover

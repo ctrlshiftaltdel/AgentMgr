@@ -4,6 +4,11 @@ This is intentionally a thin, transport-free facade.  It owns no sessions and
 does not commit: the caller decides the transaction boundary, consistent with
 ``app.audit.service.record_event`` and the existing domain services.  No HTTP,
 MCP or runtime-adapter code lives here.
+
+The facade never adds authority of its own: audit actors and business
+attribution are derived from the resolved principal inside the domain modules,
+and every call accepts a trusted ``ApprovalEvidenceVerifier`` where the PDP/PEP
+needs one.
 """
 
 from __future__ import annotations
@@ -16,7 +21,11 @@ from sqlalchemy.orm import Session
 
 from app.governance import grants, pdp, pep, policies
 from app.governance.models import ExecutionGrant, GovernancePolicyVersion
-from app.governance.pdp import EvaluationRequest, GovernanceDecision
+from app.governance.pdp import (
+    ApprovalEvidenceVerifier,
+    EvaluationRequest,
+    GovernanceDecision,
+)
 from app.governance.pep import EnforcementResult
 from app.governance.principal import GovernancePrincipal
 
@@ -45,16 +54,12 @@ class GovernanceService:
         document: Mapping[str, Any],
         *,
         principal: GovernancePrincipal,
-        created_by_employee_id: int | None = None,
-        actor_id: int | None = None,
         supersedes_id: int | None = None,
     ) -> GovernancePolicyVersion:
         return policies.create_draft(
             self.session,
             document=document,
             principal=principal,
-            created_by_employee_id=created_by_employee_id,
-            actor_id=actor_id,
             supersedes_id=supersedes_id,
         )
 
@@ -67,16 +72,12 @@ class GovernanceService:
         policy_version_id: int,
         *,
         principal: GovernancePrincipal,
-        published_by_employee_id: int | None = None,
-        actor_id: int | None = None,
         now: datetime | None = None,
     ) -> GovernancePolicyVersion:
         return policies.publish(
             self.session,
             policy_version_id=policy_version_id,
             principal=principal,
-            published_by_employee_id=published_by_employee_id,
-            actor_id=actor_id,
             now=now,
         )
 
@@ -90,7 +91,6 @@ class GovernanceService:
         policy_set_id: str,
         target_version: str,
         new_version: str | None = None,
-        actor_id: int | None = None,
         now: datetime | None = None,
     ) -> GovernancePolicyVersion:
         return policies.rollback(
@@ -99,7 +99,6 @@ class GovernanceService:
             policy_set_id=policy_set_id,
             target_version=target_version,
             new_version=new_version,
-            actor_id=actor_id,
             now=now,
         )
 
@@ -116,26 +115,35 @@ class GovernanceService:
     def rollback(
         self,
         *,
+        principal: GovernancePrincipal,
         policy_set_id: str,
         target_version: str,
         new_version: str | None = None,
-        actor_id: int | None = None,
         now: datetime | None = None,
     ) -> GovernancePolicyVersion:
         return self.rollback_policy(
+            principal=principal,
             policy_set_id=policy_set_id,
             target_version=target_version,
             new_version=new_version,
-            actor_id=actor_id,
             now=now,
         )
 
     # -- decision / grant / enforcement ----------------------------------
 
     def evaluate(
-        self, request: EvaluationRequest, *, now: datetime | None = None
+        self,
+        request: EvaluationRequest,
+        *,
+        now: datetime | None = None,
+        evidence_verifier: ApprovalEvidenceVerifier | None = None,
     ) -> GovernanceDecision:
-        return pdp.evaluate(self.session, request, now=now)
+        return pdp.evaluate(
+            self.session,
+            request,
+            now=now,
+            evidence_verifier=evidence_verifier,
+        )
 
     def issue_grant(
         self,
@@ -156,10 +164,8 @@ class GovernanceService:
         tool_contract_hash: str | None = None,
         confirmation_ref: Mapping[str, Any] | None = None,
         approval_ref: Mapping[str, Any] | None = None,
-        issued_by_service_identity_id: str | None = None,
         idempotency_key: str | None = None,
         client_payload: Mapping[str, Any] | None = None,
-        actor_id: int | None = None,
         now: datetime | None = None,
     ) -> ExecutionGrant:
         return grants.issue_grant(
@@ -180,10 +186,8 @@ class GovernanceService:
             tool_contract_hash=tool_contract_hash,
             confirmation_ref=confirmation_ref,
             approval_ref=approval_ref,
-            issued_by_service_identity_id=issued_by_service_identity_id,
             idempotency_key=idempotency_key,
             client_payload=client_payload,
-            actor_id=actor_id,
             now=now,
         )
 
@@ -205,9 +209,16 @@ def evaluate(
     request: EvaluationRequest | GovernancePrincipal | None = None,
     *,
     now: datetime | None = None,
+    evidence_verifier: ApprovalEvidenceVerifier | None = None,
     **request_fields: Any,
 ) -> GovernanceDecision:
-    return pdp.evaluate(session, request, now=now, **request_fields)
+    return pdp.evaluate(
+        session,
+        request,
+        now=now,
+        evidence_verifier=evidence_verifier,
+        **request_fields,
+    )
 
 
 def issue_grant(session: Session, **kwargs: Any) -> ExecutionGrant:

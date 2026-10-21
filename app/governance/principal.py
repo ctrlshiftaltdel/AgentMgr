@@ -37,6 +37,7 @@ from app.identity.authorization import (
 __all__ = [
     "CLIENT_ASSERTED_IDENTITY_FIELDS",
     "GovernancePrincipal",
+    "audit_actor_id",
     "principal_ref",
     "reject_client_asserted_identity",
     "require_management_permission",
@@ -82,6 +83,18 @@ def _audit_resolution_failure(
         resource_id=resource_id,
         details={"reason_code": reason_code, **dict(context)},
     )
+
+
+def audit_actor_id(principal: GovernancePrincipal) -> int | None:
+    """Return the human employee id an audit event may name.
+
+    ``record_event`` requires an actual person.  A service identity acting for
+    a requester is audited as that requester; otherwise its accountable owner
+    is the person.  Never the caller-supplied actor id.
+    """
+    if principal.employee_id is not None:
+        return principal.employee_id
+    return principal.owner_employee_id
 
 
 def require_management_permission(
@@ -241,9 +254,14 @@ def resolve_employee_principal(
     """
     _assurance_with_audit(session, identity_assurance)
     if principal_type not in {"person", "agent_instance"}:
-        raise PrincipalResolutionError(
-            "identity_unverified", context={"principal_type": principal_type}
+        context = {"principal_type": principal_type}
+        _audit_resolution_failure(
+            session,
+            reason_code="identity_unverified",
+            resource_id=None,
+            context=context,
         )
+        raise PrincipalResolutionError("identity_unverified", context=context)
 
     employee = session.get(Employee, employee_id)
     if employee is None:
@@ -322,7 +340,16 @@ def resolve_service_principal(
     an empty intersection is a valid (deny-by-default) result, not an error.
     """
     _assurance_with_audit(session, identity_assurance)
-    pk = _service_identity_pk(service_identity_id)
+    try:
+        pk = _service_identity_pk(service_identity_id)
+    except PrincipalResolutionError as exc:
+        _audit_resolution_failure(
+            session,
+            reason_code=exc.reason_code,
+            resource_id=None,
+            context={**exc.context, "field": "service_identity_id"},
+        )
+        raise
     row = session.get(ServiceIdentity, pk)
     if row is None:
         context = {"service_identity_id": str(service_identity_id)}
@@ -436,12 +463,24 @@ def resolve_principal(
     """
     _assurance_with_audit(session, identity_assurance)
     if not isinstance(principal_id, str):
+        _audit_resolution_failure(
+            session,
+            reason_code="identity_unverified",
+            resource_id=None,
+            context={"reason": "principal_id_not_a_string"},
+        )
         raise PrincipalResolutionError("identity_unverified")
     if principal_id.startswith("prin_"):
         try:
             employee_id = int(principal_id[len("prin_") :])
-        except ValueError as exc:
-            raise PrincipalResolutionError("identity_unverified") from exc
+        except ValueError:
+            _audit_resolution_failure(
+                session,
+                reason_code="identity_unverified",
+                resource_id=principal_id,
+                context={"reason": "malformed_principal_id"},
+            )
+            raise PrincipalResolutionError("identity_unverified") from None
         principal = resolve_employee_principal(
             session,
             employee_id=employee_id,
@@ -454,8 +493,14 @@ def resolve_principal(
     if principal_id.startswith("svc_"):
         try:
             pk = int(principal_id[len("svc_") :])
-        except ValueError as exc:
-            raise PrincipalResolutionError("identity_unverified") from exc
+        except ValueError:
+            _audit_resolution_failure(
+                session,
+                reason_code="identity_unverified",
+                resource_id=principal_id,
+                context={"reason": "malformed_principal_id"},
+            )
+            raise PrincipalResolutionError("identity_unverified") from None
         return resolve_service_principal(
             session,
             service_identity_id=pk,

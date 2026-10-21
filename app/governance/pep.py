@@ -47,6 +47,7 @@ from app.governance.policies import (
 )
 from app.governance.principal import (
     GovernancePrincipal,
+    audit_actor_id,
     reject_client_asserted_identity,
     resolve_employee_principal,
     resolve_service_principal,
@@ -128,7 +129,7 @@ def _deny(
         session,
         action="governance.pep.denied",
         grant_id=grant_id,
-        actor_id=principal.employee_id,
+        actor_id=audit_actor_id(principal),
         principal=principal,
         details=details,
     )
@@ -239,6 +240,70 @@ def _verify_decision_binding(
         raise GovernanceError(
             "grant_scope_mismatch", context={"field": "resource_scope"}
         )
+
+    # TTL: the grant may never outlive the decision, including after re-read.
+    grant_ttl = int((grant.expires_at - grant.issued_at).total_seconds())
+    decision_ttl = constraints.get("ttl_seconds")
+    if (
+        not isinstance(decision_ttl, int)
+        or isinstance(decision_ttl, bool)
+        or grant_ttl > decision_ttl
+    ):
+        raise GovernanceError(
+            "grant_outlives_decision", context={"field": "ttl_seconds"}
+        )
+
+    # Budget: re-check the stored grant against the decision on every call.
+    # ``None`` on the decision authorizes zero cost/runtime, never "unlimited".
+    budget = grant.budget or {}
+    max_calls = budget.get("max_calls")
+    decision_max_calls = constraints.get("max_calls")
+    if (
+        not isinstance(decision_max_calls, int)
+        or isinstance(decision_max_calls, bool)
+        or not isinstance(max_calls, int)
+        or isinstance(max_calls, bool)
+        or max_calls < 1
+        or max_calls > decision_max_calls
+    ):
+        raise GovernanceError("budget_exceeded", context={"field": "max_calls"})
+
+    max_cost = budget.get("max_cost_units")
+    decision_max_cost = constraints.get("max_cost_units")
+    if decision_max_cost is None:
+        if max_cost is not None and max_cost != 0:
+            raise GovernanceError(
+                "budget_exceeded", context={"field": "max_cost_units"}
+            )
+    elif max_cost is not None and (
+        isinstance(max_cost, bool)
+        or not isinstance(max_cost, (int, float))
+        or max_cost < 0
+        or max_cost > decision_max_cost
+    ):
+        raise GovernanceError("budget_exceeded", context={"field": "max_cost_units"})
+
+    max_runtime = budget.get("max_runtime_seconds")
+    decision_max_runtime = constraints.get("max_runtime_seconds")
+    if decision_max_runtime is None:
+        if max_runtime is not None:
+            raise GovernanceError(
+                "budget_exceeded", context={"field": "max_runtime_seconds"}
+            )
+    elif (
+        not isinstance(max_runtime, int)
+        or isinstance(max_runtime, bool)
+        or max_runtime < 1
+        or max_runtime > decision_max_runtime
+    ):
+        raise GovernanceError(
+            "budget_exceeded", context={"field": "max_runtime_seconds"}
+        )
+    if max_runtime is not None and max_runtime > grant_ttl:
+        raise GovernanceError(
+            "budget_exceeded", context={"field": "runtime_within_grant_ttl"}
+        )
+
     if bool(constraints.get("required_confirmation")) != (
         grant.confirmation_ref is not None
     ):
@@ -338,7 +403,7 @@ def enforce_tool_call(
             session,
             action="governance.pep.denied",
             grant_id=grant_id,
-            actor_id=principal.employee_id,
+            actor_id=audit_actor_id(principal),
             principal=principal,
             details={
                 "reason_code": exc.reason_code,
@@ -372,6 +437,17 @@ def enforce_tool_call(
             call_id=call_id,
             capability=capability,
             context={"field": "resource_scope", "reason": "missing_context"},
+        )
+    if not isinstance(resource_scope, Mapping):
+        _deny(
+            session,
+            grant=grant,
+            grant_id=grant_id,
+            principal=principal,
+            reason_code="grant_scope_mismatch",
+            call_id=call_id,
+            capability=capability,
+            context={"field": "resource_scope", "reason": "not_an_object"},
         )
     if tool_contract_version is None:
         _deny(
@@ -577,32 +653,35 @@ def enforce_tool_call(
             now=now,
         )
     except GovernanceError as exc:
-        _audit(
-            session,
-            action="governance.pep.denied",
-            grant_id=grant_id,
-            actor_id=principal.employee_id,
-            principal=principal,
-            details={
-                "reason_code": exc.reason_code,
-                "call_id": call_id,
-                "capability": capability,
-                "decision_id": grant.decision_id,
-                "task_id": grant.task_id,
-                "task_revision": grant.task_revision,
-                "policy_set_id": grant.policy_set_id,
-                "policy_version": grant.policy_version,
-                "policy_content_hash": grant.policy_content_hash,
-                **exc.context,
-            },
-        )
+        # ``_consume_grant`` already wrote the denial audit for grant-aware
+        # refusals; appending another row would double-count the denial.
+        if not exc.audited:
+            _audit(
+                session,
+                action="governance.pep.denied",
+                grant_id=grant_id,
+                actor_id=audit_actor_id(principal),
+                principal=principal,
+                details={
+                    "reason_code": exc.reason_code,
+                    "call_id": call_id,
+                    "capability": capability,
+                    "decision_id": grant.decision_id,
+                    "task_id": grant.task_id,
+                    "task_revision": grant.task_revision,
+                    "policy_set_id": grant.policy_set_id,
+                    "policy_version": grant.policy_version,
+                    "policy_content_hash": grant.policy_content_hash,
+                    **exc.context,
+                },
+            )
         raise
 
     _audit(
         session,
         action="governance.pep.allowed",
         grant_id=grant_id,
-        actor_id=principal.employee_id,
+        actor_id=audit_actor_id(principal),
         principal=principal,
         details={
             "call_id": call_id,

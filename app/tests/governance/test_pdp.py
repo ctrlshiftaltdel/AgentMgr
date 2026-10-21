@@ -153,7 +153,6 @@ def test_unpublished_draft_is_not_usable(session, org) -> None:
             "rules": [],
         },
         principal=admin_principal(session, org),
-        created_by_employee_id=org.finance.id,
     )
     assert draft.status == "draft"
     decision = evaluate(

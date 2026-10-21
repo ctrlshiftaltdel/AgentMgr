@@ -38,6 +38,7 @@ from app.governance.errors import (
 from app.governance.models import GovernancePolicyVersion
 from app.governance.principal import (
     GovernancePrincipal,
+    audit_actor_id,
     require_management_permission,
 )
 
@@ -224,9 +225,14 @@ def canonical_json(value: Any) -> str:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return _canonical_number(value)
     if isinstance(value, Mapping):
-        items = sorted(value.items(), key=lambda item: _utf16_sort_key(str(item[0])))
+        # RFC 8785 sorts by UTF-16 code units of JSON object *names*, which are
+        # always strings.  Silently coercing a non-string key (``1`` vs
+        # ``"1"``) would change meaning, so refuse it instead.
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError("JCS object keys must be strings")
+        items = sorted(value.items(), key=lambda item: _utf16_sort_key(item[0]))
         return "{" + ",".join(
-            canonical_json(str(key)) + ":" + canonical_json(item)
+            canonical_json(key) + ":" + canonical_json(item)
             for key, item in items
         ) + "}"
     if isinstance(value, (list, tuple)):
@@ -853,16 +859,19 @@ def create_draft(
     document: Mapping[str, Any],
     *,
     principal: GovernancePrincipal,
-    created_by_employee_id: int | None = None,
-    actor_id: int | None = None,
     supersedes_id: int | None = None,
 ) -> GovernancePolicyVersion:
     """Validate ``document`` and persist a new ``draft`` policy version.
 
     A draft is a management operation: the caller must be a resolved principal
     holding the existing ``identity/manage/company`` permission.
+
+    ``created_by_employee_id`` and the audit actor are derived from the
+    resolved principal, never from a caller-supplied id: a request body cannot
+    attribute a policy change to somebody else.
     """
     require_management_permission(principal)
+    actor_id = audit_actor_id(principal)
     parsed = parse_policy_document(document)
     existing = session.scalar(
         select(GovernancePolicyVersion.id).where(
@@ -889,14 +898,14 @@ def create_draft(
         status="draft",
         document=dict(document),
         content_hash=content_hash(document),
-        created_by_employee_id=created_by_employee_id,
+        created_by_employee_id=actor_id,
         supersedes_id=supersedes_id,
     )
     session.add(row)
     session.flush()
     _audit(
         session,
-        actor_id=actor_id if actor_id is not None else created_by_employee_id,
+        actor_id=actor_id,
         action="governance.policy.draft_created",
         row=row,
     )
@@ -908,12 +917,15 @@ def publish(
     policy_version_id: int,
     *,
     principal: GovernancePrincipal,
-    published_by_employee_id: int | None = None,
-    actor_id: int | None = None,
     now: datetime | None = None,
 ) -> GovernancePolicyVersion:
-    """Publish a draft, retiring the currently published version of the set."""
+    """Publish a draft, retiring the currently published version of the set.
+
+    The audit actor is the resolved principal, never a caller-supplied
+    employee id.
+    """
     require_management_permission(principal)
+    actor_id = audit_actor_id(principal)
     timestamp = now or datetime.now(UTC)
     row = session.get(
         GovernancePolicyVersion,
@@ -957,7 +969,7 @@ def publish(
     session.flush()
     _audit(
         session,
-        actor_id=actor_id if actor_id is not None else published_by_employee_id,
+        actor_id=actor_id,
         action="governance.policy.published",
         row=row,
     )
@@ -1049,16 +1061,17 @@ def rollback(
     policy_set_id: str,
     target_version: str,
     new_version: str | None = None,
-    actor_id: int | None = None,
     now: datetime | None = None,
 ) -> GovernancePolicyVersion:
     """Restore a previous policy as a **new** published version.
 
     The target row is read, never mutated.  A new version is created with
     ``supersedes_id`` pointing at the current published version (or the target
-    if there is none), preserving the full version history.
+    if there is none), preserving the full version history.  The audit actor is
+    the resolved principal throughout.
     """
     require_management_permission(principal)
+    actor_id = audit_actor_id(principal)
     target = get_version(session, policy_set_id, target_version)
     if target is None:
         raise PolicyError(
@@ -1088,16 +1101,12 @@ def rollback(
         session,
         document=document,
         principal=principal,
-        created_by_employee_id=actor_id,
-        actor_id=actor_id,
         supersedes_id=(current.id if current is not None else target.id),
     )
     published = publish(
         session,
         policy_version_id=draft.id,
         principal=principal,
-        published_by_employee_id=actor_id,
-        actor_id=actor_id,
         now=now,
     )
     _audit(

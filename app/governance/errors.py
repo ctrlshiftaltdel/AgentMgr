@@ -23,8 +23,17 @@ from collections.abc import Mapping
 from typing import Any, NoReturn
 
 __all__ = [
+    "ALLOW_REASON_CODES",
+    "DECISION_REASON_CODES",
     "DECISION_TYPES",
+    "DENY_REASON_CODES",
     "GRANT_REVOCATION_REASONS",
+    "MANAGED_EXECUTION_REASON_CODES",
+    "NEEDS_APPROVAL_REASON_CODES",
+    "NEEDS_CLARIFICATION_REASON_CODES",
+    "NEEDS_CONFIRMATION_REASON_CODES",
+    "NEEDS_REASON_CODES",
+    "PRE_EVALUATION_REASON_CODES",
     "REASON_CODES",
     "DelegationError",
     "GovernanceError",
@@ -100,7 +109,9 @@ REASON_CODES: frozenset[str] = frozenset(
     }
 )
 
-#: Reason codes that may appear on an authorizing (allow) decision.
+#: Reason codes that may appear on an ``allow`` decision.
+#: Exactly the frozen ``governance-decision.schema.json`` enum for
+#: ``decision_type = allow``.
 ALLOW_REASON_CODES: frozenset[str] = frozenset(
     {
         "policy_allowed",
@@ -108,11 +119,22 @@ ALLOW_REASON_CODES: frozenset[str] = frozenset(
         "approval_satisfied",
         "confirmation_satisfied",
         "managed_execution_boundary_verified",
-        "managed_execution_required",
     }
 )
 
-#: Reason codes that may appear on a deny decision.
+#: Reason codes that may appear on a ``managed_execution_required`` decision.
+MANAGED_EXECUTION_REASON_CODES: frozenset[str] = frozenset(
+    {
+        "client_local_control_insufficient",
+        "managed_execution_required",
+        "capability_requires_pep",
+        "runtime_isolation_required",
+        "managed_execution_boundary_verified",
+    }
+)
+
+#: Reason codes that may appear on a deny decision: exactly the frozen schema
+#: enum for ``decision_type = deny``.
 DENY_REASON_CODES: frozenset[str] = frozenset(
     {
         "identity_unverified",
@@ -148,37 +170,67 @@ DENY_REASON_CODES: frozenset[str] = frozenset(
         "runtime_capability_unverified",
         "retry_budget_exhausted",
         "risk_above_ceiling",
+        "evidence_missing",
+        "stop_not_confirmed",
+    }
+)
+
+#: Reason codes allowed on ``needs_clarification`` (frozen schema enum).
+NEEDS_CLARIFICATION_REASON_CODES: frozenset[str] = frozenset(
+    {
         "goal_missing",
         "required_input_missing",
         "resource_scope_ambiguous",
         "accountable_owner_unresolved",
         "due_date_ambiguous",
         "capability_ambiguous",
-        "payload_changed",
-        "high_impact_action",
-        "risk_threshold_exceeded",
-        "amount_threshold_exceeded",
-        "separation_of_duties_required",
-        "client_local_control_insufficient",
-        "capability_requires_pep",
-        "runtime_isolation_required",
-        "evidence_missing",
-        "stop_not_confirmed",
     }
 )
 
-#: Reason codes that may appear on a non-authorizing needs_* decision.
-NEEDS_REASON_CODES: frozenset[str] = frozenset(
+#: Reason codes allowed on ``needs_confirmation`` (frozen schema enum).
+NEEDS_CONFIRMATION_REASON_CODES: frozenset[str] = frozenset(
+    {"confirmation_required", "payload_changed", "high_impact_action"}
+)
+
+#: Reason codes allowed on ``needs_approval`` (frozen schema enum).
+NEEDS_APPROVAL_REASON_CODES: frozenset[str] = frozenset(
     {
-        "task_not_created",
-        "required_input_missing",
-        "resource_scope_ambiguous",
-        "capability_ambiguous",
-        "confirmation_required",
         "approval_required",
-        "pre_evaluation_only",
+        "risk_threshold_exceeded",
+        "amount_threshold_exceeded",
+        "separation_of_duties_required",
     }
 )
+
+#: Reason codes allowed on ``pre_evaluation`` (frozen schema enum).
+PRE_EVALUATION_REASON_CODES: frozenset[str] = frozenset(
+    {
+        "pre_evaluation_only",
+        "task_not_created",
+        "policy_denied",
+        "required_input_missing",
+        "client_local_control_insufficient",
+    }
+)
+
+#: Union of the non-authorizing ``needs_*`` sets (compatibility export).
+NEEDS_REASON_CODES: frozenset[str] = (
+    NEEDS_CLARIFICATION_REASON_CODES
+    | NEEDS_CONFIRMATION_REASON_CODES
+    | NEEDS_APPROVAL_REASON_CODES
+)
+
+#: The exact per-decision-type reason-code vocabulary.  A decision may only
+#: carry codes from its own set; the builder enforces this at construction time.
+DECISION_REASON_CODES: dict[str, frozenset[str]] = {
+    "allow": ALLOW_REASON_CODES,
+    "managed_execution_required": MANAGED_EXECUTION_REASON_CODES,
+    "deny": DENY_REASON_CODES,
+    "needs_clarification": NEEDS_CLARIFICATION_REASON_CODES,
+    "needs_confirmation": NEEDS_CONFIRMATION_REASON_CODES,
+    "needs_approval": NEEDS_APPROVAL_REASON_CODES,
+    "pre_evaluation": PRE_EVALUATION_REASON_CODES,
+}
 
 #: The seven decision types frozen by the contract.
 DECISION_TYPES: frozenset[str] = frozenset(
@@ -229,6 +281,9 @@ class GovernanceError(Exception):
             raise ValueError(f"unknown governance reason code: {reason_code!r}")
         self.reason_code = reason_code
         self.context: dict[str, Any] = dict(context or {})
+        #: Set by a layer that already wrote the denial audit event, so an
+        #: outer layer does not append a duplicate.
+        self.audited = False
         super().__init__(message or f"governance denied: {reason_code}")
 
     def audit_details(self) -> dict[str, Any]:

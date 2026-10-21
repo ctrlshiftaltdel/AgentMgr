@@ -23,6 +23,7 @@ boundary; this module only flushes.
 
 from __future__ import annotations
 
+import math
 import re
 import uuid
 from collections.abc import Mapping, Sequence
@@ -37,9 +38,7 @@ from sqlalchemy.orm import Session
 from app.audit.service import record_event
 from app.db.models.organization import Employee
 from app.governance.errors import (
-    ALLOW_REASON_CODES,
-    DENY_REASON_CODES,
-    NEEDS_REASON_CODES,
+    DECISION_REASON_CODES,
     REASON_CODES,
     GovernanceError,
     PolicyError,
@@ -53,6 +52,7 @@ from app.governance.policies import (
     CAPABILITY_PATTERN,
     DEFAULT_POLICY_SET_ID,
     EXECUTION_MODES,
+    MAX_SAFE_INTEGER,
     RISK_LEVELS,
     PolicyRule,
     canonical_json,
@@ -96,6 +96,17 @@ _CORRELATION_ID = re.compile(r"^corr_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$")
 _SHA256 = re.compile(r"^sha256:[a-f0-9]{64}$")
 _APPROVER_ID = re.compile(r"^(prin|role)_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$")
 _RESOLVED_PERSON = re.compile(r"^prin_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$")
+_DECISION_ID = re.compile(r"^gdec_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$")
+_DELEGATION_REF = re.compile(r"^dlg_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$")
+_CONFIRMATION_PURPOSES = frozenset(
+    {
+        "high_impact_action",
+        "data_release",
+        "irreversible_action",
+        "payload_change",
+        "manual_override",
+    }
+)
 
 
 class ApprovalEvidenceVerifier(Protocol):
@@ -284,6 +295,11 @@ def validate_confirmation_ref(
     This only proves the reference is well formed.  Whether it is *authentic*
     is decided by :class:`ApprovalEvidenceVerifier`; shape validation alone
     never satisfies a gate.
+
+    The shape is the frozen ``confirmationRef`` definition: every required
+    field (including ``purpose`` and ``canonicalization``), RFC 3339 UTC
+    date-times and no unknown keys.  A reference that would serialize to a
+    schema-invalid decision is rejected here instead of being persisted.
     """
     timestamp = now or _utcnow()
     if not isinstance(ref, Mapping):
@@ -291,13 +307,22 @@ def validate_confirmation_ref(
     required = (
         "confirmation_id",
         "payload_hash",
-        "status",
-        "single_use",
-        "satisfied_at",
-        "consumed_at",
-        "expires_at",
+        "canonicalization",
+        "purpose",
         "confirmed_by_principal_id",
+        "status",
+        "satisfied_at",
+        "expires_at",
+        "consumed_at",
+        "consumed_by_call_id",
+        "single_use",
     )
+    unknown = set(ref) - {*required, "channel_binding"}
+    if unknown:
+        raise GovernanceError(
+            "confirmation_missing",
+            context={"field": "confirmation_ref", "unknown": sorted(unknown)},
+        )
     missing = [key for key in required if key not in ref]
     if missing:
         raise GovernanceError("confirmation_missing", context={"missing": missing})
@@ -306,8 +331,10 @@ def validate_confirmation_ref(
         r"conf_[A-Za-z0-9][A-Za-z0-9_-]{3,63}", ref["confirmation_id"]
     ):
         raise GovernanceError("confirmation_missing", context={"field": "confirmation_id"})
-    if ref.get("canonicalization") not in {None, "rfc8785_jcs"}:
+    if ref.get("canonicalization") != "rfc8785_jcs":
         raise GovernanceError("confirmation_missing", context={"field": "canonicalization"})
+    if ref.get("purpose") not in _CONFIRMATION_PURPOSES:
+        raise GovernanceError("confirmation_missing", context={"field": "purpose"})
     if ref.get("status") != "satisfied":
         if ref.get("status") == "consumed":
             raise GovernanceError("replay_detected")
@@ -315,6 +342,8 @@ def validate_confirmation_ref(
             "confirmation_missing", context={"status": ref.get("status")}
         )
     if ref.get("consumed_at") is not None:
+        raise GovernanceError("replay_detected")
+    if ref.get("consumed_by_call_id") is not None:
         raise GovernanceError("replay_detected")
     if ref.get("single_use") is not True:
         raise GovernanceError("confirmation_missing", context={"field": "single_use"})
@@ -325,9 +354,13 @@ def validate_confirmation_ref(
         raise GovernanceError(
             "confirmation_missing", context={"field": "confirmed_by_principal_id"}
         )
+    satisfied_at = _parse_rfc3339(ref.get("satisfied_at"))
+    if satisfied_at is None or satisfied_at > timestamp:
+        raise GovernanceError("confirmation_missing", context={"field": "satisfied_at"})
     expires_at = _parse_rfc3339(ref.get("expires_at"))
     if expires_at is None or expires_at <= timestamp:
         raise GovernanceError("confirmation_missing", context={"field": "expires_at"})
+    _validate_channel_binding(ref.get("channel_binding"))
     ref_hash = ref.get("payload_hash")
     if not isinstance(ref_hash, str) or not _SHA256.fullmatch(ref_hash):
         raise GovernanceError("payload_hash_mismatch")
@@ -339,6 +372,40 @@ def validate_confirmation_ref(
     if ref_hash != payload_hash:
         raise GovernanceError("payload_hash_mismatch")
     return dict(ref)
+
+
+def _validate_channel_binding(binding: Any) -> None:
+    """Validate the optional ``channel_binding`` block, rejecting junk."""
+    if binding is None:
+        return
+    if not isinstance(binding, Mapping):
+        raise GovernanceError(
+            "confirmation_missing", context={"field": "channel_binding"}
+        )
+    unknown = set(binding) - {"channel", "channel_identity_ref"}
+    missing = {"channel", "channel_identity_ref"} - set(binding)
+    if unknown or missing:
+        raise GovernanceError(
+            "confirmation_missing",
+            context={
+                "field": "channel_binding",
+                "unknown": sorted(unknown),
+                "missing": sorted(missing),
+            },
+        )
+    if binding.get("channel") not in {"mcp", "rest", "web", "wechat", "other"}:
+        raise GovernanceError(
+            "confirmation_missing", context={"field": "channel_binding.channel"}
+        )
+    ref = binding.get("channel_identity_ref")
+    if ref is not None and (
+        not isinstance(ref, str)
+        or not re.fullmatch(r"chan_[A-Za-z0-9][A-Za-z0-9_-]{3,63}", ref)
+    ):
+        raise GovernanceError(
+            "confirmation_missing",
+            context={"field": "channel_binding.channel_identity_ref"},
+        )
 
 
 def validate_approval_ref(
@@ -355,6 +422,9 @@ def validate_approval_ref(
     person by the trusted verifier.  Self-approval is rejected here when the
     approver is already a concrete ``prin_`` id; the verified person is checked
     again after resolution.
+
+    Every frozen field (including ``canonicalization``) is required, both
+    date-times must be valid RFC 3339 UTC values, and unknown keys are refused.
     """
     timestamp = now or _utcnow()
     if not isinstance(ref, Mapping):
@@ -363,11 +433,18 @@ def validate_approval_ref(
         "approval_id",
         "approver_principal_id",
         "payload_hash",
+        "canonicalization",
         "decision",
         "separation_check",
         "decided_at",
         "expires_at",
     )
+    unknown = set(ref) - set(required)
+    if unknown:
+        raise GovernanceError(
+            "approval_missing",
+            context={"field": "approval_ref", "unknown": sorted(unknown)},
+        )
     missing = [key for key in required if key not in ref]
     if missing:
         raise GovernanceError("approval_missing", context={"missing": missing})
@@ -376,7 +453,7 @@ def validate_approval_ref(
         r"appr_[A-Za-z0-9][A-Za-z0-9_-]{3,63}", ref["approval_id"]
     ):
         raise GovernanceError("approval_missing", context={"field": "approval_id"})
-    if ref.get("canonicalization") not in {None, "rfc8785_jcs"}:
+    if ref.get("canonicalization") != "rfc8785_jcs":
         raise GovernanceError("approval_missing", context={"field": "canonicalization"})
     if ref.get("decision") != "approved":
         raise GovernanceError(
@@ -398,7 +475,9 @@ def validate_approval_ref(
 
     decided_at = _parse_rfc3339(ref.get("decided_at"))
     expires_at = _parse_rfc3339(ref.get("expires_at"))
-    if decided_at is None or expires_at is None or expires_at <= timestamp:
+    if decided_at is None or decided_at > timestamp:
+        raise GovernanceError("approval_missing", context={"field": "decided_at"})
+    if expires_at is None or expires_at <= timestamp:
         raise GovernanceError("approval_missing", context={"field": "expires_at"})
 
     ref_hash = ref.get("payload_hash")
@@ -531,6 +610,13 @@ def _policy_version_document(
 
 
 def _request_hash(request: EvaluationRequest) -> str:
+    """Canonical hash of the request, total over malformed input.
+
+    Field validation (:func:`_validate_request_shape`) runs *before* this
+    function, so a malformed request is already a fail-closed decision by the
+    time we get here.  The sanitizer exists so that recording that decision can
+    never fail with ``ValueError``/``TypeError`` from JCS canonicalization.
+    """
     payload = {
         "principal_id": request.principal.principal_id,
         "principal_type": request.principal.principal_type,
@@ -552,13 +638,28 @@ def _request_hash(request: EvaluationRequest) -> str:
         "decision_purpose": request.decision_purpose,
         "pre_evaluation": request.pre_evaluation,
     }
-    return sha256_digest(canonical_json(payload).encode("utf-8"))
+    return sha256_digest(canonical_json(_hash_value(payload)).encode("utf-8"))
+
+
+def _hash_value(value: Any) -> Any:
+    """Project arbitrary input onto the JSON data model deterministically."""
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, int):
+        return value if abs(value) <= MAX_SAFE_INTEGER else f"int:{value}"
+    if isinstance(value, float):
+        return value if math.isfinite(value) else f"float:{value!r}"
+    if isinstance(value, Mapping):
+        return {str(key): _hash_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_hash_value(item) for item in value]
+    return f"{type(value).__name__}:{value!r}"
 
 
 def _next_revision(
     session: Session, *, task_id: str | None, principal_id: str
 ) -> int:
-    if not task_id:
+    if not isinstance(task_id, str) or not _TASK_ID.fullmatch(task_id):
         return 1
     current = session.scalar(
         select(func.max(GovernanceDecisionRecord.decision_revision)).where(
@@ -591,14 +692,14 @@ def _build_decision(
     unknown = set(unique_reasons) - REASON_CODES
     if unknown:
         raise ValueError(f"unknown reason codes: {sorted(unknown)}")
-    if decision_type in {"allow", "managed_execution_required"}:
-        allowed_reasons = ALLOW_REASON_CODES
-    elif decision_type == "deny":
-        allowed_reasons = DENY_REASON_CODES
-    else:
-        allowed_reasons = NEEDS_REASON_CODES
+    allowed_reasons = DECISION_REASON_CODES.get(decision_type)
+    if allowed_reasons is None:
+        raise ValueError(f"unknown decision type: {decision_type!r}")
     invalid = set(unique_reasons) - allowed_reasons
     if invalid:
+        # This is an internal programming error: emitting a decision whose
+        # reason code is not in the frozen per-type enum would persist a
+        # schema-invalid authorization record.
         raise ValueError(
             f"reason codes not valid for {decision_type}: {sorted(invalid)}"
         )
@@ -656,7 +757,7 @@ def _build_decision(
         request.task_revision
         if isinstance(request.task_revision, int)
         and not isinstance(request.task_revision, bool)
-        and request.task_revision >= 0
+        and 0 <= request.task_revision <= MAX_SAFE_INTEGER
         else None
     )
     task_ref = {
@@ -853,12 +954,12 @@ def _persist(
             "policy_set_id": decision.policy_version["policy_set_id"],
             "policy_version": decision.policy_version["version"],
             "policy_content_hash": decision.policy_version["content_hash"],
-            "capability": request.capability,
-            "task_id": request.task_id,
-            "task_revision": request.task_revision,
-            "execution_mode": request.execution_mode,
-            "priority": request.priority,
-            "risk": request.risk,
+            "capability": _hash_value(request.capability),
+            "task_id": _hash_value(request.task_id),
+            "task_revision": _hash_value(request.task_revision),
+            "execution_mode": _hash_value(request.execution_mode),
+            "priority": _hash_value(request.priority),
+            "risk": _hash_value(request.risk),
             "principal_id": request.principal.principal_id,
             "service_identity_id": request.principal.service_identity_id,
         },
@@ -1053,6 +1154,89 @@ def _validate_delegation(
     return row
 
 
+def _validate_request_shape(request: EvaluationRequest) -> tuple[str, str] | None:
+    """Validate every caller-supplied request field before hashing/persisting.
+
+    Returns ``(decision_type, reason_code)`` for a fail-closed rejection, or
+    ``None`` when the request is well formed.  The caller-supplied fields are
+    never authority, but malformed values must not reach a database cast, a
+    JCS canonicalizer or a frozen-schema serializer either.
+    """
+    if not isinstance(request.capability, str) or not CAPABILITY_PATTERN.fullmatch(
+        request.capability
+    ):
+        return ("needs_clarification", "capability_ambiguous")
+    if request.task_id is not None and (
+        not isinstance(request.task_id, str)
+        or not _TASK_ID.fullmatch(request.task_id)
+    ):
+        return ("needs_clarification", "required_input_missing")
+    if request.task_revision is not None and (
+        not isinstance(request.task_revision, int)
+        or isinstance(request.task_revision, bool)
+        or request.task_revision < 0
+        or request.task_revision > MAX_SAFE_INTEGER
+    ):
+        return ("needs_clarification", "required_input_missing")
+    if request.task_idempotency_key is not None and (
+        not isinstance(request.task_idempotency_key, str)
+        or not _IDEM_KEY.fullmatch(request.task_idempotency_key)
+    ):
+        return ("needs_clarification", "required_input_missing")
+    if not isinstance(request.decision_purpose, str) or request.decision_purpose not in {
+        "initial_execution",
+        "retry",
+    }:
+        return ("needs_clarification", "required_input_missing")
+    if request.supersedes_decision_id is not None and (
+        not isinstance(request.supersedes_decision_id, str)
+        or not _DECISION_ID.fullmatch(request.supersedes_decision_id)
+    ):
+        return ("needs_clarification", "required_input_missing")
+    if not isinstance(request.policy_set_id, str) or not _POLICY_SET_ID.fullmatch(
+        request.policy_set_id
+    ):
+        return ("deny", "policy_version_invalid")
+    if request.policy_version is not None and (
+        not isinstance(request.policy_version, str)
+        or not _SEMVER.fullmatch(request.policy_version)
+    ):
+        return ("deny", "policy_version_invalid")
+    if not isinstance(request.execution_mode, str) or (
+        request.execution_mode not in EXECUTION_MODES
+    ):
+        return ("deny", "unsupported_execution_mode")
+    if not isinstance(request.risk, str) or request.risk not in RISK_LEVELS:
+        return ("deny", "risk_above_ceiling")
+    if not isinstance(request.priority, str) or request.priority not in PRIORITY_LEVELS:
+        return ("needs_clarification", "required_input_missing")
+    if request.resource_scope is not None and not isinstance(
+        request.resource_scope, Mapping
+    ):
+        return ("needs_clarification", "resource_scope_ambiguous")
+    for ref in (request.confirmation_ref, request.approval_ref):
+        if ref is not None and not isinstance(ref, Mapping):
+            return ("needs_clarification", "required_input_missing")
+    if request.payload_hash is not None and (
+        not isinstance(request.payload_hash, str)
+        or not _SHA256.fullmatch(request.payload_hash)
+    ):
+        return ("deny", "payload_hash_mismatch")
+    if request.delegation_ref is not None and (
+        not isinstance(request.delegation_ref, str)
+        or not _DELEGATION_REF.fullmatch(request.delegation_ref)
+    ):
+        return ("needs_clarification", "required_input_missing")
+    if request.correlation_id is not None and (
+        not isinstance(request.correlation_id, str)
+        or not _CORRELATION_ID.fullmatch(request.correlation_id)
+    ):
+        return ("needs_clarification", "required_input_missing")
+    if not isinstance(request.pre_evaluation, bool):
+        return ("needs_clarification", "required_input_missing")
+    return None
+
+
 def evaluate(
     session: Session,
     request: EvaluationRequest | GovernancePrincipal | None = None,
@@ -1085,12 +1269,23 @@ def evaluate(
         )
 
     evaluated_at = now or _utcnow()
-    request_hash = _request_hash(request)
     verifier = evidence_verifier or DENY_ALL_EVIDENCE
     decision_purpose = request.decision_purpose
-    if decision_purpose not in {"initial_execution", "retry"}:
+    if not isinstance(decision_purpose, str) or decision_purpose not in {
+        "initial_execution",
+        "retry",
+    }:
+        # Malformed purposes are rejected below; the persisted decision must
+        # still carry a schema/DB-valid purpose.
         decision_purpose = "initial_execution"
-    supersedes = request.supersedes_decision_id
+    # A supersedes reference is only meaningful on a retry; an initial
+    # evaluation must never persist caller-supplied junk into the document.
+    supersedes = request.supersedes_decision_id if decision_purpose == "retry" else None
+
+    # Every caller-supplied field is validated *before* the request hash and
+    # before any database cast / JCS canonicalization can raise.
+    shape_error = _validate_request_shape(request)
+    request_hash = _request_hash(request)
 
     def deny(reason_codes: Sequence[str], *, policy_row=None, scope=None):
         return _deny(
@@ -1105,54 +1300,53 @@ def evaluate(
             scope=scope,
         )
 
-    # 1. Trusted principal.
+    def malformed(decision_type: str, reason_code: str, *, scope=None):
+        if decision_type == "deny":
+            return deny([reason_code], scope=scope)
+        return _non_authorizing(
+            session,
+            request=request,
+            decision_type=decision_type,
+            reason_codes=[reason_code],
+            policy_row=None,
+            evaluated_at=evaluated_at,
+            request_hash=request_hash,
+            decision_purpose=decision_purpose,
+            supersedes_decision_id=None,
+            scope=scope,
+        )
+
+    # 0. Trusted principal first: an unverified/disabled principal is denied
+    # regardless of how malformed the rest of the request is.
     if request.principal.identity_assurance not in VERIFIED_ASSURANCES:
         return deny(["identity_unverified"])
     if not request.principal.is_active:
         return deny(["principal_disabled"])
 
-    # 1b. Request-shape validation: reject malformed identifiers before they
-    # reach a database cast or become a silently-ignored field.
-    if request.task_id is not None and (
-        not isinstance(request.task_id, str)
-        or not _TASK_ID.fullmatch(request.task_id)
-    ):
-        return deny(["required_input_missing"], scope=request.resource_scope)
-    if request.task_revision is not None and (
-        not isinstance(request.task_revision, int)
-        or isinstance(request.task_revision, bool)
-        or request.task_revision < 0
-        or request.task_revision > 2**53 - 1
-    ):
-        return deny(["required_input_missing"], scope=request.resource_scope)
-    if request.task_idempotency_key is not None and (
-        not isinstance(request.task_idempotency_key, str)
-        or not _IDEM_KEY.fullmatch(request.task_idempotency_key)
-    ):
-        return deny(["required_input_missing"], scope=request.resource_scope)
-    if request.payload_hash is not None and (
-        not isinstance(request.payload_hash, str)
-        or not _SHA256.fullmatch(request.payload_hash)
-    ):
-        return deny(["payload_hash_mismatch"], scope=request.resource_scope)
-    if request.correlation_id is not None and (
-        not isinstance(request.correlation_id, str)
-        or not _CORRELATION_ID.fullmatch(request.correlation_id)
-    ):
-        return deny(["required_input_missing"], scope=request.resource_scope)
-    if request.delegation_ref is not None and (
-        not isinstance(request.delegation_ref, str)
-        or not re.fullmatch(
-            r"^dlg_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$", request.delegation_ref
+    # 1. Malformed request shape fails closed with a schema-valid decision.
+    if shape_error is not None:
+        decision_type, reason_code = shape_error
+        scope = (
+            request.resource_scope
+            if isinstance(request.resource_scope, Mapping)
+            else None
         )
-    ):
-        return deny(["required_input_missing"], scope=request.resource_scope)
+        return malformed(decision_type, reason_code, scope=scope)
 
     # 1c. A retry must supersede the current decision of the same task and
     # principal.  There is no synthetic revision 2 without history.
     if decision_purpose == "retry":
         if not request.task_id:
-            return deny(["task_not_created"], scope=request.resource_scope)
+            # ``task_not_created`` is only valid on a pre_evaluation decision;
+            # a retry without a task is a clarification request, not a denial.
+            # Without a task there is no retry chain, so the recorded purpose
+            # must also be the initial one (the frozen schema requires a
+            # revision >= 2 and a supersedes reference for ``retry``).
+            decision_purpose = "initial_execution"
+            supersedes = None
+            return malformed(
+                "needs_clarification", "required_input_missing", scope=None
+            )
         latest = session.scalar(
             select(GovernanceDecisionRecord)
             .where(
@@ -1207,24 +1401,8 @@ def evaluate(
     if content_hash(policy_row.document) != policy_row.content_hash:
         return deny(["policy_version_invalid"], policy_row=policy_row)
 
-    # 3. A malformed capability is not a usable request; a well-formed but
-    # unknown capability falls through to the rule match below.
-    if not isinstance(request.capability, str) or not CAPABILITY_PATTERN.fullmatch(
-        request.capability
-    ):
-        return _non_authorizing(
-            session,
-            request=request,
-            decision_type="needs_clarification",
-            reason_codes=["capability_ambiguous"],
-            policy_row=policy_row,
-            evaluated_at=evaluated_at,
-            request_hash=request_hash,
-            decision_purpose=decision_purpose,
-            supersedes_decision_id=supersedes,
-            scope=request.resource_scope,
-        )
-
+    # 3. A well-formed but unknown capability falls through to the rule match
+    # below; malformed capabilities were rejected by the shape validation.
     # 4. Hard deny wins over everything except identity/policy availability.
     hard_deny = policy.hard_deny_for(request.capability)
     if hard_deny is not None:

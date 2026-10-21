@@ -502,8 +502,8 @@ class ExecutionGrant(TimestampMixin, Base):
             name="delegation_ref_format",
         ),
         CheckConstraint(
-            "NOT (consumption_mode = 'single_use' AND "
-            "(budget ->> 'max_calls')::int <> 1)",
+            "consumption_mode <> 'single_use' OR "
+            "COALESCE((budget ->> 'max_calls')::int, -1) = 1",
             name="single_use_budget_is_one",
         ),
         CheckConstraint(

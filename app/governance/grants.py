@@ -21,14 +21,19 @@ from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy import inspect as sa_inspect
-from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session, object_session
 
 from app.audit.service import record_event
 from app.governance.errors import (
     GRANT_REVOCATION_REASONS,
     GovernanceError,
 )
-from app.governance.models import ExecutionGrant, GovernanceDecisionRecord
+from app.governance.models import (
+    ExecutionGrant,
+    GovernanceDecisionRecord,
+    ServiceIdentity,
+)
 from app.governance.pdp import (
     DENY_ALL_EVIDENCE,
     ApprovalEvidenceVerifier,
@@ -47,6 +52,7 @@ from app.governance.policies import (
 )
 from app.governance.principal import (
     GovernancePrincipal,
+    audit_actor_id,
     principal_ref,
     reject_client_asserted_identity,
 )
@@ -85,7 +91,6 @@ _DECISION_ID = re.compile(r"^gdec_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$")
 _CALL_ID = re.compile(r"^call_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$")
 _SHA256 = re.compile(r"^sha256:[a-f0-9]{64}$")
 _CATALOG_ID = re.compile(r"^cat_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$")
-_PRINCIPAL_ID = re.compile(r"^(prin|rt|svc)_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$")
 _DELEGATION_ID = re.compile(r"^dlg_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$")
 
 
@@ -238,44 +243,83 @@ def _normalize_budget(
         ):
             raise GovernanceError("budget_exceeded", context={"field": "max_calls"})
 
+    # Cost: the decision's ``None`` means "no cost is authorized" (zero), not
+    # "unlimited".  A caller can therefore never widen it to a positive amount.
     decision_max_cost = constraints.get("max_cost_units")
-    max_cost_units = raw.get("max_cost_units", decision_max_cost)
-    if max_cost_units is not None:
-        if isinstance(max_cost_units, bool) or not isinstance(
-            max_cost_units, (int, float)
-        ):
-            raise GovernanceError("budget_exceeded", context={"field": "max_cost_units"})
-        if max_cost_units < 0 or (
-            decision_max_cost is not None and max_cost_units > decision_max_cost
-        ):
-            raise GovernanceError("budget_exceeded", context={"field": "max_cost_units"})
-
-    decision_max_runtime = constraints.get("max_runtime_seconds")
-    if "max_runtime_seconds" in raw:
-        max_runtime_seconds = raw.get("max_runtime_seconds")
-    elif decision_max_runtime is not None:
-        max_runtime_seconds = min(decision_max_runtime, ttl_seconds)
+    requested_cost = raw.get("max_cost_units", decision_max_cost)
+    if decision_max_cost is None:
+        if requested_cost is not None:
+            if isinstance(requested_cost, bool) or not isinstance(
+                requested_cost, (int, float)
+            ):
+                raise GovernanceError(
+                    "budget_exceeded", context={"field": "max_cost_units"}
+                )
+            if requested_cost != 0:
+                raise GovernanceError(
+                    "budget_exceeded", context={"field": "max_cost_units"}
+                )
+        max_cost_units = None
     else:
-        max_runtime_seconds = None
-    if max_runtime_seconds is not None:
-        if (
-            not isinstance(max_runtime_seconds, int)
-            or isinstance(max_runtime_seconds, bool)
-            or max_runtime_seconds < 1
-        ):
-            raise GovernanceError(
-                "budget_exceeded", context={"field": "max_runtime_seconds"}
-            )
-        if max_runtime_seconds > ttl_seconds or (
-            decision_max_runtime is not None
-            and max_runtime_seconds > decision_max_runtime
-        ):
-            raise GovernanceError(
-                "budget_exceeded", context={"field": "max_runtime_seconds"}
-            )
+        max_cost_units = requested_cost
+        if max_cost_units is not None:
+            if isinstance(max_cost_units, bool) or not isinstance(
+                max_cost_units, (int, float)
+            ):
+                raise GovernanceError(
+                    "budget_exceeded", context={"field": "max_cost_units"}
+                )
+            if max_cost_units < 0 or max_cost_units > decision_max_cost:
+                raise GovernanceError(
+                    "budget_exceeded", context={"field": "max_cost_units"}
+                )
 
-    currency = raw.get("currency", "NONE" if max_cost_units is None else "CNY")
+    # Runtime: ``None`` on the decision means no runtime is authorized.  A
+    # bounded decision can never be widened to "unlimited" by passing None.
+    decision_max_runtime = constraints.get("max_runtime_seconds")
+    if "max_runtime_seconds" not in raw:
+        max_runtime_seconds = (
+            min(decision_max_runtime, ttl_seconds)
+            if decision_max_runtime is not None
+            else None
+        )
+    else:
+        requested_runtime = raw.get("max_runtime_seconds")
+        if requested_runtime is None:
+            # Not an unlimited request: inherit the bounded decision budget.
+            max_runtime_seconds = (
+                min(decision_max_runtime, ttl_seconds)
+                if decision_max_runtime is not None
+                else None
+            )
+        else:
+            if decision_max_runtime is None:
+                # Any positive runtime exceeds a decision that authorized none.
+                raise GovernanceError(
+                    "budget_exceeded", context={"field": "max_runtime_seconds"}
+                )
+            max_runtime_seconds = requested_runtime
+            if (
+                not isinstance(max_runtime_seconds, int)
+                or isinstance(max_runtime_seconds, bool)
+                or max_runtime_seconds < 1
+            ):
+                raise GovernanceError(
+                    "budget_exceeded", context={"field": "max_runtime_seconds"}
+                )
+            if max_runtime_seconds > ttl_seconds or (
+                max_runtime_seconds > decision_max_runtime
+            ):
+                raise GovernanceError(
+                    "budget_exceeded", context={"field": "max_runtime_seconds"}
+                )
+
+    currency = raw.get(
+        "currency", "NONE" if max_cost_units is None else "CNY"
+    )
     if currency not in {"CNY", "USD", "NONE"}:
+        raise GovernanceError("budget_exceeded", context={"field": "currency"})
+    if max_cost_units is None and currency != "NONE":
         raise GovernanceError("budget_exceeded", context={"field": "currency"})
 
     return {
@@ -351,10 +395,8 @@ def issue_grant(
     tool_contract_hash: str | None = None,
     confirmation_ref: Mapping[str, Any] | None = None,
     approval_ref: Mapping[str, Any] | None = None,
-    issued_by_service_identity_id: str | None = None,
     idempotency_key: str | None = None,
     client_payload: Mapping[str, Any] | None = None,
-    actor_id: int | None = None,
     now: datetime | None = None,
 ) -> ExecutionGrant:
     """Issue a grant from an authorizing decision, refusing any expansion.
@@ -363,6 +405,12 @@ def issue_grant(
     the caller may narrow capabilities/scope/TTL/budget but can never widen
     them.  Gate references are copied from the decision, so a grant cannot
     smuggle a different confirmation/approval.
+
+    The audit actor is the resolved principal (the requester when a service
+    identity acts for one, otherwise the service identity's owner).  There is
+    no caller-supplied actor id and no caller-supplied issuing service
+    identity: Issue #78 has no trusted service-identity registry for that
+    claim, so the field stays ``NULL`` rather than being self-declared.
     """
     issued_at = now or _utcnow()
     principal.require_active()
@@ -536,14 +584,6 @@ def issue_grant(
             "tool_contract_mismatch",
             context={"reason": "catalog_id_and_hash_must_pair"},
         )
-    if issued_by_service_identity_id is not None and (
-        not isinstance(issued_by_service_identity_id, str)
-        or not _PRINCIPAL_ID.fullmatch(issued_by_service_identity_id)
-        or not issued_by_service_identity_id.startswith("svc_")
-    ):
-        raise GovernanceError(
-            "required_input_missing", context={"field": "issued_by_service_identity_id"}
-        )
 
     # Delegation provenance: the decision subject is authoritative.
     decision_delegation = (document.get("subject") or {}).get("delegation_ref")
@@ -571,36 +611,27 @@ def issue_grant(
         raise GovernanceError("policy_version_invalid")
 
     key = _normalize_idempotency_key(idempotency_key)
-    existing = session.scalar(
-        select(ExecutionGrant).where(ExecutionGrant.idempotency_key == key)
-    )
+    replay = {
+        "decision": record,
+        "task_id": task_id,
+        "task_revision": task_revision,
+        "task_idempotency_key": task_idempotency_key,
+        "principal": principal,
+        "delegation": decision_delegation or None,
+        "capabilities": granted_capabilities,
+        "scope": scope,
+        "mode": mode,
+        "consumption_mode": consumption_mode,
+        "tool_contract_version": tool_contract_version,
+        "tool_contract_id": tool_contract_id,
+        "tool_contract_hash": tool_contract_hash,
+        "confirmation_ref": confirmation_ref,
+        "approval_ref": approval_ref,
+        "budget": normalized_budget,
+    }
+    existing = _find_grant_by_idempotency_key(session, key)
     if existing is not None:
-        same = (
-            existing.decision_id == record.decision_id
-            and existing.decision_type == record.decision_type
-            and existing.task_id == task_id
-            and existing.task_revision == task_revision
-            and existing.task_idempotency_key == task_idempotency_key
-            and existing.subject_id == principal.principal_id
-            and existing.subject_type == principal.principal_type
-            and existing.subject_employee_id == principal.employee_id
-            and existing.subject_service_identity_id == principal.service_identity_id
-            and existing.delegation_ref == (decision_delegation or None)
-            and existing.capabilities == granted_capabilities
-            and existing.resource_scope == scope
-            and existing.execution_mode == mode
-            and existing.consumption_mode == consumption_mode
-            and existing.tool_contract_version == tool_contract_version
-            and existing.tool_contract_id == tool_contract_id
-            and existing.tool_contract_hash == tool_contract_hash
-            and existing.confirmation_ref == confirmation_ref
-            and existing.approval_ref == approval_ref
-            and existing.issued_by_service_identity_id == issued_by_service_identity_id
-            and existing.budget == normalized_budget
-        )
-        if not same:
-            raise GovernanceError("replay_detected", context={"idempotency_key": key})
-        return existing
+        return _replay_grant(existing, key=key, **replay)
 
     grant = ExecutionGrant(
         grant_id=_new_id("grnt_"),
@@ -620,7 +651,7 @@ def issue_grant(
         subject_id=principal.principal_id,
         subject_employee_id=principal.employee_id,
         subject_service_identity_id=principal.service_identity_id,
-        issued_by_service_identity_id=issued_by_service_identity_id,
+        issued_by_service_identity_id=None,
         delegation_ref=decision_delegation or None,
         execution_mode=mode,
         capabilities=granted_capabilities,
@@ -641,15 +672,91 @@ def issue_grant(
         status="active",
         usable=True,
     )
-    session.add(grant)
-    session.flush()
+    # The unique idempotency key is the concurrency guard.  Two issuers racing
+    # on the same key produce one row; the loser re-reads the winner and either
+    # returns it (identical request) or raises ``replay_detected``.
+    try:
+        with session.begin_nested():
+            session.add(grant)
+            session.flush()
+    except IntegrityError as exc:
+        existing = _find_grant_by_idempotency_key(session, key)
+        if existing is None:
+            raise GovernanceError(
+                "replay_detected", context={"idempotency_key": key}
+            ) from exc
+        return _replay_grant(existing, key=key, **replay)
     _audit_grant(
         session,
-        actor_id=actor_id if actor_id is not None else principal.employee_id,
+        actor_id=audit_actor_id(principal),
         action="governance.grant.issued",
         grant=grant,
     )
     return grant
+
+
+def _find_grant_by_idempotency_key(
+    session: Session, key: str
+) -> ExecutionGrant | None:
+    with session.no_autoflush:
+        row = session.scalar(
+            select(ExecutionGrant)
+            .where(ExecutionGrant.idempotency_key == key)
+            .execution_options(populate_existing=True)
+        )
+        if row is not None:
+            session.refresh(row)
+        return row
+
+
+def _replay_grant(
+    existing: ExecutionGrant,
+    *,
+    key: str,
+    decision: GovernanceDecisionRecord,
+    task_id: str,
+    task_revision: int,
+    task_idempotency_key: str,
+    principal: GovernancePrincipal,
+    delegation: str | None,
+    capabilities: Sequence[str],
+    scope: Mapping[str, Any],
+    mode: str,
+    consumption_mode: str,
+    tool_contract_version: str,
+    tool_contract_id: str | None,
+    tool_contract_hash: str | None,
+    confirmation_ref: Mapping[str, Any] | None,
+    approval_ref: Mapping[str, Any] | None,
+    budget: Mapping[str, Any],
+) -> ExecutionGrant:
+    """Return the stored grant when the replay is identical, else fail closed."""
+    same = (
+        existing.decision_id == decision.decision_id
+        and existing.decision_type == decision.decision_type
+        and existing.task_id == task_id
+        and existing.task_revision == task_revision
+        and existing.task_idempotency_key == task_idempotency_key
+        and existing.subject_id == principal.principal_id
+        and existing.subject_type == principal.principal_type
+        and existing.subject_employee_id == principal.employee_id
+        and existing.subject_service_identity_id == principal.service_identity_id
+        and existing.delegation_ref == delegation
+        and existing.capabilities == list(capabilities)
+        and existing.resource_scope == dict(scope)
+        and existing.execution_mode == mode
+        and existing.consumption_mode == consumption_mode
+        and existing.tool_contract_version == tool_contract_version
+        and existing.tool_contract_id == tool_contract_id
+        and existing.tool_contract_hash == tool_contract_hash
+        and existing.confirmation_ref == confirmation_ref
+        and existing.approval_ref == approval_ref
+        and existing.issued_by_service_identity_id is None
+        and existing.budget == dict(budget)
+    )
+    if not same:
+        raise GovernanceError("replay_detected", context={"idempotency_key": key})
+    return existing
 
 
 def get_grant(
@@ -694,7 +801,7 @@ def _deny_grant(
         record_event(
             session,
             actor_id=actor_id,
-            action="governance.grant.denied",
+            action="governance.pep.denied",
             resource_type="execution_grant",
             resource_id=grant.grant_id,
             request_id=grant.correlation_id,
@@ -709,7 +816,10 @@ def _deny_grant(
                 **details,
             },
         )
-    raise GovernanceError(reason_code, context=context)
+    exc = GovernanceError(reason_code, context=context)
+    # Only a grant-aware denial wrote its own audit row here.
+    exc.audited = grant is not None
+    raise exc
 
 
 def _validate_subject_and_binding(
@@ -780,7 +890,7 @@ def _consume_grant(
     keyword argument.
     """
     timestamp = now or _utcnow()
-    actor_id = principal.employee_id
+    actor_id = audit_actor_id(principal)
     if not isinstance(call_id, str) or not _CALL_ID.fullmatch(call_id):
         raise GovernanceError("required_input_missing", context={"field": "call_id"})
     if not isinstance(capability, str) or not CAPABILITY_PATTERN.fullmatch(capability):
@@ -878,7 +988,7 @@ def _consume_grant(
             grant=grant,
             reason_code=exc.reason_code,
             actor_id=actor_id,
-            context=exc.context,
+            context={"call_id": call_id, **exc.context},
         )
 
     if grant_remaining_calls(grant) < 1:
@@ -1036,6 +1146,22 @@ def _consume_grant(
     return grant
 
 
+def _service_owner_employee_id(
+    session: Session, service_identity_id: str | None
+) -> int | None:
+    """Return the accountable owner of a ``svc_*`` grant subject."""
+    if not isinstance(service_identity_id, str) or not service_identity_id.startswith(
+        "svc_"
+    ):
+        return None
+    try:
+        pk = int(service_identity_id[len("svc_") :])
+    except ValueError:
+        return None
+    identity = session.get(ServiceIdentity, pk)
+    return identity.owner_employee_id if identity is not None else None
+
+
 def revoke_grant(
     session: Session,
     *,
@@ -1063,11 +1189,24 @@ def revoke_grant(
         raise GovernanceError("grant_missing", context={"grant_id": grant_id})
 
     is_subject = principal.principal_id == grant.subject_id
-    is_owner = (
-        principal.employee_id is not None
-        and grant.subject_employee_id is not None
-        and principal.employee_id == grant.subject_employee_id
-    )
+    if grant.subject_type == "service":
+        # A service grant belongs to the service identity's accountable owner;
+        # the requester employee id (``subject_employee_id``) is only the
+        # acting-for principal and must not confer ownership.
+        owner_employee_id = _service_owner_employee_id(
+            session, grant.subject_service_identity_id
+        )
+        is_owner = (
+            principal.employee_id is not None
+            and owner_employee_id is not None
+            and principal.employee_id == owner_employee_id
+        )
+    else:
+        is_owner = (
+            principal.employee_id is not None
+            and grant.subject_employee_id is not None
+            and principal.employee_id == grant.subject_employee_id
+        )
     if not (is_subject or is_owner):
         if ("identity", "manage", "company") not in principal.effective_permissions:
             raise GovernanceError(
@@ -1093,7 +1232,7 @@ def revoke_grant(
     session.flush()
     _audit_grant(
         session,
-        actor_id=principal.employee_id,
+        actor_id=audit_actor_id(principal),
         action="governance.grant.revoked",
         grant=grant,
         extra={"reason_code": reason_code, "revoked_by": principal.principal_id},
@@ -1102,14 +1241,136 @@ def revoke_grant(
 
 
 def grant_document(grant: ExecutionGrant) -> dict[str, Any]:
-    """Serialize the Grant fields that are derivable from Issue #78 state.
+    """Serialize the Grant fields derivable from Issue #78 state.
 
-    This is **not** a claim of full ``execution-grant.schema.json`` conformance:
-    ``attempt`` (retry/task aggregate, Issue #79) and a real ``issued_by``
-    service identity (service-identity registry) are deliberately omitted when
-    unavailable.  All other blocks are deterministic and are the values the PEP
-    actually revalidates.
+    This is **not** a claim of full ``execution-grant.schema.json``
+    conformance: ``attempt`` (retry/task aggregate, Issue #79) and a real
+    ``issued_by`` service identity (no trusted registry in #78) are
+    deliberately omitted rather than fabricated.
+
+    ``binding`` and ``decision.freshness`` are computed by comparing the grant
+    against the **persisted** decision; nothing is hardcoded to ``true``.  The
+    frozen contract only permits ``freshness = fresh_evaluation`` and all
+    binding assertions to be true, so a grant that does not actually satisfy
+    them raises a governance error instead of producing a lying document.
     """
+    session = object_session(grant)
+    if session is None:
+        raise GovernanceError("grant_missing", context={"reason": "detached_grant"})
+    decision = _load_decision(session, grant.decision_id)
+
+    constraints = decision.constraints
+    document_body = decision.document
+    decision_mode = (document_body.get("constraints") or {}).get("execution_mode")
+
+    budget = dict(grant.budget)
+    max_calls = budget.get("max_calls")
+    max_cost = budget.get("max_cost_units")
+    max_runtime = budget.get("max_runtime_seconds")
+    decision_ttl = constraints.get("ttl_seconds")
+    decision_max_calls = constraints.get("max_calls")
+    decision_max_cost = constraints.get("max_cost_units")
+    decision_max_runtime = constraints.get("max_runtime_seconds")
+    grant_ttl = max(1, int((grant.expires_at - grant.issued_at).total_seconds()))
+
+    allowed = set(constraints.get("allowed_capabilities") or [])
+    denied = set(constraints.get("denied_capabilities") or [])
+    capabilities_ok = (
+        bool(grant.capabilities)
+        and set(grant.capabilities).issubset(allowed)
+        and not (set(grant.capabilities) & denied)
+    )
+    scope_ok = scope_is_subset(
+        grant.resource_scope, constraints.get("resource_scope") or {}
+    )
+    ttl_ok = (
+        isinstance(decision_ttl, int)
+        and not isinstance(decision_ttl, bool)
+        and grant_ttl <= decision_ttl
+    )
+    calls_ok = (
+        isinstance(decision_max_calls, int)
+        and not isinstance(decision_max_calls, bool)
+        and isinstance(max_calls, int)
+        and not isinstance(max_calls, bool)
+        and 1 <= max_calls <= decision_max_calls
+    )
+    if decision_max_cost is None:
+        cost_ok = max_cost is None or max_cost == 0
+    else:
+        cost_ok = max_cost is None or (
+            isinstance(max_cost, (int, float))
+            and not isinstance(max_cost, bool)
+            and max_cost <= decision_max_cost
+        )
+    if decision_max_runtime is None:
+        runtime_ok = max_runtime is None
+    else:
+        runtime_ok = (
+            isinstance(max_runtime, int)
+            and not isinstance(max_runtime, bool)
+            and max_runtime <= decision_max_runtime
+        )
+    runtime_ttl_ok = max_runtime is None or (
+        isinstance(max_runtime, int)
+        and not isinstance(max_runtime, bool)
+        and max_runtime <= grant_ttl
+    )
+    expires_ok = grant.expires_at <= decision.expires_at
+    mode_ok = (
+        grant.execution_mode == constraints.get("execution_mode")
+        and grant.execution_mode == decision_mode
+    )
+    decision_hash_ok = (
+        grant.decision_hash == decision.decision_hash
+        and grant.decision_revision == decision.decision_revision
+    )
+    gates_ok = (
+        bool(constraints.get("required_confirmation"))
+        == (grant.confirmation_ref is not None)
+        and bool(constraints.get("required_approval"))
+        == (grant.approval_ref is not None)
+    )
+    confirmation_payload_ok = True
+    if grant.confirmation_ref is not None:
+        confirmation_payload_ok = grant.confirmation_ref.get(
+            "payload_hash"
+        ) == (constraints.get("confirmation_ref") or {}).get("payload_hash")
+
+    binding_checks = (
+        ("task_revision_bound", grant.task_revision == decision.task_revision, "grant_scope_mismatch"),
+        ("capabilities_subset_of_decision", capabilities_ok, "capability_not_granted"),
+        ("scope_subset_of_decision", scope_ok, "grant_scope_mismatch"),
+        ("ttl_within_decision", ttl_ok, "grant_outlives_decision"),
+        ("budget_within_decision", calls_ok and cost_ok and runtime_ok, "budget_exceeded"),
+        ("expires_within_decision", expires_ok, "grant_outlives_decision"),
+        ("execution_mode_matches_decision", mode_ok, "execution_mode_mismatch"),
+        ("decision_hash_bound", decision_hash_ok, "grant_scope_mismatch"),
+        ("gates_match_decision", gates_ok, "grant_scope_mismatch"),
+        ("confirmation_payload_hash_bound", confirmation_payload_ok, "payload_hash_mismatch"),
+        ("runtime_within_grant_ttl", runtime_ttl_ok, "budget_exceeded"),
+    )
+    binding: dict[str, bool] = {}
+    for name, ok, reason in binding_checks:
+        if not ok:
+            raise GovernanceError(
+                reason, context={"field": "binding", "assertion": name}
+            )
+        binding[name] = True
+
+    # ``freshness`` is only truthful when the grant still points at the same
+    # decision document and that decision was unexpired at issuance.  A grant
+    # re-used from an older/superseded decision fails closed here.
+    fresh = (
+        decision_hash_ok
+        and decision.decision_purpose == grant.decision_purpose
+        and decision.expires_at > grant.issued_at
+    )
+    if not fresh:
+        raise GovernanceError(
+            "decision_revision_stale", context={"field": "decision.freshness"}
+        )
+
     document: dict[str, Any] = {
         "schema_version": "1.0.0",
         "grant_id": grant.grant_id,
@@ -1147,10 +1408,8 @@ def grant_document(grant: ExecutionGrant) -> dict[str, Any]:
         "expires_at": grant.expires_at.astimezone(UTC)
         .isoformat(timespec="seconds")
         .replace("+00:00", "Z"),
-        "ttl_seconds": max(
-            1, int((grant.expires_at - grant.issued_at).total_seconds())
-        ),
-        "budget": dict(grant.budget),
+        "ttl_seconds": grant_ttl,
+        "budget": budget,
         "usage": dict(grant.usage),
         "confirmation_ref": dict(grant.confirmation_ref)
         if grant.confirmation_ref is not None
@@ -1198,19 +1457,7 @@ def grant_document(grant: ExecutionGrant) -> dict[str, Any]:
             "budget_bound": True,
             "execution_mode_bound": True,
         },
-        "binding": {
-            "task_revision_bound": True,
-            "capabilities_subset_of_decision": True,
-            "scope_subset_of_decision": True,
-            "ttl_within_decision": True,
-            "budget_within_decision": True,
-            "expires_within_decision": True,
-            "execution_mode_matches_decision": True,
-            "decision_hash_bound": True,
-            "gates_match_decision": True,
-            "confirmation_payload_hash_bound": True,
-            "runtime_within_grant_ttl": True,
-        },
+        "binding": binding,
         "decision": {
             "decision_id": grant.decision_id,
             "decision_revision": grant.decision_revision,
@@ -1251,10 +1498,5 @@ def grant_document(grant: ExecutionGrant) -> dict[str, Any]:
             "catalog_id": grant.tool_contract_id,
             "version": grant.tool_contract_version,
             "content_hash": grant.tool_contract_hash,
-        }
-    if grant.issued_by_service_identity_id is not None:
-        document["issued_by"] = {
-            "service_identity_id": grant.issued_by_service_identity_id,
-            "authentication_method": "internal_workload_identity",
         }
     return document

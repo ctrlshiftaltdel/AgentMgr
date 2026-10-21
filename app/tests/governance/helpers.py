@@ -357,15 +357,11 @@ def publish_policy(
         session,
         document=document,
         principal=actor,
-        created_by_employee_id=org.finance.id,
-        actor_id=org.finance.id,
     )
     row = publish(
         session,
         policy_version_id=draft.id,
         principal=actor,
-        published_by_employee_id=org.finance.id,
-        actor_id=org.finance.id,
     )
     return PolicyContext(policy_set_id=policy_set_id, row=row)
 
