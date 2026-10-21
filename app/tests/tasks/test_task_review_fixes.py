@@ -1337,12 +1337,15 @@ def test_stop_rejects_malformed_evidence(session: Session, world: TaskWorld) -> 
         )
 
 
-def test_confirmation_document_includes_issued_at(
+def test_confirmation_records_issued_at(
     session: Session, world: TaskWorld
 ) -> None:
     task = submit_gated(session, world)
     session.commit()
     confirmation = pending_confirmation(session, task)
+    assert confirmation.issued_at is not None
+    # ``issued_at`` is a persisted column, not a contract ``confirmationRef``
+    # field: keeping it out of the document preserves the frozen schema.
     from app.tasks.service import _confirmation_document
 
-    assert _confirmation_document(confirmation)["issued_at"].endswith("Z")
+    assert "issued_at" not in _confirmation_document(confirmation)

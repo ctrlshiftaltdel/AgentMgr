@@ -708,7 +708,6 @@ def _confirmation_document(row: TaskConfirmation) -> dict[str, Any]:
         "purpose": row.purpose,
         "confirmed_by_principal_id": row.confirmed_by_principal_id,
         "status": row.status,
-        "issued_at": _rfc3339(_to_utc(row.issued_at)),  # type: ignore[arg-type]
         "satisfied_at": (
             _rfc3339(_to_utc(row.satisfied_at))  # type: ignore[arg-type]
             if row.satisfied_at is not None
