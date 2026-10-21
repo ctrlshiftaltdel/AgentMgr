@@ -4189,7 +4189,9 @@ def retry_task(
         "no_side_effects": False,
         "side_effects_reconciled": True,
     }
-    session.flush()
+    # No flush here: binding an active grant while the task is still ``failed``
+    # would violate terminal_state_grant_invalidated.  The state change and the
+    # grant binding must reach the database in the same UPDATE.
     try:
         _perform_transition(
             session, task, actor, event="task.retry_authorized", target="queued",
@@ -4376,7 +4378,8 @@ def reconcile_task(
             "no_side_effect_evidence": True,
             "side_effects_reconciled": True,
         }
-        session.flush()
+        # Bind and transition in one flush: an active grant on ``unknown`` is
+        # forbidden by unknown_state_grant_revoked.
         try:
             _perform_transition(
                 session, task, actor, event="reconcile.not_found", target="queued",
@@ -4704,7 +4707,6 @@ def takeover_task(
             task.policy_content_hash = rule.policy_content_hash
         task.grant_id = grant.grant_id
         task.grant_status = grant.status
-        session.flush()
         try:
             _perform_transition(
                 session, task, actor, event="human.redispatch", target="queued",
@@ -5488,7 +5490,6 @@ def resolve_owner_escalation(
     task.grant_id = grant.grant_id
     task.grant_status = grant.status
     task.result = {**dict(task.result or {}), "outcome": "none"}
-    session.flush()
     try:
         _perform_transition(
             session, task, actor, event="human.redispatch", target="queued",

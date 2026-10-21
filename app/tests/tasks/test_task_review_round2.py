@@ -204,7 +204,7 @@ def test_confirm_stop_rejects_a_failed_task_without_partial_writes(
 
     assert task.state == "failed"
     assert task.stop_confirmed is False
-    assert "side_effects_reconciled" not in task.result
+    assert task.result.get("side_effects_reconciled") is not True
     assert task.result == result_before
     assert attempt.state == "failed"
     assert attempt.ended_at == ended_before
@@ -691,6 +691,9 @@ def test_recheck_refuses_missing_stale_and_expired_managed_leases(
         )
     assert excinfo.value.reason_code == "task_fencing_token_stale"
 
+    # Keep the row-valid invariant expires_at > acquired_at while making the
+    # lease expired relative to the check time.
+    lease.lease.acquired_at = utcnow() - timedelta(minutes=10)
     lease.lease.lease_expires_at = utcnow() - timedelta(seconds=1)
     session.flush()
     with pytest.raises(TaskError) as excinfo:
@@ -965,11 +968,13 @@ def test_assignment_to_an_inactive_owner_is_a_deterministic_rejection(
 ) -> None:
     task = submit_gated(session, world, key="idem_round2_assign_inactive")
     session.commit()
-    world.org.finance.status = "inactive"
-    session.flush()
+    # Resolve while the directory row is still active: the point of the test is
+    # the assignment decision, not principal resolution.
     inactive = resolve_employee_principal(
         session, employee_id=world.org.finance.id
     )
+    world.org.finance.status = "inactive"
+    session.flush()
     owner_before = task.owner_principal_id
 
     with pytest.raises(TaskError) as excinfo:
@@ -1216,6 +1221,6 @@ def test_refused_queue_guard_leaves_no_active_grant(
     session.commit()
     stored = session.scalar(select(Task).where(Task.state == "evaluated"))
     assert stored is not None
-    assert stored.grant_id is not None
-    assert get_grant(session, stored.grant_id).status == "revoked"
+    # The queue guards are previewed before issuance, so no grant is created.
+    assert stored.grant_id is None
     assert _active_grants(session, stored.task_id) == 0

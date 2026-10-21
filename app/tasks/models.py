@@ -239,8 +239,11 @@ class Task(TimestampMixin, Base):
     owner_account_status: Mapped[str] = mapped_column(
         Text, nullable=False, server_default=text("'unknown'")
     )
+    # ``none_as_null`` is required for the SQL ``IS NULL`` constraints: without
+    # it an explicit ``None`` clears the gate as JSON ``null`` instead of SQL
+    # NULL, and ``active_state_owner_resolved`` would reject the row.
     owner_escalation: Mapped[dict[str, Any] | None] = mapped_column(
-        JSONB, nullable=True
+        JSONB(none_as_null=True), nullable=True
     )
     assignee_principal_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     executor_principal_id: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -365,10 +368,10 @@ class Task(TimestampMixin, Base):
     )
     payload_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
     confirmation_ref: Mapped[dict[str, Any] | None] = mapped_column(
-        JSONB, nullable=True
+        JSONB(none_as_null=True), nullable=True
     )
     approval_ref: Mapped[dict[str, Any] | None] = mapped_column(
-        JSONB, nullable=True
+        JSONB(none_as_null=True), nullable=True
     )
     #: Existing workflow instance used for approval (no second approval model).
     workflow_instance_id: Mapped[int | None] = mapped_column(
