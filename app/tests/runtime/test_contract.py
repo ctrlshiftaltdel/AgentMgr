@@ -12,13 +12,28 @@ class _StubAdapter:
     def capabilities(self, *, probe: bool = False):
         raise NotImplementedError
 
-    def submit_task(self, task_id, prompt, idempotency_key, instructions=None):
+    def submit_task(
+        self, task_id, prompt, idempotency_key, grant, instructions=None
+    ):
         raise NotImplementedError
 
-    def get_status(self, runtime_task_id):
+    def find_by_idempotency_key(
+        self, task_id, grant_id, idempotency_key, payload_hash=None
+    ):
         raise NotImplementedError
 
-    def poll_events(self, runtime_task_id, cursor=None, max_events=100, timeout=30.0):
+    def get_status(self, runtime_task_id, *, task_id=None):
+        raise NotImplementedError
+
+    def poll_events(
+        self,
+        runtime_task_id,
+        cursor=None,
+        max_events=100,
+        timeout=30.0,
+        *,
+        task_id=None,
+    ):
         raise NotImplementedError
 
     def cancel_task(
@@ -26,12 +41,14 @@ class _StubAdapter:
         runtime_task_id,
         *,
         reason=None,
+        idempotency_key=None,
+        task_id=None,
         poll_timeout=None,
         poll_interval=None,
     ):
         raise NotImplementedError
 
-    def get_result(self, runtime_task_id):
+    def get_result(self, runtime_task_id, *, task_id=None):
         raise NotImplementedError
 
     def provide_input(
@@ -92,6 +109,12 @@ def test_submit_cancel_result_and_health_outcomes() -> None:
         "timeout",
         "unknown",
         "conflict",
+    }
+    assert {item.value for item in contract.LookupOutcome} == {
+        "found",
+        "not_found",
+        "conflict",
+        "unknown",
     }
     assert {item.value for item in contract.CancelOutcome} == {
         "requested",
@@ -162,6 +185,56 @@ def test_capability_snapshot_lookup() -> None:
         contract.CapabilityStatus.UNVERIFIED
     )
     assert snapshot.capability("runtime.isolation") is None
+
+
+def test_runtime_grant_projection_is_server_resolved_shape() -> None:
+    grant = contract.RuntimeGrant(
+        grant_id="grnt_test_0001",
+        task_id="task_test_0001",
+        task_revision=3,
+        execution_mode="managed_execution",
+        capabilities=("expense.read@1.0.0",),
+        resource_scope={
+            "scope_type": "self",
+            "resource_ids": ["res_0001"],
+            "data_classifications": ["internal"],
+        },
+        expires_at=datetime(2027, 1, 1, tzinfo=UTC),
+    )
+    assert grant.is_expired(now=datetime(2026, 1, 1, tzinfo=UTC)) is False
+    assert grant.is_expired(now=datetime(2028, 1, 1, tzinfo=UTC)) is True
+    assert contract.RuntimeGrant(
+        grant_id="grnt_test_0002",
+        task_id="task_test_0001",
+        task_revision=1,
+        execution_mode="managed_execution",
+        capabilities=("expense.read@1.0.0",),
+        resource_scope={"scope_type": "self"},
+        expires_at=None,
+    ).is_expired() is True
+
+
+def test_lookup_result_is_neutral_and_serialisable() -> None:
+    result = contract.LookupResult(
+        outcome=contract.LookupOutcome.FOUND,
+        runtime_task_id="rtask_0001",
+        payload_hash="sha256:" + "0" * 64,
+        observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    assert result.outcome is contract.LookupOutcome.FOUND
+    assert "hermes" not in repr(result).lower()
+
+
+def test_runtime_event_may_omit_time_without_fabrication() -> None:
+    event = contract.RuntimeEvent(
+        event_id="1",
+        occurred_at=None,
+        type="progress",
+        payload={},
+        redacted=False,
+    )
+    assert event.occurred_at is None
+    assert event.redacted is False
 
 
 def test_runtime_error_info_is_safe_and_serialisable() -> None:

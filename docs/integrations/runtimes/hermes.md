@@ -14,9 +14,12 @@
 > contract. It does not write task state, issue or accept Grants, expose Hermes
 > profile/database/session internals, or claim OS-level isolation.
 >
-> **Evidence split.** Mock tests prove the adapter/contract mapping. Only the
-> real-runtime spike in the evidence document can support a compatibility label;
-> a mock-only run must never be presented as runtime compatibility.
+> **Evidence split.** Mock tests prove the adapter/contract mapping. Only a
+> **committed real-runtime contract suite run recorded with command, exit code,
+> runtime version and commit SHA** can support `verified`. No such run is
+> recorded yet: the manual 0.22.1 spike is **partial evidence**, so every
+> supported capability is `partially_verified`, and mock tests must never be
+> presented as runtime compatibility.
 
 ## 1. Setup
 
@@ -39,10 +42,25 @@ export HERMES_API_KEY='<api-key>'
 `HERMES_API_URL` must be an absolute `http`/`https` URL and must not embed
 credentials. The adapter never reads a Hermes profile, `.env`, session file or
 `~/.hermes`; it only uses the two variables above. Missing or invalid values
-raise `RuntimeUnavailable` at construction time.
+raise `RuntimeUnavailable` at construction time. Leading/trailing whitespace in
+the key is stripped; embedded whitespace is rejected.
 
 For TLS deployments, terminate TLS at the API server or a trusted local proxy
 and keep the key out of command history, repository files and logs.
+
+### Test-only compatibility opt-in
+
+`managed_execution` is **unverified** because Hermes cannot enforce per-tool
+capability/scope, task-scoped credentials or OS isolation. `submit_task` therefore
+returns `SubmitOutcome.UNSUPPORTED` by default. The approved compatibility suite
+may set:
+
+```bash
+export HERMES_ALLOW_UNVERIFIED_MANAGED_EXECUTION=1
+```
+
+This flag is for the isolated test host only. It must remain unset in every real
+deployment until Issue #82 provides a controlled execution environment.
 
 ## 2. Endpoints and authentication
 
@@ -51,65 +69,111 @@ and keep the key out of command history, repository files and logs.
 | Liveness | `GET /health` | none | `health()` |
 | Capabilities/version | `GET /v1/capabilities` | Bearer | `capabilities(probe=True)`, `health()` |
 | Submit | `POST /v1/runs` | Bearer + `Idempotency-Key` | `submit_task()` |
+| Lookup (local only) | `POST /v1/runs` replay | Bearer + `Idempotency-Key` | `find_by_idempotency_key()` |
 | Status | `GET /v1/runs/{id}` | Bearer | `get_status()` |
 | Events | `GET /v1/runs/{id}/events` (SSE) | Bearer | `poll_events()` |
 | Stop | `POST /v1/runs/{id}/stop` | Bearer | `cancel_task()` |
-| Approval (partial) | `POST /v1/runs/{id}/approval` | Bearer | `resolve_approval()` |
-| Unknown resolution (partial) | `POST /v1/runs/{id}/resolve-unknown` | Bearer | `resolve_unknown()` |
+| Approval (unverified) | `POST /v1/runs/{id}/approval` | Bearer | `resolve_approval()` |
+| Unknown resolution (unverified) | `POST /v1/runs/{id}/resolve-unknown` | Bearer | `resolve_unknown()` |
 
 Authentication is `Authorization: Bearer <API_SERVER_KEY>`. The adapter sends
-that header only to the configured API URL. It never logs headers, request
-bodies or the key.
+that header only to the configured API URL. **Redirects are refused**: the
+transport uses a custom opener whose redirect handler returns `None`, so a 3xx
+is surfaced as an ordinary response and mapped to `unknown`; the bearer key is
+never replayed to a `Location` target. Do not add a redirect-following opener.
 
 HTTP errors map to stable adapter errors:
 
 | HTTP | Adapter error | Meaning |
 |---|---|---|
 | 401 | `RuntimeAuthError` (`unauthorized`) | missing/rejected key |
-| 403 | `RuntimeAuthError` (`forbidden`) | key lacks access |
+| 403 | `RuntimeAuthError` (`forbidden`) | key lacks access / Grant rejected |
 | 404 | `RuntimeNotFound` (or `RuntimeState.NOT_FOUND` from status) | unknown run |
+| 408/504 | `RuntimeTimeout` (`timeout`) | request/gateway timeout; acceptance ambiguous |
 | 409 | `RuntimeConflict` | idempotency/payload or execution conflict |
 | 429 | `RuntimeRateLimited` | max concurrent runs / quota |
 | 503 | `RuntimeUnavailable` | drain, storage or dependency failure |
-| 400/415/422 | `RuntimeProtocolError` | malformed request/response |
+| 400/415/422 | `RuntimeProtocolError` | malformed request (submit returns `rejected`) |
 | 405/501 | `RuntimeUnsupported` | operation not available |
+| 3xx | `RuntimeUnknown` | redirect refused; request outcome ambiguous |
+
+`submit_task` returns `SubmitResult` for the definite `rejected`/`unsupported`/
+`conflict` outcomes. Auth, rate-limit and 503 failures raise the corresponding
+stable exception. Timeouts, connection drops and malformed 2xx bodies are
+ambiguous and are returned as `timeout`/`unknown` with the idempotency key
+preserved.
 
 ## 3. Capability labels
 
 The static labels below are returned by `capabilities()`. They come from the
-0.22.1 real-runtime spike and the committed contract tests. `capabilities(probe=True)`
-adds the live `runtime_version` from `/v1/capabilities` and marks it
-`runtime_self_reported`; the adapter never upgrades a label just because a live
-probe answered.
+**partial** 0.22.1 real-runtime spike and the committed mock contract tests.
+`capabilities(probe=True)` adds the live `runtime_name`/`runtime_version` from
+`/v1/capabilities` and marks the version `runtime_self_reported`; the adapter
+never upgrades a label just because a live probe answered.
 
 | Capability | Status | Notes |
 |---|---|---|
-| `task.submit` | `verified` | `POST /v1/runs` returns 202 + opaque `run_id`; replay/conflict paths covered. |
-| `task.status` | `verified` | `GET /v1/runs/{id}`; vendor status mapped below. |
-| `task.events.poll` | `verified` | SSE sequence ids + keepalive comments; client-side cursor. |
-| `task.cancel` | `verified` | Stop requested vs stop confirmed are distinct. |
-| `task.result` | `verified` | Text output/usage/runtime only; `structured_result=false`. |
-| `runtime.health` | `verified` | `/health` plus authenticated `/v1/capabilities`. |
+| `task.submit` | `partially_verified` | Manual spike + mock tests only; real suite not recorded. Requires a server-resolved Grant. |
+| `task.status` | `partially_verified` | Manual spike + mock tests only; real suite not recorded. |
+| `task.events.poll` | `partially_verified` | SSE sequence ids + keepalive. Last-Event-ID support unconfirmed; client-side filtering may miss events older than the 5-minute buffer. |
+| `task.cancel` | `partially_verified` | Stop requested vs stop confirmed are distinct. |
+| `task.result` | `partially_verified` | Text output/usage/runtime only; no independent evidence, so completion is `partial_success`. |
+| `runtime.health` | `partially_verified` | `/health` plus authenticated `/v1/capabilities`; manual spike only. |
 | `task.events.subscribe` | `unverified` | The adapter polls a bounded SSE stream; no durable subscription. |
-| `task.lookup` | `unverified` | No lookup-by-idempotency-key endpoint; see §4.1. |
+| `task.lookup` | `unverified` | No lookup endpoint; process-local submission map + exact POST replay only. |
 | `task.input.provide` | `unverified` | No generic input contract; unsupported. |
-| `task.approval.resolve` | `partially_verified` | Endpoint exists; not triggered end-to-end in the spike. |
-| `task.unknown.resolve` | `partially_verified` | Endpoint exists; not triggered end-to-end in the spike. |
-| `runtime.isolation` | `partially_verified` | Logical session isolation only, not an OS boundary. |
+| `task.approval.resolve` | `unverified` | Endpoint exists; not triggered end-to-end in the spike. |
+| `task.unknown.resolve` | `unverified` | Endpoint exists; not triggered end-to-end in the spike. |
+| `runtime.isolation` | `unverified` | Logical session association only; no OS-level evidence. |
 | `runtime.task_scoped_credentials` | `unverified` | No per-run credential injection. |
 | `runtime.tool_permissions` | `unverified` | No per-run tool allowlist; full configured toolset. |
 | `runtime.managed_execution` | `unverified` | Host toolset + no task credentials + no OS isolation. |
 | `runtime.structured_events` | `partially_verified` | SSE framing is stable; payload is opaque JSON with redaction. |
 
-`unverified` is the fail-closed label: the core must not schedule a capability
-whose status is not `verified` (or explicitly accept the documented
-`partially_verified` limitation).
+The labels are fail-closed: the core must not schedule a capability unless its
+status and documented limitations are explicitly accepted. `unverified` is never
+sufficient.
+
+**Probe binding.** A probe that reports a different runtime **name** downgrades
+every label to `unverified`; a different **version** adds an explicit limitation
+to every non-unverified label. This prevents reusing 0.22.1 evidence for another
+build or product.
 
 ## 4. Semantics
 
-### 4.1 Submit and idempotency
+### 4.1 Submit and Grant validation
 
-`submit_task(task_id, prompt, idempotency_key, instructions=None)` sends:
+```python
+submit_task(
+    task_id: str,
+    prompt: str,
+    idempotency_key: str,
+    grant: RuntimeGrant,
+    instructions: str | None = None,
+) -> SubmitResult
+```
+
+`RuntimeGrant` is the **server-resolved projection** defined in
+`app/runtime/contract.py`: `grant_id`, `task_id`, `task_revision`,
+`execution_mode`, `capabilities`, `resource_scope`, `expires_at`. The adapter
+never resolves an arbitrary `grant_ref`, never reads a Grant from the prompt or
+client payload, and never widens scope. It enforces what it locally can:
+
+- `grant.task_id` must equal `task_id` (otherwise `forbidden`);
+- `task_revision` must be a positive integer;
+- `execution_mode` must be `managed_execution` (B3 only);
+- `expires_at` must be present and in the future;
+- `capabilities` must be non-empty, well-formed, duplicate-free, and must not
+  name adapter-level capabilities such as `runtime.tool_permissions`;
+- `resource_scope.scope_type` must be an authorising value (not
+  `none`/`undetermined`) and must declare `data_classifications`.
+
+`managed_execution` itself remains `unverified`: without the test-only opt-in the
+submit returns `SubmitOutcome.UNSUPPORTED` and sends nothing. Hermes cannot
+enforce per-tool capability or resource scope, task-scoped credentials, or OS
+isolation; these fields are binding/audit metadata, not runtime enforcement.
+
+The POST body is:
 
 ```json
 {
@@ -126,28 +190,41 @@ with `Idempotency-Key: <idempotency_key>`. A new run returns 202:
 ```
 
 The same key with the same payload returns the **same** `run_id` and
-`replayed=true`. The same key with a different payload returns 409 → the
-adapter raises `RuntimeConflict`.
+`replayed=true`. The same key with a different payload returns 409 → the adapter
+returns `SubmitOutcome.CONFLICT`.
 
-**Timeout/connection ambiguity.** Hermes has no independent
-`find_by_idempotency_key` endpoint. The adapter therefore retries the exact same
-POST (same key, same body) up to `submit_attempts` (default 2). This is an
-idempotent replay, not a new submission. If the result is still ambiguous it
-returns:
+**Timeout/connection ambiguity.** Hermes has no independent lookup endpoint. The
+adapter stores the exact key/body in a process-local map, retries the same POST
+(same key, same body) up to `submit_attempts` (default 2), and then returns
+`timeout`/`unknown`. It never generates a new key and never reports `accepted`
+without a `run_id`. `accepted_at` is `None` when the runtime omitted it.
 
-- `SubmitOutcome.TIMEOUT` for a request timeout;
-- `SubmitOutcome.UNKNOWN` for a pre-response connection failure.
+### 4.2 `find_by_idempotency_key`
 
-It never generates a new key and never reports `accepted` without a `run_id`.
-This is the documented adapter deviation from contract §3.2; the core still must
-not blind-resubmit after an ambiguous result.
+```python
+find_by_idempotency_key(
+    task_id, grant_id, idempotency_key, payload_hash=None
+) -> LookupResult
+```
 
-`session_id` is the AgentMgr task id. It is a **logical** association, not an OS
-identity or sandbox.
+Because Hermes has no lookup endpoint, the adapter can only query its
+**process-local** submission map. It replays the exact stored POST with the same
+`Idempotency-Key` and body; it never sends a request for a key it has not seen
+(which would create a new run). Outcomes:
 
-### 4.2 Status mapping
+| Result | Meaning |
+|---|---|
+| `found` | The replay returned the same `run_id`; the payload hash is returned. |
+| `not_found` | The runtime answered 404 to the replay. |
+| `conflict` | The supplied `payload_hash` differs, the replay returned 409, or the replayed `run_id` differs. |
+| `unknown` | No local record (not proof of absence), timeout, transport failure or malformed response. |
 
-`get_status()` maps vendor status strings into the frozen neutral states:
+The map is **not durable across restarts**, so `task.lookup` stays `unverified`.
+The core must not treat `unknown` as "no task exists" and must not blind-resubmit.
+
+### 4.3 Status mapping
+
+`get_status(runtime_task_id, *, task_id=None)` maps vendor status strings:
 
 | Hermes status | Neutral state | `stop_confirmed` | Notes |
 |---|---|---|---|
@@ -155,79 +232,99 @@ identity or sandbox.
 | `running` | `running` | false | execution evidence |
 | `waiting_for_approval` | `waiting_input` | false | `input_required=true` |
 | `stopping` | `running` | false | **not stopped**; keep polling |
-| `completed` | `completed` | true | execution ended; core still verifies |
-| `failed` | `failed` | true | terminal failure |
-| `cancelled` | `stopped` | true | only here may the core treat it as stopped |
+| `completed` | `completed` | false | terminal; core still verifies |
+| `failed` | `failed` | false | terminal failure; not a confirmed stop |
+| `cancelled` | `stopped` | true | runtime stop evidence |
+| `timed_out` | `timed_out` | true | runtime timeout evidence |
 | `interrupted` | `unknown` | false | ambiguous; fail closed |
 | `unknown` | `unknown` | false | fail closed |
 | unrecognized | `unknown` | false | external status preserved |
 
-The frozen contract has no intermediate `stopping` state, so the adapter reports
-it as still running and explicitly leaves `stop_confirmed=false`. The core must
-not display it as stopped.
+**Task binding.** Pass `task_id` to require the run's `session_id` to match. A
+cross-task handle raises `forbidden` (`task_binding_mismatch`); a run without a
+binding raises `forbidden` (`task_binding_unverifiable`). When no `task_id` is
+supplied, `session_id` is **not** returned, because the adapter cannot verify it.
 
 `get_status()` returns only safe fields: `state`, `external_state`, `observed_at`,
-`heartbeat_at`, `progress`, `output` (text), `usage`, `runtime` label,
-`session_id` and a structured error. It does not expose `pending_controls`,
-`admission_id`, `execution_generation`, profile paths or internal objects.
-A 404 becomes `RuntimeState.NOT_FOUND` (the core treats it as unknown and starts
-reconciliation).
+`heartbeat_at`, `progress`, redacted `output`, `usage`, `runtime` label, a
+verified `session_id` and a structured error. It does not expose
+`pending_controls`, `admission_id`, `execution_generation`, profile paths or
+internal objects. A 404 becomes `RuntimeState.NOT_FOUND`; a malformed/ambiguous
+2xx becomes `unknown`, not an exception.
 
-### 4.3 Events (SSE)
+### 4.4 Events (SSE)
 
-`poll_events(run_id, cursor=None, max_events=100, timeout=30.0)` reads
-`text/event-stream`:
+`poll_events(run_id, cursor=None, max_events=100, timeout=30.0, *, task_id=None)`
+reads `text/event-stream`:
 
 - `id:` is the sequence number and becomes the client-side cursor;
-- `: keepalive` comment lines are ignored;
+- `: keepalive` comments are ignored, but **each keepalive advances the poll
+  deadline**, so a keepalive-only stream cannot hang past `timeout`;
+- the remaining time is used as the socket timeout;
 - multi-line `data:` fields are joined with `\n`;
 - `event:`/JSON `type` become the neutral event type;
+- `occurred_at` is `None` when the runtime omitted it (never fabricated);
 - event buffers expire after **5 minutes** on the runtime; reconnect from the
   last sequence id before expiry.
 
-The returned `EventBatch.next_cursor` is the highest observed sequence id (or the
-input cursor when nothing new arrived). Replaying a cursor is stable. Payloads
-are recursively redacted for obvious credential keys and `Authorization`-style
-strings before they leave the adapter; `redacted=true` means this sanitisation
-ran, not that the payload is a stable business schema.
+When a cursor is supplied the adapter sends the standard `Last-Event-ID` header,
+but Hermes did not confirm honoring it in the spike. Client-side filtering is
+therefore authoritative; reconnect can miss events that already expired. This is
+why `task.events.poll` is `partially_verified`.
 
-A read timeout with no events returns an empty batch with
+Payloads are recursively redacted for credential keys (including normalized
+`x-api-key`, `api-key`, `cookie`, `set-cookie`, `jwt`, `session`, token/password/
+secret/authorization names) and embedded `Authorization:`/`token=` strings.
+`redacted=true` is set **only when a value was actually filtered**. A clean event
+has `redacted=false`; the core must not interpret that as a stable business
+schema. Usage counters such as `input_tokens` are not credentials and stay
+readable.
+
+`has_more` is true only when an additional event was actually observed beyond
+`max_events`. A read timeout with no events returns an empty batch with
 `error.code=timeout`; it is not a fake success. Missing runs raise
 `RuntimeNotFound`.
 
-### 4.4 Cancel
+### 4.5 Cancel
 
-`cancel_task()` POSTs `/stop` and then polls status until terminal or the bounded
-`poll_timeout` expires:
+`cancel_task(run_id, *, reason=None, idempotency_key=None, task_id=None,
+poll_timeout=None, poll_interval=None)` POSTs `/stop` with `Idempotency-Key` and
+then polls status until terminal or the bounded `poll_timeout` expires:
 
 | Situation | Adapter outcome | `stop_confirmed` |
 |---|---|---|
 | stop returned `stopping`, later `cancelled` | `stopped` | true |
-| stop returned a terminal `completed`/`failed` | `already_terminal` | true |
+| stop returned `timed_out` | `already_terminal` | true |
+| stop returned a terminal `completed`/`failed` | `already_terminal` | false |
 | still `stopping` at the poll deadline | `requested` | false |
+| stop accepted, confirmation poll failed | `requested` | false |
 | stop endpoint 405/501 | `unsupported` | false |
-| unknown/ambiguous run | `unknown` or `RuntimeNotFound` | false |
+| 409 race (run completed while stopping) | status-derived | false unless cancelled/timed_out |
+| ambiguous response / unknown run | `unknown` | false |
 
 A request is never a stop. The core may enter `cancel_requested` on `requested`
 but must not enter `cancelled` until a later `get_status()` proves `cancelled`
-(or an equivalent stop evidence exists).
+(or an equivalent stop evidence exists). If `task_id` is supplied, the binding is
+checked before the stop is sent; a cross-task handle never reaches `/stop`.
 
-### 4.5 Result
+### 4.6 Result
 
-`get_result()` returns the runtime's free-text output plus `usage`, `runtime` and
-an opaque `result_ref`. It sets:
+`get_result(run_id, *, task_id=None)` returns the runtime's free-text output plus
+`usage`, `runtime` and an opaque `result_ref`. It sets:
 
 - `structured_result=false`;
 - `structured_payload=null`;
 - `artifacts=()`, `evidence_refs=()`, `verification_hints=()`;
-- `stop_confirmed=true` only for a terminal `completed`/`failed`/`cancelled`
-  status.
+- `outcome=partial_success` for a completed run, because there are no
+  independent evidence refs; it is **not** a verified business result;
+- `stop_confirmed=true` only for `cancelled`/`timed_out`;
+- `completed_at=null` when the runtime omitted it.
 
-The core must still apply `goal.completion_criteria`; "the runtime said
-completed" is not a verified business result. A non-terminal run returns
-`ResultOutcome.UNKNOWN`, not a fabricated result.
+`summary`/`output` are redacted and truncated; the core must still apply
+`goal.completion_criteria`. A non-terminal run returns `ResultOutcome.UNKNOWN`,
+not a fabricated result. Cross-task handles are rejected as in `get_status`.
 
-### 4.6 Health
+### 4.7 Health
 
 `health()` calls `GET /health` (unauthenticated) and then
 `GET /v1/capabilities` (Bearer):
@@ -237,28 +334,36 @@ completed" is not a verified business result. A non-terminal run returns
 - auth failure, 5xx/drain, 404 or transport failure → `unavailable`.
 
 `details` contains only booleans, HTTP statuses and a stable reason code. It
-never contains the key, headers or a response body. The core must not submit new
-tasks when health is `unavailable`.
+never contains the key, headers or a response body. Unexpected errors are caught
+and reported as `reason=unknown`; health never raises. The core must not submit
+new tasks when health is `unavailable`.
 
 ## 5. Limitations and remaining risk
 
 1. **Full host toolset.** The runtime exposes its configured tools, including
    terminal access. There is no per-run tool permission or allowlist.
-2. **No per-task credentials.** The adapter cannot inject short-lived,
+2. **Hermes tools bypass the AgentMgr PEP.** Tool calls executed inside Hermes do
+   **not** pass through the AgentMgr policy enforcement point. Until Issue #82
+   provides controlled execution, the adapter cannot claim that tool scope is
+   enforced. Managed execution and `runtime.tool_permissions` stay `unverified`.
+3. **No per-task credentials.** The adapter cannot inject short-lived,
    task-scoped credentials; Hermes uses its own configured credentials.
-3. **Logical session isolation only.** `session_id` separates conversations, not
-   OS users, filesystems, process trees or network egress.
-4. **Managed Execution is unverified.** The adapter does not claim a sandbox or
-   host boundary; `runtime.managed_execution` stays `unverified`.
-5. **Structured results are absent.** Only text + usage are available.
-6. **Approval/unknown controls are partial.** The endpoints exist, but their
-   request/response schemas were not exercised end-to-end in the spike.
-7. **Events expire.** SSE buffers are retained for about five minutes; a slow
+4. **Logical session binding only.** `session_id` associates a run with the
+   AgentMgr task id; it is not an OS user, filesystem, process or network
+   boundary.
+5. **Managed Execution is unverified.** Submissions are rejected by default until
+   the explicit test-only opt-in or Issue #82.
+6. **Structured results are absent.** Only text + usage are available;
+   completion is `partial_success`.
+7. **Approval/unknown controls are unverified.** The endpoints exist, but their
+   request/response schemas were not exercised end-to-end. Only core-resolved
+   opaque references are accepted; arbitrary payloads are rejected.
+8. **Events expire.** SSE buffers are retained for about five minutes; a slow
    consumer can lose events and must cross-check status/result.
-8. **No durable subscription.** Reconnect uses a last-event id/cursor; it is not
-   an at-least-once durable queue.
-9. **No `find_by_idempotency_key` endpoint.** A submit retry must replay the same
-   POST with the same key and payload.
+9. **No durable subscription or lookup.** Reconnect uses a client-side cursor;
+   the submission map is process-local and lost on restart.
+10. **No recorded real contract suite.** Until the Master records a run with
+    command/exit code/version/SHA, no label may be `verified`.
 
 ## 6. Integration test
 
@@ -270,10 +375,11 @@ export HERMES_API_KEY='<api-key>'
 uv run pytest app/tests/runtime/test_hermes_integration.py -q
 ```
 
-It performs a health check, a short "reply with OK" run, an idempotency replay,
-and (only with `HERMES_INTEGRATION_STOP=1`) a stop scenario. It never writes a
-token, host or profile path into the repository or test output. Mock tests run
-without any runtime or database credentials:
+It performs a health check (asserting `healthy`), a default refusal of
+`managed_execution`, a short "reply with OK" run under the test-only opt-in, an
+idempotency replay, and (only with `HERMES_INTEGRATION_STOP=1`) a stop scenario.
+It never writes a token, host or profile path into the repository or test output.
+Mock tests run without any runtime or database credentials:
 
 ```bash
 uv run pytest app/tests/runtime/test_hermes_adapter.py -q
@@ -286,8 +392,11 @@ uv run pytest app/tests/runtime/test_hermes_adapter.py -q
 - The Hermes API key is a runtime control credential, not a business Grant. It
   never enters a task prompt, event payload, audit message or log.
 - The adapter does not accept a client/model-supplied Grant, capability or
-  scope; the core resolves and re-validates the Grant before calling it.
-- Business tool calls remain subject to the PEP; this adapter does not replace
-  the PEP or the task state machine.
+  scope; it only accepts the server-resolved `RuntimeGrant` projection and
+  re-checks the local invariants.
+- Redirects are refused and buffered response bodies are size-limited; a
+  truncated body maps to `unknown`.
+- Business tool calls executed **inside Hermes** bypass the PEP until controlled
+  execution (#82) exists; the adapter does not replace the PEP.
 - Run the API server on a private address with a network allowlist and TLS (or a
   trusted local proxy). Rotate `API_SERVER_KEY` as a normal secret.

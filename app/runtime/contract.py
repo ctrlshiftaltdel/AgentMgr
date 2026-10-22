@@ -35,12 +35,15 @@ __all__ = [
     "HealthStatus",
     "InputOutcome",
     "InputResult",
+    "LookupOutcome",
+    "LookupResult",
     "ResultOutcome",
     "RuntimeAdapter",
     "RuntimeCapabilities",
     "RuntimeCapability",
     "RuntimeErrorInfo",
     "RuntimeEvent",
+    "RuntimeGrant",
     "RuntimeResult",
     "RuntimeState",
     "RuntimeType",
@@ -188,6 +191,15 @@ class HealthStatus(str, Enum):
     UNAVAILABLE = "unavailable"
 
 
+class LookupOutcome(str, Enum):
+    """Contract section 3.2 lookup-by-idempotency-key outcomes."""
+
+    FOUND = "found"
+    NOT_FOUND = "not_found"
+    CONFLICT = "conflict"
+    UNKNOWN = "unknown"
+
+
 @dataclass(frozen=True, slots=True)
 class RuntimeErrorInfo:
     """A safe, structured error attached to a normal result object.
@@ -233,6 +245,7 @@ class RuntimeCapabilities:
     version_source: VersionSource
     capabilities: tuple[Capability, ...]
     observed_at: datetime
+    runtime_name: str | None = None
 
     def capability(self, name: RuntimeCapability | str) -> Capability | None:
         wanted = name.value if isinstance(name, RuntimeCapability) else name
@@ -240,6 +253,54 @@ class RuntimeCapabilities:
             if item.name == wanted:
                 return item
         return None
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeGrant:
+    """Server-resolved execution Grant projection (contract section 3.1).
+
+    This is **not** a client-supplied authorisation object.  It is the minimal,
+    already-verified projection that AgentMgr core resolves from the authoritative
+    Grant before calling the adapter.  The adapter re-checks the local invariants
+    it can enforce (task/revision/expiry/mode/shape) and never treats the
+    projection as permission to widen scope.
+
+    Hermes cannot enforce per-tool capability or resource scope: the runtime
+    executes with its full configured toolset.  The adapter therefore records
+    those fields for binding/audit only; enforcement is a core/#82 concern.
+    """
+
+    grant_id: str
+    task_id: str
+    task_revision: int
+    execution_mode: str
+    capabilities: tuple[str, ...]
+    resource_scope: Mapping[str, Any]
+    expires_at: datetime | None
+
+    def is_expired(self, *, now: datetime | None = None) -> bool:
+        if self.expires_at is None:
+            return True
+        current = now or datetime.now(tz=self.expires_at.tzinfo)
+        return self.expires_at <= current
+
+
+@dataclass(frozen=True, slots=True)
+class LookupResult:
+    """Contract section 3.2 lookup response.
+
+    A runtime without a lookup endpoint may only answer from adapter-local
+    submission state.  ``not_found`` is a definite query answer; it must never be
+    produced merely because the adapter has no local record.
+    """
+
+    outcome: LookupOutcome
+    runtime_task_id: str | None = None
+    reported_state: str | None = None
+    payload_hash: str | None = None
+    accepted_at: datetime | None = None
+    observed_at: datetime | None = None
+    error: RuntimeErrorInfo | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,13 +340,18 @@ class StatusResult:
 
 @dataclass(frozen=True, slots=True)
 class RuntimeEvent:
-    """One typed event from contract section 3.4."""
+    """One typed event from contract section 3.4.
+
+    ``occurred_at`` is ``None`` when the runtime did not report an event time;
+    the adapter does not fabricate one.  ``redacted`` is true only when the
+    payload was actually filtered before leaving the adapter.
+    """
 
     event_id: str | None
-    occurred_at: datetime
+    occurred_at: datetime | None
     type: str
     payload: Mapping[str, Any]
-    redacted: bool = True
+    redacted: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -388,13 +454,36 @@ class RuntimeAdapter(Protocol):
         task_id: str,
         prompt: str,
         idempotency_key: str,
+        grant: RuntimeGrant,
         instructions: str | None = None,
     ) -> SubmitResult:
-        """Submit one task and return an opaque runtime handle or ambiguity."""
+        """Submit one task under a server-resolved Grant.
+
+        Definite ``rejected``/``unsupported``/``conflict`` outcomes are returned
+        on the result object.  Definite auth/rate-limit/unavailable failures
+        raise a stable :class:`app.runtime.errors.RuntimeAdapterError`; an
+        ambiguous send (timeout/connection loss/malformed 2xx) returns
+        ``timeout`` or ``unknown`` and preserves the idempotency key.
+        """
         ...
 
-    def get_status(self, runtime_task_id: str) -> StatusResult:
-        """Return the mapped status and safe runtime facts."""
+    def find_by_idempotency_key(
+        self,
+        task_id: str,
+        grant_id: str,
+        idempotency_key: str,
+        payload_hash: str | None = None,
+    ) -> LookupResult:
+        """Look up an earlier submission before any ambiguous retry."""
+        ...
+
+    def get_status(
+        self,
+        runtime_task_id: str,
+        *,
+        task_id: str | None = None,
+    ) -> StatusResult:
+        """Return the mapped status, checking the optional task binding."""
         ...
 
     def poll_events(
@@ -403,6 +492,8 @@ class RuntimeAdapter(Protocol):
         cursor: str | None = None,
         max_events: int = 100,
         timeout: float = 30.0,
+        *,
+        task_id: str | None = None,
     ) -> EventBatch:
         """Poll the runtime event stream from a client-side cursor."""
         ...
@@ -412,13 +503,20 @@ class RuntimeAdapter(Protocol):
         runtime_task_id: str,
         *,
         reason: str | None = None,
+        idempotency_key: str | None = None,
+        task_id: str | None = None,
         poll_timeout: float | None = None,
         poll_interval: float | None = None,
     ) -> CancelResult:
         """Request cancellation and report whether a stop is confirmed."""
         ...
 
-    def get_result(self, runtime_task_id: str) -> RuntimeResult:
+    def get_result(
+        self,
+        runtime_task_id: str,
+        *,
+        task_id: str | None = None,
+    ) -> RuntimeResult:
         """Return the runtime result without claiming business verification."""
         ...
 

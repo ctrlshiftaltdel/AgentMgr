@@ -47,6 +47,10 @@ def error_code_for_http_status(status: int) -> ErrorCode:
         return ErrorCode.FORBIDDEN
     if status == 404:
         return ErrorCode.NOT_FOUND
+    if status == 408 or status == 504:
+        # Request/gateway timeout: the request may have reached the runtime.
+        # Callers must treat acceptance as ambiguous, never as a definite reject.
+        return ErrorCode.TIMEOUT
     if status == 409:
         return ErrorCode.CONFLICT
     if status == 429:

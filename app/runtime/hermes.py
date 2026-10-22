@@ -1,40 +1,63 @@
-"""Hermes Runtime Adapter (B3) over the verified ``/v1/runs`` API.
+"""Hermes Runtime Adapter (B3) over the ``/v1/runs`` API.
 
 Design basis
 ============
 * ``docs/contracts/runtime-adapter.md`` -- frozen, runtime-neutral contract.
-* ``docs/research/runtime-compatibility/hermes-0.22.1.md`` -- spike evidence
-  for the endpoints, statuses, idempotency and SSE framing used below.
+* ``docs/research/runtime-compatibility/hermes-0.22.1.md`` -- **partial** spike
+  evidence for the endpoints, statuses, idempotency and SSE framing below.
 
 The adapter talks to the Hermes API server with the standard library only.  It
 does not import Hermes modules, read its profile, database or session files, or
-assume any host path.  ``runtime_task_id`` values are opaque; the only stable
-AgentMgr-side association is the ``session_id`` sent at submission time (the
-AgentMgr task id).
+assume any host path.  ``runtime_task_id`` values are opaque.  The AgentMgr task
+id is sent as the Hermes ``session_id`` and is the only task binding Hermes can
+provide; it is a logical association, not an OS identity.
+
+Honesty rules
+=============
+* No capability is ``verified``: a committed contract test suite has not been
+  run against a real runtime and recorded with command/exit code/version/SHA.
+  The labels are ``partially_verified`` or ``unverified``.
+* Hermes cannot enforce per-tool capability or resource scope, task-scoped
+  credentials, or OS isolation.  Its internal tool calls do **not** pass through
+  the AgentMgr PEP until Issue #82 provides a controlled execution environment.
+* ``submit_task`` requires a server-resolved :class:`RuntimeGrant`.  It rejects
+  expired/task-mismatched/inconsistent grants.  ``managed_execution`` is
+  unverified and is therefore rejected by default unless an explicit,
+  test-only compatibility opt-in is set.
 
 Ambiguity policy
 ================
 * A submit timeout or connection drop may mean "accepted but response lost".
-  The adapter retries the *same* POST with the *same* ``Idempotency-Key`` and
-  payload (Hermes replays the original ``run_id``), and after the bounded retry
-  budget returns ``SubmitResult.outcome=timeout|unknown``.  It never generates
-  a new key and never claims rejection.
-* ``POST /stop`` returning ``stopping`` is **not** a stop.  ``cancel_task``
-  polls until the runtime reports ``cancelled`` (or another terminal status)
-  before setting ``stop_confirmed=true``; otherwise it returns ``requested``.
-* The runtime's "completed" is reported as ``succeeded`` at the adapter layer
-  only in the sense of "execution finished"; ``structured_result=false`` tells
-  the core that no business result schema or independent evidence exists.
+  The adapter stores the original key/body, retries the *same* POST with the
+  *same* ``Idempotency-Key`` and payload (Hermes replays the original
+  ``run_id``), and after the bounded retry budget returns
+  ``SubmitResult.outcome=timeout|unknown``.  It never generates a new key and
+  never claims rejection.
+* ``find_by_idempotency_key`` can only answer from the process-local submission
+  map because Hermes has no lookup endpoint.  It replays the exact POST with the
+  stored key.  The map is not durable across restarts; this limitation is why
+  ``task.lookup`` stays ``unverified``.
+* ``POST /stop`` returning ``stopping`` is **not** a stop.  ``cancel_task`` polls
+  until the runtime reports ``cancelled``/``timed_out`` before setting
+  ``stop_confirmed=true``; ``completed``/``failed`` are terminal but are not a
+  confirmed *stop*.
+* A malformed 2xx response is ambiguous, not a definite failure: submit maps to
+  ``unknown``, status/result to ``unknown``, and cancel to ``unknown``.
+* Redirects are refused by the transport so the bearer key never follows a
+  ``Location`` header to another origin.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
+import threading
 import time
 import urllib.parse
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -52,11 +75,14 @@ from app.runtime.contract import (
     HealthStatus,
     InputOutcome,
     InputResult,
+    LookupOutcome,
+    LookupResult,
     ResultOutcome,
     RuntimeCapabilities,
     RuntimeCapability,
     RuntimeErrorInfo,
     RuntimeEvent,
+    RuntimeGrant,
     RuntimeResult,
     RuntimeState,
     RuntimeType,
@@ -89,6 +115,7 @@ from app.runtime.http import (
 __all__ = [
     "HermesConfig",
     "HermesRuntimeAdapter",
+    "HERMES_ALLOW_UNVERIFIED_EXECUTION_ENV",
     "HERMES_API_KEY_ENV",
     "HERMES_API_URL_ENV",
 ]
@@ -96,18 +123,86 @@ __all__ = [
 #: Environment variables read by :meth:`HermesConfig.from_env`.
 HERMES_API_URL_ENV = "HERMES_API_URL"
 HERMES_API_KEY_ENV = "HERMES_API_KEY"
+HERMES_ALLOW_UNVERIFIED_EXECUTION_ENV = "HERMES_ALLOW_UNVERIFIED_MANAGED_EXECUTION"
 
-#: Evidence document for the real-runtime labels below.
+#: Evidence document for the real-runtime labels below (partial evidence only).
 _SPIKE_EVIDENCE = "docs/research/runtime-compatibility/hermes-0.22.1.md"
+
+#: Runtime identity/version covered by the manual spike.  A probe that reports a
+#: different value must downgrade the static labels.
+_SPIKE_RUNTIME_NAME = "hermes"
+_SPIKE_RUNTIME_VERSION = "0.22.1"
 
 #: Default opaque AgentMgr-side runtime identifier (never a hostname or path).
 _DEFAULT_RUNTIME_ID = "rt_hermes_candidate_0001"
 
+#: The only execution mode the B3 adapter can serve.
+_MANAGED_EXECUTION = "managed_execution"
+_KNOWN_EXECUTION_MODES = frozenset(
+    {"advisory", "governed_resource_access", "managed_execution"}
+)
+_SCOPE_TYPES = frozenset(
+    {
+        "self",
+        "department",
+        "company",
+        "approval_chain",
+        "project",
+        "record_set",
+        "connector",
+    }
+)
+
+#: Capabilities that describe adapter/runtime enforcement, not a business tool.
+#: A Grant naming one of these asks Hermes to enforce something it cannot.
+_UNENFORCEABLE_CAPABILITIES = frozenset(
+    {
+        "runtime.managed_execution",
+        "runtime.tool_permissions",
+        "runtime.isolation",
+        "runtime.task_scoped_credentials",
+    }
+)
+
 #: Bodies/strings above this size are truncated when they leave the adapter.
 _MAX_TEXT = 100_000
 _MAX_EXTERNAL_STATE = 64
+_MAX_IDENTIFIER = 256
 
-#: Keys whose values are removed from event payloads before the core sees them.
+_CAPABILITY_RE = re.compile(
+    r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*@[0-9]+\.[0-9]+\.[0-9]+$"
+)
+
+#: Exact (normalised) key names that always carry a credential or session value.
+_SENSITIVE_KEY_EXACT = frozenset(
+    {
+        "api_key",
+        "apikey",
+        "x_api_key",
+        "authorization",
+        "auth",
+        "cookie",
+        "set_cookie",
+        "jwt",
+        "session",
+        "token",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "password",
+        "passwd",
+        "secret",
+        "client_secret",
+        "private_key",
+        "access_key",
+        "credential",
+        "credentials",
+    }
+)
+
+#: Substrings that mark a key as sensitive.  ``session`` is deliberately not a
+#: substring so that ``session_id`` survives in event payloads; a bare
+#: ``session`` key is covered by the exact set above.
 _SENSITIVE_KEY_PARTS = (
     "token",
     "password",
@@ -119,7 +214,26 @@ _SENSITIVE_KEY_PARTS = (
     "credential",
     "private_key",
     "access_key",
+    "cookie",
+    "jwt",
 )
+
+#: Usage counters contain "token" but are not credentials; keep them readable.
+_NON_SECRET_TOKEN_KEYS = frozenset(
+    {"input_tokens", "output_tokens", "total_tokens", "token_count", "tokens"}
+)
+
+_AUTHORIZATION_RE = re.compile(
+    r"(?i)\b(authorization\s*:\s*)(?:bearer|basic)?\s*[^\s,;\"']+"
+)
+_TOKEN_RE = re.compile(
+    r"(?i)\b(access_token|refresh_token|id_token|token|api[_-]?key|apikey|"
+    r"secret|password|jwt)\s*=\s*([^&\s;,\"']+)"
+)
+
+
+class _DeadlineReached(Exception):
+    """Internal control-flow signal for the polling deadline."""
 
 
 def _utcnow() -> datetime:
@@ -174,6 +288,19 @@ def _runtime_label(value: object) -> str | None:
     return None
 
 
+def _runtime_name_from(data: Mapping[str, Any]) -> str | None:
+    direct = _optional_str(data.get("runtime_name"), limit=200)
+    if direct:
+        return direct
+    direct = _optional_str(data.get("name"), limit=200)
+    if direct:
+        return direct
+    runtime = data.get("runtime")
+    if isinstance(runtime, Mapping):
+        return _optional_str(runtime.get("name"), limit=200)
+    return None
+
+
 def _extract_runtime_version(data: Mapping[str, Any]) -> str | None:
     direct = _optional_str(data.get("runtime_version"), limit=200)
     if direct:
@@ -187,32 +314,104 @@ def _extract_runtime_version(data: Mapping[str, Any]) -> str | None:
     return None
 
 
-def _redact(value: object, *, depth: int = 0) -> object:
-    """Recursively remove obvious credential keys from an event payload."""
+def _payload_hash(body: Mapping[str, Any]) -> str:
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+    return "sha256:" + hashlib.sha256(canonical).hexdigest()
+
+
+def _validate_text(value: object, name: str, *, limit: int = _MAX_IDENTIFIER) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+    if len(value) > limit:
+        raise ValueError(f"{name} is too long")
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+        raise ValueError(f"{name} must not contain control characters")
+    return value
+
+
+def _validate_runtime_task_id(value: object) -> str:
+    text = _validate_text(value, "runtime_task_id")
+    if text in {".", ".."} or "/" in text or "\\" in text:
+        raise ValueError("runtime_task_id must be a single opaque path segment")
+    return text
+
+
+def _validate_control_ref(value: object, name: str) -> str:
+    text = _validate_text(value, name)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}", text):
+        raise ValueError(f"{name} must be an opaque reference")
+    return text
+
+
+def _is_ambiguous_error(exc: RuntimeAdapterError) -> bool:
+    """True when a sent request may have succeeded without a usable response."""
+
+    status = exc.http_status
+    if status is None:
+        return True
+    if 200 <= status < 400:
+        return True
+    return status in (408, 504)
+
+
+def _is_sensitive_key(key: str) -> bool:
+    normalised = key.strip().lower().replace("-", "_")
+    if normalised in _NON_SECRET_TOKEN_KEYS:
+        return False
+    if normalised in _SENSITIVE_KEY_EXACT:
+        return True
+    return any(part in normalised for part in _SENSITIVE_KEY_PARTS)
+
+
+def _redact_text(value: str) -> tuple[str, bool]:
+    """Redact embedded credentials and truncate, reporting whether it changed."""
+
+    changed = False
+    text = _AUTHORIZATION_RE.sub(lambda match: f"{match.group(1)}[redacted]", value)
+    changed = changed or text != value
+    updated = _TOKEN_RE.sub(lambda match: f"{match.group(1)}=[redacted]", text)
+    changed = changed or updated != text
+    text = updated
+    if len(text) > _MAX_TEXT:
+        text = text[:_MAX_TEXT] + "...[truncated]"
+        changed = True
+    return text, changed
+
+
+def _redact(value: object, *, depth: int = 0) -> tuple[object, bool]:
+    """Recursively remove credential keys/strings; return ``(value, redacted)``."""
 
     if depth > 6:
-        return "[truncated]"
+        return "[truncated]", True
     if isinstance(value, Mapping):
         result: dict[str, Any] = {}
+        redacted = False
         for raw_key, raw_value in list(value.items())[:200]:
             key = str(raw_key)
-            lowered = key.lower()
-            if any(part in lowered for part in _SENSITIVE_KEY_PARTS):
+            if _is_sensitive_key(key):
                 result[key] = "[redacted]"
-            else:
-                result[key] = _redact(raw_value, depth=depth + 1)
-        return result
+                redacted = True
+                continue
+            item, item_redacted = _redact(raw_value, depth=depth + 1)
+            result[key] = item
+            redacted = redacted or item_redacted
+        return result, redacted
     if isinstance(value, (list, tuple)):
-        return [_redact(item, depth=depth + 1) for item in list(value)[:200]]
+        items = []
+        redacted = False
+        for raw_item in list(value)[:200]:
+            item, item_redacted = _redact(raw_item, depth=depth + 1)
+            items.append(item)
+            redacted = redacted or item_redacted
+        return items, redacted
     if isinstance(value, str):
         if value.lower().startswith(("bearer ", "basic ")):
-            return "[redacted]"
-        if len(value) > _MAX_TEXT:
-            return value[:_MAX_TEXT] + "...[truncated]"
-        return value
+            return "[redacted]", True
+        return _redact_text(value)
     if value is None or isinstance(value, (bool, int, float)):
-        return value
-    return str(value)[:_MAX_TEXT]
+        return value, False
+    text, changed = _redact_text(str(value))
+    return text, changed or text != str(value)
 
 
 def _error_info(exc: RuntimeAdapterError) -> RuntimeErrorInfo:
@@ -223,13 +422,18 @@ def _error_info(exc: RuntimeAdapterError) -> RuntimeErrorInfo:
     )
 
 
-def _static_capabilities() -> tuple[Capability, ...]:
-    """Static labels from the Hermes 0.22.1 spike plus mock contract tests.
+def _append_limitation(cap: Capability, extra: str) -> Capability:
+    limitations = extra if not cap.limitations else f"{cap.limitations} {extra}"
+    return replace(cap, limitations=limitations)
 
-    ``verified`` means the success and negative paths are covered by the
-    committed tests and the spike evidence; ``partially_verified`` means a real
-    path exists but a documented branch/limitation remains; ``unverified`` means
-    the runtime does not provide the capability (or no real evidence exists).
+
+def _static_capabilities() -> tuple[Capability, ...]:
+    """Labels from the partial Hermes 0.22.1 spike plus mock contract tests.
+
+    ``verified`` is deliberately absent: the committed real-runtime contract
+    suite has not been run and recorded (command, exit code, version, SHA), so
+    every capability is ``partially_verified`` or ``unverified``.  Mock tests are
+    adapter-mapping evidence only and can never upgrade a label.
     """
 
     def cap(
@@ -247,21 +451,33 @@ def _static_capabilities() -> tuple[Capability, ...]:
         )
 
     return (
-        cap(RuntimeCapability.TASK_SUBMIT, CapabilityStatus.VERIFIED),
+        cap(
+            RuntimeCapability.TASK_SUBMIT,
+            CapabilityStatus.PARTIALLY_VERIFIED,
+            "Only the isolated manual spike and mock tests exist; the committed "
+            "real contract suite has not been run. Submission requires a "
+            "server-resolved Grant; managed_execution stays unverified.",
+        ),
         cap(
             RuntimeCapability.TASK_LOOKUP,
             CapabilityStatus.UNVERIFIED,
-            "Hermes has no lookup-by-idempotency-key endpoint. Retry the same "
-            "POST /v1/runs with the same Idempotency-Key and payload; replay "
-            "returns the original run_id.",
+            "Hermes has no lookup-by-idempotency-key endpoint. The adapter keeps "
+            "a process-local submission map and replays the exact POST with the "
+            "same Idempotency-Key; the map is not durable across restarts.",
             evidence=None,
         ),
-        cap(RuntimeCapability.TASK_STATUS, CapabilityStatus.VERIFIED),
+        cap(
+            RuntimeCapability.TASK_STATUS,
+            CapabilityStatus.PARTIALLY_VERIFIED,
+            "Only the isolated manual spike and mock tests exist; the committed "
+            "real contract suite has not been run.",
+        ),
         cap(
             RuntimeCapability.TASK_EVENTS_POLL,
-            CapabilityStatus.VERIFIED,
-            "SSE event buffers expire after 5 minutes; reconnect from the last "
-            "sequence id before expiry.",
+            CapabilityStatus.PARTIALLY_VERIFIED,
+            "SSE buffers expire after 5 minutes; Hermes did not confirm "
+            "Last-Event-ID support, so reconnect uses client-side filtering and "
+            "can miss events. The committed real contract suite has not run.",
         ),
         cap(
             RuntimeCapability.TASK_EVENTS_SUBSCRIBE,
@@ -279,34 +495,46 @@ def _static_capabilities() -> tuple[Capability, ...]:
         ),
         cap(
             RuntimeCapability.TASK_CANCEL,
-            CapabilityStatus.VERIFIED,
+            CapabilityStatus.PARTIALLY_VERIFIED,
             "POST /stop only returns stopping; stop_confirmed is set only after "
-            "a later cancelled status.",
+            "a later cancelled/timed_out status. The committed real contract "
+            "suite has not been run.",
         ),
         cap(
             RuntimeCapability.TASK_RESULT,
-            CapabilityStatus.VERIFIED,
-            "Text output, usage and runtime labels only; structured_result is "
-            "false and there are no independent evidence artifacts.",
+            CapabilityStatus.PARTIALLY_VERIFIED,
+            "Text output, usage and runtime labels only; no independent evidence "
+            "artifacts, so a completed run is reported as partial_success. The "
+            "committed real contract suite has not been run.",
         ),
         cap(
             RuntimeCapability.TASK_APPROVAL_RESOLVE,
-            CapabilityStatus.PARTIALLY_VERIFIED,
+            CapabilityStatus.UNVERIFIED,
             "The endpoint exists, but the request/response contract was not "
-            "triggered end-to-end in the 0.22.1 spike.",
+            "triggered end-to-end in the 0.22.1 spike. Only core-resolved "
+            "references are accepted.",
+            evidence=None,
         ),
         cap(
             RuntimeCapability.TASK_UNKNOWN_RESOLVE,
-            CapabilityStatus.PARTIALLY_VERIFIED,
+            CapabilityStatus.UNVERIFIED,
             "The endpoint exists, but the request/response contract was not "
-            "triggered end-to-end in the 0.22.1 spike.",
+            "triggered end-to-end in the 0.22.1 spike. Only core-resolved "
+            "references are accepted.",
+            evidence=None,
         ),
-        cap(RuntimeCapability.RUNTIME_HEALTH, CapabilityStatus.VERIFIED),
+        cap(
+            RuntimeCapability.RUNTIME_HEALTH,
+            CapabilityStatus.PARTIALLY_VERIFIED,
+            "Only the isolated manual spike and mock tests exist; the committed "
+            "real contract suite has not been run.",
+        ),
         cap(
             RuntimeCapability.RUNTIME_ISOLATION,
-            CapabilityStatus.PARTIALLY_VERIFIED,
+            CapabilityStatus.UNVERIFIED,
             "Logical session isolation only (session_id=AgentMgr task id); no "
-            "OS-level UID, filesystem, network or process isolation.",
+            "OS-level UID, filesystem, network or process isolation evidence.",
+            evidence=None,
         ),
         cap(
             RuntimeCapability.RUNTIME_TASK_SCOPED_CREDENTIALS,
@@ -318,15 +546,17 @@ def _static_capabilities() -> tuple[Capability, ...]:
         cap(
             RuntimeCapability.RUNTIME_TOOL_PERMISSIONS,
             CapabilityStatus.UNVERIFIED,
-            "No per-run tool allowlist; the runtime exposes its full configured "
-            "toolset, including terminal access.",
+            "No per-run tool allowlist; the runtime executes its full configured "
+            "toolset. Hermes-internal tool calls do not pass through the "
+            "AgentMgr PEP until Issue #82/controlled execution.",
             evidence=None,
         ),
         cap(
             RuntimeCapability.RUNTIME_MANAGED_EXECUTION,
             CapabilityStatus.UNVERIFIED,
             "Not established: full host toolset, no task-scoped credentials and "
-            "no OS isolation.",
+            "no OS isolation. Submissions using managed_execution are rejected "
+            "unless an explicit test-only compatibility opt-in is set.",
             evidence=None,
         ),
         cap(
@@ -339,12 +569,53 @@ def _static_capabilities() -> tuple[Capability, ...]:
     )
 
 
+def _bind_capabilities(
+    capabilities: tuple[Capability, ...],
+    runtime_name: str | None,
+    runtime_version: str | None,
+) -> tuple[Capability, ...]:
+    """Downgrade labels when a live probe reports a different runtime."""
+
+    if runtime_name is not None and runtime_name.lower() != _SPIKE_RUNTIME_NAME:
+        return tuple(
+            replace(
+                cap,
+                status=CapabilityStatus.UNVERIFIED,
+                limitations=(
+                    f"{cap.limitations} " if cap.limitations else ""
+                )
+                + f"Live probe reported runtime {runtime_name!r}; evidence only "
+                f"covers {_SPIKE_RUNTIME_NAME!r}.",
+            )
+            for cap in capabilities
+        )
+    if runtime_version is not None and not runtime_version.startswith(
+        _SPIKE_RUNTIME_VERSION
+    ):
+        return tuple(
+            cap
+            if cap.status is CapabilityStatus.UNVERIFIED
+            else _append_limitation(
+                cap,
+                f"Live probe reported version {runtime_version!r}; evidence only "
+                f"covers {_SPIKE_RUNTIME_VERSION}.x.",
+            )
+            for cap in capabilities
+        )
+    return capabilities
+
+
 @dataclass(frozen=True, slots=True)
 class HermesConfig:
     """Connection settings for one Hermes API server.
 
     ``api_key`` is excluded from ``repr``; the adapter never logs headers or
     request bodies.  ``api_url`` must not embed credentials (userinfo).
+
+    ``allow_unverified_managed_execution`` is a **test-only compatibility
+    opt-in**.  It must stay false in every real deployment until Issue #82
+    provides controlled execution: Hermes cannot enforce tool scope, task-scoped
+    credentials or OS isolation.
     """
 
     api_url: str
@@ -355,6 +626,7 @@ class HermesConfig:
     cancel_poll_timeout: float = 10.0
     cancel_poll_interval: float = 0.5
     health_timeout: float = 5.0
+    allow_unverified_managed_execution: bool = False
 
     def __post_init__(self) -> None:
         url = self.api_url.strip().rstrip("/")
@@ -374,15 +646,16 @@ class HermesConfig:
                 "HERMES_API_URL must not embed credentials",
                 context={"variable": HERMES_API_URL_ENV, "reason": "embedded_credentials"},
             )
-        if len(self.api_key) < 16:
+        api_key = self.api_key.strip()
+        if len(api_key) < 16:
             raise RuntimeUnavailable(
                 "HERMES_API_KEY must be at least 16 characters",
                 context={"variable": HERMES_API_KEY_ENV, "reason": "too_short"},
             )
-        if "\r" in self.api_key or "\n" in self.api_key:
+        if any(char.isspace() for char in api_key):
             raise RuntimeUnavailable(
-                "HERMES_API_KEY contains an invalid control character",
-                context={"variable": HERMES_API_KEY_ENV, "reason": "invalid_character"},
+                "HERMES_API_KEY contains whitespace",
+                context={"variable": HERMES_API_KEY_ENV, "reason": "whitespace"},
             )
         if not self.runtime_id.strip():
             raise RuntimeUnavailable(
@@ -396,6 +669,7 @@ class HermesConfig:
         if self.cancel_poll_timeout < 0 or self.cancel_poll_interval < 0:
             raise ValueError("cancel poll values must not be negative")
         object.__setattr__(self, "api_url", url)
+        object.__setattr__(self, "api_key", api_key)
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> "HermesConfig":
@@ -414,7 +688,26 @@ class HermesConfig:
                 "HERMES_API_KEY is not configured",
                 context={"variable": HERMES_API_KEY_ENV, "reason": "missing"},
             )
-        return cls(api_url=api_url, api_key=api_key)
+        opt_in = (source.get(HERMES_ALLOW_UNVERIFIED_EXECUTION_ENV) or "").strip()
+        return cls(
+            api_url=api_url,
+            api_key=api_key,
+            allow_unverified_managed_execution=opt_in == "1",
+        )
+
+
+@dataclass
+class _SubmissionRecord:
+    """Process-local record of one submit, used by the lookup fallback."""
+
+    task_id: str
+    grant_id: str
+    idempotency_key: str
+    payload_hash: str
+    body: dict[str, Any]
+    run_id: str | None = None
+    reported_state: str | None = None
+    accepted_at: datetime | None = None
 
 
 class HermesRuntimeAdapter:
@@ -434,6 +727,8 @@ class HermesRuntimeAdapter:
         self._config = config if config is not None else HermesConfig.from_env()
         self._transport: HttpTransport = transport or UrllibTransport()
         self._static_capabilities = _static_capabilities()
+        self._submissions: dict[tuple[str, str, str], _SubmissionRecord] = {}
+        self._submissions_lock = threading.Lock()
 
     # -- identity / safety -------------------------------------------------
 
@@ -461,6 +756,7 @@ class HermesRuntimeAdapter:
         *,
         idempotency_key: str | None = None,
         accept: str = "application/json",
+        cursor: str | None = None,
     ) -> dict[str, str]:
         headers = {
             "Authorization": f"Bearer {self._config.api_key}",
@@ -468,10 +764,15 @@ class HermesRuntimeAdapter:
         }
         if idempotency_key is not None:
             headers["Idempotency-Key"] = idempotency_key
+        if cursor is not None:
+            # Standard SSE reconnect header.  Hermes did not confirm support in
+            # the spike, so the adapter still filters client-side.
+            headers["Last-Event-ID"] = cursor
         return headers
 
     @staticmethod
     def _run_path(runtime_task_id: str, suffix: str = "") -> str:
+        runtime_task_id = _validate_runtime_task_id(runtime_task_id)
         quoted = urllib.parse.quote(runtime_task_id, safe="")
         return f"/v1/runs/{quoted}{suffix}"
 
@@ -510,6 +811,8 @@ class HermesRuntimeAdapter:
                 code=ErrorCode.INVALID_REQUEST,
                 **kwargs,
             )
+        if code is ErrorCode.TIMEOUT:
+            raise RuntimeTimeout("runtime request timed out", **kwargs)
         if code is ErrorCode.UNAVAILABLE:
             raise RuntimeUnavailable("runtime is unavailable", **kwargs)
         raise RuntimeUnknown("runtime outcome is unknown", **kwargs)
@@ -524,8 +827,13 @@ class HermesRuntimeAdapter:
         idempotency_key: str | None = None,
         timeout: float | None = None,
         accept: str = "application/json",
+        cursor: str | None = None,
     ) -> dict[str, Any]:
-        headers = self._headers(idempotency_key=idempotency_key, accept=accept)
+        headers = self._headers(
+            idempotency_key=idempotency_key,
+            accept=accept,
+            cursor=cursor,
+        )
         raw_body: bytes | None = None
         if body is not None:
             raw_body = json.dumps(
@@ -556,7 +864,7 @@ class HermesRuntimeAdapter:
                 "runtime returned a non-object JSON document",
                 http_status=response.status,
                 context={"operation": operation},
-            )
+            ) from None
         return data
 
     def _get_run_data(self, runtime_task_id: str) -> dict[str, Any]:
@@ -572,13 +880,17 @@ class HermesRuntimeAdapter:
         """Return static labels, optionally enriched by ``GET /v1/capabilities``.
 
         ``probe=False`` is deterministic and never touches the network.  With
-        ``probe=True`` a live probe supplies ``runtime_version`` and sets
-        ``version_source=runtime_self_reported``; probe failures raise a stable
+        ``probe=True`` a live probe supplies ``runtime_name``/``runtime_version``
+        and sets ``version_source=runtime_self_reported``.  If the probe reports
+        a different runtime name, every label is downgraded to ``unverified``; a
+        different version adds a limitation.  Probe failures raise a stable
         adapter error so the caller can fail closed.
         """
 
+        runtime_name: str | None = None
         runtime_version: str | None = None
         version_source = VersionSource.UNKNOWN
+        capabilities = self._static_capabilities
         if probe:
             data = self._request_json(
                 "GET",
@@ -586,9 +898,15 @@ class HermesRuntimeAdapter:
                 operation="capabilities",
                 timeout=self._config.health_timeout,
             )
+            runtime_name = _runtime_name_from(data)
             runtime_version = _extract_runtime_version(data)
             if runtime_version is not None:
                 version_source = VersionSource.RUNTIME_SELF_REPORTED
+            capabilities = _bind_capabilities(
+                self._static_capabilities,
+                runtime_name,
+                runtime_version,
+            )
         return RuntimeCapabilities(
             adapter_contract_version=ADAPTER_CONTRACT_VERSION,
             boundary=BOUNDARY,
@@ -596,9 +914,122 @@ class HermesRuntimeAdapter:
             runtime_type=RuntimeType.HERMES,
             runtime_version=runtime_version,
             version_source=version_source,
-            capabilities=self._static_capabilities,
+            capabilities=capabilities,
             observed_at=_utcnow(),
+            runtime_name=runtime_name,
         )
+
+    # -- Grant validation --------------------------------------------------
+
+    def _check_grant(self, grant: RuntimeGrant, task_id: str) -> None:
+        """Validate the server-resolved projection; never resolve arbitrary refs."""
+
+        if not isinstance(grant, RuntimeGrant):
+            raise ValueError("grant must be a RuntimeGrant projection")
+        _validate_text(grant.grant_id, "grant_id")
+        _validate_text(grant.task_id, "grant.task_id")
+        if grant.task_id != task_id:
+            raise RuntimeAuthError(
+                "grant is bound to a different task",
+                code=ErrorCode.FORBIDDEN,
+                context={"reason": "task_binding_mismatch"},
+            )
+        if not isinstance(grant.task_revision, int) or grant.task_revision < 1:
+            raise RuntimeAuthError(
+                "grant task_revision must be a positive integer",
+                code=ErrorCode.FORBIDDEN,
+                context={"reason": "invalid_task_revision"},
+            )
+        if grant.execution_mode not in _KNOWN_EXECUTION_MODES:
+            raise RuntimeAuthError(
+                "grant execution_mode is not a known mode",
+                code=ErrorCode.FORBIDDEN,
+                context={"reason": "unsupported_execution_mode"},
+            )
+        if grant.execution_mode != _MANAGED_EXECUTION:
+            raise RuntimeAuthError(
+                "the B3 runtime adapter only serves managed_execution",
+                code=ErrorCode.FORBIDDEN,
+                context={"reason": "execution_mode_mismatch"},
+            )
+        if grant.expires_at is None:
+            raise RuntimeAuthError(
+                "grant has no expiry",
+                code=ErrorCode.FORBIDDEN,
+                context={"reason": "grant_expired"},
+            )
+        if grant.is_expired():
+            raise RuntimeAuthError(
+                "grant has expired",
+                code=ErrorCode.FORBIDDEN,
+                context={"reason": "grant_expired"},
+            )
+        if not isinstance(grant.capabilities, tuple) or not grant.capabilities:
+            raise RuntimeAuthError(
+                "grant must declare at least one capability",
+                code=ErrorCode.FORBIDDEN,
+                context={"reason": "inconsistent_capabilities"},
+            )
+        seen: set[str] = set()
+        for capability in grant.capabilities:
+            if not isinstance(capability, str) or not _CAPABILITY_RE.fullmatch(
+                capability
+            ):
+                raise RuntimeAuthError(
+                    "grant capability is malformed",
+                    code=ErrorCode.FORBIDDEN,
+                    context={"reason": "inconsistent_capabilities"},
+                )
+            if capability in seen:
+                raise RuntimeAuthError(
+                    "grant capabilities contain duplicates",
+                    code=ErrorCode.FORBIDDEN,
+                    context={"reason": "inconsistent_capabilities"},
+                )
+            seen.add(capability)
+            if capability.split("@", 1)[0] in _UNENFORCEABLE_CAPABILITIES:
+                raise RuntimeUnsupported(
+                    "Hermes cannot enforce runtime-level capability "
+                    f"{capability.split('@', 1)[0]}",
+                    context={"reason": "unenforceable_capability"},
+                )
+        if not isinstance(grant.resource_scope, Mapping):
+            raise RuntimeAuthError(
+                "grant resource_scope must be an object",
+                code=ErrorCode.FORBIDDEN,
+                context={"reason": "inconsistent_scope"},
+            )
+        scope_type = grant.resource_scope.get("scope_type")
+        if scope_type not in _SCOPE_TYPES:
+            raise RuntimeAuthError(
+                "grant resource_scope.scope_type is missing or not authorising",
+                code=ErrorCode.FORBIDDEN,
+                context={"reason": "inconsistent_scope"},
+            )
+        classifications = grant.resource_scope.get("data_classifications")
+        if not isinstance(classifications, (list, tuple)) or not classifications:
+            raise RuntimeAuthError(
+                "grant resource_scope must declare data_classifications",
+                code=ErrorCode.FORBIDDEN,
+                context={"reason": "inconsistent_scope"},
+            )
+        resource_ids = grant.resource_scope.get("resource_ids", [])
+        if not isinstance(resource_ids, (list, tuple)):
+            raise RuntimeAuthError(
+                "grant resource_scope.resource_ids must be an array",
+                code=ErrorCode.FORBIDDEN,
+                context={"reason": "inconsistent_scope"},
+            )
+        if (
+            grant.execution_mode == _MANAGED_EXECUTION
+            and not self._config.allow_unverified_managed_execution
+        ):
+            raise RuntimeUnsupported(
+                "managed_execution is unverified for Hermes: per-tool "
+                "capability/scope, task-scoped credentials and OS isolation "
+                "cannot be enforced before Issue #82",
+                context={"reason": "managed_execution_unverified"},
+            )
 
     # -- submit ------------------------------------------------------------
 
@@ -607,30 +1038,60 @@ class HermesRuntimeAdapter:
         task_id: str,
         prompt: str,
         idempotency_key: str,
+        grant: RuntimeGrant,
         instructions: str | None = None,
     ) -> SubmitResult:
-        """Submit one task with a stable idempotency key.
+        """Submit one task under a server-resolved Grant.
 
-        On timeout or a pre-response connection failure the exact same POST is
-        retried (same key, same body).  After the bounded attempts the result is
-        ``timeout``/``unknown`` -- never ``accepted`` without a ``run_id`` and
-        never a new idempotency key.
+        Definite ``rejected``/``unsupported``/``conflict`` answers are returned
+        on :class:`SubmitResult`.  Auth/rate-limit/unavailable failures raise a
+        stable adapter error.  A timeout, connection drop or malformed 2xx is
+        ambiguous: the same POST/key/body is replayed up to ``submit_attempts``
+        and then reported as ``timeout``/``unknown`` with the key preserved.
         """
 
-        if not isinstance(task_id, str) or not task_id.strip():
-            raise ValueError("task_id must be a non-empty string")
+        _validate_text(task_id, "task_id")
         if not isinstance(prompt, str):
             raise ValueError("prompt must be a string")
-        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
-            raise ValueError("idempotency_key must be a non-empty string")
-        if "\r" in idempotency_key or "\n" in idempotency_key:
-            raise ValueError("idempotency_key must not contain control characters")
+        _validate_text(idempotency_key, "idempotency_key")
         if instructions is not None and not isinstance(instructions, str):
             raise ValueError("instructions must be a string or None")
+
+        try:
+            self._check_grant(grant, task_id)
+        except RuntimeUnsupported as exc:
+            return SubmitResult(
+                outcome=SubmitOutcome.UNSUPPORTED,
+                error=_error_info(exc),
+            )
 
         body: dict[str, Any] = {"input": prompt, "session_id": task_id}
         if instructions is not None:
             body["instructions"] = instructions
+        payload_hash = _payload_hash(body)
+        record_key = (task_id, grant.grant_id, idempotency_key)
+        with self._submissions_lock:
+            existing = self._submissions.get(record_key)
+            if existing is not None and existing.payload_hash != payload_hash:
+                return SubmitResult(
+                    outcome=SubmitOutcome.CONFLICT,
+                    runtime_task_id=existing.run_id,
+                    error=RuntimeErrorInfo(
+                        code=ErrorCode.CONFLICT,
+                        message=(
+                            "same idempotency key was used with a different payload"
+                        ),
+                    ),
+                )
+            if existing is None:
+                existing = _SubmissionRecord(
+                    task_id=task_id,
+                    grant_id=grant.grant_id,
+                    idempotency_key=idempotency_key,
+                    payload_hash=payload_hash,
+                    body=dict(body),
+                )
+                self._submissions[record_key] = existing
 
         attempts = max(1, self._config.submit_attempts)
         last_error: RuntimeAdapterError | None = None
@@ -643,6 +1104,31 @@ class HermesRuntimeAdapter:
                     body=body,
                     idempotency_key=idempotency_key,
                 )
+            except RuntimeConflict as exc:
+                return SubmitResult(
+                    outcome=SubmitOutcome.CONFLICT,
+                    error=_error_info(exc),
+                )
+            except RuntimeUnsupported as exc:
+                return SubmitResult(
+                    outcome=SubmitOutcome.UNSUPPORTED,
+                    error=_error_info(exc),
+                )
+            except RuntimeProtocolError as exc:
+                if exc.http_status in (400, 415, 422):
+                    return SubmitResult(
+                        outcome=SubmitOutcome.REJECTED,
+                        error=_error_info(exc),
+                    )
+                if not _is_ambiguous_error(exc):
+                    raise
+                last_error = exc
+                if attempt + 1 < attempts:
+                    continue
+                return SubmitResult(
+                    outcome=SubmitOutcome.UNKNOWN,
+                    error=_error_info(exc),
+                )
             except RuntimeTimeout as exc:
                 last_error = exc
                 if attempt + 1 < attempts:
@@ -652,10 +1138,6 @@ class HermesRuntimeAdapter:
                     error=_error_info(exc),
                 )
             except RuntimeUnknown as exc:
-                # A definite HTTP response that maps to "unknown" is not an
-                # ambiguous submission; do not turn it into an accepted retry.
-                if exc.http_status is not None:
-                    raise
                 last_error = exc
                 if attempt + 1 < attempts:
                     continue
@@ -665,7 +1147,7 @@ class HermesRuntimeAdapter:
                 )
             except RuntimeUnavailable as exc:
                 # A server-sent 503 is a definite answer; only a transport-level
-                # failure (http_status is None) is safe to retry idempotently.
+                # failure is safe to retry idempotently.
                 if exc.http_status is not None:
                     raise
                 last_error = exc
@@ -678,16 +1160,28 @@ class HermesRuntimeAdapter:
 
             run_id = data.get("run_id")
             if not isinstance(run_id, str) or not run_id.strip():
-                raise RuntimeProtocolError(
+                last_error = RuntimeProtocolError(
                     "runtime submit response is missing run_id",
                     http_status=202,
                     context={"operation": "submit"},
                 )
+                if attempt + 1 < attempts:
+                    continue
+                return SubmitResult(
+                    outcome=SubmitOutcome.UNKNOWN,
+                    error=_error_info(last_error),
+                )
+            accepted_at = _parse_datetime(data.get("accepted_at"))
+            reported_state = _optional_str(data.get("status"))
+            with self._submissions_lock:
+                existing.run_id = run_id
+                existing.reported_state = reported_state
+                existing.accepted_at = accepted_at
             return SubmitResult(
                 outcome=SubmitOutcome.ACCEPTED,
                 runtime_task_id=run_id,
-                accepted_at=_parse_datetime(data.get("accepted_at")) or _utcnow(),
-                reported_state=_optional_str(data.get("status")),
+                accepted_at=accepted_at,
+                reported_state=reported_state,
                 replayed=data.get("replayed") is True,
             )
 
@@ -696,6 +1190,150 @@ class HermesRuntimeAdapter:
         return SubmitResult(
             outcome=SubmitOutcome.UNKNOWN,
             error=_error_info(last_error),
+        )
+
+    # -- lookup ------------------------------------------------------------
+
+    def find_by_idempotency_key(
+        self,
+        task_id: str,
+        grant_id: str,
+        idempotency_key: str,
+        payload_hash: str | None = None,
+    ) -> LookupResult:
+        """Look up an earlier submission by replaying the exact stored POST.
+
+        Hermes has no independent lookup endpoint, so this method can only use
+        the **process-local** submission map.  It never sends a request for a key
+        it has not seen (that would create a new run in Hermes).  Without a local
+        record it returns ``unknown``, never ``not_found``: absence of a local
+        record is not proof that no run exists.
+        """
+
+        _validate_text(task_id, "task_id")
+        _validate_text(grant_id, "grant_id")
+        _validate_text(idempotency_key, "idempotency_key")
+        if payload_hash is not None:
+            _validate_text(payload_hash, "payload_hash", limit=128)
+
+        record_key = (task_id, grant_id, idempotency_key)
+        with self._submissions_lock:
+            record = self._submissions.get(record_key)
+        observed_at = _utcnow()
+        if record is None:
+            return LookupResult(
+                outcome=LookupOutcome.UNKNOWN,
+                observed_at=observed_at,
+                error=RuntimeErrorInfo(
+                    code=ErrorCode.UNKNOWN,
+                    message=(
+                        "no process-local submission record; Hermes has no "
+                        "lookup-by-idempotency-key endpoint"
+                    ),
+                ),
+            )
+        if payload_hash is not None and payload_hash != record.payload_hash:
+            return LookupResult(
+                outcome=LookupOutcome.CONFLICT,
+                runtime_task_id=record.run_id,
+                payload_hash=record.payload_hash,
+                accepted_at=record.accepted_at,
+                observed_at=observed_at,
+                error=RuntimeErrorInfo(
+                    code=ErrorCode.CONFLICT,
+                    message="idempotency key is bound to a different payload hash",
+                ),
+            )
+
+        try:
+            data = self._request_json(
+                "POST",
+                "/v1/runs",
+                operation="lookup",
+                body=record.body,
+                idempotency_key=record.idempotency_key,
+            )
+        except RuntimeConflict as exc:
+            return LookupResult(
+                outcome=LookupOutcome.CONFLICT,
+                runtime_task_id=record.run_id,
+                payload_hash=record.payload_hash,
+                accepted_at=record.accepted_at,
+                observed_at=observed_at,
+                error=_error_info(exc),
+            )
+        except RuntimeNotFound as exc:
+            return LookupResult(
+                outcome=LookupOutcome.NOT_FOUND,
+                payload_hash=record.payload_hash,
+                observed_at=observed_at,
+                error=_error_info(exc),
+            )
+        except RuntimeProtocolError as exc:
+            if not _is_ambiguous_error(exc):
+                raise
+            return LookupResult(
+                outcome=LookupOutcome.UNKNOWN,
+                payload_hash=record.payload_hash,
+                observed_at=observed_at,
+                error=_error_info(exc),
+            )
+        except RuntimeTimeout as exc:
+            return LookupResult(
+                outcome=LookupOutcome.UNKNOWN,
+                payload_hash=record.payload_hash,
+                observed_at=observed_at,
+                error=_error_info(exc),
+            )
+        except RuntimeUnavailable as exc:
+            if exc.http_status is not None:
+                raise
+            return LookupResult(
+                outcome=LookupOutcome.UNKNOWN,
+                payload_hash=record.payload_hash,
+                observed_at=observed_at,
+                error=_error_info(exc),
+            )
+        except RuntimeUnknown as exc:
+            return LookupResult(
+                outcome=LookupOutcome.UNKNOWN,
+                payload_hash=record.payload_hash,
+                observed_at=observed_at,
+                error=_error_info(exc),
+            )
+
+        run_id = data.get("run_id")
+        if not isinstance(run_id, str) or not run_id.strip():
+            return LookupResult(
+                outcome=LookupOutcome.UNKNOWN,
+                payload_hash=record.payload_hash,
+                observed_at=observed_at,
+                error=RuntimeErrorInfo(
+                    code=ErrorCode.UNKNOWN,
+                    message="lookup replay response is missing run_id",
+                ),
+            )
+        with self._submissions_lock:
+            if record.run_id is not None and record.run_id != run_id:
+                return LookupResult(
+                    outcome=LookupOutcome.CONFLICT,
+                    runtime_task_id=record.run_id,
+                    payload_hash=record.payload_hash,
+                    observed_at=observed_at,
+                    error=RuntimeErrorInfo(
+                        code=ErrorCode.CONFLICT,
+                        message="lookup replay returned a different run_id",
+                    ),
+                )
+            record.run_id = run_id
+            record.reported_state = _optional_str(data.get("status"))
+        return LookupResult(
+            outcome=LookupOutcome.FOUND,
+            runtime_task_id=run_id,
+            reported_state=record.reported_state,
+            payload_hash=record.payload_hash,
+            accepted_at=record.accepted_at,
+            observed_at=observed_at,
         )
 
     # -- status ------------------------------------------------------------
@@ -714,27 +1352,70 @@ class HermesRuntimeAdapter:
             # must not treat this as a confirmed cancellation.
             return RuntimeState.RUNNING, False, False
         if raw == "completed":
-            return RuntimeState.COMPLETED, True, False
+            # Terminal, but not a confirmed *stop*.  ``stop_confirmed`` is only
+            # for cancelled/timed_out with explicit runtime evidence.
+            return RuntimeState.COMPLETED, False, False
         if raw == "failed":
-            return RuntimeState.FAILED, True, False
+            return RuntimeState.FAILED, False, False
         if raw == "cancelled":
             return RuntimeState.STOPPED, True, False
+        if raw == "timed_out":
+            return RuntimeState.TIMED_OUT, True, False
         if raw == "interrupted":
             # Terminal in Hermes but ambiguous for the neutral contract; fail
             # closed instead of claiming a stop or a failure.
             return RuntimeState.UNKNOWN, False, False
         return RuntimeState.UNKNOWN, False, False
 
-    def get_status(self, runtime_task_id: str) -> StatusResult:
+    def _binding_session_id(
+        self,
+        data: Mapping[str, Any],
+        *,
+        runtime_task_id: str,
+        task_id: str | None,
+    ) -> str | None:
+        """Return the verified session id, or reject a cross-task handle."""
+
+        run_id = data.get("run_id")
+        if isinstance(run_id, str) and run_id and run_id != runtime_task_id:
+            raise RuntimeProtocolError(
+                "runtime status identifies a different run",
+                http_status=200,
+                context={"reason": "run_id_mismatch"},
+            )
+        session_id = _optional_str(data.get("session_id"))
+        if task_id is None:
+            # Do not surface an unverified binding to the core.
+            return None
+        if session_id is None:
+            raise RuntimeAuthError(
+                "runtime handle has no task binding",
+                code=ErrorCode.FORBIDDEN,
+                context={"reason": "task_binding_unverifiable"},
+            )
+        if session_id != task_id:
+            raise RuntimeAuthError(
+                "runtime handle is bound to a different task",
+                code=ErrorCode.FORBIDDEN,
+                context={"reason": "task_binding_mismatch"},
+            )
+        return session_id
+
+    def get_status(
+        self,
+        runtime_task_id: str,
+        *,
+        task_id: str | None = None,
+    ) -> StatusResult:
         """Return mapped status and safe runtime facts.
 
-        A 404 is a definitive ``not_found`` fact and is returned as
-        ``RuntimeState.NOT_FOUND``; the core treats it as ``unknown`` and starts
-        reconciliation.  Other HTTP/transport failures raise.
+        A 404 is a definitive ``not_found`` fact.  A malformed/ambiguous 2xx is
+        ``unknown``, not an exception.  When ``task_id`` is supplied, the run's
+        ``session_id`` must match it; cross-task handles are rejected.  Without a
+        binding, ``session_id`` is not returned.
         """
 
-        if not isinstance(runtime_task_id, str) or not runtime_task_id:
-            raise ValueError("runtime_task_id must be a non-empty string")
+        runtime_task_id = _validate_runtime_task_id(runtime_task_id)
         observed_at = _utcnow()
         try:
             data = self._get_run_data(runtime_task_id)
@@ -746,7 +1427,22 @@ class HermesRuntimeAdapter:
                 observed_at=observed_at,
                 error=_error_info(exc),
             )
+        except (RuntimeProtocolError, RuntimeTimeout, RuntimeUnknown) as exc:
+            if not _is_ambiguous_error(exc):
+                raise
+            return StatusResult(
+                runtime_task_id=runtime_task_id,
+                state=RuntimeState.UNKNOWN,
+                external_state=None,
+                observed_at=observed_at,
+                error=_error_info(exc),
+            )
 
+        session_id = self._binding_session_id(
+            data,
+            runtime_task_id=runtime_task_id,
+            task_id=task_id,
+        )
         raw = _optional_str(data.get("status"), limit=_MAX_EXTERNAL_STATE)
         state, stop_confirmed, input_required = self._map_state(raw)
         error: RuntimeErrorInfo | None = None
@@ -756,6 +1452,9 @@ class HermesRuntimeAdapter:
                 message="runtime status is unknown or not mapped",
                 context={"external_state": raw},
             )
+        output, _ = _redact(_as_text(data.get("output")))
+        progress, _ = _redact(_as_mapping(data.get("progress")))
+        usage, _ = _redact(_as_mapping(data.get("usage")))
         return StatusResult(
             runtime_task_id=runtime_task_id,
             state=state,
@@ -764,13 +1463,13 @@ class HermesRuntimeAdapter:
             heartbeat_at=_parse_datetime(
                 data.get("heartbeat_at") or data.get("updated_at")
             ),
-            progress=_as_mapping(data.get("progress")),
+            progress=progress if isinstance(progress, Mapping) else None,
             stop_confirmed=stop_confirmed,
             input_required=input_required,
-            output=_as_text(data.get("output")),
-            usage=_as_mapping(data.get("usage")),
+            output=output if isinstance(output, str) else None,
+            usage=usage if isinstance(usage, Mapping) else None,
             runtime=_runtime_label(data.get("runtime")),
-            session_id=_optional_str(data.get("session_id")),
+            session_id=session_id,
             error=error,
         )
 
@@ -822,12 +1521,10 @@ class HermesRuntimeAdapter:
             or _optional_str(sse.event, limit=200)
             or "message"
         )
-        occurred_at = (
-            _parse_datetime(payload_obj.get("occurred_at"))
-            or _parse_datetime(payload_obj.get("timestamp"))
-            or _utcnow()
-        )
-        payload = _redact(payload_obj)
+        occurred_at = _parse_datetime(
+            payload_obj.get("occurred_at")
+        ) or _parse_datetime(payload_obj.get("timestamp"))
+        payload, redacted = _redact(payload_obj)
         if not isinstance(payload, Mapping):
             payload = {"data": payload}
         return RuntimeEvent(
@@ -835,7 +1532,7 @@ class HermesRuntimeAdapter:
             occurred_at=occurred_at,
             type=event_type,
             payload=payload,
-            redacted=True,
+            redacted=redacted,
         )
 
     def poll_events(
@@ -844,25 +1541,30 @@ class HermesRuntimeAdapter:
         cursor: str | None = None,
         max_events: int = 100,
         timeout: float = 30.0,
+        *,
+        task_id: str | None = None,
     ) -> EventBatch:
         """Poll the SSE stream, filtering client-side by sequence id.
 
-        Keepalive comments are ignored.  ``next_cursor`` is the highest sequence
-        id observed (or the input cursor when nothing new arrived).  Event
-        buffers expire after five minutes on Hermes; a reconnect must happen
-        before then.  A read timeout with no events is reported as an empty
-        batch with ``error.code=timeout`` rather than a fake success.
+        ``Last-Event-ID`` is sent when a cursor is supplied, but Hermes support is
+        unconfirmed, so client-side filtering remains authoritative.  Keepalive
+        comments also advance the poll deadline: a stream that only sends
+        keepalives cannot hang past ``timeout``.  ``has_more`` is true only when
+        an additional event was actually observed beyond ``max_events``.
         """
 
-        if not isinstance(runtime_task_id, str) or not runtime_task_id:
-            raise ValueError("runtime_task_id must be a non-empty string")
+        runtime_task_id = _validate_runtime_task_id(runtime_task_id)
         if not isinstance(max_events, int) or max_events < 1:
             raise ValueError("max_events must be a positive integer")
         if timeout < 0:
             raise ValueError("timeout must not be negative")
+        if task_id is not None:
+            bound = self.get_status(runtime_task_id, task_id=task_id)
+            if bound.state is RuntimeState.NOT_FOUND:
+                raise RuntimeNotFound("runtime task not found")
 
         socket_timeout = max(timeout, 0.001)
-        headers = self._headers(accept="text/event-stream")
+        headers = self._headers(accept="text/event-stream", cursor=cursor)
         url = self._url(self._run_path(runtime_task_id, "/events"))
         deadline = time.monotonic() + timeout
 
@@ -871,25 +1573,35 @@ class HermesRuntimeAdapter:
         has_more = False
         error: RuntimeErrorInfo | None = None
         iterator: Iterator[str] | None = None
+
+        def _enforce_deadline() -> None:
+            if time.monotonic() >= deadline:
+                raise _DeadlineReached
+
         try:
             iterator = self._transport.stream(
                 url,
                 headers=headers,
-                timeout=socket_timeout,
+                timeout=min(socket_timeout, max(deadline - time.monotonic(), 0.001)),
             )
-            for sse in iter_sse(iterator):
+            for sse in iter_sse(iterator, on_keepalive=_enforce_deadline):
                 event = self._event_from_sse(sse, cursor=cursor)
                 if event is None:
+                    _enforce_deadline()
                     continue
                 collected.append(event)
                 if event.event_id is not None:
                     next_cursor = event.event_id
-                if len(collected) >= max_events:
+                if len(collected) > max_events:
+                    # One extra event proves there is more; it is not returned
+                    # and will be re-read on the next poll from the cursor.
+                    collected = collected[:max_events]
+                    next_cursor = collected[-1].event_id or next_cursor
                     has_more = True
                     break
-                if time.monotonic() >= deadline:
-                    has_more = True
-                    break
+                _enforce_deadline()
+        except _DeadlineReached:
+            pass
         except HttpStatusError as exc:
             self._raise_for_status(exc.status, operation="events")
         except RuntimeTimeout as exc:
@@ -910,24 +1622,56 @@ class HermesRuntimeAdapter:
 
     # -- cancel ------------------------------------------------------------
 
+    def _cancel_from_status(self, status: StatusResult) -> CancelResult:
+        if status.state is RuntimeState.STOPPED:
+            return CancelResult(
+                outcome=CancelOutcome.STOPPED,
+                stop_confirmed=True,
+                observed_at=_utcnow(),
+            )
+        if status.state is RuntimeState.TIMED_OUT:
+            return CancelResult(
+                outcome=CancelOutcome.ALREADY_TERMINAL,
+                stop_confirmed=True,
+                observed_at=_utcnow(),
+                error=status.error,
+            )
+        if status.state in {RuntimeState.COMPLETED, RuntimeState.FAILED}:
+            # Terminal, but not a confirmed stop.
+            return CancelResult(
+                outcome=CancelOutcome.ALREADY_TERMINAL,
+                stop_confirmed=False,
+                observed_at=_utcnow(),
+                error=status.error,
+            )
+        return CancelResult(
+            outcome=CancelOutcome.UNKNOWN,
+            stop_confirmed=False,
+            observed_at=_utcnow(),
+            error=status.error,
+        )
+
     def cancel_task(
         self,
         runtime_task_id: str,
         *,
         reason: str | None = None,
+        idempotency_key: str | None = None,
+        task_id: str | None = None,
         poll_timeout: float | None = None,
         poll_interval: float | None = None,
     ) -> CancelResult:
-        """Request cancellation and only confirm a stop after a terminal status.
+        """Request cancellation and only confirm a stop after terminal evidence.
 
-        ``POST /v1/runs/{id}/stop`` returns ``status=stopping``; that is not a
-        stop.  The method polls ``GET /v1/runs/{id}`` until ``cancelled`` (or
-        another terminal status) or the bounded poll deadline.  On deadline it
-        returns ``requested`` with ``stop_confirmed=false``.
+        ``POST /v1/runs/{id}/stop`` returns ``stopping``; that is not a stop.
+        ``stop_confirmed`` requires a later ``cancelled``/``timed_out`` status.
+        Once the stop request has been accepted, a status poll error never
+        discards the request: the result is ``requested`` with the error attached.
         """
 
-        if not isinstance(runtime_task_id, str) or not runtime_task_id:
-            raise ValueError("runtime_task_id must be a non-empty string")
+        runtime_task_id = _validate_runtime_task_id(runtime_task_id)
+        if idempotency_key is not None:
+            _validate_text(idempotency_key, "idempotency_key")
         poll_timeout = (
             self._config.cancel_poll_timeout if poll_timeout is None else poll_timeout
         )
@@ -938,6 +1682,10 @@ class HermesRuntimeAdapter:
         )
         if poll_timeout < 0 or poll_interval < 0:
             raise ValueError("poll_timeout and poll_interval must not be negative")
+        if task_id is not None:
+            bound = self.get_status(runtime_task_id, task_id=task_id)
+            if bound.state is RuntimeState.NOT_FOUND:
+                raise RuntimeNotFound("runtime task not found")
 
         observed_at = _utcnow()
         body: dict[str, Any] = {} if reason is None else {"reason": reason}
@@ -947,6 +1695,7 @@ class HermesRuntimeAdapter:
                 self._run_path(runtime_task_id, "/stop"),
                 operation="cancel",
                 body=body,
+                idempotency_key=idempotency_key,
             )
         except RuntimeUnsupported as exc:
             return CancelResult(
@@ -957,6 +1706,58 @@ class HermesRuntimeAdapter:
             )
         except RuntimeNotFound:
             raise
+        except RuntimeConflict as exc:
+            # A 409 usually means completion raced the stop.  Query the current
+            # status instead of guessing that the stop failed.
+            try:
+                status = self.get_status(runtime_task_id, task_id=task_id)
+            except RuntimeAdapterError:
+                return CancelResult(
+                    outcome=CancelOutcome.REQUESTED,
+                    stop_confirmed=False,
+                    observed_at=_utcnow(),
+                    error=_error_info(exc),
+                )
+            if status.state in {
+                RuntimeState.STOPPED,
+                RuntimeState.TIMED_OUT,
+                RuntimeState.COMPLETED,
+                RuntimeState.FAILED,
+            }:
+                return self._cancel_from_status(status)
+            return CancelResult(
+                outcome=CancelOutcome.REQUESTED,
+                stop_confirmed=False,
+                observed_at=_utcnow(),
+                error=_error_info(exc),
+            )
+        except RuntimeProtocolError as exc:
+            if not _is_ambiguous_error(exc):
+                raise
+            return CancelResult(
+                outcome=CancelOutcome.UNKNOWN,
+                stop_confirmed=False,
+                observed_at=_utcnow(),
+                error=_error_info(exc),
+            )
+        except (RuntimeTimeout, RuntimeUnknown) as exc:
+            return CancelResult(
+                outcome=CancelOutcome.UNKNOWN,
+                stop_confirmed=False,
+                observed_at=_utcnow(),
+                error=_error_info(exc),
+            )
+        except RuntimeUnavailable as exc:
+            if exc.http_status is not None:
+                raise
+            # A transport-level failure means the stop may or may not have been
+            # delivered; never claim it was requested.
+            return CancelResult(
+                outcome=CancelOutcome.UNKNOWN,
+                stop_confirmed=False,
+                observed_at=_utcnow(),
+                error=_error_info(exc),
+            )
 
         raw = _optional_str(data.get("status"), limit=_MAX_EXTERNAL_STATE)
         if raw == "cancelled":
@@ -965,28 +1766,39 @@ class HermesRuntimeAdapter:
                 stop_confirmed=True,
                 observed_at=_utcnow(),
             )
-        if raw in {"completed", "failed"}:
+        if raw == "timed_out":
             return CancelResult(
                 outcome=CancelOutcome.ALREADY_TERMINAL,
                 stop_confirmed=True,
                 observed_at=_utcnow(),
             )
+        if raw in {"completed", "failed"}:
+            return CancelResult(
+                outcome=CancelOutcome.ALREADY_TERMINAL,
+                stop_confirmed=False,
+                observed_at=_utcnow(),
+            )
 
         deadline = time.monotonic() + poll_timeout
         while time.monotonic() < deadline:
-            status = self.get_status(runtime_task_id)
-            if status.state is RuntimeState.STOPPED:
+            try:
+                status = self.get_status(runtime_task_id, task_id=task_id)
+            except RuntimeAdapterError as exc:
+                # The stop request was accepted; do not lose that fact because
+                # the confirmation poll failed.
                 return CancelResult(
-                    outcome=CancelOutcome.STOPPED,
-                    stop_confirmed=True,
+                    outcome=CancelOutcome.REQUESTED,
+                    stop_confirmed=False,
                     observed_at=_utcnow(),
+                    error=_error_info(exc),
                 )
-            if status.state in {RuntimeState.COMPLETED, RuntimeState.FAILED}:
-                return CancelResult(
-                    outcome=CancelOutcome.ALREADY_TERMINAL,
-                    stop_confirmed=True,
-                    observed_at=_utcnow(),
-                )
+            if status.state in {
+                RuntimeState.STOPPED,
+                RuntimeState.TIMED_OUT,
+                RuntimeState.COMPLETED,
+                RuntimeState.FAILED,
+            }:
+                return self._cancel_from_status(status)
             if status.state in {RuntimeState.NOT_FOUND, RuntimeState.UNKNOWN}:
                 return CancelResult(
                     outcome=CancelOutcome.UNKNOWN,
@@ -1013,72 +1825,103 @@ class HermesRuntimeAdapter:
 
     # -- result ------------------------------------------------------------
 
-    def get_result(self, runtime_task_id: str) -> RuntimeResult:
+    def get_result(
+        self,
+        runtime_task_id: str,
+        *,
+        task_id: str | None = None,
+    ) -> RuntimeResult:
         """Return the runtime result without claiming business verification.
 
         Hermes returns free text plus usage/runtime labels.  Therefore
         ``structured_result=false``, ``structured_payload`` is null, and no
-        independent ``evidence_refs`` are fabricated.  ``result_ref`` is an
-        opaque handle to the runtime run, not a verified artifact.
+        independent ``evidence_refs`` are fabricated.  A completed run without
+        evidence is reported as ``partial_success``, not ``succeeded``.
+        ``completed_at`` is ``None`` when the runtime omitted it.
         """
 
-        if not isinstance(runtime_task_id, str) or not runtime_task_id:
-            raise ValueError("runtime_task_id must be a non-empty string")
-        data = self._get_run_data(runtime_task_id)
+        runtime_task_id = _validate_runtime_task_id(runtime_task_id)
+        try:
+            data = self._get_run_data(runtime_task_id)
+        except RuntimeProtocolError as exc:
+            if not _is_ambiguous_error(exc):
+                raise
+            return self._unknown_result(exc)
+        except (RuntimeTimeout, RuntimeUnknown) as exc:
+            return self._unknown_result(exc)
+
+        self._binding_session_id(
+            data,
+            runtime_task_id=runtime_task_id,
+            task_id=task_id,
+        )
         raw = _optional_str(data.get("status"), limit=_MAX_EXTERNAL_STATE)
-        output = _as_text(data.get("output"))
-        usage = _as_mapping(data.get("usage"))
+        raw_output = _as_text(data.get("output"))
+        output, _ = _redact(raw_output) if raw_output is not None else (None, False)
+        usage, _ = _redact(_as_mapping(data.get("usage")))
         runtime = _runtime_label(data.get("runtime"))
-        now = _utcnow()
         completed_at = _parse_datetime(data.get("completed_at"))
+        result_ref = f"runtime-result:{runtime_task_id}"
+
+        def _result(
+            outcome: ResultOutcome,
+            *,
+            stop_confirmed: bool,
+            summary: str | None,
+            error: RuntimeErrorInfo | None = None,
+        ) -> RuntimeResult:
+            keeps_reference = outcome in {
+                ResultOutcome.PARTIAL_SUCCESS,
+                ResultOutcome.CANCELLED,
+                ResultOutcome.TIMED_OUT,
+            }
+            return RuntimeResult(
+                outcome=outcome,
+                result_ref=result_ref if keeps_reference else None,
+                summary=summary,
+                structured_payload=None,
+                artifacts=(),
+                evidence_refs=(),
+                verification_hints=(),
+                stop_confirmed=stop_confirmed,
+                completed_at=completed_at,
+                structured_result=False,
+                output=output if isinstance(output, str) else None,
+                usage=usage if isinstance(usage, Mapping) else None,
+                runtime=runtime,
+                error=error,
+            )
 
         if raw == "completed":
-            return RuntimeResult(
-                outcome=ResultOutcome.SUCCEEDED,
-                result_ref=f"runtime-result:{runtime_task_id}",
-                summary=output,
-                structured_payload=None,
-                artifacts=(),
-                evidence_refs=(),
-                verification_hints=(),
-                stop_confirmed=True,
-                completed_at=completed_at or now,
-                structured_result=False,
-                output=output,
-                usage=usage,
-                runtime=runtime,
+            return _result(
+                ResultOutcome.PARTIAL_SUCCESS,
+                stop_confirmed=False,
+                summary=output if isinstance(output, str) else None,
+                error=RuntimeErrorInfo(
+                    code=ErrorCode.UNKNOWN,
+                    message=(
+                        "runtime completed without independent evidence_refs; "
+                        "the result is not verifiable at the adapter layer"
+                    ),
+                ),
             )
         if raw == "failed":
-            return RuntimeResult(
-                outcome=ResultOutcome.FAILED,
-                result_ref=None,
+            return _result(
+                ResultOutcome.FAILED,
+                stop_confirmed=False,
                 summary=None,
-                structured_payload=None,
-                artifacts=(),
-                evidence_refs=(),
-                verification_hints=(),
-                stop_confirmed=True,
-                completed_at=completed_at or now,
-                structured_result=False,
-                output=output,
-                usage=usage,
-                runtime=runtime,
             )
         if raw == "cancelled":
-            return RuntimeResult(
-                outcome=ResultOutcome.CANCELLED,
-                result_ref=None,
-                summary=None,
-                structured_payload=None,
-                artifacts=(),
-                evidence_refs=(),
-                verification_hints=(),
+            return _result(
+                ResultOutcome.CANCELLED,
                 stop_confirmed=True,
-                completed_at=completed_at or now,
-                structured_result=False,
-                output=output,
-                usage=usage,
-                runtime=runtime,
+                summary=None,
+            )
+        if raw == "timed_out":
+            return _result(
+                ResultOutcome.TIMED_OUT,
+                stop_confirmed=True,
+                summary=None,
             )
 
         reason = (
@@ -1086,6 +1929,19 @@ class HermesRuntimeAdapter:
             if raw == "interrupted"
             else "runtime result is not available for the current status"
         )
+        return _result(
+            ResultOutcome.UNKNOWN,
+            stop_confirmed=False,
+            summary=None,
+            error=RuntimeErrorInfo(
+                code=ErrorCode.UNKNOWN,
+                message=reason,
+                context={"external_state": raw},
+            ),
+        )
+
+    @staticmethod
+    def _unknown_result(exc: RuntimeAdapterError) -> RuntimeResult:
         return RuntimeResult(
             outcome=ResultOutcome.UNKNOWN,
             result_ref=None,
@@ -1097,14 +1953,7 @@ class HermesRuntimeAdapter:
             stop_confirmed=False,
             completed_at=None,
             structured_result=False,
-            output=output,
-            usage=usage,
-            runtime=runtime,
-            error=RuntimeErrorInfo(
-                code=ErrorCode.UNKNOWN,
-                message=reason,
-                context={"external_state": raw},
-            ),
+            error=_error_info(exc),
         )
 
     # -- optional input / control -----------------------------------------
@@ -1133,47 +1982,79 @@ class HermesRuntimeAdapter:
             ),
         )
 
+    def _assert_control_binding(self, runtime_task_id: str, task_id: str) -> None:
+        if not isinstance(task_id, str) or not task_id.strip():
+            raise ValueError("task_id must be a non-empty string")
+        status = self.get_status(runtime_task_id, task_id=task_id)
+        if status.state is RuntimeState.NOT_FOUND:
+            raise RuntimeNotFound("runtime task not found")
+
     def resolve_approval(
         self,
         runtime_task_id: str,
-        payload: Mapping[str, Any],
+        approval_ref: str,
+        *,
+        task_id: str,
+        decision: str = "approve",
     ) -> ControlResult:
-        """Optional, partially verified approval control (no core claim).
+        """Optional, unverified approval control using a core-resolved reference.
 
         The endpoint exists in the spike but its request/response schema was not
-        exercised end-to-end.  The caller must supply the runtime payload; the
-        adapter passes it through without inventing a core authorization claim.
+        exercised end-to-end.  Only an opaque reference and a decision are sent;
+        the adapter does not forward an arbitrary caller payload.
         """
 
-        return self._control_post(runtime_task_id, "/approval", payload, "approval")
+        runtime_task_id = _validate_runtime_task_id(runtime_task_id)
+        approval_ref = _validate_control_ref(approval_ref, "approval_ref")
+        if decision not in {"approve", "reject"}:
+            raise ValueError("decision must be 'approve' or 'reject'")
+        self._assert_control_binding(runtime_task_id, task_id)
+        return self._control_post(
+            runtime_task_id,
+            "/approval",
+            {"approval_id": approval_ref, "decision": decision},
+            "approval",
+        )
 
     def resolve_unknown(
         self,
         runtime_task_id: str,
-        payload: Mapping[str, Any],
+        resolution_ref: str,
+        *,
+        task_id: str,
+        reason: str | None = None,
     ) -> ControlResult:
-        """Optional, partially verified unknown-resolution control."""
+        """Optional, unverified unknown-resolution control."""
 
+        runtime_task_id = _validate_runtime_task_id(runtime_task_id)
+        resolution_ref = _validate_control_ref(resolution_ref, "resolution_ref")
+        if reason is not None and not isinstance(reason, str):
+            raise ValueError("reason must be a string or None")
+        self._assert_control_binding(runtime_task_id, task_id)
+        body: dict[str, Any] = {"resolution_id": resolution_ref}
+        if reason is not None:
+            body["reason"] = reason[:_MAX_TEXT]
         return self._control_post(
-            runtime_task_id, "/resolve-unknown", payload, "resolve_unknown"
+            runtime_task_id,
+            "/resolve-unknown",
+            body,
+            "resolve_unknown",
         )
 
     def _control_post(
         self,
         runtime_task_id: str,
         suffix: str,
-        payload: Mapping[str, Any],
+        body: dict[str, Any],
         operation: str,
     ) -> ControlResult:
-        if not isinstance(payload, Mapping):
-            raise ValueError("payload must be a mapping")
         observed_at = _utcnow()
         try:
             data = self._request_json(
                 "POST",
                 self._run_path(runtime_task_id, suffix),
                 operation=operation,
-                body=dict(payload),
+                body=body,
             )
         except RuntimeUnsupported as exc:
             return ControlResult(
@@ -1196,7 +2077,7 @@ class HermesRuntimeAdapter:
         Health never raises for runtime failures and never includes the API key,
         headers or response body in ``details``.  A 429 on capabilities is
         ``degraded`` (the process is alive but saturated); auth/5xx/transport
-        failures are ``unavailable``.
+        failures are ``unavailable`` with a stable reason code.
         """
 
         checked_at = _utcnow()

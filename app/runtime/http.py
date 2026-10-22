@@ -9,19 +9,27 @@ The adapter uses this module instead of a third-party client (no ``httpx`` or
 
 Security notes: requests are built with an explicit header mapping.  The
 transport never logs or serialises headers, and errors carry only the HTTP
-status -- never a body, URL or credential.
+status -- never a body, URL or credential.  Redirects are refused outright, the
+buffered response body is size-limited, and a truncated body maps to an
+ambiguous ``unknown`` rather than a definite failure.
 """
 
 from __future__ import annotations
 
+import http.client
 import socket
 import urllib.error
 import urllib.request
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Any, Protocol
 
-from app.runtime.errors import RuntimeTimeout, RuntimeUnavailable
+from app.runtime.errors import (
+    RuntimeProtocolError,
+    RuntimeTimeout,
+    RuntimeUnavailable,
+    RuntimeUnknown,
+)
 
 __all__ = [
     "HttpResponse",
@@ -31,6 +39,20 @@ __all__ = [
     "UrllibTransport",
     "iter_sse",
 ]
+
+#: Hard ceiling for a fully buffered response body.  A larger body is a
+#: protocol error, not something the adapter streams to the core.
+DEFAULT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect so credentials never follow a Location header."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        # Returning None makes urllib surface the original 3xx HTTPError.  The
+        # transport then returns it as a normal response and the adapter maps it
+        # to ``unknown``; no request is sent to the redirect target.
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,7 +112,51 @@ class HttpTransport(Protocol):
 
 
 class UrllibTransport:
-    """Standard-library transport with deterministic error translation."""
+    """Standard-library transport with deterministic error translation.
+
+    Redirects are never followed.  This is deliberate: ``urllib`` would replay
+    the ``Authorization`` header to the redirect target, leaking the runtime
+    credential.  A 3xx is returned to the adapter as an ordinary response and
+    then mapped to ``unknown``.
+    """
+
+    def __init__(self, *, max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES) -> None:
+        if max_response_bytes < 1:
+            raise ValueError("max_response_bytes must be positive")
+        self._max_response_bytes = max_response_bytes
+        self._opener = urllib.request.build_opener(_NoRedirectHandler())
+
+    def _read_bounded(self, response: Any) -> bytes:
+        limit = self._max_response_bytes
+        declared = getattr(response, "length", None)
+        try:
+            body = response.read(limit + 1)
+        except http.client.IncompleteRead as exc:
+            raise RuntimeUnknown(
+                "runtime response was truncated",
+                context={"operation": "read"},
+            ) from None
+        except (TimeoutError, socket.timeout):
+            raise RuntimeTimeout(
+                "runtime response timed out",
+                context={"operation": "read"},
+            ) from None
+        except OSError:
+            raise RuntimeUnavailable(
+                "runtime connection failed",
+                context={"operation": "read"},
+            ) from None
+        if len(body) > limit:
+            raise RuntimeProtocolError(
+                "runtime response body exceeds the adapter limit",
+                context={"operation": "read", "limit_bytes": limit},
+            )
+        if declared is not None and len(body) < declared:
+            raise RuntimeUnknown(
+                "runtime response was truncated",
+                context={"operation": "read"},
+            )
+        return body
 
     def request(
         self,
@@ -108,22 +174,24 @@ class UrllibTransport:
             method=method,
         )
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with self._opener.open(request, timeout=timeout) as response:
                 return HttpResponse(
                     status=int(response.status),
                     headers=dict(response.headers.items()),
-                    body=response.read(),
+                    body=self._read_bounded(response),
                 )
         except urllib.error.HTTPError as exc:
             # HTTP errors are normal protocol signals; the adapter maps them.
+            # Redirect targets are never contacted because the opener refused
+            # to follow the Location header.
             try:
-                error_body = exc.read()
-            except OSError:
+                error_body = exc.read(self._max_response_bytes + 1)
+            except (OSError, http.client.IncompleteRead):
                 error_body = b""
             return HttpResponse(
                 status=int(exc.code),
                 headers=dict(exc.headers.items()) if exc.headers else {},
-                body=error_body,
+                body=error_body[: self._max_response_bytes],
             )
         except urllib.error.URLError as exc:
             if isinstance(exc.reason, (TimeoutError, socket.timeout)):
@@ -159,11 +227,11 @@ class UrllibTransport:
             method="GET",
         )
         try:
-            response = urllib.request.urlopen(request, timeout=timeout)
+            response = self._opener.open(request, timeout=timeout)
         except urllib.error.HTTPError as exc:
             try:
                 error_body = exc.read(65536)
-            except OSError:
+            except (OSError, http.client.IncompleteRead):
                 error_body = b""
             raise HttpStatusError(
                 int(exc.code),
@@ -189,6 +257,11 @@ class UrllibTransport:
         try:
             for raw in response:
                 yield raw.decode("utf-8", "replace").rstrip("\r\n")
+        except http.client.IncompleteRead:
+            raise RuntimeUnknown(
+                "runtime event stream was truncated",
+                context={"operation": "GET"},
+            ) from None
         except (TimeoutError, socket.timeout):
             raise RuntimeTimeout(
                 "runtime event stream timed out",
@@ -213,12 +286,18 @@ class SseEvent:
     retry: int | None = None
 
 
-def iter_sse(lines: Iterable[str]) -> Iterator[SseEvent]:
+def iter_sse(
+    lines: Iterable[str],
+    *,
+    on_keepalive: Callable[[], None] | None = None,
+) -> Iterator[SseEvent]:
     """Parse SSE lines into events, ignoring keepalive comments.
 
     Supports multi-line ``data:`` fields, ``id:`` sequence numbers, named
     events and the optional ``retry:`` field.  A final event without a trailing
-    blank line is flushed at end of stream.
+    blank line is flushed at end of stream.  ``on_keepalive`` is called for each
+    comment line so a caller can enforce a wall-clock deadline on a stream that
+    only sends keepalives.
     """
 
     event_id: str | None = None
@@ -254,6 +333,8 @@ def iter_sse(lines: Iterable[str]) -> Iterator[SseEvent]:
             continue
         if line.startswith(":"):
             # Keepalive comment (for example ``: ping``).
+            if on_keepalive is not None:
+                on_keepalive()
             continue
         field_name, separator, value = line.partition(":")
         if not separator:
