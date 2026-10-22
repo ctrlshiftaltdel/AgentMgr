@@ -140,6 +140,11 @@ class UrllibTransport:
                 "runtime request timed out",
                 context={"operation": method},
             ) from None
+        except OSError:
+            raise RuntimeUnavailable(
+                "runtime connection failed",
+                context={"operation": method},
+            ) from None
 
     def stream(
         self,
@@ -187,6 +192,11 @@ class UrllibTransport:
         except (TimeoutError, socket.timeout):
             raise RuntimeTimeout(
                 "runtime event stream timed out",
+                context={"operation": "GET"},
+            ) from None
+        except OSError:
+            raise RuntimeUnavailable(
+                "runtime event stream connection failed",
                 context={"operation": "GET"},
             ) from None
         finally:
