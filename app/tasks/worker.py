@@ -391,26 +391,40 @@ def recover_expired_leases(
     * ``running``/``verifying``: never replayed; enter ``unknown``.
     """
     timestamp = now or _utcnow()
-    leases = list(
-        session.scalars(
-            select(TaskLease)
+    # I1: take the same lock order as ``claim_task`` / ``acquire_recovery_lease``
+    # -- task first, then lease.  The candidate list is read without a lock and
+    # every row is re-checked under the task lock, so a worker claiming or a
+    # recovery pass racing this one is skipped instead of deadlocking.
+    candidates = list(
+        session.execute(
+            select(TaskLease.id, TaskLease.task_id)
             .where(
                 TaskLease.released_at.is_(None),
                 TaskLease.lease_expires_at <= timestamp,
             )
             .order_by(TaskLease.id)
             .limit(limit)
-            .with_for_update(skip_locked=True)
         )
     )
     results: list[LeaseRecovery] = []
-    for lease in leases:
+    for lease_id, lease_task_id in candidates:
         task = session.scalar(
-            select(Task).where(Task.task_id == lease.task_id).with_for_update()
+            select(Task)
+            .where(Task.task_id == lease_task_id)
+            .with_for_update(skip_locked=True)
         )
         if task is None:
-            lease.released_at = timestamp
-            session.flush()
+            continue
+        lease = session.scalar(
+            select(TaskLease).where(TaskLease.id == lease_id).with_for_update()
+        )
+        if (
+            lease is None
+            or lease.released_at is not None
+            or _to_utc(lease.lease_expires_at) > timestamp
+        ):
+            # Another pass/claim handled it after the unlocked read; never
+            # recover a lease we do not still hold exclusively.
             continue
         lease.released_at = timestamp
         session.flush()
@@ -667,7 +681,10 @@ def escalate_overdue_tasks(
     """Deadline/SLA worker pass for T26/T27/T34/T40 (Important 4).
 
     * ``queued`` past ``due_at``/``complete_by`` -> T27 ``timed_out`` (nothing
-      was dispatched); past ``response_by`` -> T26 ``needs_human``.
+      was dispatched); past ``response_by`` -> T26 ``needs_human``.  A managed
+      queued task cannot write the T27 submission fact without a producer
+      lease, so its deadline is escalated through the lease-free T26 edge
+      instead of being dropped (I3).
     * ``dispatched`` past deadline -> T34 only with explicit no-side-effect
       evidence; otherwise T35 ``needs_human`` (never claim a stop).
     * ``running`` past deadline -> T40 ``needs_human`` (stop not confirmed).
@@ -710,26 +727,51 @@ def escalate_overdue_tasks(
         try:
             if task.state == "queued":
                 if due_passed:
-                    service.record_dispatch_failure(
-                        session,
-                        task_id=task.task_id,
-                        actor=resolved_actor,
-                        outcome="deadline_exceeded",
-                        evidence_refs=["evidence:sla_deadline_exceeded"],
-                        reason="task_deadline_exceeded",
-                        now=timestamp,
-                    )
-                    results.append(
-                        SlaEscalation(
+                    if task.execution_mode == "managed_execution":
+                        # I3: a managed submission fact may only be written by
+                        # the execution producer holding the current lease; a
+                        # queued task has no lease and
+                        # ``acquire_recovery_lease`` deliberately refuses
+                        # ``queued`` rows.  Do not swallow the deadline: hand
+                        # the task to a human through the lease-free T26 edge
+                        # instead of leaving it silently queued.
+                        service.escalate_task(
+                            session,
                             task_id=task.task_id,
-                            # Honest label: T27 closes a never-dispatched task as
-                            # ``timed_out``; a requeued (attempt >= 1) task has no
-                            # attempt=0 edge and escalates to ``needs_human``.
-                            action=task.state,
-                            state=task.state,
+                            actor=resolved_actor,
                             reason_code="task_deadline_exceeded",
+                            evidence_refs=["evidence:sla_deadline_exceeded"],
+                            now=timestamp,
                         )
-                    )
+                        results.append(
+                            SlaEscalation(
+                                task_id=task.task_id,
+                                action="needs_human",
+                                state=task.state,
+                                reason_code="task_deadline_exceeded",
+                            )
+                        )
+                    else:
+                        service.record_dispatch_failure(
+                            session,
+                            task_id=task.task_id,
+                            actor=resolved_actor,
+                            outcome="deadline_exceeded",
+                            evidence_refs=["evidence:sla_deadline_exceeded"],
+                            reason="task_deadline_exceeded",
+                            now=timestamp,
+                        )
+                        results.append(
+                            SlaEscalation(
+                                task_id=task.task_id,
+                                # Honest label: T27 closes a never-dispatched task as
+                                # ``timed_out``; a requeued (attempt >= 1) task has no
+                                # attempt=0 edge and escalates to ``needs_human``.
+                                action=task.state,
+                                state=task.state,
+                                reason_code="task_deadline_exceeded",
+                            )
+                        )
                 else:
                     service.escalate_task(
                         session,

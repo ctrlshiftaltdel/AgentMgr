@@ -171,7 +171,9 @@ def test_retry_after_the_cumulative_runtime_cap_escalates(
     task = _failed_attempt(session, world, key="idem_r3_runtime_retry")
     old_grant = task.grant_id
     attempt = _attempt(session, task)
+    # A closed attempt's contribution is ``ended_at - started_at``.
     attempt.started_at = utcnow() - timedelta(seconds=TASK_RUNTIME_CAP + 1)
+    attempt.ended_at = utcnow()
     session.flush()
 
     retry_task(session, task_id=task.task_id, actor=world.actors.owner)
@@ -191,6 +193,7 @@ def test_retry_within_the_cumulative_runtime_cap_still_queues(
     task = _failed_attempt(session, world, key="idem_r3_runtime_retry_ok")
     attempt = _attempt(session, task)
     attempt.started_at = utcnow() - timedelta(seconds=10)
+    attempt.ended_at = utcnow()
     session.flush()
 
     retry_task(session, task_id=task.task_id, actor=world.actors.owner)
@@ -227,7 +230,9 @@ def test_t61_redispatch_after_the_cumulative_runtime_cap_is_refused(
     session.commit()
     assert task.state == "needs_human"
     attempt = _attempt(session, task)
+    # A closed attempt's contribution is ``ended_at - started_at``.
     attempt.started_at = utcnow() - timedelta(seconds=TASK_RUNTIME_CAP + 1)
+    attempt.ended_at = utcnow()
     session.flush()
 
     with pytest.raises(TaskError) as excinfo:
@@ -253,7 +258,9 @@ def test_worker_escalates_a_queued_task_whose_runtime_is_spent(
     # the row a claim candidate again.
     _release_open_lease(session, task)
     attempt = _attempt(session, task)
+    # A closed attempt's contribution is ``ended_at - started_at``.
     attempt.started_at = utcnow() - timedelta(seconds=TASK_RUNTIME_CAP + 1)
+    attempt.ended_at = utcnow()
     session.flush()
 
     assert (

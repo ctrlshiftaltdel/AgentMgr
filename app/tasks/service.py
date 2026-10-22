@@ -483,18 +483,36 @@ def _clamped_task_budget(
 def _attempt_runtime_elapsed(
     session: Session, task: Task, *, now: datetime
 ) -> timedelta | None:
-    """Total task runtime, measured from the first opened attempt.
+    """Actual execution runtime consumed by the task's attempts.
 
-    ``None`` means no attempt was ever opened, so no runtime was consumed.
+    Only time spent inside an attempt counts: the closed attempts contribute
+    ``ended_at - started_at`` and the currently open attempt contributes
+    ``now - started_at``.  Queue time and human time between attempts are
+    therefore excluded (I2).  A T33-voided attempt (``abandoned``: the
+    submission was never accepted) consumed no execution time and is skipped,
+    including when ``start_attempt`` later reuses the row.
+
+    ``None`` means no attempt row exists at all, so no runtime was consumed.
     """
-    started_at = session.scalar(
-        select(func.min(TaskAttempt.started_at)).where(
-            TaskAttempt.task_id == task.task_id
-        )
-    )
-    if started_at is None:
+    rows = session.execute(
+        select(
+            TaskAttempt.started_at,
+            TaskAttempt.ended_at,
+            TaskAttempt.state,
+        ).where(TaskAttempt.task_id == task.task_id)
+    ).all()
+    if not rows:
         return None
-    return now - _to_utc(started_at)  # type: ignore[operator]
+    total = timedelta(0)
+    for started_at, ended_at, state in rows:
+        if state == "abandoned":
+            continue
+        started = _to_utc(started_at)
+        ended = _to_utc(ended_at) if ended_at is not None else _to_utc(now)
+        if ended <= started:  # type: ignore[operator]
+            continue
+        total += ended - started  # type: ignore[operator]
+    return total
 
 
 def _requeue_would_exceed_runtime(
@@ -506,11 +524,12 @@ def _requeue_would_exceed_runtime(
 ) -> int | None:
     """Return the elapsed seconds when a requeue could never be dispatched.
 
-    The task runtime cap is **cumulative** across attempts (see
-    :func:`_assert_task_budget`).  A requeue that already exceeds it would sit
-    in ``queued`` forever, because ``start_attempt`` refuses the dispatch while
-    no worker may claim the row away.  Callers therefore escalate (T70) or fail
-    closed instead of requeueing.
+    The task runtime cap is **cumulative across attempts**, measured as the sum
+    of actual attempt execution time (see :func:`_attempt_runtime_elapsed`).  A
+    requeue that already exceeds it would sit in ``queued`` forever, because
+    ``start_attempt`` refuses the dispatch while no worker may claim the row
+    away.  Callers therefore escalate (T70) or fail closed instead of
+    requeueing.
     """
     elapsed = _attempt_runtime_elapsed(session, task, now=now)
     if elapsed is None:
@@ -526,12 +545,14 @@ def _assert_task_budget(
     """Enforce the persisted task budget at dispatch and the PEP boundary.
 
     Beyond the per-grant ceiling, a task has a total (cumulative) runtime budget
-    measured from its first opened attempt and shared by every attempt.  ``now``
-    is therefore authoritative: a worker whose attempt outlived the task's
-    runtime cap can never dispatch or execute another call, even if its
-    individual grant is still live.  Because the cap is cumulative, every
-    requeue path must prove the task can still be dispatched
-    (:func:`_requeue_would_exceed_runtime`) rather than narrowing the cap.
+    measured from the actual execution time of its attempts (closed attempt
+    windows plus the open one).  ``now`` is therefore authoritative for the
+    open attempt: a worker whose attempt outlived the task's runtime cap can
+    never dispatch or execute another call, even if its individual grant is
+    still live.  Queue/human time between attempts is not charged.  Because the
+    cap is cumulative, every requeue path must prove the task can still be
+    dispatched (:func:`_requeue_would_exceed_runtime`) rather than narrowing the
+    cap.
     """
     if grant is None:
         return
@@ -1025,7 +1046,15 @@ def _base_context(
     *,
     now: datetime,
     expected_revision: int | None = None,
+    safely_retryable: bool | None = None,
 ) -> TransitionContext:
+    """Build the guard facts for one transition preview/apply.
+
+    ``safely_retryable`` is an explicit caller override (C1): a human may
+    authorise a retry of an action the task marked ``retry_safe=False``.  When
+    supplied it *replaces* the persisted flag for this transition instead of
+    being overwritten by it.
+    """
     record = _decision_record(session, task)
     grant = _grant_record(session, task)
     constraints = dict(record.constraints) if record is not None else {}
@@ -1137,6 +1166,9 @@ def _base_context(
     )
 
     open_attempt = _has_open_attempt(session, task)
+    retry_safe = bool(task.retry_safe) if safely_retryable is None else bool(
+        safely_retryable
+    )
     current_attempt = session.scalar(
         select(TaskAttempt)
         .where(TaskAttempt.task_id == task.task_id)
@@ -1272,11 +1304,11 @@ def _base_context(
         side_effects_reconciled=bool(
             (task.result or {}).get("side_effects_reconciled", False)
         ),
-        safely_retryable=bool(task.retry_safe),
+        safely_retryable=retry_safe,
         retry_exhausted=(
             task.attempt >= task.max_attempts
             or task.retry_budget_remaining <= 0
-            or not task.retry_safe
+            or not retry_safe
             or task.attempt == 0
         ),
         retry_allowed=task.retry_budget_remaining > 0,
@@ -4221,6 +4253,13 @@ def _fresh_retry_decision(
 ) -> tuple[GovernanceDecision, ExecutionGrant, GovernanceDecisionRecord | None, _BudgetClamp]:
     """Evaluate a retry decision (revision >= 2, purpose=retry) and grant it.
 
+    The new decision must supersede the **latest persisted decision** for this
+    task/principal, not the decision currently bound to the task row: a retry
+    whose guard was refused still persisted its allow decision, so the bound
+    row may lag the chain by one or more revisions.  Superseding the bound
+    decision would make every later retry fail ``decision_revision_stale`` and
+    strand a ``failed`` task with no way into ``needs_human`` (C1).
+
     The task is deliberately **not** mutated: a caller must first prove the
     transition guards (and that the task runtime budget still allows a
     dispatch), then bind the returned decision/grant and apply the returned
@@ -4229,7 +4268,6 @@ def _fresh_retry_decision(
     orphan active grant, or narrowed caps on a task that never requeued; the
     orphan grant is revoked by the caller.
     """
-    record = _decision_record(session, task)
     capability = capability or (task.requested_capabilities or [None])[0]
     if not capability:
         raise TaskError(
@@ -4241,6 +4279,17 @@ def _fresh_retry_decision(
         session,
         task.executor_principal_id or "",
         principal_type=task.executor_principal_type,
+    )
+    # The PDP requires a retry to supersede the current (highest-revision)
+    # decision of the same task/principal; anything older is stale.
+    latest = session.scalar(
+        select(GovernanceDecisionRecord)
+        .where(
+            GovernanceDecisionRecord.task_id == task.task_id,
+            GovernanceDecisionRecord.principal_id == executor.principal_id,
+        )
+        .order_by(GovernanceDecisionRecord.decision_revision.desc())
+        .limit(1)
     )
     decision = evaluate(
         session,
@@ -4261,7 +4310,7 @@ def _fresh_retry_decision(
             policy_version=task.policy_version,
             correlation_id=task.correlation_id,
             decision_purpose="retry",
-            supersedes_decision_id=record.decision_id if record is not None else None,
+            supersedes_decision_id=(latest.decision_id if latest is not None else None),
         ),
         now=now,
         evidence_verifier=TaskEvidenceVerifier(session, task_id=task.task_id),
@@ -4339,7 +4388,9 @@ def retry_task(
     if task.attempt < 1:
         # F39: never-started failures cannot enter the T64/T70 loop.
         ctx = replace(
-            _base_context(session, task, actor, now=timestamp),
+            _base_context(
+                session, task, actor, now=timestamp, safely_retryable=retryable
+            ),
             retry_exhausted=True,
             escalation_justified=True,
         )
@@ -4357,7 +4408,9 @@ def retry_task(
         or task.retry_budget_remaining <= 0
     ):
         ctx = replace(
-            _base_context(session, task, actor, now=timestamp),
+            _base_context(
+                session, task, actor, now=timestamp, safely_retryable=retryable
+            ),
             retry_exhausted=True,
             escalation_justified=True,
         )
@@ -4376,7 +4429,9 @@ def retry_task(
     # C7: only a reconciled failure may be replayed.  A failure without
     # persisted reconciliation evidence escalates to a human instead of issuing
     # a new decision/grant.
-    base_ctx = _base_context(session, task, actor, now=timestamp)
+    base_ctx = _base_context(
+        session, task, actor, now=timestamp, safely_retryable=retryable
+    )
     if not base_ctx.no_side_effects:
         ctx = replace(
             base_ctx,
@@ -4416,7 +4471,9 @@ def retry_task(
             session, grant, reason_code="task_terminal", now=timestamp
         )
         ctx = replace(
-            _base_context(session, task, actor, now=timestamp),
+            _base_context(
+                session, task, actor, now=timestamp, safely_retryable=retryable
+            ),
             retry_exhausted=True,
             escalation_justified=True,
         )
@@ -4440,7 +4497,9 @@ def retry_task(
     # is derived from it instead of being asserted unconditionally.
     reconciled = bool(base_ctx.side_effects_reconciled) or bool(base_ctx.no_side_effects)
     ctx = replace(
-        _base_context(session, task, actor, now=timestamp),
+        _base_context(
+            session, task, actor, now=timestamp, safely_retryable=retryable
+        ),
         decision_purpose="retry",
         decision_revision=int(decision.decision_revision or 2),
         decision_supersedes=(rule.supersedes_decision_id if rule else None),
