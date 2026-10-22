@@ -14,12 +14,15 @@ dependencies = [
     "openpyxl>=3.1.5",
     "reportlab>=5.0.1",
     "jinja2>=3.1.6",
+    "mcp==2.3.0",
 ]
 
 [dependency-groups]
 dev = [
     "pytest",
     "httpx",
+    # The MCP test client uses httpx2 directly (also a transitive mcp dep).
+    "httpx2",
     # Contract-schema tests use JSON Schema Draft 2020-12 + FormatChecker.
     "jsonschema",
 ]

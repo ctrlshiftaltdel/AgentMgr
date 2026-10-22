@@ -90,6 +90,16 @@ from app.workflow.service import (
     start_approval,
 )
 
+#: Task columns whose value makes a principal a participant.  Kept in one
+#: place so list/read projections cannot drift from ``_is_participant``.
+PARTICIPANT_PRINCIPAL_ATTRIBUTES: tuple[str, ...] = (
+    "requester_principal_id",
+    "owner_principal_id",
+    "assignee_principal_id",
+    "executor_principal_id",
+    "approver_principal_id",
+)
+
 __all__ = [
     "APPROVAL_MAX_TTL_SECONDS",
     "APPROVAL_TTL_SECONDS",
@@ -97,6 +107,7 @@ __all__ = [
     "CONFIRMATION_TTL_SECONDS",
     "DEFAULT_LEASE_SECONDS",
     "NecessityResult",
+    "PARTICIPANT_PRINCIPAL_ATTRIBUTES",
     "TaskEvidenceVerifier",
     "acquire_recovery_lease",
     "add_dependency",
@@ -235,13 +246,10 @@ def _is_privileged(actor: GovernancePrincipal) -> bool:
 
 
 def _is_participant(actor: GovernancePrincipal, task: Task) -> bool:
-    return actor.principal_id in {
-        task.requester_principal_id,
-        task.owner_principal_id,
-        task.assignee_principal_id,
-        task.executor_principal_id,
-        task.approver_principal_id,
-    }
+    return any(
+        getattr(task, attribute) == actor.principal_id
+        for attribute in PARTICIPANT_PRINCIPAL_ATTRIBUTES
+    )
 
 
 def _actor_authorized(actor: GovernancePrincipal, task: Task) -> bool:
