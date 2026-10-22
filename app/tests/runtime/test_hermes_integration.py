@@ -14,9 +14,11 @@ in the repository.  The optional stop scenario is additionally gated by
 ``HERMES_INTEGRATION_STOP=1`` because it creates a second run and is not part of
 the minimal compatibility check.
 
-The lifecycle scenarios explicitly enable the **test-only** unverified managed
-execution opt-in so the compatibility mapping can be exercised before Issue #82.
-A separate test proves that the default configuration refuses such a submission.
+The lifecycle scenarios require the explicit **test-only** unverified managed
+execution opt-in
+(``HERMES_ALLOW_UNVERIFIED_MANAGED_EXECUTION=1``) so the compatibility mapping
+can be exercised before Issue #82. Without it, lifecycle tests are skipped and a
+separate test proves that the default configuration refuses such a submission.
 """
 
 from __future__ import annotations
@@ -41,6 +43,9 @@ from app.runtime.hermes import HermesConfig, HermesRuntimeAdapter
 
 HERMES_API_URL = os.environ.get("HERMES_API_URL")
 HERMES_API_KEY = os.environ.get("HERMES_API_KEY")
+ALLOW_UNVERIFIED = (
+    os.environ.get("HERMES_ALLOW_UNVERIFIED_MANAGED_EXECUTION") == "1"
+)
 
 pytestmark = pytest.mark.skipif(
     not (HERMES_API_URL and HERMES_API_KEY),
@@ -56,7 +61,7 @@ def _config(*, allow_unverified: bool) -> HermesConfig:
     )
 
 
-def _adapter(*, allow_unverified: bool = True) -> HermesRuntimeAdapter:
+def _adapter(*, allow_unverified: bool = ALLOW_UNVERIFIED) -> HermesRuntimeAdapter:
     return HermesRuntimeAdapter(_config(allow_unverified=allow_unverified))
 
 
@@ -126,6 +131,10 @@ def test_default_config_refuses_unverified_managed_execution() -> None:
     assert result.runtime_task_id is None
 
 
+@pytest.mark.skipif(
+    not ALLOW_UNVERIFIED,
+    reason="set HERMES_ALLOW_UNVERIFIED_MANAGED_EXECUTION=1 for the lifecycle scenario",
+)
 def test_short_run_completes_and_replays() -> None:
     adapter = _adapter()
     task_id = _unique("task_it")
@@ -163,6 +172,10 @@ def test_short_run_completes_and_replays() -> None:
     assert "OK" in result.output.upper()
 
 
+@pytest.mark.skipif(
+    not ALLOW_UNVERIFIED,
+    reason="set HERMES_ALLOW_UNVERIFIED_MANAGED_EXECUTION=1 for the lifecycle scenario",
+)
 @pytest.mark.skipif(
     os.environ.get("HERMES_INTEGRATION_STOP") != "1",
     reason="set HERMES_INTEGRATION_STOP=1 to run the stop scenario",
