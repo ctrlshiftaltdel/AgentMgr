@@ -987,7 +987,7 @@ class HermesRuntimeAdapter:
                     stop_confirmed=True,
                     observed_at=_utcnow(),
                 )
-            if status.state is RuntimeState.NOT_FOUND:
+            if status.state in {RuntimeState.NOT_FOUND, RuntimeState.UNKNOWN}:
                 return CancelResult(
                     outcome=CancelOutcome.UNKNOWN,
                     stop_confirmed=False,

@@ -908,6 +908,17 @@ def test_cancel_already_terminal(
     assert result.stop_confirmed is True
 
 
+def test_cancel_unknown_status_is_not_reported_as_requested(
+    adapter: HermesRuntimeAdapter, mock_server: MockHermes
+) -> None:
+    run_id = mock_server.create_run(fixed_status="unknown")
+    result = adapter.cancel_task(run_id, poll_timeout=0.5, poll_interval=0.01)
+    assert result.outcome is CancelOutcome.UNKNOWN
+    assert result.stop_confirmed is False
+    assert result.error is not None
+    assert result.error.code is ErrorCode.UNKNOWN
+
+
 def test_cancel_missing_run_raises(adapter: HermesRuntimeAdapter) -> None:
     with pytest.raises(RuntimeNotFound):
         adapter.cancel_task("run_missing")
