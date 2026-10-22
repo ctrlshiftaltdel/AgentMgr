@@ -1,7 +1,7 @@
 # Hermes 0.22.1 runtime compatibility spike
 
 - Issue: #81 (Epic #74)
-- Runtime: Hermes `0.22.1+72.g450ad50`
+- Runtime: Hermes `0.22.1+72.g450ad50` (2026.9.24)
 - Environment: approved isolated **test host** (`<test-host>`)
 - API surface: Hermes API server `/health` and `/v1/*`
 - Implementation under test: `app/runtime/hermes.py`
@@ -11,17 +11,19 @@
 - Env-gated real test: `app/tests/runtime/test_hermes_integration.py`
 
 > **Evidence scope.** This document records the real-runtime observations that
-> support the `partially_verified` labels for the adapter. It is **partial
-> evidence**: a committed real-runtime contract suite run (command, exit code,
-> runtime version, commit SHA) has **not** been recorded, so no capability is
-> labelled `verified`. It does **not** claim OS isolation, task-scoped
-> credentials, per-task tool permissions, managed-execution readiness, or a
-> stable business result schema. Mock tests are labelled separately and are not
-> runtime compatibility evidence.
+> support the `partially_verified` labels for the adapter. A committed
+> real-runtime contract suite run is now recorded in §3.6 (command, exit code,
+> runtime version, commit SHA). It covers health/auth and the positive advisory
+> lifecycle only; redirects, 408/504, malformed 2xx, keepalive-only streams and
+> cross-task rejection remain mock-only, so no capability is upgraded from
+> `partially_verified` to `verified`. It does **not** claim OS isolation,
+> task-scoped credentials, per-task tool permissions, managed-execution
+> readiness, or a stable business result schema. Mock tests are labelled
+> separately and are not runtime compatibility evidence.
 >
 > **Placeholders.** Host, port, run ids and the API key are redacted as
 > `<test-host>`, `<api-port>`, `<run-id>` and `<api-key>`. The temporary test
-> key and API-server configuration were removed after the spike; the original
+> key and API-server configuration were removed after the run; the original
 > gateway/`.env` state was restored. No credential, hostname, IP address or
 > profile path is committed.
 
@@ -151,16 +153,63 @@ minutes; reconnecting after expiry can lose events, so status/result calls must
 cross-check. The adapter filters client-side by sequence id and redacts obvious
 credential fields before returning payloads.
 
+### 3.6 Committed real integration suite run
+
+The committed env-gated suite was executed on the approved isolated test host
+against the Hermes API server in advisory mode. The exact run is recorded here
+as real-runtime evidence:
+
+```bash
+HERMES_API_URL='http://<test-host>:<api-port>' \
+HERMES_API_KEY='<api-key>' \
+HERMES_INTEGRATION_STOP=1 \
+uv run pytest app/tests/runtime/test_hermes_integration.py -q -o addopts='' --noconftest
+# 4 passed in 36.44s
+```
+
+- Exit code: `0`
+- Result: `4 passed in 36.44s`
+- Runtime: Hermes Agent `v0.22.1+72.g450ad50` (2026.9.24), API server
+  `/v1/runs`
+- Commit under test: `d46c2431aa798e550d1fd00e820b73c7ba78b980`
+- Suite: `app/tests/runtime/test_hermes_integration.py`
+
+Scenarios actually exercised by the real suite:
+
+1. `test_health_against_real_runtime` — `health()` returns `healthy` with both
+   `api_ok` and `auth_ok` true (`/health` plus authenticated
+   `/v1/capabilities`).
+2. `test_managed_execution_is_always_unsupported` — a `managed_execution` grant
+   is refused with `SubmitOutcome.UNSUPPORTED` and no run id; nothing is sent.
+3. `test_short_run_completes_and_replays` — an advisory submit returns an
+   accepted `run_id` with `replayed=false`; the same idempotency key/payload
+   replays to the same `run_id` with `replayed=true`; the run reaches
+   `completed`; the result is `partial_success` with non-empty text containing
+   `OK` and `structured_result=false`.
+4. `test_stop_is_requested_then_confirmed` — stop is requested (`stopping`) and
+   the run reaches `cancelled`; a request is never treated as a confirmed stop.
+
+The run used a temporary test API key and API-server configuration; both were
+removed afterwards and the original gateway/`.env` state was restored. The key
+and host are not committed.
+
+Why the labels stay `partially_verified`: the real suite covers only the
+positive lifecycle and health/auth paths. Redirect refusal, 408/504 handling,
+malformed-2xx mapping, keepalive-only streams and cross-task binding rejection
+are covered by the committed mock contract suite, not by the real runtime. The
+supported capabilities therefore remain `partially_verified`; no label is
+`verified`.
+
 ## 4. Capability summary
 
 | Capability | Label | Evidence / limitation |
 |---|---|---|
-| `task.submit` | `partially_verified` | 202 + opaque `run_id`; replay and 409 conflict observed. No committed real contract suite recorded. |
-| `task.status` | `partially_verified` | Status transitions observed: queued/running/completed and stopping/cancelled. No committed real contract suite recorded. |
-| `task.events.poll` | `partially_verified` | SSE `id:`, keepalive, `message.delta`, `run.completed`; client cursor implemented and tested. Last-Event-ID support not confirmed. |
-| `task.cancel` | `partially_verified` | Requested (`stopping`) vs confirmed (`cancelled`) observed. No committed real contract suite recorded. |
-| `task.result` | `partially_verified` | Text output + usage + runtime; no evidence refs, so completion is `partial_success`. |
-| `runtime.health` | `partially_verified` | `/health` + authenticated `/v1/capabilities`; manual spike only. |
+| `task.submit` | `partially_verified` | 202 + opaque `run_id`; real suite covers submit + replay. 409 conflict is mock-only. |
+| `task.status` | `partially_verified` | queued/running/completed and stopping/cancelled observed; real suite polls to `completed` and `cancelled`. |
+| `task.events.poll` | `partially_verified` | SSE `id:`, keepalive, `message.delta`, `run.completed` observed in the manual spike; client cursor implemented and mock-tested, not exercised by the real suite. Last-Event-ID support not confirmed. |
+| `task.cancel` | `partially_verified` | Requested (`stopping`) vs confirmed (`cancelled`); real suite covers stop → `cancelled`. |
+| `task.result` | `partially_verified` | Text output + usage + runtime; real suite asserts `partial_success` with `structured_result=false`. No evidence refs. |
+| `runtime.health` | `partially_verified` | `/health` + authenticated `/v1/capabilities`; real suite asserts `healthy` with `api_ok`/`auth_ok`. |
 | `task.approval.resolve` | `unverified` | Endpoint exists; request/response not E2E-triggered. |
 | `task.unknown.resolve` | `unverified` | Endpoint exists; request/response not E2E-triggered. |
 | `runtime.isolation` | `unverified` | Logical session association only; no OS boundary observed. |
@@ -194,9 +243,9 @@ reconciliation.
 
 ## 6. What this does not prove
 
-- No committed real-runtime contract suite run with command, exit code, runtime
-  version and commit SHA was recorded. The manual observation above is partial
-  evidence only, so no capability is `verified`.
+- The committed real suite covers only the positive lifecycle and health/auth
+  paths. The negative paths (redirects, 408/504, malformed 2xx, keepalive-only,
+  cross-task binding) remain mock-only, so no capability is `verified`.
 - No OS-level UID, filesystem, process or network-egress isolation was observed.
 - No per-task tool allowlist or credential injection exists in the observed API;
   Hermes-internal tool calls do not pass through the AgentMgr PEP.
@@ -222,10 +271,15 @@ Against the approved isolated test host only:
 
 ```bash
 export HERMES_API_URL='http://<test-host>:<api-port>'
-export HERMES_API_KEY='<api-key>'
-export HERMES_INTEGRATION_STOP=0   # set 1 only for the optional stop scenario
-uv run pytest app/tests/runtime/test_hermes_integration.py -q
+export HERMES_API_KEY='<api-key>'    # test-only, >= 16 characters
+export HERMES_INTEGRATION_STOP=1     # include the stop scenario
+uv run pytest app/tests/runtime/test_hermes_integration.py -q -o addopts='' --noconftest
 ```
+
+The recorded run for commit `d46c2431aa798e550d1fd00e820b73c7ba78b980` against
+Hermes Agent `v0.22.1+72.g450ad50` produced `4 passed in 36.44s` with exit code
+0. `-o addopts='' --noconftest` bypasses the repository-wide conftest and its
+PostgreSQL autouse fixture; these runtime tests do not use the database.
 
 The test asserts `healthy` for the health probe, proves that a
 `managed_execution` grant is always `unsupported`, and then exercises the

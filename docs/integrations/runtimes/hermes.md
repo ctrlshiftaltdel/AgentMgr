@@ -15,11 +15,14 @@
 > It does not write task state, issue or accept Grants, expose Hermes
 > profile/database/session internals, or claim OS-level isolation.
 >
-> **Evidence split.** Mock tests prove the adapter/contract mapping. Only a
-> **committed real-runtime contract suite run recorded with command, exit code,
-> runtime version and commit SHA** can support `verified`. No such run is
-> recorded yet: the manual 0.22.1 spike is **partial evidence**, so every
-> supported capability is `partially_verified`, and mock tests must never be
+> **Evidence split.** Mock tests prove the adapter/contract mapping and the
+> negative paths (redirects, 408/504, malformed 2xx, keepalive-only, cross-task).
+> A committed real-runtime contract suite run covering health/auth and the
+> positive advisory lifecycle is recorded in
+> [the spike evidence](../../research/runtime-compatibility/hermes-0.22.1.md)
+> (§3.6, command, exit code, runtime version, commit SHA). Because the negative
+> paths remain mock-only, every supported capability stays
+> `partially_verified`; none is upgraded to `verified`, and mock tests are never
 > presented as runtime compatibility.
 
 ## 1. Setup
@@ -109,12 +112,12 @@ never upgrades a label just because a live probe answered.
 
 | Capability | Status | Notes |
 |---|---|---|
-| `task.submit` | `partially_verified` | Manual spike + mock tests only; real suite not recorded. Requires a server-resolved Grant. |
-| `task.status` | `partially_verified` | Manual spike + mock tests only; real suite not recorded. |
-| `task.events.poll` | `partially_verified` | SSE sequence ids + keepalive. Last-Event-ID support unconfirmed; client-side filtering may miss events older than the 5-minute buffer. |
-| `task.cancel` | `partially_verified` | Stop requested vs stop confirmed are distinct. |
-| `task.result` | `partially_verified` | Text output/usage/runtime only; no independent evidence, so completion is `partial_success`. |
-| `runtime.health` | `partially_verified` | `/health` plus authenticated `/v1/capabilities`; manual spike only. |
+| `task.submit` | `partially_verified` | Real suite covers submit + replay; 409 conflict and other negative paths are mock-only. Requires a server-resolved Grant. |
+| `task.status` | `partially_verified` | Real suite polls to `completed` and `cancelled`; other statuses are manual-spike or mock-only. |
+| `task.events.poll` | `partially_verified` | SSE sequence ids + keepalive, mock-tested; not exercised by the real suite. Last-Event-ID support unconfirmed; client-side filtering may miss events older than the 5-minute buffer. |
+| `task.cancel` | `partially_verified` | Stop requested vs stop confirmed are distinct; real suite covers stop → `cancelled`. |
+| `task.result` | `partially_verified` | Text output/usage/runtime only; real suite asserts `partial_success`; no independent evidence. |
+| `runtime.health` | `partially_verified` | `/health` plus authenticated `/v1/capabilities`; real suite asserts `healthy` with `api_ok`/`auth_ok`. |
 | `task.events.subscribe` | `unverified` | The adapter polls a bounded SSE stream; no durable subscription. |
 | `task.lookup` | `unverified` | No lookup endpoint; process-local submission map + exact POST replay only. |
 | `task.input.provide` | `unverified` | No generic input contract; unsupported. |
@@ -361,8 +364,12 @@ new tasks when health is `unavailable`.
    consumer can lose events and must cross-check status/result.
 9. **No durable subscription or lookup.** Reconnect uses a client-side cursor;
    the submission map is process-local and lost on restart.
-10. **No recorded real contract suite.** Until the Master records a run with
-    command/exit code/version/SHA, no label may be `verified`.
+10. **The real suite is positive-path only.** The recorded run at commit
+    `d46c2431aa798e550d1fd00e820b73c7ba78b980` against Hermes
+    `v0.22.1+72.g450ad50` passed (`4 passed in 36.44s`, exit 0) for health/auth,
+    managed-execution refusal, submit/replay/completed and stop→cancelled.
+    Redirects, 408/504, malformed 2xx, keepalive-only and cross-task rejection
+    are mock-only, so no label is `verified`.
 
 ## 6. Integration test
 
@@ -370,14 +377,21 @@ The real-runtime test is skipped unless both variables are present:
 
 ```bash
 export HERMES_API_URL='http://<test-host>:<api-port>'
-export HERMES_API_KEY='<api-key>'
-uv run pytest app/tests/runtime/test_hermes_integration.py -q
+export HERMES_API_KEY='<api-key>'    # test-only, >= 16 characters
+export HERMES_INTEGRATION_STOP=1     # include the stop scenario
+uv run pytest app/tests/runtime/test_hermes_integration.py -q -o addopts='' --noconftest
 ```
 
-It performs a health check (asserting `healthy`), a refusal of a
-`managed_execution` grant (always `unsupported`, no opt-in), a short
-"reply with OK" advisory run, an idempotency replay, and (only with
-`HERMES_INTEGRATION_STOP=1`) a stop scenario.
+The recorded run on the approved test host at commit
+`d46c2431aa798e550d1fd00e820b73c7ba78b980` against Hermes Agent
+`v0.22.1+72.g450ad50` (2026.9.24) produced `4 passed in 36.44s` with exit code
+0. `-o addopts='' --noconftest` bypasses the repository-wide conftest and its
+PostgreSQL autouse fixture; these runtime tests do not use the database.
+
+It performs a health check (asserting `healthy` with `api_ok`/`auth_ok`), a
+refusal of a `managed_execution` grant (always `unsupported`, no opt-in), a
+short "reply with OK" advisory run with idempotency replay, and (with
+`HERMES_INTEGRATION_STOP=1`) a stop scenario that reaches `cancelled`.
 It never writes a token, host or profile path into the repository or test output.
 Mock tests run without any runtime or database credentials:
 
