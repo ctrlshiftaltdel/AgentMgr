@@ -14,16 +14,13 @@ in the repository.  The optional stop scenario is additionally gated by
 ``HERMES_INTEGRATION_STOP=1`` because it creates a second run and is not part of
 the minimal compatibility check.
 
-The lifecycle scenarios require the explicit **test-only** unverified managed
-execution opt-in
-(``HERMES_ALLOW_UNVERIFIED_MANAGED_EXECUTION=1``) so the compatibility mapping
-can be exercised before Issue #82. Without it, lifecycle tests are skipped and a
-separate test proves that the default configuration refuses such a submission.
+The adapter only serves ``advisory`` execution until Issue #82, so the lifecycle
+scenarios submit ``advisory`` grants.  ``managed_execution`` has no opt-in and is
+always refused; a separate test proves that.
 """
 
 from __future__ import annotations
 
-import dataclasses
 import os
 import time
 import uuid
@@ -43,9 +40,6 @@ from app.runtime.hermes import HermesConfig, HermesRuntimeAdapter
 
 HERMES_API_URL = os.environ.get("HERMES_API_URL")
 HERMES_API_KEY = os.environ.get("HERMES_API_KEY")
-ALLOW_UNVERIFIED = (
-    os.environ.get("HERMES_ALLOW_UNVERIFIED_MANAGED_EXECUTION") == "1"
-)
 
 pytestmark = pytest.mark.skipif(
     not (HERMES_API_URL and HERMES_API_KEY),
@@ -53,24 +47,17 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _config(*, allow_unverified: bool) -> HermesConfig:
+def _adapter() -> HermesRuntimeAdapter:
     # from_env reads the two variables; the test must never print their values.
-    return dataclasses.replace(
-        HermesConfig.from_env(),
-        allow_unverified_managed_execution=allow_unverified,
-    )
+    return HermesRuntimeAdapter(HermesConfig.from_env())
 
 
-def _adapter(*, allow_unverified: bool = ALLOW_UNVERIFIED) -> HermesRuntimeAdapter:
-    return HermesRuntimeAdapter(_config(allow_unverified=allow_unverified))
-
-
-def _grant(task_id: str) -> RuntimeGrant:
+def _grant(task_id: str, *, execution_mode: str = "advisory") -> RuntimeGrant:
     return RuntimeGrant(
         grant_id=f"grnt_{uuid.uuid4().hex[:16]}",
         task_id=task_id,
         task_revision=1,
-        execution_mode="managed_execution",
+        execution_mode=execution_mode,
         capabilities=("expense.read@1.0.0",),
         resource_scope={
             "scope_type": "self",
@@ -118,23 +105,19 @@ def test_health_against_real_runtime() -> None:
     assert result.details.get("auth_ok") is True
 
 
-def test_default_config_refuses_unverified_managed_execution() -> None:
-    adapter = _adapter(allow_unverified=False)
+def test_managed_execution_is_always_unsupported() -> None:
+    adapter = _adapter()
     task_id = _unique("task_refuse")
     result = adapter.submit_task(
         task_id,
         "Reply with exactly OK and nothing else.",
         _unique("idem_refuse"),
-        _grant(task_id),
+        _grant(task_id, execution_mode="managed_execution"),
     )
     assert result.outcome is SubmitOutcome.UNSUPPORTED
     assert result.runtime_task_id is None
 
 
-@pytest.mark.skipif(
-    not ALLOW_UNVERIFIED,
-    reason="set HERMES_ALLOW_UNVERIFIED_MANAGED_EXECUTION=1 for the lifecycle scenario",
-)
 def test_short_run_completes_and_replays() -> None:
     adapter = _adapter()
     task_id = _unique("task_it")
@@ -172,10 +155,6 @@ def test_short_run_completes_and_replays() -> None:
     assert "OK" in result.output.upper()
 
 
-@pytest.mark.skipif(
-    not ALLOW_UNVERIFIED,
-    reason="set HERMES_ALLOW_UNVERIFIED_MANAGED_EXECUTION=1 for the lifecycle scenario",
-)
 @pytest.mark.skipif(
     os.environ.get("HERMES_INTEGRATION_STOP") != "1",
     reason="set HERMES_INTEGRATION_STOP=1 to run the stop scenario",

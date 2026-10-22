@@ -21,9 +21,10 @@ Honesty rules
   credentials, or OS isolation.  Its internal tool calls do **not** pass through
   the AgentMgr PEP until Issue #82 provides a controlled execution environment.
 * ``submit_task`` requires a server-resolved :class:`RuntimeGrant`.  It rejects
-  expired/task-mismatched/inconsistent grants.  ``managed_execution`` is
-  unverified and is therefore rejected by default unless an explicit,
-  test-only compatibility opt-in is set.
+  expired/task-mismatched/inconsistent grants.  Until Issue #82 the adapter only
+  serves ``advisory`` execution: a ``managed_execution`` grant is always
+  rejected with ``SubmitOutcome.UNSUPPORTED``, and there is no environment or
+  configuration bypass.
 
 Ambiguity policy
 ================
@@ -115,7 +116,6 @@ from app.runtime.http import (
 __all__ = [
     "HermesConfig",
     "HermesRuntimeAdapter",
-    "HERMES_ALLOW_UNVERIFIED_EXECUTION_ENV",
     "HERMES_API_KEY_ENV",
     "HERMES_API_URL_ENV",
 ]
@@ -123,7 +123,6 @@ __all__ = [
 #: Environment variables read by :meth:`HermesConfig.from_env`.
 HERMES_API_URL_ENV = "HERMES_API_URL"
 HERMES_API_KEY_ENV = "HERMES_API_KEY"
-HERMES_ALLOW_UNVERIFIED_EXECUTION_ENV = "HERMES_ALLOW_UNVERIFIED_MANAGED_EXECUTION"
 
 #: Evidence document for the real-runtime labels below (partial evidence only).
 _SPIKE_EVIDENCE = "docs/research/runtime-compatibility/hermes-0.22.1.md"
@@ -136,10 +135,12 @@ _SPIKE_RUNTIME_VERSION = "0.22.1"
 #: Default opaque AgentMgr-side runtime identifier (never a hostname or path).
 _DEFAULT_RUNTIME_ID = "rt_hermes_candidate_0001"
 
-#: The only execution mode the B3 adapter can serve.
+#: The only execution mode this adapter serves until Issue #82.
+_ADVISORY_EXECUTION = "advisory"
+#: Execution mode that requires enforcement evidence the runtime cannot provide.
 _MANAGED_EXECUTION = "managed_execution"
 _KNOWN_EXECUTION_MODES = frozenset(
-    {"advisory", "governed_resource_access", "managed_execution"}
+    {_ADVISORY_EXECUTION, "governed_resource_access", _MANAGED_EXECUTION}
 )
 _SCOPE_TYPES = frozenset(
     {
@@ -555,8 +556,8 @@ def _static_capabilities() -> tuple[Capability, ...]:
             RuntimeCapability.RUNTIME_MANAGED_EXECUTION,
             CapabilityStatus.UNVERIFIED,
             "Not established: full host toolset, no task-scoped credentials and "
-            "no OS isolation. Submissions using managed_execution are rejected "
-            "unless an explicit test-only compatibility opt-in is set.",
+            "no OS isolation. Managed-execution grants are always rejected with "
+            "unsupported until Issue #82; there is no opt-in.",
             evidence=None,
         ),
         cap(
@@ -612,10 +613,9 @@ class HermesConfig:
     ``api_key`` is excluded from ``repr``; the adapter never logs headers or
     request bodies.  ``api_url`` must not embed credentials (userinfo).
 
-    ``allow_unverified_managed_execution`` is a **test-only compatibility
-    opt-in**.  It must stay false in every real deployment until Issue #82
-    provides controlled execution: Hermes cannot enforce tool scope, task-scoped
-    credentials or OS isolation.
+    There is deliberately no opt-in for ``managed_execution``: Hermes cannot
+    enforce tool scope, task-scoped credentials or OS isolation, so a managed
+    grant is unconditionally unsupported until Issue #82.
     """
 
     api_url: str
@@ -626,7 +626,6 @@ class HermesConfig:
     cancel_poll_timeout: float = 10.0
     cancel_poll_interval: float = 0.5
     health_timeout: float = 5.0
-    allow_unverified_managed_execution: bool = False
 
     def __post_init__(self) -> None:
         url = self.api_url.strip().rstrip("/")
@@ -688,12 +687,7 @@ class HermesConfig:
                 "HERMES_API_KEY is not configured",
                 context={"variable": HERMES_API_KEY_ENV, "reason": "missing"},
             )
-        opt_in = (source.get(HERMES_ALLOW_UNVERIFIED_EXECUTION_ENV) or "").strip()
-        return cls(
-            api_url=api_url,
-            api_key=api_key,
-            allow_unverified_managed_execution=opt_in == "1",
-        )
+        return cls(api_url=api_url, api_key=api_key)
 
 
 @dataclass
@@ -946,9 +940,21 @@ class HermesRuntimeAdapter:
                 code=ErrorCode.FORBIDDEN,
                 context={"reason": "unsupported_execution_mode"},
             )
-        if grant.execution_mode != _MANAGED_EXECUTION:
+        if grant.execution_mode == _MANAGED_EXECUTION:
+            # Unconditional, with no environment or configuration bypass: Hermes
+            # cannot enforce per-tool capability/scope, task-scoped credentials
+            # or OS isolation, so managed execution stays unsupported until
+            # Issue #82.
+            raise RuntimeUnsupported(
+                "managed_execution is unverified for Hermes: per-tool "
+                "capability/scope, task-scoped credentials and OS isolation "
+                "cannot be enforced before Issue #82",
+                context={"reason": "managed_execution_unverified"},
+            )
+        if grant.execution_mode != _ADVISORY_EXECUTION:
             raise RuntimeAuthError(
-                "the B3 runtime adapter only serves managed_execution",
+                "the B3 Hermes adapter only serves advisory execution until "
+                "Issue #82",
                 code=ErrorCode.FORBIDDEN,
                 context={"reason": "execution_mode_mismatch"},
             )
@@ -1019,16 +1025,6 @@ class HermesRuntimeAdapter:
                 "grant resource_scope.resource_ids must be an array",
                 code=ErrorCode.FORBIDDEN,
                 context={"reason": "inconsistent_scope"},
-            )
-        if (
-            grant.execution_mode == _MANAGED_EXECUTION
-            and not self._config.allow_unverified_managed_execution
-        ):
-            raise RuntimeUnsupported(
-                "managed_execution is unverified for Hermes: per-tool "
-                "capability/scope, task-scoped credentials and OS isolation "
-                "cannot be enforced before Issue #82",
-                context={"reason": "managed_execution_unverified"},
             )
 
     # -- submit ------------------------------------------------------------

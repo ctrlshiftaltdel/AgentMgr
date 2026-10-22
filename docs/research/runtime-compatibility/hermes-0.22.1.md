@@ -224,16 +224,15 @@ Against the approved isolated test host only:
 export HERMES_API_URL='http://<test-host>:<api-port>'
 export HERMES_API_KEY='<api-key>'
 export HERMES_INTEGRATION_STOP=0   # set 1 only for the optional stop scenario
-# Test-only: managed_execution is refused by default until Issue #82.
-export HERMES_ALLOW_UNVERIFIED_MANAGED_EXECUTION=1
 uv run pytest app/tests/runtime/test_hermes_integration.py -q
 ```
 
-The test asserts `healthy` for the health probe, proves the default refusal when
-the opt-in is absent, and then exercises the lifecycle under the explicit
-test-only opt-in. It reads credentials from the environment, never prints or
-stores them, and is skipped by default. Mock contract tests need no runtime or
-database credentials:
+The test asserts `healthy` for the health probe, proves that a
+`managed_execution` grant is always `unsupported`, and then exercises the
+lifecycle with `advisory` grants. Managed execution has no opt-in and is
+rejected unconditionally until Issue #82. The test reads credentials from the
+environment, never prints or stores them, and is skipped by default. Mock
+contract tests need no runtime or database credentials:
 
 ```bash
 uv run pytest app/tests/runtime/test_hermes_adapter.py -q

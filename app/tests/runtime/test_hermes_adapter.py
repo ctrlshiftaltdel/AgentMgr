@@ -48,7 +48,6 @@ from app.runtime.errors import (
     RuntimeUnsupported,
 )
 from app.runtime.hermes import (
-    HERMES_ALLOW_UNVERIFIED_EXECUTION_ENV,
     HermesConfig,
     HermesRuntimeAdapter,
 )
@@ -73,7 +72,7 @@ def _grant(
     task_id: str,
     *,
     grant_id: str = "grnt_test_0001",
-    execution_mode: str = "managed_execution",
+    execution_mode: str = "advisory",
     capabilities: tuple[str, ...] = ("expense.read@1.0.0",),
     scope_type: str = "self",
     data_classifications: tuple[str, ...] = ("internal",),
@@ -489,7 +488,6 @@ def _config(
     *,
     key: str = TEST_KEY,
     attempts: int = 2,
-    allow_unverified: bool = True,
 ) -> HermesConfig:
     return HermesConfig(
         api_url=api_url,
@@ -499,7 +497,6 @@ def _config(
         cancel_poll_timeout=1.0,
         cancel_poll_interval=0.01,
         submit_attempts=attempts,
-        allow_unverified_managed_execution=allow_unverified,
     )
 
 
@@ -1003,26 +1000,31 @@ def test_submit_rejects_task_mismatch(
     assert mock_server.runs == {}
 
 
-@pytest.mark.parametrize("mode", ["advisory", "governed_resource_access"])
-def test_submit_rejects_non_managed_modes(
-    adapter: HermesRuntimeAdapter, mock_server: MockHermes, mode: str
+def test_submit_rejects_governed_resource_access_mode(
+    adapter: HermesRuntimeAdapter, mock_server: MockHermes
 ) -> None:
-    grant = _grant("task_1", execution_mode=mode)
+    grant = _grant("task_1", execution_mode="governed_resource_access")
     with pytest.raises(RuntimeAuthError):
         adapter.submit_task("task_1", "hello", "idem-mode", grant)
 
 
-def test_submit_rejects_managed_execution_without_explicit_opt_in(
-    mock_server: MockHermes,
+def test_managed_execution_is_always_unsupported(
+    mock_server: MockHermes, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    adapter = HermesRuntimeAdapter(
-        _config(mock_server.api_url, allow_unverified=False)
-    )
+    # The removed test-only opt-in must not resurrect via the environment.
+    monkeypatch.setenv("HERMES_ALLOW_UNVERIFIED_MANAGED_EXECUTION", "1")
+    adapter = HermesRuntimeAdapter(_config(mock_server.api_url))
     result = adapter.submit_task(
-        "task_1", "hello", "idem-managed", _grant("task_1")
+        "task_1",
+        "hello",
+        "idem-managed",
+        _grant("task_1", execution_mode="managed_execution"),
     )
     assert result.outcome is SubmitOutcome.UNSUPPORTED
+    assert result.runtime_task_id is None
     assert result.error is not None
+    assert result.error.code is ErrorCode.UNSUPPORTED
+    assert result.error.context.get("reason") == "managed_execution_unverified"
     assert mock_server.runs == {}
 
 
@@ -1663,15 +1665,18 @@ def test_config_strips_key_whitespace_and_rejects_internal_spaces() -> None:
         )
 
 
-def test_config_from_env_reads_unverified_execution_opt_in() -> None:
-    config = HermesConfig.from_env(
-        {
-            "HERMES_API_URL": "http://127.0.0.1:8080",
-            "HERMES_API_KEY": TEST_KEY,
-            HERMES_ALLOW_UNVERIFIED_EXECUTION_ENV: "1",
-        }
+def test_config_has_no_managed_execution_opt_in() -> None:
+    base = {
+        "HERMES_API_URL": "http://127.0.0.1:8080",
+        "HERMES_API_KEY": TEST_KEY,
+    }
+    config = HermesConfig.from_env(base)
+    assert not hasattr(config, "allow_unverified_managed_execution")
+    # A leftover legacy switch in the environment must be ignored.
+    legacy = HermesConfig.from_env(
+        {**base, "HERMES_ALLOW_UNVERIFIED_MANAGED_EXECUTION": "1"}
     )
-    assert config.allow_unverified_managed_execution is True
+    assert legacy == config
 
 
 def test_run_path_rejects_control_and_dot_segments(

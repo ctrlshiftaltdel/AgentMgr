@@ -9,9 +9,10 @@
 - Contract tests: `app/tests/runtime/test_hermes_adapter.py` (mock server),
   `app/tests/runtime/test_hermes_integration.py` (env-gated real runtime)
 
-> **Scope.** This adapter is the internal B3 execution boundary for Managed
-> Execution. It maps the Hermes `/v1/runs` API onto the neutral Runtime Adapter
-> contract. It does not write task state, issue or accept Grants, expose Hermes
+> **Scope.** This adapter is the internal B3 runtime boundary for Hermes. It
+> maps the Hermes `/v1/runs` API onto the neutral Runtime Adapter contract and
+> serves `advisory` execution only; managed execution is refused until Issue #82.
+> It does not write task state, issue or accept Grants, expose Hermes
 > profile/database/session internals, or claim OS-level isolation.
 >
 > **Evidence split.** Mock tests prove the adapter/contract mapping. Only a
@@ -48,19 +49,14 @@ the key is stripped; embedded whitespace is rejected.
 For TLS deployments, terminate TLS at the API server or a trusted local proxy
 and keep the key out of command history, repository files and logs.
 
-### Test-only compatibility opt-in
+### Managed execution is always refused
 
 `managed_execution` is **unverified** because Hermes cannot enforce per-tool
-capability/scope, task-scoped credentials or OS isolation. `submit_task` therefore
-returns `SubmitOutcome.UNSUPPORTED` by default. The approved compatibility suite
-may set:
-
-```bash
-export HERMES_ALLOW_UNVERIFIED_MANAGED_EXECUTION=1
-```
-
-This flag is for the isolated test host only. It must remain unset in every real
-deployment until Issue #82 provides a controlled execution environment.
+capability/scope, task-scoped credentials or OS isolation. A managed grant is
+therefore **always** rejected with `SubmitOutcome.UNSUPPORTED`, and nothing is
+sent to the runtime. There is no environment variable, configuration field or
+test-only bypass: the adapter serves only `advisory` execution until Issue #82
+provides a controlled execution environment.
 
 ## 2. Endpoints and authentication
 
@@ -161,17 +157,20 @@ client payload, and never widens scope. It enforces what it locally can:
 
 - `grant.task_id` must equal `task_id` (otherwise `forbidden`);
 - `task_revision` must be a positive integer;
-- `execution_mode` must be `managed_execution` (B3 only);
+- `execution_mode` must be `advisory` (the only mode this adapter serves until
+  Issue #82; `managed_execution` is always `unsupported`, and
+  `governed_resource_access` is refused as a mode mismatch);
 - `expires_at` must be present and in the future;
 - `capabilities` must be non-empty, well-formed, duplicate-free, and must not
   name adapter-level capabilities such as `runtime.tool_permissions`;
 - `resource_scope.scope_type` must be an authorising value (not
   `none`/`undetermined`) and must declare `data_classifications`.
 
-`managed_execution` itself remains `unverified`: without the test-only opt-in the
-submit returns `SubmitOutcome.UNSUPPORTED` and sends nothing. Hermes cannot
-enforce per-tool capability or resource scope, task-scoped credentials, or OS
-isolation; these fields are binding/audit metadata, not runtime enforcement.
+`managed_execution` itself remains `unverified` and is always refused: the
+submit returns `SubmitOutcome.UNSUPPORTED` and sends nothing, with no opt-in.
+Hermes cannot enforce per-tool capability or resource scope, task-scoped
+credentials, or OS isolation; these fields are binding/audit metadata, not
+runtime enforcement.
 
 The POST body is:
 
@@ -351,8 +350,8 @@ new tasks when health is `unavailable`.
 4. **Logical session binding only.** `session_id` associates a run with the
    AgentMgr task id; it is not an OS user, filesystem, process or network
    boundary.
-5. **Managed Execution is unverified.** Submissions are rejected by default until
-   the explicit test-only opt-in or Issue #82.
+5. **Managed Execution is unverified.** Managed-execution submissions are always
+   rejected as `unsupported` until Issue #82; there is no test-only opt-in.
 6. **Structured results are absent.** Only text + usage are available;
    completion is `partial_success`.
 7. **Approval/unknown controls are unverified.** The endpoints exist, but their
@@ -375,9 +374,10 @@ export HERMES_API_KEY='<api-key>'
 uv run pytest app/tests/runtime/test_hermes_integration.py -q
 ```
 
-It performs a health check (asserting `healthy`), a default refusal of
-`managed_execution`, a short "reply with OK" run under the test-only opt-in, an
-idempotency replay, and (only with `HERMES_INTEGRATION_STOP=1`) a stop scenario.
+It performs a health check (asserting `healthy`), a refusal of a
+`managed_execution` grant (always `unsupported`, no opt-in), a short
+"reply with OK" advisory run, an idempotency replay, and (only with
+`HERMES_INTEGRATION_STOP=1`) a stop scenario.
 It never writes a token, host or profile path into the repository or test output.
 Mock tests run without any runtime or database credentials:
 
