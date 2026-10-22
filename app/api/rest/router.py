@@ -23,7 +23,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, Path, Query
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_principal, get_request_id
+from app.api.deps import get_principal
 from app.api.rest import operations
 from app.api.rest.models import (
     CancelTaskRequest,
@@ -55,7 +55,6 @@ def evaluate_task(
     body: EvaluateTaskRequest,
     session: Session = Depends(get_session),
     principal: Principal = Depends(get_principal),
-    _request_id: str | None = Depends(get_request_id),
 ) -> dict[str, Any]:
     """Read-only PDP evaluation; never mutates task state or issues a grant."""
     return _execute(
@@ -68,7 +67,6 @@ def submit_task(
     body: SubmitTaskRequest,
     session: Session = Depends(get_session),
     principal: Principal = Depends(get_principal),
-    _request_id: str | None = Depends(get_request_id),
 ) -> dict[str, Any]:
     """Submit an advisory task and return its task id + current status."""
     return _execute(
