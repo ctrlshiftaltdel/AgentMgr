@@ -185,7 +185,12 @@ The POST body is:
 }
 ```
 
-with `Idempotency-Key: <idempotency_key>`. A new run returns 202:
+with `Idempotency-Key: <idempotency_key>`. The body is encoded as canonical
+UTF-8 JSON: object keys sorted recursively, compact `,`/`:` separators, and
+non-ASCII characters emitted literally (`ensure_ascii=false`). The same bytes are
+hashed for `payload_hash` (SHA-256, JCS-style canonicalisation), so a Chinese
+prompt hashes to exactly the bytes sent instead of an ASCII-escaped form. A new
+run returns 202:
 
 ```json
 {"run_id": "<opaque-run-id>", "status": "started", "replayed": false}
@@ -211,15 +216,19 @@ find_by_idempotency_key(
 
 Because Hermes has no lookup endpoint, the adapter can only query its
 **process-local** submission map. It replays the exact stored POST with the same
-`Idempotency-Key` and body; it never sends a request for a key it has not seen
-(which would create a new run). Outcomes:
+`Idempotency-Key` and canonical body when the submission outcome is still
+ambiguous; it never sends a request for a key it has not seen (which would create
+a new run). A definite `rejected`/`unsupported`/`conflict` submit outcome is
+recorded and returned from that record without replaying the create POST. A 404
+on the create route maps to `unknown` — it does not prove that no run exists.
+Outcomes:
 
 | Result | Meaning |
 |---|---|
 | `found` | The replay returned the same `run_id`; the payload hash is returned. |
-| `not_found` | The runtime answered 404 to the replay. |
-| `conflict` | The supplied `payload_hash` differs, the replay returned 409, or the replayed `run_id` differs. |
-| `unknown` | No local record (not proof of absence), timeout, transport failure or malformed response. |
+| `not_found` | A recorded definite rejection/unsupported outcome proves no run was created (the original error is attached). |
+| `conflict` | The supplied `payload_hash` differs, a definite conflict was recorded, the replay returned 409, or the replayed `run_id` differs. |
+| `unknown` | No local record (not proof of absence), a 404 on the create route, timeout, transport failure or malformed response. |
 
 The map is **not durable across restarts**, so `task.lookup` stays `unverified`.
 The core must not treat `unknown` as "no task exists" and must not blind-resubmit.

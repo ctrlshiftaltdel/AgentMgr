@@ -10,6 +10,9 @@ The adapter distinguishes three situations:
 
 * definite failures (401/403/404/409/429/503, malformed protocol) raise one of
   the subclasses below;
+* 408/504 (timeout) and 502 (gateway error) are ambiguous: the request may have
+  been accepted, so they are reported as ``timeout``/``unknown`` rather than as
+  a definite rejection or unavailability;
 * ambiguous submission outcomes are returned as
   :class:`app.runtime.contract.SubmitResult` with ``timeout``/``unknown``;
 * a health probe degrades to :class:`app.runtime.contract.HealthResult` instead
@@ -59,6 +62,11 @@ def error_code_for_http_status(status: int) -> ErrorCode:
         return ErrorCode.INVALID_REQUEST
     if status in (405, 501):
         return ErrorCode.UNSUPPORTED
+    if status == 502:
+        # Bad gateway: the request may have reached the upstream runtime before
+        # the proxy failed.  Treat it as an ambiguous/unknown outcome, not as a
+        # definite unavailability answer.
+        return ErrorCode.UNKNOWN
     if status == 503:
         return ErrorCode.UNAVAILABLE
     if 500 <= status < 600:

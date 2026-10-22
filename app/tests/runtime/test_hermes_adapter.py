@@ -15,6 +15,7 @@ import logging
 import threading
 import time
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -50,6 +51,7 @@ from app.runtime.errors import (
 from app.runtime.hermes import (
     HermesConfig,
     HermesRuntimeAdapter,
+    _payload_hash as adapter_payload_hash,
 )
 from app.runtime.http import HttpResponse, UrllibTransport
 
@@ -64,7 +66,9 @@ def _json_bytes(payload: object) -> bytes:
 
 
 def _payload_hash(body: object) -> str:
-    canonical = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+    canonical = json.dumps(
+        body, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
 
 
@@ -736,6 +740,51 @@ def test_capabilities_probe_version_mismatch_adds_limitation(
     assert "9.9.9" in (submit.limitations or "")
 
 
+def test_capabilities_version_compares_semver_components(
+    adapter: HermesRuntimeAdapter, mock_server: MockHermes
+) -> None:
+    # ``0.22.10`` must not be treated as covered by ``0.22.1`` just because the
+    # string starts with it.  Every numeric component is compared.
+    mock_server.runtime_version = "0.22.10"
+    snapshot = adapter.capabilities(probe=True)
+    submit = snapshot.capability(RuntimeCapability.TASK_SUBMIT)
+    assert submit is not None
+    assert submit.status is CapabilityStatus.PARTIALLY_VERIFIED
+    assert "0.22.10" in (submit.limitations or "")
+    assert "Live probe reported version" in (submit.limitations or "")
+
+
+def test_capabilities_version_build_metadata_still_covered(
+    adapter: HermesRuntimeAdapter, mock_server: MockHermes
+) -> None:
+    # The default mock reports ``0.22.1+72.g450ad50``; build metadata does not
+    # turn the spike evidence into a mismatch.
+    snapshot = adapter.capabilities(probe=True)
+    submit = snapshot.capability(RuntimeCapability.TASK_SUBMIT)
+    assert submit is not None
+    assert submit.status is CapabilityStatus.PARTIALLY_VERIFIED
+    assert "Live probe reported version" not in (submit.limitations or "")
+
+
+def test_capability_limitations_reflect_the_recorded_real_suite(
+    adapter: HermesRuntimeAdapter,
+) -> None:
+    snapshot = adapter.capabilities()
+    for item in snapshot.capabilities:
+        text = (item.limitations or "").lower()
+        assert "has not been run" not in text
+        assert "has not run" not in text
+    submit = snapshot.capability(RuntimeCapability.TASK_SUBMIT)
+    status = snapshot.capability(RuntimeCapability.TASK_STATUS)
+    cancel = snapshot.capability(RuntimeCapability.TASK_CANCEL)
+    health = snapshot.capability(RuntimeCapability.RUNTIME_HEALTH)
+    for item in (submit, status, cancel, health):
+        assert item is not None
+        assert item.status is CapabilityStatus.PARTIALLY_VERIFIED
+        assert "mock-only" in (item.limitations or "")
+        assert "real suite" in (item.limitations or "")
+
+
 def test_capabilities_probe_auth_failure(mock_server: MockHermes) -> None:
     adapter = HermesRuntimeAdapter(_config(mock_server.api_url, key=WRONG_KEY))
     with pytest.raises(RuntimeAuthError):
@@ -824,6 +873,69 @@ def test_submit_accepted_and_body(
     assert request["headers"]["Authorization"] == f"Bearer {TEST_KEY}"
 
 
+def test_payload_hash_uses_exact_utf8_canonical_bytes() -> None:
+    body = {
+        "input": "请总结这份合同",
+        "session_id": "task_cn",
+        "instructions": "用简体中文回答",
+    }
+    expected_bytes = (
+        '{"input":"请总结这份合同","instructions":"用简体中文回答",'
+        '"session_id":"task_cn"}'
+    ).encode("utf-8")
+    assert adapter_payload_hash(body) == (
+        "sha256:" + hashlib.sha256(expected_bytes).hexdigest()
+    )
+    # The ASCII-escaped form (the old behaviour) is a different byte string and
+    # therefore a different digest.
+    escaped = json.dumps(
+        body, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    assert escaped != expected_bytes
+    assert adapter_payload_hash(body) != (
+        "sha256:" + hashlib.sha256(escaped).hexdigest()
+    )
+
+
+def test_submit_sends_and_hashes_canonical_utf8_bytes(
+    mock_server: MockHermes,
+) -> None:
+    submit_response = HttpResponse(
+        202, body=_json_bytes({"run_id": "run_cn", "status": "started"})
+    )
+    replay_response = HttpResponse(
+        202, body=_json_bytes({"run_id": "run_cn", "status": "started"})
+    )
+    transport = _SequencedTransport([submit_response, replay_response])
+    adapter = HermesRuntimeAdapter(
+        _config(mock_server.api_url, attempts=1),
+        transport=transport,
+    )
+    prompt = "请用一句话概括这份报告"
+    instructions = "使用简体中文"
+    result = adapter.submit_task(
+        "task_cn", prompt, "idem-cn", _grant("task_cn"), instructions=instructions
+    )
+    assert result.outcome is SubmitOutcome.ACCEPTED
+
+    expected_bytes = (
+        '{"input":"请用一句话概括这份报告","instructions":"使用简体中文",'
+        '"session_id":"task_cn"}'
+    ).encode("utf-8")
+    assert transport.calls[0]["body"] == expected_bytes
+
+    found = adapter.find_by_idempotency_key(
+        "task_cn", "grnt_test_0001", "idem-cn"
+    )
+    assert found.outcome is LookupOutcome.FOUND
+    assert found.payload_hash == (
+        "sha256:" + hashlib.sha256(expected_bytes).hexdigest()
+    )
+    # The lookup replay sends the identical canonical bytes, so the runtime
+    # recognises the same idempotent submission.
+    assert transport.calls[1]["body"] == expected_bytes
+
+
 def test_submit_idempotent_replay_and_local_conflict(
     adapter: HermesRuntimeAdapter, mock_server: MockHermes
 ) -> None:
@@ -880,6 +992,34 @@ def test_submit_definite_outcomes_are_returned(
     result = adapter.submit_task("task_1", "hello", "idem-definite", _grant("task_1"))
     assert result.outcome is outcome
     assert result.error is not None
+
+
+def test_submit_404_on_create_route_is_unknown(
+    adapter: HermesRuntimeAdapter, mock_server: MockHermes
+) -> None:
+    mock_server.submit_status = 404
+    result = adapter.submit_task("task_1", "hello", "idem-404", _grant("task_1"))
+    assert result.outcome is SubmitOutcome.UNKNOWN
+    assert result.error is not None
+    assert result.error.code is ErrorCode.NOT_FOUND
+    assert mock_server.runs == {}
+
+
+@pytest.mark.parametrize("status", [502])
+def test_submit_502_is_ambiguous_unknown(
+    adapter: HermesRuntimeAdapter, mock_server: MockHermes, status: int
+) -> None:
+    mock_server.submit_status = status
+    result = adapter.submit_task("task_1", "hello", "idem-502", _grant("task_1"))
+    assert result.outcome is SubmitOutcome.UNKNOWN
+    assert result.error is not None
+    assert result.error.code is ErrorCode.UNKNOWN
+    keys = [
+        item["headers"].get("Idempotency-Key")
+        for item in mock_server.requests
+        if item["method"] == "POST" and item["path"] == "/v1/runs"
+    ]
+    assert keys and all(key == "idem-502" for key in keys)
 
 
 @pytest.mark.parametrize("status", [408, 504])
@@ -1048,6 +1188,28 @@ def test_submit_rejects_inconsistent_grant_shape(
     assert result.outcome is SubmitOutcome.UNSUPPORTED
 
 
+def test_submit_rejects_boolean_task_revision(
+    adapter: HermesRuntimeAdapter, mock_server: MockHermes
+) -> None:
+    # ``bool`` is an ``int`` subclass; ``True`` must not pass as revision 1.
+    grant = _grant("task_1", task_revision=True)  # type: ignore[arg-type]
+    with pytest.raises(RuntimeAuthError) as excinfo:
+        adapter.submit_task("task_1", "hello", "idem-bool-rev", grant)
+    assert excinfo.value.context.get("reason") == "invalid_task_revision"
+    assert mock_server.runs == {}
+
+
+def test_submit_rejects_non_datetime_expiry(
+    adapter: HermesRuntimeAdapter, mock_server: MockHermes
+) -> None:
+    grant = _grant("task_1")
+    malformed = replace(grant, expires_at="2026-01-01T00:00:00Z")  # type: ignore[arg-type]
+    with pytest.raises(RuntimeAuthError) as excinfo:
+        adapter.submit_task("task_1", "hello", "idem-bad-expiry", malformed)
+    assert excinfo.value.context.get("reason") == "invalid_expiry"
+    assert mock_server.runs == {}
+
+
 # --------------------------------------------------------------------------- #
 # Lookup by idempotency key
 # --------------------------------------------------------------------------- #
@@ -1110,13 +1272,55 @@ def test_find_by_idempotency_key_conflict_on_server_409(
     assert result.outcome is LookupOutcome.CONFLICT
 
 
-def test_find_by_idempotency_key_not_found_on_replay_404(
+def test_find_by_idempotency_key_404_on_create_route_is_unknown(
     adapter: HermesRuntimeAdapter, mock_server: MockHermes
 ) -> None:
     adapter.submit_task("task_1", "hello", "idem-404", _grant("task_1"))
     mock_server.submit_status = 404
     result = adapter.find_by_idempotency_key("task_1", "grnt_test_0001", "idem-404")
-    assert result.outcome is LookupOutcome.NOT_FOUND
+    # A 404 on the create route does not prove that no run exists.
+    assert result.outcome is LookupOutcome.UNKNOWN
+    assert result.error is not None
+    assert result.error.code is ErrorCode.NOT_FOUND
+
+
+@pytest.mark.parametrize(
+    ("status", "submit_outcome", "lookup_outcome", "error_code"),
+    [
+        (422, SubmitOutcome.REJECTED, LookupOutcome.NOT_FOUND, ErrorCode.INVALID_REQUEST),
+        (501, SubmitOutcome.UNSUPPORTED, LookupOutcome.NOT_FOUND, ErrorCode.UNSUPPORTED),
+        (409, SubmitOutcome.CONFLICT, LookupOutcome.CONFLICT, ErrorCode.CONFLICT),
+    ],
+)
+def test_find_by_idempotency_key_returns_recorded_terminal_fact(
+    adapter: HermesRuntimeAdapter,
+    mock_server: MockHermes,
+    status: int,
+    submit_outcome: SubmitOutcome,
+    lookup_outcome: LookupOutcome,
+    error_code: ErrorCode,
+) -> None:
+    key = f"idem-terminal-{status}"
+    mock_server.submit_status = status
+    submitted = adapter.submit_task("task_1", "hello", key, _grant("task_1"))
+    assert submitted.outcome is submit_outcome
+
+    def _create_posts() -> list[dict[str, Any]]:
+        return [
+            item
+            for item in mock_server.requests
+            if item["method"] == "POST" and item["path"] == "/v1/runs"
+        ]
+
+    before = len(_create_posts())
+    # Even if the runtime would now accept the request, the recorded definite
+    # outcome is returned without replaying the create POST.
+    mock_server.submit_status = None
+    result = adapter.find_by_idempotency_key("task_1", "grnt_test_0001", key)
+    assert result.outcome is lookup_outcome
+    assert result.error is not None
+    assert result.error.code is error_code
+    assert len(_create_posts()) == before
 
 
 # --------------------------------------------------------------------------- #
@@ -1198,6 +1402,18 @@ def test_status_408_504_maps_to_unknown(
     result = adapter.get_status(run_id)
     assert result.state is RuntimeState.UNKNOWN
     assert result.error is not None
+
+
+def test_status_502_maps_to_unknown(
+    adapter: HermesRuntimeAdapter, mock_server: MockHermes
+) -> None:
+    run_id = mock_server.create_run(fixed_status="running")
+    mock_server.status_status = 502
+    result = adapter.get_status(run_id)
+    # 502 is ambiguous, not a definite unavailability answer.
+    assert result.state is RuntimeState.UNKNOWN
+    assert result.error is not None
+    assert result.error.code is ErrorCode.UNKNOWN
 
 
 def test_status_404_is_not_found(adapter: HermesRuntimeAdapter) -> None:
@@ -1309,6 +1525,19 @@ def test_events_timeout_returns_empty_batch_with_error(
     assert batch.next_cursor is None
     assert batch.error is not None
     assert batch.error.code is ErrorCode.TIMEOUT
+
+
+def test_events_rejects_invalid_cursor_and_argument_types(
+    adapter: HermesRuntimeAdapter,
+) -> None:
+    with pytest.raises(ValueError):
+        adapter.poll_events("run_1", cursor=1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        adapter.poll_events("run_1", cursor="bad\ncursor")
+    with pytest.raises(ValueError):
+        adapter.poll_events("run_1", max_events=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        adapter.poll_events("run_1", timeout="1")  # type: ignore[arg-type]
 
 
 # --------------------------------------------------------------------------- #
@@ -1436,6 +1665,22 @@ def test_cancel_rejects_cross_task_handle(
     run_id = mock_server.create_run(session_id="task_a")
     with pytest.raises(RuntimeAuthError):
         adapter.cancel_task(run_id, task_id="task_b")
+    assert not any(
+        item["method"] == "POST" and item["path"].endswith("/stop")
+        for item in mock_server.requests
+    )
+
+
+def test_cancel_rejects_invalid_reason_and_poll_types(
+    adapter: HermesRuntimeAdapter, mock_server: MockHermes
+) -> None:
+    run_id = mock_server.create_run()
+    with pytest.raises(ValueError):
+        adapter.cancel_task(run_id, reason=123)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        adapter.cancel_task(run_id, reason="x" * 100_001)
+    with pytest.raises(ValueError):
+        adapter.cancel_task(run_id, poll_timeout="1")  # type: ignore[arg-type]
     assert not any(
         item["method"] == "POST" and item["path"].endswith("/stop")
         for item in mock_server.requests

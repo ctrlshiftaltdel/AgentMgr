@@ -239,7 +239,9 @@ Observed error behavior:
 The adapter maps these to `RuntimeAuthError`, `RuntimeNotFound`,
 `RuntimeConflict`, `RuntimeRateLimited` and `RuntimeUnavailable`. A 404 on status
 becomes `RuntimeState.NOT_FOUND`; the core treats it as unknown and starts
-reconciliation.
+reconciliation. A 404 on the **create** route and a 502 from an intervening
+gateway are ambiguous (`unknown`), not definite absence or unavailability; they
+are covered by mock tests only.
 
 ## 6. What this does not prove
 

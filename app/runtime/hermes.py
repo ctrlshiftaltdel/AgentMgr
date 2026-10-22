@@ -14,9 +14,13 @@ provide; it is a logical association, not an OS identity.
 
 Honesty rules
 =============
-* No capability is ``verified``: a committed contract test suite has not been
-  run against a real runtime and recorded with command/exit code/version/SHA.
-  The labels are ``partially_verified`` or ``unverified``.
+* No capability is ``verified``.  The committed real-runtime suite *has* been
+  run and recorded (command, exit code, version, SHA) against Hermes 0.22.1; it
+  covers the positive lifecycle (health, managed rejection, submit/replay,
+  completed, stop).  The negative paths (redirects, 408/504, malformed 2xx,
+  keepalive-only streams, cross-task binding) are mock-only.  The labels stay
+  ``partially_verified`` or ``unverified``; mock tests are adapter-mapping
+  evidence and never upgrade a label.
 * Hermes cannot enforce per-tool capability or resource scope, task-scoped
   credentials, or OS isolation.  Its internal tool calls do **not** pass through
   the AgentMgr PEP until Issue #82 provides a controlled execution environment.
@@ -36,14 +40,20 @@ Ambiguity policy
   never claims rejection.
 * ``find_by_idempotency_key`` can only answer from the process-local submission
   map because Hermes has no lookup endpoint.  It replays the exact POST with the
-  stored key.  The map is not durable across restarts; this limitation is why
-  ``task.lookup`` stays ``unverified``.
+  stored key for a submission whose outcome is still ambiguous.  A definite
+  ``rejected``/``unsupported``/``conflict`` outcome is recorded and returned
+  from that record without replaying the create POST.  A 404 on the create route
+  is ``unknown`` (nothing proves the run does not exist).  The map is not
+  durable across restarts; this limitation is why ``task.lookup`` stays
+  ``unverified``.
 * ``POST /stop`` returning ``stopping`` is **not** a stop.  ``cancel_task`` polls
   until the runtime reports ``cancelled``/``timed_out`` before setting
   ``stop_confirmed=true``; ``completed``/``failed`` are terminal but are not a
   confirmed *stop*.
 * A malformed 2xx response is ambiguous, not a definite failure: submit maps to
-  ``unknown``, status/result to ``unknown``, and cancel to ``unknown``.
+  ``unknown``, status/result to ``unknown``, and cancel to ``unknown``.  A 502
+  from an intervening gateway is likewise ambiguous, while 503 remains a
+  definite unavailability answer.
 * Redirects are refused by the transport so the bearer key never follows a
   ``Location`` header to another origin.
 """
@@ -173,6 +183,12 @@ _MAX_IDENTIFIER = 256
 _CAPABILITY_RE = re.compile(
     r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*@[0-9]+\.[0-9]+\.[0-9]+$"
 )
+
+#: Leading numeric ``major.minor.patch`` components of a reported version.
+#: Build metadata (``+72.g450ad50``) and a pre-release suffix are ignored for the
+#: coverage comparison; every numeric component is compared, so ``0.22.10`` is
+#: not covered by ``0.22.1``.
+_SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:[+-].*)?$")
 
 #: Exact (normalised) key names that always carry a credential or session value.
 _SENSITIVE_KEY_EXACT = frozenset(
@@ -315,9 +331,39 @@ def _extract_runtime_version(data: Mapping[str, Any]) -> str | None:
     return None
 
 
+def _semver_components(value: str) -> tuple[int, int, int] | None:
+    """Return ``(major, minor, patch)`` for a dotted version, else ``None``."""
+
+    match = _SEMVER_RE.match(value.strip())
+    if match is None:
+        return None
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+
+
+def _canonical_body_bytes(body: Mapping[str, Any]) -> bytes:
+    """Encode a request body as canonical UTF-8 JSON.
+
+    Canonicalisation (JCS-style for the string-keyed objects this adapter
+    sends): object keys are sorted recursively, separators are ``","``/``":"``
+    with no insignificant whitespace, and non-ASCII characters are emitted
+    literally.  The result is UTF-8 encoded.  The very same bytes are hashed by
+    :func:`_payload_hash` and written to the wire by
+    :meth:`HermesRuntimeAdapter._request_json`, so a Chinese prompt hashes to
+    its actual sent bytes rather than to an ASCII-escaped representation.
+    """
+
+    return json.dumps(
+        dict(body),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
 def _payload_hash(body: Mapping[str, Any]) -> str:
-    canonical = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
-    return "sha256:" + hashlib.sha256(canonical).hexdigest()
+    """SHA-256 of the canonical payload bytes that are sent for ``body``."""
+
+    return "sha256:" + hashlib.sha256(_canonical_body_bytes(body)).hexdigest()
 
 
 def _validate_text(value: object, name: str, *, limit: int = _MAX_IDENTIFIER) -> str:
@@ -352,7 +398,9 @@ def _is_ambiguous_error(exc: RuntimeAdapterError) -> bool:
         return True
     if 200 <= status < 400:
         return True
-    return status in (408, 504)
+    # 408/504 are timeouts; 502 is a gateway error where the request may have
+    # reached the runtime.  503 remains a definite unavailability answer.
+    return status in (408, 502, 504)
 
 
 def _is_sensitive_key(key: str) -> bool:
@@ -429,12 +477,14 @@ def _append_limitation(cap: Capability, extra: str) -> Capability:
 
 
 def _static_capabilities() -> tuple[Capability, ...]:
-    """Labels from the partial Hermes 0.22.1 spike plus mock contract tests.
+    """Labels from the recorded real Hermes 0.22.1 run plus mock contract tests.
 
-    ``verified`` is deliberately absent: the committed real-runtime contract
-    suite has not been run and recorded (command, exit code, version, SHA), so
-    every capability is ``partially_verified`` or ``unverified``.  Mock tests are
-    adapter-mapping evidence only and can never upgrade a label.
+    ``verified`` is deliberately absent: the committed real-runtime suite covers
+    only the positive lifecycle (health, managed rejection, submit/replay,
+    completed, stop), while redirects, 408/504, malformed 2xx, keepalive-only
+    streams and cross-task binding are mock-only.  Every capability is therefore
+    ``partially_verified`` or ``unverified``.  Mock tests are adapter-mapping
+    evidence only and can never upgrade a label.
     """
 
     def cap(
@@ -455,9 +505,10 @@ def _static_capabilities() -> tuple[Capability, ...]:
         cap(
             RuntimeCapability.TASK_SUBMIT,
             CapabilityStatus.PARTIALLY_VERIFIED,
-            "Only the isolated manual spike and mock tests exist; the committed "
-            "real contract suite has not been run. Submission requires a "
-            "server-resolved Grant; managed_execution stays unverified.",
+            "The committed real suite covers the positive submit/replay path "
+            "and managed-execution refusal; conflicts, redirects and 408/504 are "
+            "mock-only. Submission requires a server-resolved Grant; "
+            "managed_execution stays unverified.",
         ),
         cap(
             RuntimeCapability.TASK_LOOKUP,
@@ -470,15 +521,16 @@ def _static_capabilities() -> tuple[Capability, ...]:
         cap(
             RuntimeCapability.TASK_STATUS,
             CapabilityStatus.PARTIALLY_VERIFIED,
-            "Only the isolated manual spike and mock tests exist; the committed "
-            "real contract suite has not been run.",
+            "The committed real suite polls runs to completed and cancelled; "
+            "404, 408/504, malformed 2xx and cross-task binding are mock-only.",
         ),
         cap(
             RuntimeCapability.TASK_EVENTS_POLL,
             CapabilityStatus.PARTIALLY_VERIFIED,
             "SSE buffers expire after 5 minutes; Hermes did not confirm "
             "Last-Event-ID support, so reconnect uses client-side filtering and "
-            "can miss events. The committed real contract suite has not run.",
+            "can miss events. The real suite does not exercise SSE; keepalive "
+            "and cursor edge cases are mock-only.",
         ),
         cap(
             RuntimeCapability.TASK_EVENTS_SUBSCRIBE,
@@ -498,15 +550,16 @@ def _static_capabilities() -> tuple[Capability, ...]:
             RuntimeCapability.TASK_CANCEL,
             CapabilityStatus.PARTIALLY_VERIFIED,
             "POST /stop only returns stopping; stop_confirmed is set only after "
-            "a later cancelled/timed_out status. The committed real contract "
-            "suite has not been run.",
+            "a later cancelled/timed_out status. The real suite covers stop → "
+            "cancelled; 409, 501 and confirmation-poll failures are mock-only.",
         ),
         cap(
             RuntimeCapability.TASK_RESULT,
             CapabilityStatus.PARTIALLY_VERIFIED,
             "Text output, usage and runtime labels only; no independent evidence "
             "artifacts, so a completed run is reported as partial_success. The "
-            "committed real contract suite has not been run.",
+            "real suite asserts partial_success; 408/504 and malformed 2xx are "
+            "mock-only.",
         ),
         cap(
             RuntimeCapability.TASK_APPROVAL_RESOLVE,
@@ -527,8 +580,8 @@ def _static_capabilities() -> tuple[Capability, ...]:
         cap(
             RuntimeCapability.RUNTIME_HEALTH,
             CapabilityStatus.PARTIALLY_VERIFIED,
-            "Only the isolated manual spike and mock tests exist; the committed "
-            "real contract suite has not been run.",
+            "The committed real suite asserts healthy with api_ok/auth_ok; "
+            "auth failures, 429 degradation and 5xx paths are mock-only.",
         ),
         cap(
             RuntimeCapability.RUNTIME_ISOLATION,
@@ -590,19 +643,20 @@ def _bind_capabilities(
             )
             for cap in capabilities
         )
-    if runtime_version is not None and not runtime_version.startswith(
-        _SPIKE_RUNTIME_VERSION
-    ):
-        return tuple(
-            cap
-            if cap.status is CapabilityStatus.UNVERIFIED
-            else _append_limitation(
-                cap,
-                f"Live probe reported version {runtime_version!r}; evidence only "
-                f"covers {_SPIKE_RUNTIME_VERSION}.x.",
+    if runtime_version is not None:
+        reported = _semver_components(runtime_version)
+        covered = _semver_components(_SPIKE_RUNTIME_VERSION)
+        if reported is None or covered is None or reported != covered:
+            return tuple(
+                cap
+                if cap.status is CapabilityStatus.UNVERIFIED
+                else _append_limitation(
+                    cap,
+                    f"Live probe reported version {runtime_version!r}; evidence "
+                    f"only covers {_SPIKE_RUNTIME_VERSION}.",
+                )
+                for cap in capabilities
             )
-            for cap in capabilities
-        )
     return capabilities
 
 
@@ -692,7 +746,14 @@ class HermesConfig:
 
 @dataclass
 class _SubmissionRecord:
-    """Process-local record of one submit, used by the lookup fallback."""
+    """Process-local record of one submit, used by the lookup fallback.
+
+    ``outcome``/``error`` capture a **definite** terminal answer
+    (``rejected``/``unsupported``/``conflict``) so a later lookup can return
+    that fact without replaying the create POST.  ``outcome`` stays ``None``
+    while the submission is accepted (``run_id`` set) or still ambiguous, in
+    which case lookup replays the stored request.
+    """
 
     task_id: str
     grant_id: str
@@ -702,6 +763,8 @@ class _SubmissionRecord:
     run_id: str | None = None
     reported_state: str | None = None
     accepted_at: datetime | None = None
+    outcome: SubmitOutcome | None = None
+    error: RuntimeErrorInfo | None = None
 
 
 class HermesRuntimeAdapter:
@@ -830,9 +893,7 @@ class HermesRuntimeAdapter:
         )
         raw_body: bytes | None = None
         if body is not None:
-            raw_body = json.dumps(
-                dict(body), ensure_ascii=False, separators=(",", ":")
-            ).encode("utf-8")
+            raw_body = _canonical_body_bytes(body)
             headers["Content-Type"] = "application/json"
         response = self._transport.request(
             method,
@@ -928,7 +989,11 @@ class HermesRuntimeAdapter:
                 code=ErrorCode.FORBIDDEN,
                 context={"reason": "task_binding_mismatch"},
             )
-        if not isinstance(grant.task_revision, int) or grant.task_revision < 1:
+        if (
+            isinstance(grant.task_revision, bool)
+            or not isinstance(grant.task_revision, int)
+            or grant.task_revision < 1
+        ):
             raise RuntimeAuthError(
                 "grant task_revision must be a positive integer",
                 code=ErrorCode.FORBIDDEN,
@@ -963,6 +1028,12 @@ class HermesRuntimeAdapter:
                 "grant has no expiry",
                 code=ErrorCode.FORBIDDEN,
                 context={"reason": "grant_expired"},
+            )
+        if not isinstance(grant.expires_at, datetime):
+            raise RuntimeAuthError(
+                "grant expires_at must be a datetime",
+                code=ErrorCode.FORBIDDEN,
+                context={"reason": "invalid_expiry"},
             )
         if grant.is_expired():
             raise RuntimeAuthError(
@@ -1029,6 +1100,24 @@ class HermesRuntimeAdapter:
 
     # -- submit ------------------------------------------------------------
 
+    def _record_terminal_outcome(
+        self,
+        record_key: tuple[str, str, str],
+        outcome: SubmitOutcome,
+        info: RuntimeErrorInfo,
+    ) -> None:
+        """Store a definite submit answer so lookup can return it without a POST.
+
+        An accepted record (``run_id`` set) is never overwritten; its run remains
+        the recorded fact.
+        """
+
+        with self._submissions_lock:
+            record = self._submissions.get(record_key)
+            if record is not None and record.run_id is None:
+                record.outcome = outcome
+                record.error = info
+
     def submit_task(
         self,
         task_id: str,
@@ -1040,10 +1129,13 @@ class HermesRuntimeAdapter:
         """Submit one task under a server-resolved Grant.
 
         Definite ``rejected``/``unsupported``/``conflict`` answers are returned
-        on :class:`SubmitResult`.  Auth/rate-limit/unavailable failures raise a
-        stable adapter error.  A timeout, connection drop or malformed 2xx is
-        ambiguous: the same POST/key/body is replayed up to ``submit_attempts``
-        and then reported as ``timeout``/``unknown`` with the key preserved.
+        on :class:`SubmitResult` and stored on the submission record, so a later
+        lookup returns that fact without replaying the create POST.  A 404 on the
+        create route is ``unknown``, never a definite absence.  Auth/rate-limit/
+        unavailable failures raise a stable adapter error.  A timeout, connection
+        drop or malformed 2xx is ambiguous: the same POST/key/body is replayed up
+        to ``submit_attempts`` and then reported as ``timeout``/``unknown`` with
+        the key preserved.
         """
 
         _validate_text(task_id, "task_id")
@@ -1088,6 +1180,11 @@ class HermesRuntimeAdapter:
                     body=dict(body),
                 )
                 self._submissions[record_key] = existing
+            elif existing.run_id is None:
+                # A new explicit submit attempt supersedes an earlier definite
+                # answer; whatever this attempt returns will be recorded instead.
+                existing.outcome = None
+                existing.error = None
 
         attempts = max(1, self._config.submit_attempts)
         last_error: RuntimeAdapterError | None = None
@@ -1101,21 +1198,32 @@ class HermesRuntimeAdapter:
                     idempotency_key=idempotency_key,
                 )
             except RuntimeConflict as exc:
-                return SubmitResult(
-                    outcome=SubmitOutcome.CONFLICT,
-                    error=_error_info(exc),
+                info = _error_info(exc)
+                self._record_terminal_outcome(
+                    record_key, SubmitOutcome.CONFLICT, info
                 )
+                return SubmitResult(outcome=SubmitOutcome.CONFLICT, error=info)
             except RuntimeUnsupported as exc:
+                info = _error_info(exc)
+                self._record_terminal_outcome(
+                    record_key, SubmitOutcome.UNSUPPORTED, info
+                )
+                return SubmitResult(outcome=SubmitOutcome.UNSUPPORTED, error=info)
+            except RuntimeNotFound as exc:
+                # A 404 on the create route is ambiguous: it may be a routing
+                # or proxy answer, not proof that no run exists.  Do not record
+                # it as a terminal rejection.
                 return SubmitResult(
-                    outcome=SubmitOutcome.UNSUPPORTED,
+                    outcome=SubmitOutcome.UNKNOWN,
                     error=_error_info(exc),
                 )
             except RuntimeProtocolError as exc:
                 if exc.http_status in (400, 415, 422):
-                    return SubmitResult(
-                        outcome=SubmitOutcome.REJECTED,
-                        error=_error_info(exc),
+                    info = _error_info(exc)
+                    self._record_terminal_outcome(
+                        record_key, SubmitOutcome.REJECTED, info
                     )
+                    return SubmitResult(outcome=SubmitOutcome.REJECTED, error=info)
                 if not _is_ambiguous_error(exc):
                     raise
                 last_error = exc
@@ -1173,6 +1281,8 @@ class HermesRuntimeAdapter:
                 existing.run_id = run_id
                 existing.reported_state = reported_state
                 existing.accepted_at = accepted_at
+                existing.outcome = None
+                existing.error = None
             return SubmitResult(
                 outcome=SubmitOutcome.ACCEPTED,
                 runtime_task_id=run_id,
@@ -1201,9 +1311,13 @@ class HermesRuntimeAdapter:
 
         Hermes has no independent lookup endpoint, so this method can only use
         the **process-local** submission map.  It never sends a request for a key
-        it has not seen (that would create a new run in Hermes).  Without a local
-        record it returns ``unknown``, never ``not_found``: absence of a local
-        record is not proof that no run exists.
+        it has not seen (that would create a new run in Hermes).
+
+        A definite ``rejected``/``unsupported`` outcome is returned as
+        ``not_found`` (from the recorded fact: no run was created) and a recorded
+        ``conflict`` as ``conflict``, without replaying the create POST.  A 404
+        on the create route is ``unknown``: it is not proof that no run exists.
+        Without a local record it also returns ``unknown``, never ``not_found``.
         """
 
         _validate_text(task_id, "task_id")
@@ -1241,6 +1355,26 @@ class HermesRuntimeAdapter:
                 ),
             )
 
+        if record.run_id is None and record.outcome is not None:
+            # A definite submit answer is a local fact.  Replaying the create
+            # POST here would be a pointless side effect (and could create a run
+            # the runtime already refused).
+            if record.outcome is SubmitOutcome.CONFLICT:
+                return LookupResult(
+                    outcome=LookupOutcome.CONFLICT,
+                    payload_hash=record.payload_hash,
+                    accepted_at=record.accepted_at,
+                    observed_at=observed_at,
+                    error=record.error,
+                )
+            return LookupResult(
+                outcome=LookupOutcome.NOT_FOUND,
+                payload_hash=record.payload_hash,
+                accepted_at=record.accepted_at,
+                observed_at=observed_at,
+                error=record.error,
+            )
+
         try:
             data = self._request_json(
                 "POST",
@@ -1259,8 +1393,10 @@ class HermesRuntimeAdapter:
                 error=_error_info(exc),
             )
         except RuntimeNotFound as exc:
+            # A 404 on the create route is ambiguous: it does not prove that no
+            # run exists, so it must not become ``not_found``.
             return LookupResult(
-                outcome=LookupOutcome.NOT_FOUND,
+                outcome=LookupOutcome.UNKNOWN,
                 payload_hash=record.payload_hash,
                 observed_at=observed_at,
                 error=_error_info(exc),
@@ -1550,10 +1686,20 @@ class HermesRuntimeAdapter:
         """
 
         runtime_task_id = _validate_runtime_task_id(runtime_task_id)
-        if not isinstance(max_events, int) or max_events < 1:
+        if (
+            isinstance(max_events, bool)
+            or not isinstance(max_events, int)
+            or max_events < 1
+        ):
             raise ValueError("max_events must be a positive integer")
-        if timeout < 0:
-            raise ValueError("timeout must not be negative")
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or timeout < 0
+        ):
+            raise ValueError("timeout must be a non-negative number")
+        if cursor is not None:
+            _validate_text(cursor, "cursor", limit=_MAX_IDENTIFIER)
         if task_id is not None:
             bound = self.get_status(runtime_task_id, task_id=task_id)
             if bound.state is RuntimeState.NOT_FOUND:
@@ -1668,6 +1814,11 @@ class HermesRuntimeAdapter:
         runtime_task_id = _validate_runtime_task_id(runtime_task_id)
         if idempotency_key is not None:
             _validate_text(idempotency_key, "idempotency_key")
+        if reason is not None:
+            if not isinstance(reason, str):
+                raise ValueError("reason must be a string or None")
+            if len(reason) > _MAX_TEXT:
+                raise ValueError("reason is too long")
         poll_timeout = (
             self._config.cancel_poll_timeout if poll_timeout is None else poll_timeout
         )
@@ -1676,6 +1827,13 @@ class HermesRuntimeAdapter:
             if poll_interval is None
             else poll_interval
         )
+        if (
+            isinstance(poll_timeout, bool)
+            or not isinstance(poll_timeout, (int, float))
+            or isinstance(poll_interval, bool)
+            or not isinstance(poll_interval, (int, float))
+        ):
+            raise ValueError("poll_timeout and poll_interval must be numbers")
         if poll_timeout < 0 or poll_interval < 0:
             raise ValueError("poll_timeout and poll_interval must not be negative")
         if task_id is not None:
