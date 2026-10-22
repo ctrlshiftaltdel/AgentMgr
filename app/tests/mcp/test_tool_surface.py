@@ -5,7 +5,14 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from app.tests.mcp.helpers import open_mcp_session, tool_error_code, tool_text
+from app.api.mcp.server import MCP_ALLOWED_HOSTS_ENV
+from app.tests.mcp.helpers import (
+    initialize_body,
+    open_mcp_session,
+    tool_error_code,
+    tool_text,
+    transport_headers,
+)
 
 #: This module is intentionally runnable without PostgreSQL.  Its own fixtures
 #: still set a token so the authentication path is exercised.
@@ -60,7 +67,9 @@ FORBIDDEN_PROPERTIES = {
 
 @pytest.mark.anyio
 async def test_streamable_http_exposes_the_client_tool_surface(app):
-    async with open_mcp_session(app) as session:
+    async with open_mcp_session(
+        app, headers=transport_headers(_SURFACE_TOKEN)
+    ) as session:
         tools = (await session.list_tools()).tools
 
     by_name = {tool.name: tool for tool in tools}
@@ -81,7 +90,9 @@ async def test_streamable_http_exposes_the_client_tool_surface(app):
 
 @pytest.mark.anyio
 async def test_submit_schema_requires_core_inputs_and_has_no_authority_fields(app):
-    async with open_mcp_session(app) as session:
+    async with open_mcp_session(
+        app, headers=transport_headers(_SURFACE_TOKEN)
+    ) as session:
         tools = {tool.name: tool for tool in (await session.list_tools()).tools}
 
     schema = tools["governance.submit_task"].input_schema
@@ -96,32 +107,69 @@ async def test_submit_schema_requires_core_inputs_and_has_no_authority_fields(ap
     assert props["requested_capabilities"]["items"]["pattern"].endswith(
         "@[0-9]+\\.[0-9]+\\.[0-9]+$"
     )
+    # Exactly one capability is supported until the core can evaluate/grant
+    # several; the schema rejects a longer list before task creation.
+    assert props["requested_capabilities"]["maxItems"] == 1
+    assert props["requested_capabilities"]["minItems"] == 1
     assert "execution_mode" not in props
     defs = schema["$defs"]
     assert defs["ResourceScope"]["additionalProperties"] is False
     assert defs["Goal"]["additionalProperties"] is False
 
 
+def test_unauthenticated_initialize_and_tools_list_are_rejected_at_transport(
+    client,
+):
+    """No MCP request reaches the SDK without the internal bearer token."""
+    for method in ("initialize", "tools/list"):
+        body = initialize_body()
+        body["method"] = method
+        body["id"] = 1
+        response = client.post("/mcp/", json=body)
+        assert response.status_code == 401, (method, response.text)
+        assert response.json() == {
+            "error": {"code": "unauthorized", "message": "authentication required"}
+        }
+
+
+def test_forged_bearer_token_is_rejected_at_transport(client):
+    response = client.post(
+        "/mcp/",
+        json=initialize_body(),
+        headers=transport_headers("not-the-token"),
+    )
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "unauthorized"
+
+
+def test_remote_host_is_rejected_without_an_explicit_allowlist(monkeypatch):
+    monkeypatch.setenv("AJAIMGR_INTERNAL_TOKEN", _SURFACE_TOKEN)
+    from app.api.app import create_app
+
+    with TestClient(create_app(), base_url="http://api.example.com:8000") as client:
+        response = client.post(
+            "/mcp/",
+            json=initialize_body(),
+            headers=transport_headers(_SURFACE_TOKEN),
+        )
+    assert response.status_code == 421, response.text
+
+
 @pytest.mark.anyio
-async def test_unauthenticated_tool_call_is_rejected(app):
-    async with open_mcp_session(app) as session:
-        result = await session.call_tool("governance.get_task", {"task_id": "task_0001"})
+async def test_configured_remote_host_is_accepted(monkeypatch):
+    monkeypatch.setenv("AJAIMGR_INTERNAL_TOKEN", _SURFACE_TOKEN)
+    monkeypatch.setenv(MCP_ALLOWED_HOSTS_ENV, "api.example.com:*")
+    from app.api.app import create_app
 
-    assert result.is_error is True
-    assert tool_error_code(result) == "unauthorized"
-    assert "Traceback" not in tool_text(result)
-    assert "sqlalchemy" not in tool_text(result).lower()
-
-
-@pytest.mark.anyio
-async def test_forged_bearer_token_is_rejected(app):
+    app = create_app()
     async with open_mcp_session(
-        app, headers={"Authorization": "Bearer not-the-token", "X-Employee-Id": "1"}
+        app,
+        headers=transport_headers(_SURFACE_TOKEN),
+        base_url="http://api.example.com:8000",
     ) as session:
-        result = await session.call_tool("governance.get_task", {"task_id": "task_0001"})
+        tools = (await session.list_tools()).tools
 
-    assert result.is_error is True
-    assert tool_error_code(result) == "unauthorized"
+    assert {tool.name for tool in tools} == EXPECTED_TOOLS
 
 
 @pytest.mark.anyio
@@ -141,7 +189,9 @@ async def test_malformed_employee_header_is_rejected(app):
 
 @pytest.mark.anyio
 async def test_unknown_tool_and_invalid_arguments_use_stable_codes(app):
-    async with open_mcp_session(app) as session:
+    async with open_mcp_session(
+        app, headers=transport_headers(_SURFACE_TOKEN)
+    ) as session:
         unknown = await session.call_tool("governance.no_such_tool", {})
         extra = await session.call_tool(
             "governance.get_task",

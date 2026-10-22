@@ -21,6 +21,8 @@ dependencies = [
 dev = [
     "pytest",
     "httpx",
+    # The MCP test client uses httpx2 directly (also a transitive mcp dep).
+    "httpx2",
     # Contract-schema tests use JSON Schema Draft 2020-12 + FormatChecker.
     "jsonschema",
 ]

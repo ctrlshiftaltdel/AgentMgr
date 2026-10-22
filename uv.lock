@@ -27,6 +27,7 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "httpx" },
+    { name = "httpx2" },
     { name = "jsonschema" },
     { name = "pytest" },
 ]
@@ -49,6 +50,7 @@ requires-dist = [
 [package.metadata.requires-dev]
 dev = [
     { name = "httpx" },
+    { name = "httpx2" },
     { name = "jsonschema" },
     { name = "pytest" },
 ]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import func, select
@@ -10,8 +11,10 @@ from sqlalchemy.orm import Session
 
 from app.api.rest import operations
 from app.api.rest.ratelimit import RateLimiter
-from app.db.models.organization import Employee
+from app.audit.models import AuditEvent
+from app.db.models.organization import Company, Employee
 from app.governance.models import ExecutionGrant
+from app.identity.models import EmployeeRole, Role
 from app.tasks import service as task_service
 from app.tasks.models import Task
 from app.tests.mcp.helpers import (
@@ -68,7 +71,10 @@ async def test_a_denied_pdp_decision_is_denied_through_rest_and_mcp(
     mcp_body = tool_json(result)
     assert mcp_body["decision_type"] == "deny"
     assert mcp_body["reason_codes"] == rest_body["reason_codes"]
-    assert mcp_body["read_only"] is True
+    assert rest_body["side_effects"]["persists_governance_decision"] is True
+    assert rest_body["side_effects"]["mutates_task_state"] is False
+    assert "read_only" not in rest_body
+    assert mcp_body["side_effects"] == rest_body["side_effects"]
 
 
 @pytest.mark.anyio
@@ -310,7 +316,10 @@ async def test_confirmation_and_approval_gates_are_not_bypassed(
     assert approval.is_error is False, tool_text(approval)
     body = tool_json(approval)
     assert body["status"] == "in_progress"
-    assert body["approver_principal_id"] != f"prin_{world.employee_id:04d}"
+    assert body["approver_assigned"] is True
+    assert body["separation_of_duties"] == "enforced"
+    # The approver identity is server-side and intentionally not disclosed.
+    assert "approver_principal_id" not in body
 
 
 @pytest.mark.anyio
@@ -392,6 +401,208 @@ async def test_rate_limit_is_shared_by_rest_and_mcp(
     second = client.get(f"/governance/tasks/{task_id}", headers=headers)
     assert second.status_code == 429
     assert second.json()["error"]["code"] == "rate_limited"
+
+
+def _tasks_with_key(engine, idempotency_key: str) -> int:
+    with Session(engine) as session:
+        return int(
+            session.scalar(
+                select(func.count())
+                .select_from(Task)
+                .where(Task.idempotency_key == idempotency_key)
+            )
+            or 0
+        )
+
+
+def _submission_rejections(engine, idempotency_key: str) -> list[AuditEvent]:
+    with Session(engine) as session:
+        rows = list(
+            session.scalars(
+                select(AuditEvent).where(
+                    AuditEvent.action == "governance.task.submission_rejected"
+                )
+            )
+        )
+        return [
+            row
+            for row in rows
+            if (row.details or {}).get("idempotency_key") == idempotency_key
+        ]
+
+
+@pytest.mark.anyio
+async def test_multi_capability_submission_is_rejected_before_creation(
+    world, client, live_app, auth, engine
+):
+    """B1 accepts exactly one capability; a longer list never creates a task."""
+    headers = auth(world.employee_id)
+    body = submit_body(idempotency_key="idem_multi_0001")
+    body["requested_capabilities"] = [
+        "expense.read@1.0.0",
+        "expense.confirm@1.0.0",
+    ]
+    rest = client.post("/governance/tasks", json=body, headers=headers)
+    assert rest.status_code == 422, rest.text
+    assert rest.json()["error"]["code"] == "validation_error"
+
+    async with open_mcp_session(live_app, headers=headers, manage_lifespan=False) as session:
+        mcp = await session.call_tool("governance.submit_task", body)
+    assert mcp.is_error is True
+    assert tool_error_code(mcp) == "invalid_arguments"
+
+    assert _tasks_with_key(engine, "idem_multi_0001") == 0
+
+
+@pytest.mark.anyio
+async def test_no_approver_rejection_leaves_no_task_and_retry_is_deterministic(
+    world, client, live_app, auth, engine
+):
+    """A gated submission without an approver rolls the partial task back."""
+    with Session(engine) as session:
+        company = Company(name=f"Lonely {uuid4().hex[:8]}")
+        session.add(company)
+        session.flush()
+        employee = Employee(company_id=company.id, employee_no="E-lonely")
+        session.add(employee)
+        session.flush()
+        role = session.scalar(select(Role).where(Role.name == "employee"))
+        assert role is not None
+        session.add(EmployeeRole(employee_id=employee.id, role_id=role.id))
+        session.commit()
+        lonely_id = employee.id
+
+    headers = auth(lonely_id)
+    body = submit_body(
+        idempotency_key="idem_noapprover_0001",
+        capability="expense.approve@1.0.0",
+    )
+    first = client.post("/governance/tasks", json=body, headers=headers)
+    assert first.status_code == 422, first.text
+    assert first.json()["error"]["code"] == "accountable_owner_unresolved"
+    assert _tasks_with_key(engine, "idem_noapprover_0001") == 0
+    rejections = _submission_rejections(engine, "idem_noapprover_0001")
+    assert len(rejections) == 1
+    assert rejections[0].details["reason_code"] == "accountable_owner_unresolved"
+
+    # The retry must re-run and fail identically, not return a stranded row.
+    second = client.post("/governance/tasks", json=body, headers=headers)
+    assert second.status_code == 422, second.text
+    assert second.json()["error"]["code"] == "accountable_owner_unresolved"
+    assert _tasks_with_key(engine, "idem_noapprover_0001") == 0
+
+
+@pytest.mark.anyio
+async def test_non_gated_task_has_no_approver_and_is_invisible_to_the_manager(
+    world, client, live_app, auth, engine
+):
+    """Only an actual approval gate makes the resolved approver a participant."""
+    employee_headers = auth(world.employee_id)
+    created = client.post(
+        "/governance/tasks",
+        json=submit_body(idempotency_key="idem_nongated_0001"),
+        headers=employee_headers,
+    )
+    assert created.status_code == 201, created.text
+    task_id = created.json()["task_id"]
+
+    with Session(engine) as session:
+        task = session.scalar(select(Task).where(Task.task_id == task_id))
+        assert task is not None
+        assert task.approver_principal_id is None
+
+    manager_headers = auth(world.manager_id)
+    listed = client.get("/governance/tasks", headers=manager_headers)
+    assert listed.status_code == 200, listed.text
+    assert all(item["task_id"] != task_id for item in listed.json()["tasks"])
+    denied = client.get(f"/governance/tasks/{task_id}", headers=manager_headers)
+    assert denied.status_code == 403, denied.text
+    assert denied.json()["error"]["code"] == "task_unauthorized_actor"
+
+
+@pytest.mark.anyio
+async def test_cross_company_manager_is_not_used_as_approver(
+    world, client, auth, engine
+):
+    """The manager shortcut is company-scoped; fallback stays in-company."""
+    with Session(engine) as session:
+        other_company = Company(name=f"Other {uuid4().hex[:8]}")
+        session.add(other_company)
+        session.flush()
+        cross_manager = Employee(
+            company_id=other_company.id, employee_no="E-cross-manager"
+        )
+        session.add(cross_manager)
+        session.flush()
+        role = session.scalar(select(Role).where(Role.name == "manager"))
+        assert role is not None
+        session.add(
+            EmployeeRole(employee_id=cross_manager.id, role_id=role.id)
+        )
+        employee = session.get(Employee, world.employee_id)
+        assert employee is not None
+        employee.manager_id = cross_manager.id
+        session.commit()
+        cross_manager_id = cross_manager.id
+
+    created = client.post(
+        "/governance/tasks",
+        json=submit_body(
+            idempotency_key="idem_cross_company_0001",
+            capability="expense.approve@1.0.0",
+        ),
+        headers=auth(world.employee_id),
+    )
+    assert created.status_code == 201, created.text
+    task_id = created.json()["task_id"]
+
+    with Session(engine) as session:
+        task = session.scalar(select(Task).where(Task.task_id == task_id))
+        assert task is not None
+        assert task.approver_employee_id == world.manager_id
+        assert task.approver_employee_id != cross_manager_id
+
+    # An actual approval gate does make the approver a participant.
+    manager_headers = auth(world.manager_id)
+    listed = client.get("/governance/tasks", headers=manager_headers)
+    assert listed.status_code == 200, listed.text
+    assert any(item["task_id"] == task_id for item in listed.json()["tasks"])
+    visible = client.get(f"/governance/tasks/{task_id}", headers=manager_headers)
+    assert visible.status_code == 200, visible.text
+
+
+@pytest.mark.anyio
+async def test_reserved_payload_authority_keys_are_rejected(
+    world, client, live_app, auth, engine
+):
+    """The payload is opaque; authority-bearing keys fail before creation."""
+    headers = auth(world.employee_id)
+    for index, payload in enumerate(
+        (
+            {"execution_mode": "managed_execution"},
+            {"step": {"owner": "prin_9999"}},
+        )
+    ):
+        key = f"idem_payload_bad_{index:04d}"
+        body = submit_body(idempotency_key=key)
+        body["payload"] = payload
+        rest = client.post("/governance/tasks", json=body, headers=headers)
+        assert rest.status_code == 422, rest.text
+        assert rest.json()["error"]["code"] == "validation_error"
+        assert _tasks_with_key(engine, key) == 0
+
+        async with open_mcp_session(
+            live_app, headers=headers, manage_lifespan=False
+        ) as session:
+            mcp = await session.call_tool("governance.submit_task", body)
+        assert mcp.is_error is True
+        assert tool_error_code(mcp) == "invalid_arguments"
+        assert _tasks_with_key(engine, key) == 0
+
+    ok = submit_body(idempotency_key="idem_payload_ok_0001")
+    ok["payload"] = {"note": "opaque execution data"}
+    accepted = client.post("/governance/tasks", json=ok, headers=headers)
+    assert accepted.status_code == 201, accepted.text
 
 
 def test_handlers_do_not_duplicate_authorization_rules():

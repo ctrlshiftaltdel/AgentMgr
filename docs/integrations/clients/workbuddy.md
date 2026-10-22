@@ -8,7 +8,7 @@
 
 | Path | What it is | Trusted principal | What this task can claim |
 |---|---|---|---|
-| **Remote MCP** | WorkBuddy connects to AgentMgr's Streamable HTTP endpoint (`/mcp/`) over the network | `Authorization` + `X-Employee-Id` must be injected by WorkBuddy or its gateway for every request | The endpoint and tools are verified with the official Inspector (`mcp-inspector.md`). WorkBuddy itself is **not** verified. |
+| **Remote MCP** | WorkBuddy connects through a trusted gateway to AgentMgr's Streamable HTTP endpoint (`/mcp/`) | `Authorization` + `X-Employee-Id` must be injected by the gateway for every request; the gateway must authenticate the user first | The endpoint and tools are verified with the official Inspector (`mcp-inspector.md`). WorkBuddy itself is **not** verified. |
 | **Local bridge** | WorkBuddy launches a local process/connector on the user's device and forwards tool calls | The bridge, not the model, must inject the verified employee context; a local process cannot simply forward a model-supplied `employee_id` | **Not verified.** A local bridge is B0/B1-adjacent: model arguments remain untrusted. |
 
 The server never accepts a principal, owner, approver, role or priority from a
@@ -22,17 +22,24 @@ not evidence that WorkBuddy supports them:
 
 | Setting | Value |
 |---|---|
-| Transport | Streamable HTTP |
-| URL | `http://<test-host>:<port>/mcp/` (local development) or the TLS-terminated deployment URL |
-| Header | `Authorization: Bearer <internal-token>` |
-| Header | `X-Employee-Id: <verified-employee-id>` |
+| Transport | Streamable HTTP (server is stateless; no session affinity needed) |
+| URL | `http://127.0.0.1:<port>/mcp/` for local development only; a remote deployment must use the TLS-terminated gateway URL |
+| Header | `Authorization: Bearer <internal-token>` (injected by the gateway, never by the model/client) |
+| Header | `X-Employee-Id: <verified-employee-id>` (injected by the gateway after authentication) |
+| Server env | `AJAIMGR_MCP_ALLOWED_HOSTS=<gateway-host>:*` when the gateway's `Host` is not loopback |
 | Tools | `governance.evaluate_task`, `governance.submit_task`, `governance.get_task`, `governance.list_my_tasks`, `governance.request_confirmation`, `governance.request_approval`, `governance.cancel_task`, `governance.get_result` |
+
+The server enforces a transport-level bearer check on `initialize`,
+`tools/list` and session creation. That protects the SDK surface, but it does
+**not** make the shared token safe to give to a remote client: a gateway must
+authenticate the user and inject both headers. Direct remote use with the shared
+token is not a supported trust path.
 
 Requirements before this can be called compatible:
 
-1. WorkBuddy sends both headers on every MCP HTTP request, including the first
-   initialize and every tool call.
-2. WorkBuddy does not let the model supply or override those headers.
+1. WorkBuddy reaches AgentMgr through a gateway that injects both headers on
+   every MCP HTTP request, including the first initialize and every tool call.
+2. Neither WorkBuddy nor the model can supply or override those headers.
 3. WorkBuddy's MCP client supports the Streamable HTTP transport and the
    server's negotiated protocol version.
 4. A recorded acceptance run shows `tools/list`, a successful `submit_task`, a
@@ -57,7 +64,8 @@ A local bridge (stdio or a loopback child process) has different constraints:
 
 ## 4. Current conclusion
 
-- **Remote MCP path:** implemented and verified with the official Inspector.
+- **Remote MCP path:** implemented and verified with the official Inspector over
+  the loopback/Gateway boundary; not a direct remote-client API.
 - **WorkBuddy remote integration:** not tested; no compatibility claim.
 - **WorkBuddy local bridge:** not supported by this release's header-based
   principal adapter; no compatibility claim.

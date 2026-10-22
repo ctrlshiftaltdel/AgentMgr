@@ -24,11 +24,12 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
 from app.api.errors import ApiError
 from app.api.rest import ratelimit
+from app.audit.service import record_event
 from app.governance.errors import GovernanceError
 from app.api.rest.models import (
     CancelTaskRequest,
@@ -40,12 +41,22 @@ from app.api.rest.principal import TrustedActor
 from app.db.models.organization import Employee
 from app.governance import service as governance_service
 from app.governance.pdp import DENY_ALL_EVIDENCE, EvaluationRequest
-from app.governance.principal import GovernancePrincipal, resolve_employee_principal
+from app.governance.policies import (
+    DEFAULT_POLICY_SET_ID,
+    get_active,
+    parse_policy_document,
+)
+from app.governance.principal import (
+    GovernancePrincipal,
+    audit_actor_id,
+    resolve_employee_principal,
+)
 from app.identity.models import EmployeeRole, Role
 from app.tasks import service as task_service
 from app.tasks.errors import TaskError
 from app.tasks.models import TASK_TERMINAL_STATES, Task, TaskConfirmation
 from app.tasks.service import (
+    PARTICIPANT_PRINCIPAL_ATTRIBUTES,
     _load_task,
     _require_confirmation_issuer,
     _require_task_authority,
@@ -82,8 +93,9 @@ def unit_of_work(session: Session) -> Iterator[None]:
 
     The task/governance services write a denial audit event and then raise.  A
     plain rollback would discard that audit, so the domain-exception path
-    commits the rejection record without changing business state.  Unexpected
-    errors roll back.
+    commits the rejection record without changing business state.  Operations
+    that can leave a partial business row (``submit_task``) roll back to a
+    savepoint before this commit.  Unexpected errors roll back.
     """
     try:
         yield
@@ -99,10 +111,6 @@ def unit_of_work(session: Session) -> Iterator[None]:
 
 def _rate_limit(operation: str, actor: TrustedActor) -> None:
     ratelimit.GOVERNANCE_LIMITER.check(f"{actor.principal_id}:{operation}")
-
-
-def _utcnow() -> datetime:
-    return datetime.now(UTC)
 
 
 def _rfc3339(value: datetime | None) -> str | None:
@@ -164,6 +172,27 @@ def _load_authorized_task(
     return task
 
 
+def _policy_requires_approval(session: Session, capability: str) -> bool:
+    """Whether the published policy gates this capability behind approval.
+
+    This only decides whether an approver should be resolved.  The PDP remains
+    the authority: it evaluates the same published policy document, and the task
+    service still fails closed if an approval decision has no independent
+    approver.  Reading the rule first keeps a non-gated task from carrying an
+    approver who would otherwise become a visible participant.
+    """
+    try:
+        row = get_active(session, DEFAULT_POLICY_SET_ID)
+        if row is None:
+            return False
+        document = parse_policy_document(row.document)
+    except GovernanceError:
+        # An unavailable/invalid policy is a PDP denial, not an approval gate.
+        return False
+    rule = document.rule_for(capability)
+    return bool(rule is not None and rule.required_approval)
+
+
 def _resolve_approver(
     session: Session, actor: TrustedActor
 ) -> GovernancePrincipal | None:
@@ -172,8 +201,9 @@ def _resolve_approver(
     Preference order: the actor's manager, then any active employee in the same
     company holding an existing management/finance/administration role.  The
     actor is always excluded, so self-approval cannot be constructed by the
-    client.  ``None`` is honest: a policy that requires approval then fails
-    closed instead of inventing an approver.
+    client, and the manager shortcut is company-scoped so a cross-company
+    manager can never become the approver.  ``None`` is honest: a policy that
+    requires approval then fails closed instead of inventing an approver.
     """
     employee = session.get(Employee, actor.employee_id)
     if employee is not None and employee.manager_id is not None:
@@ -182,6 +212,7 @@ def _resolve_approver(
             manager is not None
             and manager.status == "active"
             and manager.id != actor.employee_id
+            and manager.company_id == actor.governance.company_id
         ):
             try:
                 return resolve_employee_principal(session, manager.id)
@@ -210,6 +241,34 @@ def _resolve_approver(
     return None
 
 
+def _record_submission_rejection(
+    session: Session,
+    actor: TrustedActor,
+    request: SubmitTaskRequest,
+    exc: TaskError | GovernanceError,
+) -> None:
+    """Record a stable rejection audit without persisting the partial task.
+
+    ``task_service.submit_task`` inserts the task before it evaluates the PDP
+    and opens the confirmation/approval gate.  A later domain rejection must not
+    commit that partial row, so the caller rolls the submission back to a
+    savepoint first; this event is then written in the outer transaction that
+    ``unit_of_work`` commits.
+    """
+    record_event(
+        session,
+        actor_id=audit_actor_id(actor.governance),
+        action="governance.task.submission_rejected",
+        resource_type="task",
+        resource_id=None,
+        details={
+            "reason_code": exc.reason_code,
+            "idempotency_key": request.idempotency_key,
+            "requested_capabilities": list(request.requested_capabilities),
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # Operations
 # ---------------------------------------------------------------------------
@@ -224,8 +283,8 @@ def evaluate_task(
 
     The PDP persists an immutable decision/audit record by contract.  This
     operation never creates a task, issues a grant, mutates a task, or consumes
-    a confirmation/approval; ``read_only`` is therefore true in the business
-    sense (the test asserts task state/revision and grant count are unchanged).
+    a confirmation/approval.  The response therefore reports its real side
+    effects (a persisted decision row) instead of claiming ``read_only``.
     """
     _rate_limit(OPERATION_EVALUATE, actor)
     task: Task | None = None
@@ -237,6 +296,8 @@ def evaluate_task(
         priority = task.priority
         payload_hash = task.payload_hash
         correlation_id = task.correlation_id
+        policy_set_id = task.policy_set_id or DEFAULT_POLICY_SET_ID
+        policy_version = task.policy_version
         evidence_verifier = task_service.TaskEvidenceVerifier(
             session, task_id=task.task_id
         )
@@ -251,6 +312,8 @@ def evaluate_task(
         priority = "normal"
         payload_hash = None
         correlation_id = None
+        policy_set_id = DEFAULT_POLICY_SET_ID
+        policy_version = None
         evidence_verifier = DENY_ALL_EVIDENCE
 
     decision = governance_service.evaluate(
@@ -266,13 +329,22 @@ def evaluate_task(
             execution_mode=execution_mode,
             risk="low",
             payload_hash=payload_hash,
+            policy_set_id=policy_set_id,
+            policy_version=policy_version,
             correlation_id=correlation_id,
             pre_evaluation=request.task_id is None,
         ),
         evidence_verifier=evidence_verifier,
     )
     result = _decision_summary(decision)
-    result["read_only"] = True
+    # The PDP persists an immutable decision + audit row by contract, so
+    # ``read_only`` would be a lie.  Report the actual side effects instead.
+    result["side_effects"] = {
+        "persists_governance_decision": True,
+        "mutates_task_state": False,
+        "issues_execution_grant": False,
+        "consumes_confirmation_or_approval": False,
+    }
     result["task_state_mutated"] = False
     return result
 
@@ -280,33 +352,52 @@ def evaluate_task(
 def submit_task(
     session: Session, actor: TrustedActor, request: SubmitTaskRequest
 ) -> dict[str, Any]:
-    """Submit an advisory task; owner/executor/approver are server-resolved."""
+    """Submit an advisory task; owner/executor/approver are server-resolved.
+
+    The core inserts the task before evaluating the PDP and opening a gate, so
+    the whole call runs in a savepoint.  If the domain rejects the submission
+    (for example an approval decision with no independent approver), the
+    savepoint is rolled back: no ``evaluated`` task or decision survives.  The
+    rejection audit is then written in the outer transaction and committed by
+    ``unit_of_work``.  A retry with the same idempotency key therefore cannot
+    observe a stranded row; it re-runs and fails deterministically.
+    """
     _rate_limit(OPERATION_SUBMIT, actor)
-    approver = _resolve_approver(session, actor)
-    task = task_service.submit_task(
-        session,
-        requester=actor.governance,
-        idempotency_key=request.idempotency_key,
-        goal=request.goal.model_dump(exclude_none=True),
-        owner=actor.governance,
-        executor=actor.governance,
-        assignee=actor.governance,
-        approver=approver,
-        summary=request.summary,
-        priority="normal",
-        execution_mode="advisory",
-        resource_scope=request.resource_scope.model_dump(),
-        requested_capabilities=tuple(request.requested_capabilities),
-        payload=request.payload,
-        max_attempts=request.max_attempts,
-        retry_budget=request.retry_budget,
-        retry_safe=request.retry_safe,
-        max_calls=request.max_calls,
-        max_runtime_seconds=request.max_runtime_seconds,
-        max_cost_units=request.max_cost_units,
-        client_task_ref=request.client_task_ref,
-        correlation_id=request.correlation_id,
+    capability = request.requested_capabilities[0]
+    approver = (
+        _resolve_approver(session, actor)
+        if _policy_requires_approval(session, capability)
+        else None
     )
+    try:
+        with session.begin_nested():
+            task = task_service.submit_task(
+                session,
+                requester=actor.governance,
+                idempotency_key=request.idempotency_key,
+                goal=request.goal.model_dump(exclude_none=True),
+                owner=actor.governance,
+                executor=actor.governance,
+                assignee=actor.governance,
+                approver=approver,
+                summary=request.summary,
+                priority="normal",
+                execution_mode="advisory",
+                resource_scope=request.resource_scope.model_dump(),
+                requested_capabilities=tuple(request.requested_capabilities),
+                payload=request.payload,
+                max_attempts=request.max_attempts,
+                retry_budget=request.retry_budget,
+                retry_safe=request.retry_safe,
+                max_calls=request.max_calls,
+                max_runtime_seconds=request.max_runtime_seconds,
+                max_cost_units=request.max_cost_units,
+                client_task_ref=request.client_task_ref,
+                correlation_id=request.correlation_id,
+            )
+    except (GovernanceError, TaskError) as exc:
+        _record_submission_rejection(session, actor, request, exc)
+        raise
     return _task_summary(task)
 
 
@@ -326,17 +417,23 @@ def list_my_tasks(
     _rate_limit(OPERATION_LIST, actor)
     bounded = max(1, min(int(limit), 100))
     principal_id = actor.principal_id
+    # Reuse the core participant column list instead of copying it.  An
+    # approver only participates through an actual approval gate: a stray
+    # approver on a non-gated task must not see it in their list.
+    clauses = [
+        getattr(Task, attribute) == principal_id
+        for attribute in PARTICIPANT_PRINCIPAL_ATTRIBUTES
+        if attribute != "approver_principal_id"
+    ]
+    clauses.append(
+        and_(
+            Task.approver_principal_id == principal_id,
+            Task.workflow_instance_id.is_not(None),
+        )
+    )
     rows = session.scalars(
         select(Task)
-        .where(
-            or_(
-                Task.requester_principal_id == principal_id,
-                Task.owner_principal_id == principal_id,
-                Task.assignee_principal_id == principal_id,
-                Task.executor_principal_id == principal_id,
-                Task.approver_principal_id == principal_id,
-            )
-        )
+        .where(or_(*clauses))
         .order_by(Task.created_at.desc())
         .limit(bounded)
     ).all()
@@ -422,7 +519,10 @@ def request_approval(
         "approval_request_id": str(instance.id),
         "workflow_type": instance.workflow_type,
         "status": instance.status,
-        "approver_principal_id": task.approver_principal_id,
+        # The approver's identity is intentionally opaque to the client: it is
+        # server-resolved and not useful for requesting the gate.
+        "approver_assigned": bool(task.approver_principal_id),
+        "separation_of_duties": "enforced",
         "task_state": task.state,
     }
 

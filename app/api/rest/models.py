@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 __all__ = [
     "CancelTaskRequest",
@@ -18,6 +18,7 @@ __all__ = [
     "ConfirmationRequest",
     "EvaluateTaskRequest",
     "Goal",
+    "RESERVED_PAYLOAD_KEYS",
     "ResourceScope",
     "SubmitTaskRequest",
     "Verifier",
@@ -34,6 +35,53 @@ _RESOURCE_ID = r"^res_[A-Za-z0-9][A-Za-z0-9_-]{2,95}$"
 _CONNECTOR_ID = r"^conn_[A-Za-z0-9][A-Za-z0-9_-]{2,63}$"
 _EVIDENCE_REF = r"^evidence:[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$"
 _SHA256 = r"^sha256:[a-f0-9]{64}$"
+
+#: Payload keys that name authority-bearing concepts.  The B1 ``payload`` is an
+#: opaque execution blob, so the server never interprets these keys; rejecting
+#: them is defence in depth against a future handler treating the payload as
+#: identity/role/priority input.  Matching is case-insensitive and recursive.
+RESERVED_PAYLOAD_KEYS: frozenset[str] = frozenset(
+    {
+        "approver",
+        "approver_employee_id",
+        "approver_principal_id",
+        "assignee",
+        "assignee_principal_id",
+        "auth",
+        "authorization",
+        "employee_id",
+        "execution_mode",
+        "executor",
+        "executor_employee_id",
+        "executor_principal_id",
+        "owner",
+        "owner_employee_id",
+        "owner_principal_id",
+        "permissions",
+        "principal_id",
+        "principal_type",
+        "priority",
+        "priority_authorized_by",
+        "role",
+        "role_ids",
+        "roles",
+        "service_identity_id",
+        "token",
+    }
+)
+
+_RESERVED_PAYLOAD_MESSAGE = "payload contains a reserved authority field"
+
+
+def _check_reserved_payload_keys(value: Any, path: str = "payload") -> None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if isinstance(key, str) and key.lower() in RESERVED_PAYLOAD_KEYS:
+                raise ValueError(f"{path}.{key}: {_RESERVED_PAYLOAD_MESSAGE}")
+            _check_reserved_payload_keys(child, f"{path}.{key}")
+    elif isinstance(value, (list, tuple)):
+        for index, child in enumerate(value):
+            _check_reserved_payload_keys(child, f"{path}[{index}]")
 
 
 class Verifier(BaseModel):
@@ -127,6 +175,15 @@ class SubmitTaskRequest(BaseModel):
     ``execution_mode`` is absent on purpose: a B1 client can never choose a
     stronger mode, and the adapter always submits advisory work.  ``priority``
     is absent for the same reason (priority never grants authority).
+
+    Exactly one requested capability is accepted.  The core evaluates only the
+    first capability while a grant must cover every requested capability, so a
+    multi-capability request can never be honoured by this surface yet; it is
+    rejected here, before any task row or decision is created.
+
+    ``payload`` is opaque execution data.  It is rejected if it contains any
+    authority-bearing key (owner/approver/role/priority/execution mode/...),
+    even nested, so no transport can smuggle identity through the payload.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -135,7 +192,7 @@ class SubmitTaskRequest(BaseModel):
     goal: Goal
     requested_capabilities: list[
         Annotated[str, Field(pattern=_CAPABILITY)]
-    ] = Field(min_length=1, max_length=10)
+    ] = Field(min_length=1, max_length=1)
     resource_scope: ResourceScope
     payload: dict[str, Any] | None = None
     summary: str | None = Field(default=None, max_length=500)
@@ -147,6 +204,14 @@ class SubmitTaskRequest(BaseModel):
     max_attempts: int = Field(default=3, ge=1, le=100)
     retry_budget: int | None = Field(default=None, ge=0, le=100)
     retry_safe: bool = True
+
+    @field_validator("payload")
+    @classmethod
+    def _reject_reserved_payload_keys(
+        cls, value: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        _check_reserved_payload_keys(value)
+        return value
 
 
 class ConfirmationRequest(BaseModel):

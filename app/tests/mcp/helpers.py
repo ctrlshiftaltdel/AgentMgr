@@ -33,33 +33,58 @@ async def open_mcp_session(
     headers: dict[str, str] | None = None,
     *,
     manage_lifespan: bool = True,
+    base_url: str = BASE_URL,
 ):
     """Open an official-SDK Streamable HTTP client against the mounted app.
 
     A given app's MCP session manager may be started once, so tests that open
     more than one client session use the ``live_app`` fixture and pass
-    ``manage_lifespan=False``.
+    ``manage_lifespan=False``.  ``base_url`` is configurable so a test can send
+    a non-loopback ``Host`` header.
     """
     if manage_lifespan:
         async with app.router.lifespan_context(app):
             async with open_mcp_session(
-                app, headers, manage_lifespan=False
+                app,
+                headers,
+                manage_lifespan=False,
+                base_url=base_url,
             ) as session:
                 yield session
         return
 
+    mcp_url = base_url.rstrip("/") + "/mcp/"
     async with httpx2.AsyncClient(
         transport=httpx2.ASGITransport(app=app),
-        base_url=BASE_URL,
+        base_url=base_url,
         headers=headers or {},
     ) as http_client:
         async with streamable_http_client(
-            MCP_URL, http_client=http_client
+            mcp_url, http_client=http_client
         ) as streams:
             read_stream, write_stream = streams[0], streams[1]
             async with ClientSession(read_stream, write_stream) as session:
                 await session.initialize()
                 yield session
+
+
+def initialize_body() -> dict[str, Any]:
+    """A minimal Streamable HTTP ``initialize`` JSON-RPC request."""
+    return {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "pytest", "version": "1.0.0"},
+        },
+    }
+
+
+def transport_headers(token: str) -> dict[str, str]:
+    """Only the token header needed by the MCP transport middleware."""
+    return {"Authorization": f"Bearer {token}"}
 
 
 def tool_text(result: Any) -> str:
