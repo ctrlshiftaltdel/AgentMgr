@@ -46,6 +46,7 @@ MODEL_MODULES: tuple[str, ...] = (
     "app.identity.models",
     "app.intake.models",
     "app.integrations.models",
+    "app.tasks.models",
     "app.workflow.models",
 )
 
