@@ -147,7 +147,7 @@
                                                       │ root
                        ┌──────────────────────────────▼───────────────────────────────────────────┐
                        │ systemd: transient unit agentmgr-task-<12hex>                            │
-                       │  DynamicUser=yes → 独立 UID；StateDirectory=agentmgr-exec/%N (0700)      │
+                       │  DynamicUser=yes → 独立 UID；StateDirectory=agentmgr-exec/<unit> (0700)│
                        │  ProtectSystem=strict / ProtectHome=yes / PrivateTmp / PrivateDevices    │
                        │  PrivateNetwork=yes + RestrictAddressFamilies=AF_UNIX + IPAddressDeny=any│
                        │  LoadCredential=task-credential:/run/agentmgr-exec/credentials/<unit>.json│
@@ -295,7 +295,7 @@ class BoundaryClaim:
 | systemd 属性 | 值 | 目的 |
 |---|---|---|
 | `DynamicUser=` | `yes` | 每单元独立、非持久的 UID；停止后回收 |
-| `StateDirectory=` | `agentmgr-exec/%N` | 每单元可写状态目录；`%N` = 去后缀单元名（见 §8.5） |
+| `StateDirectory=` | `agentmgr-exec/<unit>` | 每单元可写状态目录；transient 单元使用显式校验过的单元名（见 §8.5） |
 | `StateDirectoryMode=` | `0700` | 状态目录仅该 UID 可访问 |
 | `RuntimeMaxSec=` | `<ttl>`（秒，1..300） | 硬运行时长上限，超时由 systemd 终止；上限与凭据 TTL 一致 |
 | `TimeoutStopSec=` | `5` | SIGTERM 后 5s 升级 SIGKILL |
@@ -339,11 +339,13 @@ class BoundaryClaim:
 | 同上 | `/run/agentmgr-exec/workload.py:/workload.py` | 固定负载脚本，只读 |
 | `ExecStart=` | `/usr/bin/python3 /workload.py` | 固定命令，无参数、无 shell |
 
-说明：`MemoryMax`/`CPUQuota`/`TasksMax` 不是固定常量，而是由 §7.2 校验过的 spec 整数渲染成上表占位形式；未显式给值时取默认值。范围之外的取值在校验阶段即 `invalid_spec`，不会启动单元。表格其余属性（含 `StateDirectory=agentmgr-exec/%N`）是固定常量，任务输入不能覆盖。
+说明：`MemoryMax`/`CPUQuota`/`TasksMax` 不是固定常量，而是由 §7.2 校验过的 spec 整数渲染成上表占位形式；未显式给值时取默认值。范围之外的取值在校验阶段即 `invalid_spec`，不会启动单元。表格其余属性（含 `StateDirectory=agentmgr-exec/<unit>`）是固定常量，任务输入不能覆盖。
 
 所有 `InaccessiblePaths=` 条目都使用 systemd 的**可选路径语法** `-<path>`：目标路径不存在时 systemd 忽略该条（因此 `/etc/agentmgr`、`/var/lib/agentmgr` 等部署目录尚未创建的精简测试机仍能启动单元），目标路径存在时仍被设为不可访问。该前缀只影响“路径不存在时是否拒绝启动”，不放宽任何已存在路径的沙箱属性；不得为了兼容主机而删掉条目或改用不带 `-` 的普通路径。
 
 **不得对 `/run/systemd` 目录整体使用 `InaccessiblePaths`。** 在已批准测试机上，`InaccessiblePaths=-/run/systemd` 会使 systemd 的命名空间设置失败，单元以 `226/NAMESPACE` 启动失败；只屏蔽 `/run/dbus` 或改用 `TemporaryFileSystem` 则可成功。对照 matrix 显示 `TemporaryFileSystem=/run/systemd` 与 `/run/dbus` 以私有 tmpfs 遮蔽宿主 socket 目录后能够启动，因此两者在**两种 profile** 中都作为固定属性使用。该结论仅基于已批准测试机，不外推到其它宿主；Master 仍需按 §16 重跑 live 验证。
+
+**`StateDirectory` 在 transient 单元中使用显式单元名。** `systemd-run -p` 不会展开 `%N`、`%i` 等 specifier；写成 `StateDirectory=agentmgr-exec/%N` 会在已批准测试机上创建一个字面目录 `/var/lib/private/agentmgr-exec/%N`，而 harness 查找的 `<unit>` 目录并不存在。因此 `build_systemd_run_argv` 渲染 `StateDirectory=agentmgr-exec/<unit>`（`<unit>` 已匹配 `^agentmgr-task-[0-9a-f]{12}$`）。单元文件模板不经过 `systemd-run -p`，可以继续使用模板自己的 `%i`（§8.5）。
 
 同一 profile 内的附加加固（不改变上表语义）：
 
@@ -351,14 +353,14 @@ class BoundaryClaim:
 |---|---|---|
 | `SystemCallErrorNumber=` | `EPERM` | 被过滤 syscall 返回 EPERM 而非 SIGSYS，避免异常路径差异 |
 
-版本前提：**systemd ≥ 249**（其中 `ProtectProc`/`ProcSubset` 需 ≥ 247，`LoadCredential` 需 ≥ 244，`%N` 需 ≥ 240；249 是本属性集合的安全基线），内核支持 cgroup v2 与 BPF cgroup IP 过滤。运行时不满足时**启动失败**（fail closed），不得降级为一组“尽力而为”的属性。
+版本前提：**systemd ≥ 249**（其中 `ProtectProc`/`ProcSubset` 需 ≥ 247，`LoadCredential` 需 ≥ 244；249 是本属性集合的安全基线），内核支持 cgroup v2 与 BPF cgroup IP 过滤。运行时不满足时**启动失败**（fail closed），不得降级为一组“尽力而为”的属性。
 
 参数构造示例（由 `app/security/systemd.py` 生成，实际以 argv 数组传递，不经过 shell）：
 
 ```
 systemd-run --unit=agentmgr-task-<12hex> --description=agentmgr-exec \
   --property=DynamicUser=yes \
-  --property=StateDirectory=agentmgr-exec/%N \
+  --property=StateDirectory=agentmgr-exec/agentmgr-task-<12hex> \
   --property=StateDirectoryMode=0700 \
   --property=RuntimeMaxSec=<ttl>s \
   --property=TimeoutStopSec=5 \
@@ -418,7 +420,7 @@ systemd-run --unit=agentmgr-task-<12hex> --description=agentmgr-exec \
 ### 8.3 单任务 UID 与状态目录
 
 - `DynamicUser=yes` 让 systemd 为每个单元分配一个未使用的 UID（通常在 `61184..65519` 的动态范围），并在停止后释放。
-- `StateDirectory=agentmgr-exec/%N` 创建 `/var/lib/private/agentmgr-exec/agentmgr-task-<hex>/`，权限 `0700`，属主为动态 UID；单元内 `$STATE_DIRECTORY` 指向它。
+- `StateDirectory=agentmgr-exec/<unit>`（transient 单元使用显式单元名，见 §8.5）创建 `/var/lib/private/agentmgr-exec/agentmgr-task-<hex>/`，权限 `0700`，属主为动态 UID；单元内 `$STATE_DIRECTORY` 指向它。
 - 任务之间因此没有共享可写路径：不同单元不同 UID、不同目录、不同私有 `/tmp`。
 - **UID 复用风险**：停止后状态目录不会自动删除；若同一数值 UID 之后被另一单元分配，旧目录可能被读到。缓解：Supervisor 的 `cleanup` 必须在 `process_gone=true`（或 `never_started=true`）后删除状态目录（§11.4），并把“清理残留”作为告警指标（§19）。
 
@@ -447,7 +449,7 @@ unit = "agentmgr-task-" + sha256(("agentmgr-task:v1:" + task_id).encode("utf-8")
 - 只含 `[a-z0-9-]`，固定前缀，长度固定 25；
 - 启动前用 `^agentmgr-task-[0-9a-f]{12}$` 复核；不满足即 `invalid_spec`；
 - **不存在**由用户、模型或任务输入直接构造的单元名；
-- 单元名不含 `@`，因此是非模板 transient unit。`%i`（实例名）对非模板单元为空，**不能**用于 `StateDirectory`；本设计使用 `%N`（去类型后缀的完整单元名）。若未来改为模板单元 `agentmgr-task@<hex>.service`，`%i` 才等价且路径不变。这是对“每任务独立状态目录”这一目标的必要修正，不改变目录布局。
+- 单元名不含 `@`，因此是非模板 transient unit。`systemd-run -p` **不会展开** `%N`/`%i` 等 specifier，所以 transient 单元的 `StateDirectory` 必须由 builder 渲染为显式的 `agentmgr-exec/<unit>`；写成 `%N` 会创建字面目录并破坏每任务隔离。若部署改用模板单元 `agentmgr-task@<hex>.service`，模板文件中的 `%i` 由 systemd 的 unit-file 展开机制处理，路径仍是 `agentmgr-exec/agentmgr-task-<hex>`，布局不变（见 §8.1、§8.3）。
 
 ### 8.6 文件系统可写面
 
@@ -999,7 +1001,7 @@ Supervisor.cleanup(handle):
 | 无 IP 网络 | `PrivateNetwork=yes`（默认）、`RestrictAddressFamilies=AF_UNIX`、`IPAddressDeny=any` |
 | 唯一外部入口为网关 socket | 只读 bind mount 一个 socket；`TemporaryFileSystem=/run/systemd`、`/run/dbus` 遮蔽宿主 systemd/D-Bus 目录 |
 | 资源与时间上限 | `MemoryMax`、`CPUQuota`、`TasksMax`、`LimitNOFILE`、`RuntimeMaxSec` |
-| 跨任务状态隔离 | 独立 UID + `StateDirectoryMode=0700` |
+| 跨任务状态隔离 | 独立 UID + `StateDirectory=agentmgr-exec/<unit>`（`StateDirectoryMode=0700`） |
 | 凭据任务绑定/短时/可撤销 | `task_id`/`grant_id` claims、`exp ≤ GrantStatusProvider 剩余`、`RevocationStore` |
 | 停止/退出区分 | `process_gone` = 单元不再运行；`stop_confirmed` 仅在 stop/cancel/timeout 取得证据时为 true；`cleanup` 用 `process_gone \|\| never_started` |
 | 网关准入上限 | per-task 8 连接 / 16 req/s、global 64 连接 / 200 req/s、单请求 64 KiB、读写 5s |
@@ -1052,7 +1054,7 @@ Supervisor.cleanup(handle):
 | `test_boundary.py` | 未知字段/重复键/非法 JSON（显式覆盖 `grant_expires_at`/`workspace`/`state` 被拒）、NUL/控制字符、模式拒绝、`ttl_seconds` 的 1/300 边界、资源范围默认值与边界、Grant 子集校验、`BoundaryClaim` 常量完整性、单元名确定性与正则、哈希碰撞分支 |
 | `test_credentials.py` | **RFC 8785 JCS 向量**：UTF-8（`café`、非 BMP）、UTF-16 键序 vs code point 顺序、整数边界（`0`、`-0`、`2^53-1`、`2^53` 拒绝）、嵌套对象/数组、稳定重放；MAC 校验、篡改/截断/错误 kid/过期/`nbf`、claim 键集合、`exp - iat ≤ 300`、短密钥与缺失密钥 fail closed、轮换窗口、`InMemoryRevocationStore`、`FileRevocationStore` 原子写入与并发读、prune |
 | `test_gateway.py` | NDJSON 单请求、64 KiB 边界、未知字段、版本、所有 deny 原因码（含 `rate_limited`/`busy`）、per-UID/全局连接与速率限额、一个任务不能占满全局配额（fake clock/计数器）、超限不排队、`SO_PEERCRED` 记录（用 socketpair/mock）、审计白名单（token 不出现）、backend 路径校验/符号链接拒绝、超时 |
-| `test_systemd_unit.py` | argv 构造精确匹配、`RuntimeMaxSec` 1..300、`MemoryMax` 32..1024、`CPUQuota` 1..100、`TasksMax` 1..64、空 capability 语法、`%N` 使用、无 shell 拼接、`systemctl show` 输出解析、状态映射表逐行 |
+| `test_systemd_unit.py` | argv 构造精确匹配、`RuntimeMaxSec` 1..300、`MemoryMax` 32..1024、`CPUQuota` 1..100、`TasksMax` 1..64、空 capability 语法、显式 `StateDirectory=agentmgr-exec/<unit>`（无 specifier）、无 shell 拼接、`systemctl show` 输出解析、状态映射表逐行 |
 | `test_supervisor.py` | 用 fake runner 测 launch/stop/cleanup 状态机、竞态（完成 vs 停止按 `ExecMainExitTimestamp` 与停止请求时间排序、撤销写失败、启动超时、停止超时）、错误码；逐行验证 `completed`/`failed` → `process_gone=true, stop_confirmed=false`、`not_started` → `never_started=true`、`timed_out`/`cancelled` → `stop_confirmed=true`、`cleanup` 前置条件 |
 
 ### 16.3 真实隔离负向矩阵
@@ -1263,7 +1265,7 @@ sudo -n rm -f /var/lib/agentmgr-exec/* 2>/dev/null || true
 
 **无阻塞性开放问题。** 以下为设计阶段已作出的取舍，记录以备评审：
 
-1. `StateDirectory=agentmgr-exec/%N` 而非 `%i`：`%i` 只对模板实例化单元有值，本方案使用非模板 transient unit，`%N` 才能得到每任务目录（§8.5）。该写法**保持不变**。
+1. `StateDirectory=agentmgr-exec/<unit>`：transient 单元使用显式、已校验的单元名，因为 `systemd-run -p` 不展开 `%N`/`%i`；字面 `%N` 会创建 `/var/lib/private/agentmgr-exec/%N` 并破坏每任务隔离。单元文件模板仍可使用自己的 `%i`（§8.1、§8.5）。
 2. **MVP 验证固定为同进程**：`ops/security/verify_isolation.py` 在同一进程启动 gateway 线程并注入内存实时 `GrantStatusProvider`，因此“每次调用实时读取、无缓存”成立；`FileRevocationStore` 用于跨进程/重启恢复，在 MVP 中可选（内存实现即可），语义不变。独立网关服务是生产/#83 路径，必须接真实 Grant 存储适配器（§9.6、§9.7、§16.5）。
 3. 网络回退是**主机级**选择，不是每任务选择（§8.4）；避免同一主机出现两种声明。
 4. 停止语义拆成三个独立事实：`process_gone`（单元不再运行）、`stop_confirmed`（stop/cancel/timeout 已取得证据）、`never_started`（从未启动）。`completed`/`failed` 不等于 `stop_confirmed`；`cleanup` 的前置条件是 `process_gone || never_started`（§11.1、§11.4）。

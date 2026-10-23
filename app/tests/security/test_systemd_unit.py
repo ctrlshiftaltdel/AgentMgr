@@ -121,7 +121,7 @@ def _expected_properties(config: SystemdUnitConfig) -> list[str]:
     private_netns = config.network_profile == "private_netns"
     return [
         "--property=DynamicUser=yes",
-        "--property=StateDirectory=agentmgr-exec/%N",
+        f"--property=StateDirectory=agentmgr-exec/{config.unit}",
         "--property=StateDirectoryMode=0700",
         f"--property=RuntimeMaxSec={config.spec.ttl_seconds}s",
         "--property=TimeoutStopSec=5",
@@ -186,6 +186,7 @@ def test_systemd_argv_exact_properties(
     assert "--description=agentmgr-exec" in argv
     properties = [item for item in argv if item.startswith("--property=")]
     assert properties == _expected_properties(config)
+    assert not any("%N" in item or "%i" in item for item in properties)
     # Both profiles mask the host systemd private socket and D-Bus with a
     # private tmpfs so the bound gateway socket remains the only AF_UNIX entry.
     assert "--property=TemporaryFileSystem=/run/systemd" in properties
@@ -227,6 +228,26 @@ def test_whole_directory_inaccessible_paths_are_not_emitted(
         assert "--property=InaccessiblePaths=-/run/dbus" not in properties
         assert "--property=TemporaryFileSystem=/run/systemd" in properties
         assert "--property=TemporaryFileSystem=/run/dbus" in properties
+
+
+def test_state_directory_uses_exact_unit_name(tmp_path: Path) -> None:
+    first = _config(tmp_path / "first")
+    second = _config(
+        tmp_path / "second", spec=_spec(task_id="task_synthetic_0002")
+    )
+
+    first_properties = set(build_systemd_run_argv(first))
+    second_properties = set(build_systemd_run_argv(second))
+
+    assert f"--property=StateDirectory=agentmgr-exec/{first.unit}" in first_properties
+    assert (
+        f"--property=StateDirectory=agentmgr-exec/{second.unit}"
+        in second_properties
+    )
+    assert f"--property=StateDirectory=agentmgr-exec/{UNIT}" in first_properties
+    assert not any(
+        "%N" in item or "%i" in item for item in first_properties | second_properties
+    )
 
 
 def test_unknown_network_profile_is_rejected(tmp_path: Path) -> None:

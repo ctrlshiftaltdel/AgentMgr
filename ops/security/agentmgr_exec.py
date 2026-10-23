@@ -469,9 +469,11 @@ def build_launch_argv(unit: str, spec: object) -> list[str]:
         raise HelperError("unit_name_mismatch")
 
     credential = _credentials_dir() / f"{unit}.json"
+    # `systemd-run -p` does not expand `%N`/`%i`; use the validated unit name so
+    # the state directory is `agentmgr-exec/<unit>`, not a literal `%N` path.
     properties = [
         "--property=DynamicUser=yes",
-        "--property=StateDirectory=agentmgr-exec/%N",
+        f"--property=StateDirectory=agentmgr-exec/{unit}",
         "--property=StateDirectoryMode=0700",
         f"--property=RuntimeMaxSec={ttl}s",
         "--property=TimeoutStopSec=5",

@@ -21,6 +21,9 @@ After=agentmgr-pep-gateway.service
 [Service]
 Type=simple
 DynamicUser=yes
+# Unit-file templates may use their own specifier: %i is the instance name
+# (agentmgr-task@<hex>.service).  Transient units use the explicit validated
+# unit name because `systemd-run -p` does not expand %N/%i.
 StateDirectory=agentmgr-exec/agentmgr-task-%i
 StateDirectoryMode=0700
 RuntimeMaxSec=300

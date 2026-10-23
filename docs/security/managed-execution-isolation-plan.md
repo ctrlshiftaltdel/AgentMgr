@@ -18,7 +18,7 @@
 - TTL and credential lifetime are both capped at **300 seconds**. Longer tasks/credential refresh are #83.
 - Sandbox baseline: systemd **>= 249**; test host is systemd 257 / cgroup v2. If a required property is unsupported, fail closed; do not silently drop a property.
 - Per-task unit name is exactly `agentmgr-task-<12 lowercase hex>` derived from `sha256("agentmgr-task:v1:" + task_id)`. No user-controlled unit names.
-- `StateDirectory=agentmgr-exec/%N` (not `%i`) is required for non-template transient units.
+- `StateDirectory=agentmgr-exec/<unit>` uses the explicit validated unit name for non-template transient units; `systemd-run -p` does not expand `%N`/`%i`.
 - Credentials are `agx1` HMAC-SHA256 tokens, JCS-canonicalized, injected only via `LoadCredential`; never in argv, environment, prompts, events, audit, or logs.
 - `process_gone`, `stop_confirmed`, and `never_started` are distinct facts. `stop_confirmed=true` only for a requested stop/cancel or systemd timeout with verified evidence. Natural `completed`/`failed` are not stop confirmations.
 - Test host changes are temporary and reversible: `sudo -n` transient units, `/run/agentmgr-exec`, `/var/lib/private/agentmgr-exec`; no persistent users, packages, firewall/nftables changes, or writes to existing Hermes profiles. Clean up all units/dirs after tests.
@@ -30,7 +30,7 @@
 
 These are the failure modes the spec implies but a task-local happy-path test may miss; each is pinned by a test in the owning task.
 
-1. **`%N` vs `%i` in a non-template unit** — if `StateDirectory` collapses to a shared path, tasks can read each other's state. Task 4 asserts the exact property; Task 6's live test asserts two units have distinct `$STATE_DIRECTORY`.
+1. **`StateDirectory` specifier expansion in a transient unit** — `systemd-run -p` does not expand `%N`/`%i`; a literal `%N` creates a shared literal directory and breaks per-task isolation. The builder must emit `agentmgr-exec/<unit>`. Task 4 asserts the exact property; Task 6's live test asserts two units have distinct `$STATE_DIRECTORY`.
 2. **`PrivateNetwork=yes` plus a bind-mounted Unix socket** — if the socket cannot be reached, the fallback must still permit **no IP** and only `AF_UNIX`. Task 6 probes the allowed gateway call and denied `AF_INET`; the evidence records `private_netns` or `af_unix_only_fallback`.
 3. **Natural completion misreported as a confirmed stop** — `completed`/`failed` must be `process_gone=true, stop_confirmed=false`; `not_started` must be `never_started=true`. Task 5 tests the full table; Task 6 races completion vs stop.
 4. **Stale Grant provider** — a revoked/expired Grant must be denied on the next gateway call even while the unit is still stopping. Task 3 mutates the provider between calls; Task 5 stops the unit; Task 6 exercises both.
@@ -239,7 +239,7 @@ git commit -m "feat(security): add Unix-socket PEP gateway"
 **Interfaces:**
 - Consumes: `ManagedTaskSpec`, `RuntimeObservation`, `SecurityError`.
 - Produces: `SystemdUnitConfig(unit, spec, credential_source: Path, workload_source: Path, gateway_socket_source: Path)`.
-- Produces: `build_systemd_run_argv(config) -> list[str]`; exact properties from spec §8.1, including `StateDirectory=agentmgr-exec/%N`, `LoadCredential=task-credential:<credential_source>`, `BindReadOnlyPaths=<gateway_socket_source>:/run/agentmgr/gateway.sock`, `BindReadOnlyPaths=<workload_source>:/workload.py`, `ExecStart=/usr/bin/python3 /workload.py`.
+- Produces: `build_systemd_run_argv(config) -> list[str]`; exact properties from spec §8.1, including `StateDirectory=agentmgr-exec/<unit>`, `LoadCredential=task-credential:<credential_source>`, `BindReadOnlyPaths=<gateway_socket_source>:/run/agentmgr/gateway.sock`, `BindReadOnlyPaths=<workload_source>:/workload.py`, `ExecStart=/usr/bin/python3 /workload.py`.
 - Produces: `build_systemctl_show_argv(unit) -> list[str]`.
 - Produces: `parse_systemctl_show(text: str) -> dict[str, str]`.
 - Produces: `parse_systemd_timestamp(value: str) -> datetime | None`.
@@ -251,7 +251,7 @@ git commit -m "feat(security): add Unix-socket PEP gateway"
 - [ ] **Step 1: Write failing systemd tests**
 
 `app/tests/security/test_systemd_unit.py`:
-- `test_systemd_argv_exact_properties`: assert `DynamicUser=yes`, `StateDirectory=agentmgr-exec/%N`, `StateDirectoryMode=0700`, `RuntimeMaxSec=60s`, `ProtectSystem=strict`, `ProtectHome=yes`, `InaccessiblePaths` entries, `PrivateTmp=yes`, `PrivateDevices=yes`, `PrivateNetwork=yes`, `RestrictAddressFamilies=AF_UNIX`, `IPAddressDeny=any`, `NoNewPrivileges=yes`, `CapabilityBoundingSet=` and `AmbientCapabilities=` empty, `SystemCallFilter=@system-service`, `SystemCallArchitectures=native`, `RestrictNamespaces=yes`, `LockPersonality=yes`, `MemoryDenyWriteExecute=yes`, `RestrictRealtime=yes`, `RestrictSUIDSGID=yes`, `RemoveIPC=yes`, `ProtectClock/KernelTunables/KernelModules/KernelLogs/ControlGroups/Hostname=yes`, `ProtectProc=invisible`, `ProcSubset=pid`, `UMask=0077`, `MemoryMax=256M`, `CPUQuota=50%`, `TasksMax=32`, `LimitNOFILE=256`, `LoadCredential=...`, both `BindReadOnlyPaths`, `ExecStart`.
+- `test_systemd_argv_exact_properties`: assert `DynamicUser=yes`, `StateDirectory=agentmgr-exec/<unit>`, `StateDirectoryMode=0700`, `RuntimeMaxSec=60s`, `ProtectSystem=strict`, `ProtectHome=yes`, `InaccessiblePaths` entries, `PrivateTmp=yes`, `PrivateDevices=yes`, `PrivateNetwork=yes`, `RestrictAddressFamilies=AF_UNIX`, `IPAddressDeny=any`, `NoNewPrivileges=yes`, `CapabilityBoundingSet=` and `AmbientCapabilities=` empty, `SystemCallFilter=@system-service`, `SystemCallArchitectures=native`, `RestrictNamespaces=yes`, `LockPersonality=yes`, `MemoryDenyWriteExecute=yes`, `RestrictRealtime=yes`, `RestrictSUIDSGID=yes`, `RemoveIPC=yes`, `ProtectClock/KernelTunables/KernelModules/KernelLogs/ControlGroups/Hostname=yes`, `ProtectProc=invisible`, `ProcSubset=pid`, `UMask=0077`, `MemoryMax=256M`, `CPUQuota=50%`, `TasksMax=32`, `LimitNOFILE=256`, `LoadCredential=...`, both `BindReadOnlyPaths`, `ExecStart`.
 - `test_argv_contains_no_user_string_command_or_shell`: no `sh`, `-c`, `bash`, `Environment`, `User=`, `ExecStart` from spec; unit must match regex.
 - `test_show_parser_and_state_table`: table-driven rows for activating/active/deactivating/completed/timed_out/cancelled/failed/not-found/unknown; assert `process_gone`, `stop_confirmed`, `never_started`.
 - `test_natural_completion_is_not_stop_confirmed`: `Result=success`, `ExecMainStatus=0`, exit timestamp before stop request → `stop_confirmed=False`.
@@ -490,5 +490,5 @@ git commit -m "docs(security): record managed execution isolation evidence"
 - **Spec coverage:** Tasks 1–5 cover the model, credentials, gateway, systemd sandbox, and supervisor; Task 6 covers workload/harness/live negative tests; Task 7 covers production helper/templates; Task 8 covers evidence, boundary record, and verification. All #82 acceptance bullets map to Task 6/8 evidence.
 - **No new dependency:** stdlib only; no DB; no migrations; no governance/task/runtime changes.
 - **Type consistency:** `ManagedTaskSpec`, `ResourceScope`, `GrantStatus`, `RuntimeObservation`, `LaunchHandle`, `StopResult`, `CleanupResult`, `CredentialClaims`, `GatewayResponse`, `SystemdUnitConfig` are defined in Tasks 1/2/3/4 and consumed by name in Tasks 5–8.
-- **Review Focus:** each of the five risks has a task test: `%N` (Task 4/6), Unix socket/no IP (Task 6), stop semantics (Task 5/6), live Grant provider (Task 3/5/6), credential/run-dir ownership and cleanup (Task 2/5/6).
+- **Review Focus:** each of the five risks has a task test: explicit `StateDirectory`/no specifier expansion (Task 4/6), Unix socket/no IP (Task 6), stop semantics (Task 5/6), live Grant provider (Task 3/5/6), credential/run-dir ownership and cleanup (Task 2/5/6).
 - **Proportion:** each task is independently testable and reviewable; no task requires an unstated interface.

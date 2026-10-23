@@ -597,3 +597,7 @@ def test_helper_argv_matches_product_builder() -> None:
     assert "--property=TemporaryFileSystem=/run/dbus" in ours
     assert "--property=InaccessiblePaths=-/run/systemd" not in ours
     assert "--property=InaccessiblePaths=-/run/dbus" not in ours
+    # Transient argv uses the explicit unit name; specifiers are not expanded
+    # by `systemd-run -p` and would create a literal `%N`/`%i` directory.
+    assert f"--property=StateDirectory=agentmgr-exec/{UNIT}" in ours
+    assert not any("%N" in arg or "%i" in arg for arg in ours)

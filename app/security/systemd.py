@@ -209,9 +209,12 @@ def build_systemd_run_argv(config: SystemdUnitConfig) -> list[str]:
     private_netns = config.network_profile == NETWORK_PROFILE_PRIVATE_NETNS
     inaccessible = [*_BASE_INACCESSIBLE_PATHS]
 
+    # systemd does not expand specifiers (%N, %i) in `systemd-run -p` values;
+    # `%N` would create a literal directory.  Use the validated unit name.
+    # Unit-file templates may use their own specifiers (see §8.5).
     properties = [
         "--property=DynamicUser=yes",
-        "--property=StateDirectory=agentmgr-exec/%N",
+        f"--property=StateDirectory=agentmgr-exec/{unit}",
         "--property=StateDirectoryMode=0700",
         f"--property=RuntimeMaxSec={ttl}s",
         "--property=TimeoutStopSec=5",
