@@ -1,9 +1,9 @@
 # 受控执行边界记录（合成隔离基座，#82）
 
-- 状态：**合成隔离基座已在 `4175a3d` 验证（证据绑定该 head；最终修复轮后需由 Master 重跑刷新）**；Hermes Managed Execution 与真实业务运行时仍未验证
+- 状态：**合成隔离基座已在 `60c809f77727a8ad2fee972659a68777a31fcfcf` 验证（live 证据已在该 head 刷新）**；Hermes Managed Execution 与真实业务运行时仍未验证
 - 日期：2026-10-24
 - 关联：Issue #82、PR #94（Epic #74）；[隔离设计](managed-execution-isolation-design.md)、[威胁模型](threat-model.md)、[Runtime Adapter 契约](../contracts/runtime-adapter.md)、[ADR-001 产品边界](../architecture/ADR-001-product-boundary.md)
-- 证据提交：`4175a3da45a00ff2be79c5f467cedc714c9df6d4`
+- 证据提交：`60c809f77727a8ad2fee972659a68777a31fcfcf`
 - 证据工件：`<evidence-file>`（仓库外，不提交）；`run_id`、命令与退出码记录在 Issue #82 / PR #94
 
 ## 1. 结论与范围
@@ -36,9 +36,9 @@ uv run --no-sync pytest app/tests/security/test_isolation_live.py -q -o addopts=
 
 | 项 | 值 |
 |---|---|
-| 提交 | `4175a3da45a00ff2be79c5f467cedc714c9df6d4` |
-| `run_id` | `iso-20261023T191652Z-7130`（证据 JSON 内；仓库外） |
-| 结果 | **32 passed in 16.57s**，退出码 `0` |
+| 提交 | `60c809f77727a8ad2fee972659a68777a31fcfcf` |
+| `run_id` | `iso-20261023T205139Z-2db7`（证据 JSON 内；仓库外） |
+| 结果 | **35 passed in 16.53s**，退出码 `0` |
 | Harness 汇总 | `result=pass`、`failures=[]`、`probe_count=56`、`failed_probes=[]` |
 | 宿主/运行时 | Linux；kernel `6.12.111+deb13-amd64`；systemd `257 (257.13-1~deb13u1)`；cgroup v2 |
 | 网络 profile | `private_netns`（`af_unix_only_fallback` 也已启动并通过网关连接探针，本次未使用） |
@@ -46,7 +46,7 @@ uv run --no-sync pytest app/tests/security/test_isolation_live.py -q -o addopts=
 
 运行环境未记录主机名、密钥、个人路径或真实凭据；证据 JSON 自检为 `token_absent=true`、`home_path_absent=true`、`ipv4_absent=true`。
 
-> 真实测试只有同时设置 `AGENTMGR_ISOLATION_TEST=1` 与 `AGENTMGR_ISOLATION_SUDO=1` 才会执行；缺失任一变量时 pytest 会 skip。**跳过的运行不能作为验收证据。** 证据绑定上述 head，head 变化后必须重跑。
+> 真实测试只有同时设置 `AGENTMGR_ISOLATION_TEST=1` 与 `AGENTMGR_ISOLATION_SUDO=1` 才会执行；缺失任一变量时 pytest 会 skip。**跳过的运行不能作为验收证据。** 证据绑定上述 head 的实现；仅文档提交不改变实现，代码、沙箱属性或限额变化后必须重跑。
 
 ## 2. 已验证的强制属性
 
@@ -72,7 +72,7 @@ uv run --no-sync pytest app/tests/security/test_isolation_live.py -q -o addopts=
 - **停止证据**：撤销后停止在 5s 内取得 `MainPID=0` 并保留退出时间戳；`process_gone` 与 `stop_confirmed` 分别记录，不以“已发送停止请求”代替停止事实。
 - **运行目录**：`/run/agentmgr-exec` 属主与 controller 一致、模式 `0700`；`gateway.sock` 属主一致、模式 `0666`（MVP）；单元激活后凭据源与 spec 源文件均不存在；单元无法遍历 `/run/agentmgr-exec`。
 - **网关形态**：`mode=in_process_harness`、`grant_provider=in_memory_live`；限额为每任务 8 连接 / 16 req/s、全局 64 连接 / 200 req/s、单请求 64 KiB、读写超时 5s。每任务限额由 live 矩阵 #25/#26 验证；全局限额由 `test_gateway.py` 的 fake clock/计数器覆盖，本次**没有**制造 64 个并发任务，不能把全局上限当作 live 证据。
-- **审计**：`4175a3d` 的运行已证明证据 JSON 与审计不含令牌（`token_absent=true`）。最终修复轮起，网关与 supervisor 使用**独立 sink**：网关审计只接受 `security.exec.gateway.*` 事件，supervisor 的 `manual_stop` 等停止原因不再出现在网关 `deny_reasons` 中。本记录不再引用旧运行的合并条数或原因码总数，待 Master 在最终 head 重跑后刷新。
+- **审计**：本次运行 `gateway_events_only=true`，网关审计 44 条事件、supervisor 审计 15 条事件，二者均 `token_absent=true`。网关 `deny_reasons` 精确为 `bad_request`、`busy`、`capability_not_granted`、`credential_expired`、`credential_revoked`、`cross_task_denied`、`grant_revoked`、`rate_limited`、`resource_scope_denied`、`timeout`，**不含** `manual_stop`；supervisor 审计事件名为 `launch`/`stop`/`cleanup`。网关与 supervisor 使用独立 sink，停止原因不混入网关拒绝原因。
 - **清理**：`units_remaining=0`、`remaining_unit_names=[]`、`remaining_state_dirs=[]`、`run_dir_present=false`、`resources_dir_present=false`、`state_clean=true`。
 
 ## 3. 未强制或无法消除的剩余风险
@@ -97,12 +97,12 @@ uv run --no-sync pytest app/tests/security/test_isolation_live.py -q -o addopts=
 
 1. **协作式负载自报**：单元级的文件系统、网络、capability、namespace 与进程可见性探针由**协作式合成负载**执行并自报；它的 `plan.json` 与 `result.json` 位于该任务可写的状态目录。合成负载不会伪造，但**恶意任务可以伪造**这些结果。控制器侧的网关证据（#15–#26）与 `systemctl show` 状态证据不经过该通道，是独立的。**#83 不得**把该通道用于对抗性隔离声明；必须使用可信验证器或只读 plan 通道。
 2. **只读不等于不可读**：本记录只声称宿主文件系统**只读**、受权限保护的文件被拒绝；world-readable 宿主文件可能仍可读。宿主 `AF_UNIX` socket 也只遮蔽了 `/run/systemd` 与 `/run/dbus`，其余路径不在“已阻断”声明内（见设计 §15.2）。
-3. **探针范围**：本轮没有新增 live 探针。`InaccessiblePaths`、`ProtectHome`、`TemporaryFileSystem` 的结论只覆盖 `4175a3d` 运行中实际命中的路径与探针，不对其它宿主、内核、systemd 版本或未探测路径作保证。
-4. **证据与 head**：本记录绑定 `4175a3da45a00ff2be79c5f467cedc714c9df6d4`。最终修复轮（边界措辞收窄、网关/supervisor 审计 sink 分离、失败启动残留处理、生产网关模板 fail-closed）改变了 head；Master 必须在最终 head 上重跑 §16.3 并刷新本记录后才能引用当前 head 的证据。旧 head 的通过结论不得外推。
+3. **探针范围**：本次运行没有新增 live 探针（`probe_count=56`，对应 §16.3 的 26 行）。`InaccessiblePaths`、`ProtectHome`、`TemporaryFileSystem` 的结论只覆盖 `60c809f` 运行中实际命中的路径与探针，不对其它宿主、内核、systemd 版本或未探测路径作保证。
+4. **证据与 head**：本记录绑定 `60c809f77727a8ad2fee972659a68777a31fcfcf`。此前最终修复轮（边界措辞收窄、网关/supervisor 审计 sink 分离、失败启动残留处理、生产网关模板 fail-closed）改变了 head，已在该 head 上重跑 §16.3 并刷新本记录；旧 head（包括 `4175a3d`）的通过结论不得外推。
 
 ## 4. 产品声明限制
 
-**可以声称**：在 `4175a3d`，于已批准测试机的指定内核/systemd 版本上，合成 Agent 负载在受控隔离单元中运行，设计 §16.3 的负向矩阵全部通过；宿主文件系统只读、无 IP 网络、capability/namespace/进程可见性、任务级凭据、停止与清理边界有可复现证据。文件系统可读性只到“受权限保护的文件被拒绝”这一基线，**不**包含 world-readable 宿主文件或 `/run/systemd`、`/run/dbus` 之外的宿主 Unix socket。
+**可以声称**：在 `60c809f`，于已批准测试机的指定内核/systemd 版本上，合成 Agent 负载在受控隔离单元中运行，设计 §16.3 的负向矩阵全部通过；宿主文件系统只读、无 IP 网络、capability/namespace/进程可见性、任务级凭据、停止与清理边界有可复现证据。文件系统可读性只到“受权限保护的文件被拒绝”这一基线，**不**包含 world-readable 宿主文件或 `/run/systemd`、`/run/dbus` 之外的宿主 Unix socket。
 
 **不得声称**：
 
@@ -119,7 +119,7 @@ uv run --no-sync pytest app/tests/security/test_isolation_live.py -q -o addopts=
 ### 5.1 复现
 
 1. 只使用所有者批准的 `<test-host>`；不得在开发机或 CI 运行真实隔离测试。
-2. 从 `<repo-root>` 检出 `4175a3da45a00ff2be79c5f467cedc714c9df6d4`。
+2. 从 `<repo-root>` 检出 `60c809f77727a8ad2fee972659a68777a31fcfcf`。
 3. 使用 §1.3 命令，证据写入仓库外 `<evidence-file>`；不得把证据提交到仓库，也不得在证据中包含主机名、个人路径、IP、令牌或密钥。
 4. 任一断言失败即非零退出；失败输出与证据 JSON 一并保留，不得只记录“通过”。
 
@@ -140,15 +140,15 @@ test ! -e /var/lib/private/agentmgr-exec
 - `ops/security/agentmgr-exec`、`.sudoers`、`agentmgr-pep-gateway.service`、`agentmgr-task@.service` 是**生产模板**，本次**未安装**到测试机；#82 的 live 路径使用 `SudoSystemdOps`。模板不构成已验证的生产部署。
 - 生产网关必须是独立进程、接真实 Grant 存储的实时适配器；socket 建议 `0660` + 专用组；Secret Manager 注入替代测试用的受限环境变量。
 - 回滚不需要数据库迁移；`DynamicUser` 由 systemd 回收，无持久用户需删除；停止并 disable 网关、移除 sudoers 行、删除运行/状态/资源目录即可，详见[设计 §18](managed-execution-isolation-design.md#18-上线与回滚)。
-- 证据失效条件：head 变化、systemd/内核升级、沙箱属性或网关限额变更、宿主更换。任一变化后必须重跑 §16.3，旧结论不得沿用。
+- 证据失效条件：代码 head 变化、systemd/内核升级、沙箱属性或网关限额变更、宿主更换。任一变化后必须重跑 §16.3，旧结论不得沿用。
 
 ## 6. 历史失败与本次修复
 
-本次 live 证据之所以在 `4175a3d`，是因为之前几轮真实运行失败并已修复；这些失败不是环境噪声，而是基座缺陷：
+本次 live 证据之所以在 `60c809f`，是因为之前几轮真实运行失败并已修复；这些失败不是环境噪声，而是基座缺陷：
 
 1. **`226/NAMESPACE`（对整个目录使用 `InaccessiblePaths`）**：`InaccessiblePaths=-/run/systemd` 会让 systemd 的命名空间设置失败，单元以 `226/NAMESPACE` 启动失败。改为 `TemporaryFileSystem=/run/systemd` 与 `/run/dbus` 遮蔽宿主 socket 目录后成功（`20753c2`）。
 2. **`StateDirectory` 的字面 `%N`**：transient 单元的 `systemd-run -p` 不展开 specifier，字面 `%N` 会创建共享目录并破坏每任务隔离。改为显式 `agentmgr-exec/<unit>`（`3c5abf5`）。
-3. **transient 单元回收导致退出证据丢失**：普通 transient 单元退出后被回收，`ExecMainExitTimestamp`/`Result` 消失，无法证明停止。改为 `RemainAfterExit=yes` + `ExitType=cgroup` 并保留退出时间戳（`a7957b8`），随后修正停止顺序、微秒级时间戳与审计失败清理。最后一条 `4175a3d` 让跨任务资源探针接受单元级与 controller 级的同 id 条目。
+3. **transient 单元回收导致退出证据丢失**：普通 transient 单元退出后被回收，`ExecMainExitTimestamp`/`Result` 消失，无法证明停止。改为 `RemainAfterExit=yes` + `ExitType=cgroup` 并保留退出时间戳（`a7957b8`），随后修正停止顺序、微秒级时间戳与审计失败清理。此前的 `4175a3d` 让跨任务资源探针接受单元级与 controller 级的同 id 条目。
 
 结论：只有在这些修复之后，§16.3 的停止、TTL、跨任务与清理断言才真实成立；更早的失败运行不得作为证据引用。
 

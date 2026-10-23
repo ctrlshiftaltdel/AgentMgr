@@ -1,6 +1,6 @@
 # 受控执行隔离设计（Managed Execution 隔离基座，#82）
 
-- 状态：**已实现（合成隔离基座）**。`app/security/**`、`ops/security/**` 与 `app/tests/security/**` 已按本文落地；合成基座在 `4175a3da45a00ff2be79c5f467cedc714c9df6d4` 有真实 live 证据（见[受控执行边界记录](managed-execution-boundary.md)）。Hermes 入沙箱与真实业务运行时属于 **#83**，仍未验证。
+- 状态：**已实现（合成隔离基座）**。`app/security/**`、`ops/security/**` 与 `app/tests/security/**` 已按本文落地；合成基座在 `60c809f77727a8ad2fee972659a68777a31fcfcf` 有真实 live 证据（见[受控执行边界记录](managed-execution-boundary.md)）。Hermes 入沙箱与真实业务运行时属于 **#83**，仍未验证。
 - 日期：2026-10-23；实现与 live 证据更新：2026-10-24
 - 关联 Issue：#82（Epic：#74）；依赖 #77（威胁模型）、#78（PDP/PEP）、#81（Runtime Adapter，均已 VERIFIED）
 - 契约版本：1.0.0（Phase 0 冻结候选，尚未发布）；凭据格式 `agx1`；网关协议版本 `1.0.0`
@@ -19,9 +19,9 @@
 
 本文最初作为设计基线提交；当前分支已经包含对应实现、单元测试和一次真实 live 运行。阅读时请注意：
 
-- 文中命令、单元属性与负向用例仍是**验收规格**；只有 `4175a3da45a00ff2be79c5f467cedc714c9df6d4` 上有记录的部分才算已验证；
+- 文中命令、单元属性与负向用例仍是**验收规格**；只有 `60c809f77727a8ad2fee972659a68777a31fcfcf` 上有记录的部分才算已验证；
 - 未在该次运行中覆盖的能力（Hermes、模型出口、真实业务连接器、生产网关形态）保持 `未验证`，不得据本文外推；
-- 证据绑定 head：head 变化后必须按 §16 重跑，旧结论不自动沿用。
+- 证据绑定代码 head：实现、沙箱属性或限额变化后必须按 §16 重跑，旧结论不自动沿用；仅文档提交不改变实现。
 
 ## 2. 背景与目标
 
@@ -95,10 +95,10 @@
 
 | #82 验收条目 | 本基座对应机制 | 证据状态 |
 |---|---|---|
-| 受控 Agent 无法读取其他主体的凭据或访问未授权资源 | 独立 UID、StateDirectory 0700、凭据目录 `root:root 0700` 且仅 `LoadCredential` 读取、网关 token/scope/cross-task 校验 | 合成基座 verified at `4175a3d`；Hermes/真实业务未验证 |
-| Grant 到期或撤销后，后续受控调用失败 | 凭据 `exp = min(provider.expires_at, iat + ttl_seconds)` 且 `exp - iat ≤ 300`；网关每次调用实时读取撤销存储与 `GrantStatusProvider`（无缓存）；Supervisor 停止单元并验证 `process_gone` | 合成基座 verified at `4175a3d`；生产 Grant 存储未验证 |
-| 绕行测试有真实命令、退出码和证据 | §16 的负向矩阵、`verify_isolation.sh`（环境检查）+ `verify_isolation.py`（同进程 harness）、证据 JSON | verified：32 passed，exit 0，见[边界记录](managed-execution-boundary.md) |
-| 无法强制治理的能力有明确风险记录与产品声明限制 | §4、§15、§17 | 设计层已记录；`4175a3d` 运行证据见边界记录；#83 能力仍未验证 |
+| 受控 Agent 无法读取其他主体的凭据或访问未授权资源 | 独立 UID、StateDirectory 0700、凭据目录 `root:root 0700` 且仅 `LoadCredential` 读取、网关 token/scope/cross-task 校验 | 合成基座 verified at `60c809f`；Hermes/真实业务未验证 |
+| Grant 到期或撤销后，后续受控调用失败 | 凭据 `exp = min(provider.expires_at, iat + ttl_seconds)` 且 `exp - iat ≤ 300`；网关每次调用实时读取撤销存储与 `GrantStatusProvider`（无缓存）；Supervisor 停止单元并验证 `process_gone` | 合成基座 verified at `60c809f`；生产 Grant 存储未验证 |
+| 绕行测试有真实命令、退出码和证据 | §16 的负向矩阵、`verify_isolation.sh`（环境检查）+ `verify_isolation.py`（同进程 harness）、证据 JSON | verified：35 passed in 16.53s，exit 0，见[边界记录](managed-execution-boundary.md) |
+| 无法强制治理的能力有明确风险记录与产品声明限制 | §4、§15、§17 | 设计层已记录；`60c809f` 运行证据见边界记录；#83 能力仍未验证 |
 
 ## 6. 架构
 
@@ -349,7 +349,7 @@ class BoundaryClaim:
 
 **`StateDirectory` 在 transient 单元中使用显式单元名。** `systemd-run -p` 不会展开 `%N`、`%i` 等 specifier；写成 `StateDirectory=agentmgr-exec/%N` 会在已批准测试机上创建一个字面目录 `/var/lib/private/agentmgr-exec/%N`，而 harness 查找的 `<unit>` 目录并不存在。因此 `build_systemd_run_argv` 渲染 `StateDirectory=agentmgr-exec/<unit>`（`<unit>` 已匹配 `^agentmgr-task-[0-9a-f]{12}$`）。单元文件模板不经过 `systemd-run -p`，可以继续使用模板自己的 `%i`（§8.5）。
 
-**`RemainAfterExit=yes` 保留成功退出的证据。** 普通 transient 单元退出后会被 systemd 回收，`systemctl show` 只剩 `LoadState=not-found`，`ExecMainExitTimestamp`/`Result` 随之丢失，导致 stop-on-revoke 无法证明停止。`RemainAfterExit=yes` 让成功退出的单元保留为 `active/exited`；failed/timeout 单元按 systemd 默认 GC 仍为 `failed` 并保持 loaded。**不设置 `CollectMode=`**：它的默认值 `inactive` 会在单元进入 inactive 时卸载单元，不能作为证据保留机制；显式写 `CollectMode=inactive` 与默认值等价，inactive 单元仍会被卸载。`ExitType=cgroup` 使 `MainPID=0`/`active/exited` 表示整个 cgroup 已为空。该保留行为已在 `4175a3d` 的合成基座 live run 中验证；见[受控执行边界记录](managed-execution-boundary.md)。清理时 `reset-failed` 对已回收单元必须视为 no-op。
+**`RemainAfterExit=yes` 保留成功退出的证据。** 普通 transient 单元退出后会被 systemd 回收，`systemctl show` 只剩 `LoadState=not-found`，`ExecMainExitTimestamp`/`Result` 随之丢失，导致 stop-on-revoke 无法证明停止。`RemainAfterExit=yes` 让成功退出的单元保留为 `active/exited`；failed/timeout 单元按 systemd 默认 GC 仍为 `failed` 并保持 loaded。**不设置 `CollectMode=`**：它的默认值 `inactive` 会在单元进入 inactive 时卸载单元，不能作为证据保留机制；显式写 `CollectMode=inactive` 与默认值等价，inactive 单元仍会被卸载。`ExitType=cgroup` 使 `MainPID=0`/`active/exited` 表示整个 cgroup 已为空。该保留行为已在 `60c809f` 的合成基座 live run 中验证；见[受控执行边界记录](managed-execution-boundary.md)。清理时 `reset-failed` 对已回收单元必须视为 no-op。
 
 同一 profile 内的附加加固（不改变上表语义）：
 
@@ -1055,7 +1055,7 @@ Supervisor.cleanup(handle):
 
 ## 16. 测试计划
 
-> **Live evidence（2026-10-24）**：合成隔离基座已在 `4175a3da45a00ff2be79c5f467cedc714c9df6d4` 按 §16.3 真实运行并通过（32 passed，exit 0）；证据与剩余风险见[受控执行边界记录](managed-execution-boundary.md)。本文仍是设计基线；Hermes 与真实业务运行时未验证。
+> **Live evidence（2026-10-24）**：合成隔离基座已在 `60c809f77727a8ad2fee972659a68777a31fcfcf` 按 §16.3 真实运行并通过（35 passed in 16.53s，exit 0）；证据与剩余风险见[受控执行边界记录](managed-execution-boundary.md)。本文仍是设计基线；Hermes 与真实业务运行时未验证。
 
 ### 16.1 分层
 
@@ -1117,7 +1117,7 @@ Supervisor.cleanup(handle):
 - 第 15 项成功后必须验证返回体**不含**其它资源内容。
 - 第 18 项区分两种拒绝：令牌/凭据身份（`task_id`/`grant_id`/`subject_id`）与实时 Grant 不一致才是 `cross_task_denied`；另一任务的资源 ID 属于资源范围判定，返回 `resource_scope_denied`，不要为它增加重复的资源归属检查。
 - 第 25/26 项验证 **per-task** 上限；全局上限（64 连接 / 200 req/s）由 `test_gateway.py` 的 fake clock/计数器覆盖，不在单机 live 矩阵中制造 64 个并发任务。两项都必须核对：超限响应后连接立即关闭，进程/文件描述符没有泄漏。
-- 第 1–5、10–14 项是**单元内合成负载自报**的结果：探针计划（`plan.json`）与结果（`result.json`）位于该任务可写的状态目录。协作式合成负载不会伪造，但恶意任务可以；这些探针因此是**协作式负向验证**，不是对抗性证明。控制器侧的网关判定（#15–#26）与 `systemctl show` 状态证据不经该通道，独立于任务自报。#83 若要处理对抗性隔离声明，必须使用可信验证器或只读 plan 通道。
+- 第 1–5、6–9、10–14 项是**单元内合成负载自报**的结果：探针计划（`plan.json`）与结果（`result.json`）位于该任务可写的状态目录。协作式合成负载不会伪造，但恶意任务可以；这些探针因此是**协作式负向验证**，不是对抗性证明。控制器侧的网关判定（#15–#26）与 `systemctl show` 状态证据不经该通道，独立于任务自报。#83 若要处理对抗性隔离声明，必须使用可信验证器或只读 plan 通道。
 
 ### 16.4 证据 JSON
 
@@ -1206,18 +1206,18 @@ Supervisor.cleanup(handle):
 
 **生产形态**：独立 `agentmgr-pep-gateway.service`（`python -m app.security.gateway`）是 **#83** 路径，必须接真实 Grant 存储的实时适配器；它不是本 MVP 的验证入口。当前该入口在没有生产 `GrantStatusProvider` 适配器时会以稳定消息退出 `2` 且**不绑定 socket**，服务模板也由 enable marker 与 `Restart=no` 门控，避免“空配置却启动成功”。
 
-**真实测试只有在所有者批准后才可运行。** 本文档所属的设计基线轮次未运行 live 测试；合成隔离基座的 live 证据已在 `4175a3da45a00ff2be79c5f467cedc714c9df6d4` 执行，记录见[受控执行边界记录](managed-execution-boundary.md)。Hermes、模型供应商出口与真实业务的声明仍未验证。
+**真实测试只有在所有者批准后才可运行。** 本文档所属的设计基线轮次未运行 live 测试；合成隔离基座的 live 证据已在 `60c809f77727a8ad2fee972659a68777a31fcfcf` 执行，记录见[受控执行边界记录](managed-execution-boundary.md)。Hermes、模型供应商出口与真实业务的声明仍未验证。
 
 ## 17. 验收映射
 
 | # | #82 验收条目 | 设计落点 | 证据状态 |
 |---|---|---|---|
-| 1 | 受控 Agent 无法读取其他主体的凭据或访问未授权资源 | §6.3 目录权限、§8 沙箱属性、§10.4 校验链、§10.1 准入限额、§16.3 #4/#5/#15/#18/#19/#25/#26 | **verified at `4175a3d`**（合成基座）；Hermes/真实业务/生产 Grant 存储未验证 |
-| 2 | Grant 到期或撤销后，后续受控调用失败 | §9.6 实时双重校验（不缓存）、§11.4 stop/cleanup、§14.4/§14.5、§16.3 #16/#17/#21/#23 | **verified at `4175a3d`**（内存实时 Grant provider）；持久化撤销与生产适配器未验证 |
-| 3 | 绕行测试有真实命令、退出码和证据 | §16.3 全部 26 项、§16.4 证据格式、`verify_isolation.sh` + `verify_isolation.py` | **verified：32 passed，exit 0**（[边界记录](managed-execution-boundary.md)） |
-| 4 | 无法强制治理的能力有明确风险记录和对应产品声明限制 | §4、§15.2、§15.3、`BoundaryClaim` | 设计层已记录；`4175a3d` 运行证据与残余限制见边界记录；#83 能力仍为未验证 |
+| 1 | 受控 Agent 无法读取其他主体的凭据或访问未授权资源 | §6.3 目录权限、§8 沙箱属性、§10.4 校验链、§10.1 准入限额、§16.3 #4/#5/#15/#18/#19/#25/#26 | **verified at `60c809f`**（合成基座）；Hermes/真实业务/生产 Grant 存储未验证 |
+| 2 | Grant 到期或撤销后，后续受控调用失败 | §9.6 实时双重校验（不缓存）、§11.4 stop/cleanup、§14.4/§14.5、§16.3 #16/#17/#21/#23 | **verified at `60c809f`**（内存实时 Grant provider）；持久化撤销与生产适配器未验证 |
+| 3 | 绕行测试有真实命令、退出码和证据 | §16.3 全部 26 项、§16.4 证据格式、`verify_isolation.sh` + `verify_isolation.py` | **verified：35 passed in 16.53s，exit 0**（[边界记录](managed-execution-boundary.md)） |
+| 4 | 无法强制治理的能力有明确风险记录和对应产品声明限制 | §4、§15.2、§15.3、`BoundaryClaim` | 设计层已记录；`60c809f` 运行证据与残余限制见边界记录；#83 能力仍为未验证 |
 
-补充：本文档对应的实现已在当前分支落地；上表“verified”仅绑定 `4175a3da45a00ff2be79c5f467cedc714c9df6d4` 的合成基座 live 证据。head 变化（含本轮边界措辞与审计 sink 修复）后必须按 §16 重跑，未重跑前不得把该证据当作当前 head 的证据。Hermes Managed Execution 与真实业务运行时仍未验证。
+补充：本文档对应的实现已在当前分支落地；上表“verified”绑定 `60c809f77727a8ad2fee972659a68777a31fcfcf` 的合成基座 live 证据，该 head 已按 §16 重跑。仅文档提交不改变实现；此后任何代码、沙箱属性或限额变化仍须重跑 §16，未重跑前不得沿用该证据。Hermes Managed Execution 与真实业务运行时仍未验证。
 
 ## 18. 上线与回滚
 
