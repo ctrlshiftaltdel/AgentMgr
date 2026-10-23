@@ -209,9 +209,10 @@ def build_systemd_run_argv(config: SystemdUnitConfig) -> list[str]:
     private_netns = config.network_profile == NETWORK_PROFILE_PRIVATE_NETNS
     inaccessible = [*_BASE_INACCESSIBLE_PATHS]
 
-    # `RemainAfterExit=yes` + `CollectMode=inactive` keep an exited transient
-    # unit loaded long enough to read ExecMainExitTimestamp/Result; otherwise
-    # systemd collects it immediately and stop evidence is lost.
+    # `RemainAfterExit=yes` keeps a successfully exited transient unit loaded as
+    # `active/exited` long enough to read ExecMainExitTimestamp/Result; failed
+    # and timeout units are retained by systemd's default GC.  `ExitType=cgroup`
+    # makes `MainPID=0`/active-exited mean the whole cgroup is empty.
     # systemd does not expand specifiers (%N, %i) in `systemd-run -p` values;
     # `%N` would create a literal directory.  Use the validated unit name.
     # Unit-file templates may use their own specifiers (see §8.5).
@@ -220,11 +221,11 @@ def build_systemd_run_argv(config: SystemdUnitConfig) -> list[str]:
         f"--property=StateDirectory=agentmgr-exec/{unit}",
         "--property=StateDirectoryMode=0700",
         "--property=RemainAfterExit=yes",
-        "--property=CollectMode=inactive",
         f"--property=RuntimeMaxSec={ttl}s",
         "--property=TimeoutStopSec=5",
         "--property=KillMode=control-group",
         "--property=SendSIGKILL=yes",
+        "--property=ExitType=cgroup",
         "--property=ProtectSystem=strict",
         "--property=ProtectHome=yes",
         *(
@@ -479,11 +480,19 @@ def observation_from_show(
             "starting", False, False, False, main_pid, result, exec_main_status
         )
     if active_state == "active" and sub_state == "exited" and main_pid_value == 0:
-        # `RemainAfterExit=yes` + `CollectMode=inactive` keep a finished unit
-        # loaded as active/exited so the exit evidence survives collection.
-        if stop_requested_at is None:
+        # `RemainAfterExit=yes` keeps a finished unit loaded as active/exited so
+        # the exit evidence survives collection.
+        if result != "success":
             return _observation(
-                "completed", True, False, False, main_pid, result, exec_main_status
+                "unknown", True, False, False, main_pid, result, exec_main_status
+            )
+        if stop_requested_at is None:
+            if exec_main_status == 0:
+                return _observation(
+                    "completed", True, False, False, main_pid, result, exec_main_status
+                )
+            return _observation(
+                "unknown", True, False, False, main_pid, result, exec_main_status
             )
         if exit_at is None:
             return _observation(
@@ -494,8 +503,16 @@ def observation_from_show(
                 "unknown", True, False, False, main_pid, result, exec_main_status
             )
         if exit_at < stop_requested_at:
+            if exec_main_status == 0:
+                return _observation(
+                    "completed", True, False, False, main_pid, result, exec_main_status
+                )
             return _observation(
-                "completed", True, False, False, main_pid, result, exec_main_status
+                "unknown", True, False, False, main_pid, result, exec_main_status
+            )
+        if exec_main_status is None:
+            return _observation(
+                "unknown", True, False, False, main_pid, result, exec_main_status
             )
         return _observation(
             "cancelled", True, True, False, main_pid, result, exec_main_status
@@ -847,6 +864,12 @@ class SudoSystemdOps:
 
     def cleanup(self, unit: str) -> None:
         resolved = _validate_unit(unit)
+        try:
+            self.stop(resolved)
+        except SecurityError:
+            # A collected transient unit is already gone; stop is a no-op.
+            if self.show(resolved).get("LoadState") != "not-found":
+                raise
         self.reset_failed(resolved)
         _invoke(
             self._runner,

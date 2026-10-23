@@ -297,12 +297,12 @@ class BoundaryClaim:
 | `DynamicUser=` | `yes` | 每单元独立、非持久的 UID；停止后回收 |
 | `StateDirectory=` | `agentmgr-exec/<unit>` | 每单元可写状态目录；transient 单元使用显式校验过的单元名（见 §8.5） |
 | `StateDirectoryMode=` | `0700` | 状态目录仅该 UID 可访问 |
-| `RemainAfterExit=` | `yes` | 进程退出后保留单元为 `active/exited`，使退出证据可读取 |
-| `CollectMode=` | `inactive` | 不自动回收 inactive/failed 单元，直到 supervisor 读取证据并清理 |
+| `RemainAfterExit=` | `yes` | 进程退出后保留单元为 `active/exited`，使退出证据可读取；failed/timeout 单元由 systemd 默认 GC 保留 |
 | `RuntimeMaxSec=` | `<ttl>`（秒，1..300） | 硬运行时长上限，超时由 systemd 终止；上限与凭据 TTL 一致 |
 | `TimeoutStopSec=` | `5` | SIGTERM 后 5s 升级 SIGKILL |
 | `KillMode=` | `control-group` | 终止整个 cgroup，含子进程 |
 | `SendSIGKILL=` | `yes` | 允许 SIGKILL 兜底 |
+| `ExitType=` | `cgroup` | 以整个 cgroup 为空作为退出条件，配合 `MainPID=0`/`active/exited` 证明所有进程已退出 |
 | `ProtectSystem=` | `strict` | `/usr`、`/boot`、`/etc`、`/var` 等只读 |
 | `ProtectHome=` | `yes` | `/home`、`/root`、`/run/user` 不可访问 |
 | `InaccessiblePaths=` | `-/etc/agentmgr -/var/lib/agentmgr -/var/lib/postgresql -/srv -/opt` | 显式屏蔽控制面、数据库与业务目录；`-` 为可选路径语法（不存在则忽略，存在则仍屏蔽） |
@@ -349,7 +349,7 @@ class BoundaryClaim:
 
 **`StateDirectory` 在 transient 单元中使用显式单元名。** `systemd-run -p` 不会展开 `%N`、`%i` 等 specifier；写成 `StateDirectory=agentmgr-exec/%N` 会在已批准测试机上创建一个字面目录 `/var/lib/private/agentmgr-exec/%N`，而 harness 查找的 `<unit>` 目录并不存在。因此 `build_systemd_run_argv` 渲染 `StateDirectory=agentmgr-exec/<unit>`（`<unit>` 已匹配 `^agentmgr-task-[0-9a-f]{12}$`）。单元文件模板不经过 `systemd-run -p`，可以继续使用模板自己的 `%i`（§8.5）。
 
-**`RemainAfterExit=yes` + `CollectMode=inactive` 保留退出证据。** 普通 transient 单元退出后会被 systemd 立即回收，`systemctl show` 只剩 `LoadState=not-found`，`ExecMainExitTimestamp`/`Result` 随之丢失，导致 stop-on-revoke 无法证明停止。两个属性让成功退出的单元保留为 `active/exited`、超时单元保留为 `failed`，直到 supervisor 读取证据后再 `systemctl stop`/cleanup。该行为在已批准测试机上手动验证；清理时 `reset-failed` 对已回收单元必须视为 no-op，不得把 `not-found` 当成失败。
+**`RemainAfterExit=yes` 保留成功退出的证据。** 普通 transient 单元退出后会被 systemd 回收，`systemctl show` 只剩 `LoadState=not-found`，`ExecMainExitTimestamp`/`Result` 随之丢失，导致 stop-on-revoke 无法证明停止。`RemainAfterExit=yes` 让成功退出的单元保留为 `active/exited`；failed/timeout 单元按 systemd 默认 GC 仍为 `failed` 并保持 loaded。**不设置 `CollectMode=`**：它的默认值 `inactive` 会在单元进入 inactive 时卸载单元，不能作为证据保留机制；显式写 `CollectMode=inactive` 与默认值等价，inactive 单元仍会被卸载。`ExitType=cgroup` 使 `MainPID=0`/`active/exited` 表示整个 cgroup 已为空。该保留行为待 Master 在已批准测试机上按 §16 重跑验证；清理时 `reset-failed` 对已回收单元必须视为 no-op。
 
 同一 profile 内的附加加固（不改变上表语义）：
 
@@ -367,11 +367,11 @@ systemd-run --unit=agentmgr-task-<12hex> --description=agentmgr-exec \
   --property=StateDirectory=agentmgr-exec/agentmgr-task-<12hex> \
   --property=StateDirectoryMode=0700 \
   --property=RemainAfterExit=yes \
-  --property=CollectMode=inactive \
   --property=RuntimeMaxSec=<ttl>s \
   --property=TimeoutStopSec=5 \
   --property=KillMode=control-group \
   --property=SendSIGKILL=yes \
+  --property=ExitType=cgroup \
   --property=ProtectSystem=strict \
   --property=ProtectHome=yes \
   --property=InaccessiblePaths=-/etc/agentmgr \
@@ -737,8 +737,9 @@ class ResourceBackend(Protocol):
 |---|---|---|---|---|
 | `ActiveState=activating` | `starting` | false | false | false |
 | `ActiveState=active` 且 `SubState=running` | `running` | false | false | false |
-| `ActiveState=active` 且 `SubState=exited` 且**停止请求存在且退出不早于请求** | `cancelled` | **true** | **true** | false |
-| `ActiveState=active` 且 `SubState=exited` 且**无停止请求（或退出早于请求）** | `completed` | **true** | **false** | false |
+| `ActiveState=active` 且 `SubState=exited` 且 `Result=success` 且**停止请求存在且退出不早于请求** | `cancelled` | **true** | **true** | false |
+| `ActiveState=active` 且 `SubState=exited` 且 `Result=success` 且 `ExecMainStatus=0` 且**无停止请求（或退出早于请求）** | `completed` | **true** | **false** | false |
+| `ActiveState=active` 且 `SubState=exited` 但 `Result` 非 `success`，或无法确认退出时间/状态 | `unknown` | **true** | false | false |
 | `ActiveState=deactivating` | `stopping` | false | false | false |
 | `ActiveState=inactive` 且 `MainPID=0` 且 `Result=success` 且 `ExecMainStatus=0` 且**无 stop/cancel 请求（或退出早于请求）** | `completed` | **true** | **false** | false |
 | `ActiveState=inactive/failed` 且 `MainPID=0` 且 `Result=timeout` | `timed_out` | **true** | **true** | false |
@@ -750,7 +751,7 @@ class ResourceBackend(Protocol):
 
 三个布尔值语义不同，不能互相替代：
 
-- **`process_gone`**：单元已不在运行。判定为 `ActiveState ∈ {inactive, failed}` 且 `MainPID` 解析为整数 `0`、`ActiveState=active` 且 `SubState=exited`，或 `LoadState=not-found` 且已有启动证据。`MainPID=0` 单独不足以证明“曾经运行过”——从未启动的单元也是 0，因此必须结合 `ActiveEnterTimestamp`/`ExecMainStartTimestamp`/`ExecMainExitTimestamp`/`LoadState` 区分 `not_started`。
+- **`process_gone`**：单元已不在运行。判定为 `ActiveState ∈ {inactive, failed}` 且 `MainPID` 解析为整数 `0`、`ActiveState=active` 且 `SubState=exited` 且 `Result=success` 且 `MainPID=0`（`ExitType=cgroup`），或 `LoadState=not-found` 且已有启动证据。`MainPID=0` 单独不足以证明“曾经运行过”——从未启动的单元也是 0，因此必须结合 `ActiveEnterTimestamp`/`ExecMainStartTimestamp`/`ExecMainExitTimestamp`/`LoadState` 区分 `not_started`。
 - **`stop_confirmed`**：由 Supervisor 发起 terminate/stop/cancel，或由 `RuntimeMaxSec` 触发的 timeout 停止，并且已取得上述停止证据。自然 `completed`/`failed` 只说明进程结束，**不是**“停止请求已被证实”，一律为 false；`deactivating`、`activating`、`unknown`、字段缺失也为 false。`cancelled` 与 `completed` 用 `ExecMainExitTimestamp` 和停止请求时间排序判定：退出早于请求即自然完成，请求早于退出即已确认停止；同一秒内无法可靠排序时返回 `unknown`，不得猜测。
 - **`never_started`**：`LoadState=not-found` 且没有任何启动证据；它表示“从未开始”，不是“已停止”。
 
@@ -780,7 +781,7 @@ class ResourceBackend(Protocol):
 `stop(handle, reason)`：
 
 1. 先在撤销存储写入 `jti`（reason = `grant_revoked`/`grant_expired`/`manual_stop`/`task_terminal`）；
-2. 调用 `terminate <unit>`（固定 `systemctl kill --signal=SIGTERM --kill-whom=all <unit>`），让负载收到 SIGTERM；`RemainAfterExit=yes`/`CollectMode=inactive` 保证单元退出后仍保留为 `active/exited`；
+2. 调用 `terminate <unit>`（固定 `systemctl kill --signal=SIGTERM --kill-whom=all <unit>`），让负载收到 SIGTERM；`RemainAfterExit=yes` 保证成功退出的单元保留为 `active/exited`，failed/timeout 单元按默认 GC 保留为 `failed`；
 3. 轮询 `inspect` 直到取得退出证据（`ActiveState=active` 且 `SubState=exited` 且有 `ExecMainExitTimestamp`，或 `ActiveState ∈ {inactive, failed}` 且 `MainPID=0`），上限 **10s**；
 4. 若进程仍在运行：调用 `systemctl kill --signal=SIGKILL --kill-whom=all <unit>`，再轮询 3s；
 5. 仍无退出证据 → 返回 `unit_stop_unconfirmed`（`process_gone=false`、`stop_confirmed=false`），写 `security.exec.supervisor.stop_unconfirmed` 审计并告警；**不得**报告已停止；
@@ -790,11 +791,12 @@ class ResourceBackend(Protocol):
 `cleanup(handle)`：
 
 1. 仅当 `process_gone=true` 或 `never_started=true` 时执行；两者都为 false（例如停止未确认）时拒绝清理并返回 `unit_stop_unconfirmed`，不得删除状态目录或凭据残留；
-2. `systemctl reset-failed <unit>`（清理失败态残留）；若单元已被回收（`LoadState=not-found`），该调用是 **no-op**，不得视为失败；
-3. 删除 `/var/lib/private/agentmgr-exec/<unit>`（及 `/var/lib/agentmgr-exec/<unit>` 符号链接，若仍存在）；
-4. 由 root helper 删除残留凭据/spec 文件（`credentials/`、`specs/` 为 `root:root 0700`）；
-5. prune 过期撤销记录；
-6. 返回 `CleanupResult`（`units_remaining=0`、`state_dir_removed=true`、`credential_removed=true`）。
+2. `systemctl stop <unit>`（幂等；`LoadState=not-found` 时 no-op），确保自然完成的 `active/exited` 单元不会残留在系统中；
+3. `systemctl reset-failed <unit>`（清理失败态残留）；若单元已被回收（`LoadState=not-found`），该调用是 **no-op**，不得视为失败；
+4. 删除 `/var/lib/private/agentmgr-exec/<unit>`（及 `/var/lib/agentmgr-exec/<unit>` 符号链接，若仍存在）；
+5. 由 root helper 删除残留凭据/spec 文件（`credentials/`、`specs/` 为 `root:root 0700`）；
+6. prune 过期撤销记录；
+7. 返回 `CleanupResult`（`units_remaining=0`、`state_dir_removed=true`、`credential_removed=true`）。
 
 ### 11.5 竞态处理
 
@@ -1015,7 +1017,7 @@ Supervisor.cleanup(handle):
 | 资源与时间上限 | `MemoryMax`、`CPUQuota`、`TasksMax`、`LimitNOFILE`、`RuntimeMaxSec` |
 | 跨任务状态隔离 | 独立 UID + `StateDirectory=agentmgr-exec/<unit>`（`StateDirectoryMode=0700`） |
 | 凭据任务绑定/短时/可撤销 | `task_id`/`grant_id` claims、`exp ≤ GrantStatusProvider 剩余`、`RevocationStore` |
-| 停止/退出区分 | `process_gone` = 单元不再运行（含 `active/exited`）；`stop_confirmed` 仅在 terminate/stop/cancel/timeout 取得退出证据时为 true；`RemainAfterExit`+`CollectMode=inactive` 保留退出证据；`cleanup` 用 `process_gone \|\| never_started` |
+| 停止/退出区分 | `process_gone` = 单元不再运行（含 `active/exited`）；`stop_confirmed` 仅在 terminate/stop/cancel/timeout 取得退出证据时为 true；`RemainAfterExit` 保留成功退出证据，`ExitType=cgroup` 证明 cgroup 为空；`cleanup` 用 `process_gone \|\| never_started` |
 | 网关准入上限 | per-task 8 连接 / 16 req/s、global 64 连接 / 200 req/s、单请求 64 KiB、读写 5s |
 | 模式一致 | spec 与 Grant 双重校验 `managed_execution` |
 

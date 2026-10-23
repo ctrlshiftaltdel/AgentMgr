@@ -470,8 +470,10 @@ def build_launch_argv(unit: str, spec: object) -> list[str]:
         raise HelperError("unit_name_mismatch")
 
     credential = _credentials_dir() / f"{unit}.json"
-    # Keep the exited transient unit loaded as active/exited until the supervisor
-    # reads ExecMainExitTimestamp/Result; systemd would otherwise collect it.
+    # `RemainAfterExit=yes` keeps a successful transient unit loaded as
+    # active/exited so the supervisor can read ExecMainExitTimestamp/Result;
+    # failed/timeout units are retained by systemd's default GC.  ExitType=cgroup
+    # ensures MainPID=0/active-exited means the whole cgroup is empty.
     # `systemd-run -p` does not expand `%N`/`%i`; use the validated unit name so
     # the state directory is `agentmgr-exec/<unit>`, not a literal `%N` path.
     properties = [
@@ -479,11 +481,11 @@ def build_launch_argv(unit: str, spec: object) -> list[str]:
         f"--property=StateDirectory=agentmgr-exec/{unit}",
         "--property=StateDirectoryMode=0700",
         "--property=RemainAfterExit=yes",
-        "--property=CollectMode=inactive",
         f"--property=RuntimeMaxSec={ttl}s",
         "--property=TimeoutStopSec=5",
         "--property=KillMode=control-group",
         "--property=SendSIGKILL=yes",
+        "--property=ExitType=cgroup",
         "--property=ProtectSystem=strict",
         "--property=ProtectHome=yes",
         *(
@@ -757,10 +759,17 @@ def _remove_state(unit: str) -> None:
 
 
 def cleanup(unit: object, *, runner: Runner = run_checked) -> None:
-    """Reset failed state, then remove only the unit's derived residue."""
+    """Stop an idempotent unit, reset failed state, then remove residue."""
 
     validate_unit(unit)
     assert isinstance(unit, str)
+    try:
+        stop(unit, runner=runner)
+    except HelperError:
+        # A collected transient unit has nothing to stop; every other failure
+        # still aborts before any path is removed.
+        if inspect(unit, runner=runner).get("LoadState") != "not-found":
+            raise
     reset_failed(unit, runner=runner)
     _remove_sources(unit)
     _remove_state(unit)

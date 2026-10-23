@@ -124,11 +124,11 @@ def _expected_properties(config: SystemdUnitConfig) -> list[str]:
         f"--property=StateDirectory=agentmgr-exec/{config.unit}",
         "--property=StateDirectoryMode=0700",
         "--property=RemainAfterExit=yes",
-        "--property=CollectMode=inactive",
         f"--property=RuntimeMaxSec={config.spec.ttl_seconds}s",
         "--property=TimeoutStopSec=5",
         "--property=KillMode=control-group",
         "--property=SendSIGKILL=yes",
+        "--property=ExitType=cgroup",
         "--property=ProtectSystem=strict",
         "--property=ProtectHome=yes",
         *(
@@ -189,6 +189,8 @@ def test_systemd_argv_exact_properties(
     properties = [item for item in argv if item.startswith("--property=")]
     assert properties == _expected_properties(config)
     assert not any("%N" in item or "%i" in item for item in properties)
+    assert "--property=ExitType=cgroup" in properties
+    assert "--property=CollectMode=inactive" not in properties
     # Both profiles mask the host systemd private socket and D-Bus with a
     # private tmpfs so the bound gateway socket remains the only AF_UNIX entry.
     assert "--property=TemporaryFileSystem=/run/systemd" in properties
@@ -444,13 +446,39 @@ def test_show_parser_and_state_table() -> None:
                 "ActiveState": "active",
                 "SubState": "exited",
                 "MainPID": "0",
-                "Result": "signal",
+                "Result": "success",
                 "ExecMainStatus": "15",
                 "LoadState": "loaded",
                 "ExecMainExitTimestamp": _timestamp(NOW + timedelta(seconds=1)),
             },
             {"stop_requested_at": stop_at},
             ("cancelled", True, True, False),
+        ),
+        (
+            {
+                "ActiveState": "active",
+                "SubState": "exited",
+                "MainPID": "0",
+                "Result": "success",
+                "ExecMainStatus": "1",
+                "LoadState": "loaded",
+                "ExecMainExitTimestamp": _timestamp(NOW - timedelta(seconds=1)),
+            },
+            {},
+            ("unknown", True, False, False),
+        ),
+        (
+            {
+                "ActiveState": "active",
+                "SubState": "exited",
+                "MainPID": "0",
+                "Result": "signal",
+                "ExecMainStatus": "15",
+                "LoadState": "loaded",
+                "ExecMainExitTimestamp": _timestamp(NOW - timedelta(seconds=1)),
+            },
+            {},
+            ("unknown", True, False, False),
         ),
         (
             {
@@ -1022,6 +1050,36 @@ def test_sudo_reset_failed_still_raises_for_loaded_unit(tmp_path: Path) -> None:
     assert excinfo.value.detail == "reset_failed_failed"
 
 
+def test_sudo_cleanup_stops_loaded_active_exited_unit_first(
+    tmp_path: Path,
+) -> None:
+    calls: list[list[str]] = []
+
+    def runner(
+        argv: list[str], input_text: str | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            "ActiveState=active\nSubState=exited\nMainPID=0\nLoadState=loaded\n",
+            "",
+        )
+
+    ops = SudoSystemdOps(
+        runner=runner,
+        runtime_root=tmp_path / "run",
+        state_root=tmp_path / "state",
+        state_link_root=tmp_path / "state-link",
+    )
+
+    ops.cleanup(UNIT)
+
+    assert calls[0][:4] == ["sudo", "-n", "systemctl", "stop"]
+    assert calls[1][:4] == ["sudo", "-n", "systemctl", "reset-failed"]
+    assert calls[2][:5] == ["sudo", "-n", "rm", "-rf", "--"]
+
+
 def test_sudo_ops_cleanup_only_removes_validated_unit_paths(
     tmp_path: Path,
 ) -> None:
@@ -1039,11 +1097,15 @@ def test_sudo_ops_cleanup_only_removes_validated_unit_paths(
     ops.cleanup(UNIT)
 
     assert runner.calls[0] == (
+        ["sudo", "-n", "systemctl", "stop", UNIT],
+        None,
+    )
+    assert runner.calls[1] == (
         ["sudo", "-n", "systemctl", "reset-failed", UNIT],
         None,
     )
-    assert len(runner.calls) == 2
-    rm_argv, rm_input = runner.calls[1]
+    assert len(runner.calls) == 3
+    rm_argv, rm_input = runner.calls[2]
     assert rm_argv[:5] == ["sudo", "-n", "rm", "-rf", "--"]
     assert rm_input is None
     assert set(rm_argv[5:]) == {

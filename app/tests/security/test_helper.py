@@ -502,13 +502,40 @@ def test_cleanup_removes_only_unit_derived_paths(sandbox: SimpleNamespace) -> No
     assert (victim / "keep").read_text(encoding="utf-8") == "keep"
     assert not sandbox.spec_path.exists()
     assert not sandbox.credential_path.exists()
-    assert runner.calls == [["/usr/bin/systemctl", "reset-failed", UNIT]]
+    assert runner.calls == [
+        ["/usr/bin/systemctl", "stop", UNIT],
+        ["/usr/bin/systemctl", "reset-failed", UNIT],
+    ]
 
     # A symlink in the unit's state-directory slot is never followed.
     state_dir.symlink_to(victim)
     with pytest.raises(helper.HelperError):
         helper.cleanup(UNIT, runner=runner)
     assert (victim / "keep").read_text(encoding="utf-8") == "keep"
+
+
+def test_cleanup_ignores_collected_unit_and_removes_residue(
+    sandbox: SimpleNamespace,
+) -> None:
+    state_dir = sandbox.state / UNIT
+    state_dir.mkdir()
+
+    class CollectedRunner:
+        def __init__(self) -> None:
+            self.calls: list[list[str]] = []
+
+        def __call__(self, argv) -> subprocess.CompletedProcess[str]:
+            self.calls.append(list(argv))
+            if "stop" in argv or "reset-failed" in argv:
+                return subprocess.CompletedProcess(argv, 1, "", "")
+            return subprocess.CompletedProcess(argv, 0, "LoadState=not-found\n", "")
+
+    runner = CollectedRunner()
+    helper.cleanup(UNIT, runner=runner)
+
+    assert not state_dir.exists()
+    assert runner.calls[0][:3] == ["/usr/bin/systemctl", "stop", UNIT]
+    assert runner.calls[2][:3] == ["/usr/bin/systemctl", "reset-failed", UNIT]
 
 
 def test_remove_sources_rejects_wrong_mode_and_symlinks(
@@ -595,7 +622,7 @@ def test_service_templates_use_hardening_and_unix_socket() -> None:
         "StateDirectory=agentmgr-exec/agentmgr-task-%i",
         "StateDirectoryMode=0700",
         "RemainAfterExit=yes",
-        "CollectMode=inactive",
+        "ExitType=cgroup",
         "NoNewPrivileges=yes",
         "ProtectSystem=strict",
         "ProtectHome=yes",
@@ -653,4 +680,5 @@ def test_helper_argv_matches_product_builder() -> None:
     assert f"--property=StateDirectory=agentmgr-exec/{UNIT}" in ours
     assert not any("%N" in arg or "%i" in arg for arg in ours)
     assert "--property=RemainAfterExit=yes" in ours
-    assert "--property=CollectMode=inactive" in ours
+    assert "--property=ExitType=cgroup" in ours
+    assert "--property=CollectMode=inactive" not in ours

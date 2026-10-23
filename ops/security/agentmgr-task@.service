@@ -26,15 +26,16 @@ DynamicUser=yes
 # unit name because `systemd-run -p` does not expand %N/%i.
 StateDirectory=agentmgr-exec/agentmgr-task-%i
 StateDirectoryMode=0700
-# Keep an exited unit loaded so the supervisor can read ExecMainExitTimestamp
-# and Result.  The supervisor terminates with SIGTERM, reads that evidence,
-# then stops and cleans the unit.
+# Keep an exited unit loaded as active/exited so the supervisor can read
+# ExecMainExitTimestamp and Result.  The supervisor terminates with SIGTERM,
+# reads that evidence, then stops and cleans the unit.  ExitType=cgroup makes
+# MainPID=0/active-exited mean the whole cgroup is empty.
 RemainAfterExit=yes
-CollectMode=inactive
 RuntimeMaxSec=300
 TimeoutStopSec=5
 KillMode=control-group
 SendSIGKILL=yes
+ExitType=cgroup
 
 # Filesystem and network sandbox (design §8.1).  The host systemd and D-Bus
 # socket directories are masked with private tmpfs; whole-directory

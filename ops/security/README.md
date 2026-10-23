@@ -116,11 +116,14 @@ environment or a log.
 | `remove-sources` | `command`, `unit` | Deletes only `credentials/<unit>.json` and `specs/<unit>.json`. |
 | `cleanup` | `command`, `unit` | `reset-failed`, then deletes only the unit's derived source files, state directory and compatibility symlink. |
 
-Transient units are launched with `RemainAfterExit=yes` and
-`CollectMode=inactive`, so an exited unit remains loaded as `active/exited`
-until the supervisor reads `ExecMainExitTimestamp`/`Result`; it then uses
-`stop`/`cleanup`. `reset-failed` on a collected (`LoadState=not-found`) unit is
-a no-op.
+Transient units are launched with `RemainAfterExit=yes`, so a successfully
+exited unit remains loaded as `active/exited` until the supervisor reads
+`ExecMainExitTimestamp`/`Result`; failed/timeout units stay `failed` under
+systemd's default GC. `ExitType=cgroup` makes `MainPID=0`/`active-exited` mean
+the whole cgroup is empty. `CollectMode` is left at its default (`inactive`);
+it is not a retention mechanism and inactive units are still unloaded. The
+supervisor then uses `stop`/`cleanup`, and `reset-failed` on a collected
+(`LoadState=not-found`) unit is a no-op.
 
 Unit names must match `^agentmgr-task-[0-9a-f]{12}$`. The unit is re-derived
 from the validated task ID, so a client cannot select an arbitrary unit. The

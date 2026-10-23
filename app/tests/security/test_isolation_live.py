@@ -29,6 +29,8 @@ from pathlib import Path
 
 import pytest
 
+from app.security.systemd import SystemdUnitConfig, build_systemd_run_argv
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 LIVE_ENV_VARS = ("AGENTMGR_ISOLATION_TEST", "AGENTMGR_ISOLATION_SUDO")
@@ -411,6 +413,29 @@ def test_optional_inaccessible_targets_strip_prefix(tmp_path: Path) -> None:
     stripped = instance._inaccessible_paths()
     assert stripped == list(harness.optional_inaccessible_targets(raw))
     assert all(not path.startswith("-") for path in stripped)
+
+
+def test_live_preflight_argv_retains_exit_evidence(tmp_path: Path) -> None:
+    harness = importlib.import_module("ops.security.verify_isolation")
+    spec = harness._spec(
+        "task_iso_preflight", "grnt_iso_preflight", (harness.RESOURCE_A,), ttl_seconds=30
+    )
+    config = SystemdUnitConfig(
+        unit=harness.unit_name_for_task(spec.task_id),
+        spec=spec,
+        credential_source=tmp_path / "run" / "credentials" / "unit.json",
+        workload_source=tmp_path / "run" / "workload.py",
+        gateway_socket_source=tmp_path / "run" / "gateway.sock",
+    )
+    properties = [
+        item
+        for item in build_systemd_run_argv(config)
+        if item.startswith("--property=")
+    ]
+
+    assert "--property=RemainAfterExit=yes" in properties
+    assert "--property=ExitType=cgroup" in properties
+    assert "--property=CollectMode=inactive" not in properties
 
 
 def test_preflight_allows_absent_optional_paths(
