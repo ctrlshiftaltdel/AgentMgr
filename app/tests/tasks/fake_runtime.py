@@ -1,0 +1,319 @@
+"""A scripted, in-process :class:`RuntimeAdapter` for dispatcher tests.
+
+The fake reports facts only, exactly like a real adapter: it never writes task
+state and never inspects the database.  Every call is recorded so a test can
+assert that a fail-closed path did **not** reach the runtime.
+
+This helper is test-only evidence.  It never upgrades a real runtime's
+capability labels and must not be used to claim that Hermes (or any other
+runtime) supports Managed Execution.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
+
+from app.runtime.contract import (
+    ADAPTER_CONTRACT_VERSION,
+    BOUNDARY,
+    CancelOutcome,
+    CancelResult,
+    Capability,
+    CapabilityStatus,
+    EventBatch,
+    HealthResult,
+    HealthStatus,
+    InputOutcome,
+    InputResult,
+    LookupOutcome,
+    LookupResult,
+    ResultOutcome,
+    RuntimeCapabilities,
+    RuntimeCapability,
+    RuntimeGrant,
+    RuntimeResult,
+    RuntimeState,
+    RuntimeType,
+    StatusResult,
+    SubmitOutcome,
+    SubmitResult,
+    VersionSource,
+)
+
+__all__ = ["FakeRuntimeAdapter"]
+
+#: Opaque handle the fake returns for an accepted submission.
+DEFAULT_RUNTIME_TASK_ID = "rtask_fake_0001"
+
+#: Capabilities the fake advertises.  ``task.submit``/``task.status`` are the
+#: two the dispatcher requires; the rest keep the snapshot shaped like a real
+#: managed runtime rather than a submit-only special case.
+_ADVERTISED_CAPABILITIES = (
+    RuntimeCapability.TASK_SUBMIT,
+    RuntimeCapability.TASK_STATUS,
+    RuntimeCapability.TASK_LOOKUP,
+    RuntimeCapability.TASK_RESULT,
+    RuntimeCapability.TASK_CANCEL,
+    RuntimeCapability.TASK_EVENTS_POLL,
+    RuntimeCapability.TASK_INPUT_PROVIDE,
+    RuntimeCapability.RUNTIME_HEALTH,
+    RuntimeCapability.RUNTIME_MANAGED_EXECUTION,
+)
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
+class FakeRuntimeAdapter:
+    """Scripted adapter with recorded calls and conservative defaults.
+
+    Parameters script one response per protocol method.  ``status`` also
+    accepts a sequence: each ``get_status`` call consumes the next item and the
+    final item repeats, so a test can script a short state progression.
+
+    Unscripted defaults are deliberately conservative:
+
+    * ``capabilities`` is ``verified`` (set ``capabilities_verified=False`` to
+      script an unsupported runtime);
+    * ``submit`` is ``accepted``;
+    * ``lookup`` is ``unknown`` and ``get_result`` is ``unknown`` (never a
+      definite "not found"/"succeeded" answer the test did not ask for);
+    * ``cancel`` is ``requested`` with ``stop_confirmed=False``;
+    * ``provide_input`` is ``unsupported``.
+
+    Passing an exception instance as ``health`` raises it from :meth:`health`,
+    which lets a test exercise the dispatcher's unexpected-error rollback.
+    """
+
+    def __init__(
+        self,
+        *,
+        capabilities_verified: bool = True,
+        health: HealthStatus | BaseException = HealthStatus.HEALTHY,
+        submit: SubmitResult | None = None,
+        status: StatusResult | Sequence[StatusResult] | None = None,
+        result: RuntimeResult | None = None,
+        lookup: LookupResult | None = None,
+        cancel: CancelResult | None = None,
+        events: EventBatch | None = None,
+        provide_input: InputResult | None = None,
+        capabilities: RuntimeCapabilities | None = None,
+        runtime_task_id: str = DEFAULT_RUNTIME_TASK_ID,
+        now: datetime | None = None,
+    ) -> None:
+        self.capabilities_verified = capabilities_verified
+        self.health_status = health
+        self.runtime_task_id = runtime_task_id
+        self.now = now or _utcnow()
+
+        self._capabilities = capabilities
+        self._submit = submit
+        self._status = status
+        self._status_index = 0
+        self._result = result
+        self._lookup = lookup
+        self._cancel = cancel
+        self._events = events
+        self._provide_input = provide_input
+
+        #: ``(task_id, idempotency_key, grant_id, prompt)`` per submission.
+        self.submit_calls: list[tuple[str, str, str, str]] = []
+        self.lookup_calls: list[tuple[str, str, str, str | None]] = []
+        self.status_calls: list[tuple[str, str | None]] = []
+        self.cancel_calls: list[dict[str, object]] = []
+        self.event_calls: list[tuple[str, str | None]] = []
+        self.input_calls: list[tuple[str, str, str]] = []
+        self.capability_probes: list[bool] = []
+        self.health_calls = 0
+
+    # -- capability / health -------------------------------------------------
+
+    def capabilities(self, *, probe: bool = False) -> RuntimeCapabilities:
+        self.capability_probes.append(probe)
+        if self._capabilities is not None:
+            return self._capabilities
+        status = (
+            CapabilityStatus.VERIFIED
+            if self.capabilities_verified
+            else CapabilityStatus.UNVERIFIED
+        )
+        limitations = (
+            None
+            if status is CapabilityStatus.VERIFIED
+            else "the fake adapter script marks this capability as unverified"
+        )
+        return RuntimeCapabilities(
+            adapter_contract_version=ADAPTER_CONTRACT_VERSION,
+            boundary=BOUNDARY,
+            runtime_id="rt_fake_0001",
+            runtime_type=RuntimeType.OTHER,
+            runtime_version=None,
+            version_source=VersionSource.UNKNOWN,
+            capabilities=tuple(
+                Capability(
+                    name=name.value,
+                    version="1.0.0",
+                    status=status,
+                    evidence_ref=(
+                        "evidence:fake_runtime_capability"
+                        if status is CapabilityStatus.VERIFIED
+                        else None
+                    ),
+                    limitations=limitations,
+                )
+                for name in _ADVERTISED_CAPABILITIES
+            ),
+            observed_at=self.now,
+            runtime_name="fake-runtime",
+        )
+
+    def health(self) -> HealthResult:
+        self.health_calls += 1
+        if isinstance(self.health_status, BaseException):
+            raise self.health_status
+        return HealthResult(status=self.health_status, checked_at=self.now)
+
+    # -- submission / lookup -------------------------------------------------
+
+    def submit_task(
+        self,
+        task_id: str,
+        prompt: str,
+        idempotency_key: str,
+        grant: RuntimeGrant,
+        instructions: str | None = None,
+    ) -> SubmitResult:
+        self.submit_calls.append(
+            (task_id, idempotency_key, grant.grant_id, prompt)
+        )
+        if self._submit is not None:
+            return self._submit
+        return SubmitResult(
+            outcome=SubmitOutcome.ACCEPTED,
+            runtime_task_id=self.runtime_task_id,
+            accepted_at=self.now,
+            reported_state=RuntimeState.ACCEPTED.value,
+        )
+
+    def find_by_idempotency_key(
+        self,
+        task_id: str,
+        grant_id: str,
+        idempotency_key: str,
+        payload_hash: str | None = None,
+    ) -> LookupResult:
+        self.lookup_calls.append(
+            (task_id, grant_id, idempotency_key, payload_hash)
+        )
+        if self._lookup is not None:
+            return self._lookup
+        return LookupResult(outcome=LookupOutcome.UNKNOWN)
+
+    # -- status / events / result -------------------------------------------
+
+    def get_status(
+        self,
+        runtime_task_id: str,
+        *,
+        task_id: str | None = None,
+    ) -> StatusResult:
+        self.status_calls.append((runtime_task_id, task_id))
+        return self._next_status(runtime_task_id)
+
+    def poll_events(
+        self,
+        runtime_task_id: str,
+        cursor: str | None = None,
+        max_events: int = 100,
+        timeout: float = 30.0,
+        *,
+        task_id: str | None = None,
+    ) -> EventBatch:
+        self.event_calls.append((runtime_task_id, cursor))
+        if self._events is not None:
+            return self._events
+        return EventBatch(events=(), next_cursor=None, has_more=False)
+
+    def get_result(
+        self,
+        runtime_task_id: str,
+        *,
+        task_id: str | None = None,
+    ) -> RuntimeResult:
+        if self._result is not None:
+            return self._result
+        return RuntimeResult(
+            outcome=ResultOutcome.UNKNOWN,
+            result_ref=None,
+            summary=None,
+            structured_payload=None,
+            artifacts=(),
+            evidence_refs=(),
+            verification_hints=(),
+            stop_confirmed=False,
+            completed_at=None,
+        )
+
+    # -- control -------------------------------------------------------------
+
+    def cancel_task(
+        self,
+        runtime_task_id: str,
+        *,
+        reason: str | None = None,
+        idempotency_key: str | None = None,
+        task_id: str | None = None,
+        poll_timeout: float | None = None,
+        poll_interval: float | None = None,
+    ) -> CancelResult:
+        self.cancel_calls.append(
+            {
+                "runtime_task_id": runtime_task_id,
+                "reason": reason,
+                "idempotency_key": idempotency_key,
+                "task_id": task_id,
+            }
+        )
+        if self._cancel is not None:
+            return self._cancel
+        return CancelResult(
+            outcome=CancelOutcome.REQUESTED,
+            stop_confirmed=False,
+            observed_at=self.now,
+        )
+
+    def provide_input(
+        self,
+        runtime_task_id: str,
+        input_request_id: str,
+        payload_hash: str,
+        payload: Mapping[str, object],
+    ) -> InputResult:
+        self.input_calls.append(
+            (runtime_task_id, input_request_id, payload_hash)
+        )
+        if self._provide_input is not None:
+            return self._provide_input
+        return InputResult(outcome=InputOutcome.UNSUPPORTED, observed_at=self.now)
+
+    # -- internals -----------------------------------------------------------
+
+    def _next_status(self, runtime_task_id: str) -> StatusResult:
+        scripted = self._status
+        if scripted is None:
+            return StatusResult(
+                runtime_task_id=runtime_task_id,
+                state=RuntimeState.ACCEPTED,
+                external_state=None,
+                observed_at=self.now,
+            )
+        if isinstance(scripted, StatusResult):
+            return scripted
+        items = list(scripted)
+        if not items:
+            raise AssertionError("FakeRuntimeAdapter status sequence is empty")
+        index = min(self._status_index, len(items) - 1)
+        self._status_index += 1
+        return items[index]
