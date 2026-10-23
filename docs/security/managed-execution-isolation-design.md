@@ -707,18 +707,18 @@ class ResourceBackend(Protocol):
 | `ActiveState=activating` | `starting` | false | false | false |
 | `ActiveState=active` | `running` | false | false | false |
 | `ActiveState=deactivating` | `stopping` | false | false | false |
-| `ActiveState=inactive` 且 `MainPID=0` 且 `Result=success` 且 `ExecMainStatus=0` | `completed` | **true** | **false** | false |
+| `ActiveState=inactive` 且 `MainPID=0` 且 `Result=success` 且 `ExecMainStatus=0` 且**无 stop/cancel 请求（或退出早于请求）** | `completed` | **true** | **false** | false |
 | `ActiveState=inactive/failed` 且 `MainPID=0` 且 `Result=timeout` | `timed_out` | **true** | **true** | false |
-| `ActiveState=inactive/failed` 且 `MainPID=0` 且**已发起 stop/cancel** 且 `Result` 非 `success`/`timeout` | `cancelled` | **true** | **true** | false |
-| `ActiveState=failed` 且 `MainPID=0` 且无 stop 请求（其它 `Result`） | `failed` | **true** | **false** | false |
+| `ActiveState=inactive/failed` 且 `MainPID=0` 且**停止请求早于退出** 且 `Result` 非 `timeout` | `cancelled` | **true** | **true** | false |
+| `ActiveState=failed` 且 `MainPID=0` 且无 stop/cancel 请求（其它 `Result`） | `failed` | **true** | **false** | false |
 | 单元不存在（`LoadState=not-found`）且**已有启动证据** | `unknown` | **true** | false | false |
 | 单元不存在且**无启动证据** | `not_started` | false | **false** | **true**（可安全重试） |
 | `ActiveState=unknown` / 字段缺失 | `unknown` | false | false | false |
 
 三个布尔值语义不同，不能互相替代：
 
-- **`process_gone`**：单元已不在运行。判定为 `ActiveState ∈ {inactive, failed}` 且 `MainPID` 解析为整数 `0`，或 `LoadState=not-found` 且已有启动证据。`MainPID=0` 单独不足以证明“曾经运行过”——从未启动的单元也是 0，因此必须结合 `ActiveEnterTimestamp`/`ExecMainStartTimestamp`/`LoadState` 区分 `not_started`。
-- **`stop_confirmed`**：由 Supervisor 发起 stop/cancel，或由 `RuntimeMaxSec` 触发的 timeout 停止，并且已取得上述停止证据。自然 `completed`/`failed` 只说明进程结束，**不是**“停止请求已被证实”，一律为 false；`deactivating`、`activating`、`unknown`、字段缺失也为 false。
+- **`process_gone`**：单元已不在运行。判定为 `ActiveState ∈ {inactive, failed}` 且 `MainPID` 解析为整数 `0`，或 `LoadState=not-found` 且已有启动证据。`MainPID=0` 单独不足以证明“曾经运行过”——从未启动的单元也是 0，因此必须结合 `ActiveEnterTimestamp`/`ExecMainStartTimestamp`/`ExecMainExitTimestamp`/`LoadState` 区分 `not_started`。
+- **`stop_confirmed`**：由 Supervisor 发起 stop/cancel，或由 `RuntimeMaxSec` 触发的 timeout 停止，并且已取得上述停止证据。自然 `completed`/`failed` 只说明进程结束，**不是**“停止请求已被证实”，一律为 false；`deactivating`、`activating`、`unknown`、字段缺失也为 false。`cancelled` 与 `completed` 用 `ExecMainExitTimestamp` 和停止请求时间排序判定：退出早于请求即自然完成，请求早于退出即已确认停止。
 - **`never_started`**：`LoadState=not-found` 且没有任何启动证据；它表示“从未开始”，不是“已停止”。
 
 `RuntimeObservation` 同时暴露这三个字段；`cleanup` 的前置条件是 `process_gone || never_started`（§11.4），不是 `stop_confirmed`。
@@ -738,7 +738,7 @@ class ResourceBackend(Protocol):
 
 ### 11.3 轮询
 
-- `Supervisor.poll(handle)` 每次执行一次 `inspect`，返回 `RuntimeObservation`（状态、`MainPID`、`Result`、`ExecMainStatus`、`ActiveEnterTimestamp`、`ExecMainStartTimestamp`）；
+- `Supervisor.poll(handle)` 每次执行一次 `inspect`，返回 `RuntimeObservation`（状态、`MainPID`、`Result`、`ExecMainStatus`、`ActiveEnterTimestamp`、`ExecMainStartTimestamp`、`ExecMainExitTimestamp`）；
 - 监控循环默认 **1s** 一次；发现 `grant_revoked`/`grant_expired` 立即进入 stop 流程；
 - `RuntimeMaxSec` 到期由 systemd 终止；Supervisor 观测到 `Result=timeout` 后标记 `timed_out` 并撤销凭据；
 - 轮询不修改任务状态机，只报告事实。
@@ -767,8 +767,8 @@ class ResourceBackend(Protocol):
 
 | 竞态 | 处理 |
 |---|---|
-| 完成 vs 停止 | 以最终 `Result`/`ExecMainStatus` 为准：`Result=success` 且 `ExecMainStatus=0` → 保持 `completed`（`process_gone=true`、`stop_confirmed=false`），`systemctl stop` 视为幂等空操作；不得把自然完成降级为 `cancelled` |
-| 停止请求与自然完成竞争 | 若最终 `Result` 表明被信号终止 → `cancelled`（`process_gone=true`、`stop_confirmed=true`）；若仍为 `success`/`ExecMainStatus=0` → 按自然完成记 `completed`，`stop_confirmed=false`；不得仅凭“发过 stop 请求”声明停止成功 |
+| 完成 vs 停止 | 以最终 `Result`/`ExecMainStatus` 与时间戳为准：`Result=success` 且 `ExecMainStatus=0` 且退出早于停止请求 → 保持 `completed`（`process_gone=true`、`stop_confirmed=false`），`systemctl stop` 视为幂等空操作；不得把自然完成降级为 `cancelled` |
+| 停止请求与自然完成竞争 | 用 `ExecMainExitTimestamp` 与停止请求时间排序：退出早于请求 → `completed`（`stop_confirmed=false`）；请求早于退出 → `cancelled`（`process_gone=true`、`stop_confirmed=true`）。不得仅凭“发过 stop 请求”声明停止成功，也不得把已确认的停止降级为自然完成 |
 | 凭据撤销写失败 | 写失败重试一次；launch 阶段失败则**不启动**（返回 `unknown`）；stop 阶段失败仍继续停止，标记 `credential_revoke_failed`，告警，且网关对 `GrantStatusProvider` 的实时检查仍会拒绝 |
 | 撤销存储与 Grant 状态源均不可用 | 网关拒绝全部调用（`unknown`），触发告警 |
 | `systemd-run` 超时 | 视为“可能已启动”：`inspect` 确认；存在则 stop + 取证，不存在（`LoadState=not-found` 且无时间戳）才返回 `unit_start_failed` |
@@ -825,7 +825,7 @@ class ResourceBackend(Protocol):
 |---|---|---|
 | `launch` | `--spec <path>` | 读取 root 拥有的 spec 文件，校验字段白名单，构造固定 `systemd-run` argv |
 | `stop` | `<unit>` | `systemctl stop`，返回结构化结果 |
-| `inspect` | `<unit>` | `systemctl show -p ActiveState,SubState,MainPID,Result,ExecMainStatus,ActiveEnterTimestamp,ExecMainStartTimestamp,LoadState` |
+| `inspect` | `<unit>` | `systemctl show -p ActiveState,SubState,MainPID,Result,ExecMainStatus,ActiveEnterTimestamp,ExecMainStartTimestamp,ExecMainExitTimestamp,LoadState` |
 | `cleanup` | `<unit>` | `reset-failed` + 删除经校验的状态目录与残留文件 |
 
 助手的强制校验：
@@ -1027,7 +1027,7 @@ Supervisor.cleanup(handle):
 | `test_credentials.py` | **RFC 8785 JCS 向量**：UTF-8（`café`、非 BMP）、UTF-16 键序 vs code point 顺序、整数边界（`0`、`-0`、`2^53-1`、`2^53` 拒绝）、嵌套对象/数组、稳定重放；MAC 校验、篡改/截断/错误 kid/过期/`nbf`、claim 键集合、`exp - iat ≤ 300`、短密钥与缺失密钥 fail closed、轮换窗口、`InMemoryRevocationStore`、`FileRevocationStore` 原子写入与并发读、prune |
 | `test_gateway.py` | NDJSON 单请求、64 KiB 边界、未知字段、版本、所有 deny 原因码（含 `rate_limited`/`busy`）、per-UID/全局连接与速率限额、一个任务不能占满全局配额（fake clock/计数器）、超限不排队、`SO_PEERCRED` 记录（用 socketpair/mock）、审计白名单（token 不出现）、backend 路径校验/符号链接拒绝、超时 |
 | `test_systemd_unit.py` | argv 构造精确匹配、`RuntimeMaxSec` 1..300、`MemoryMax` 32..1024、`CPUQuota` 1..100、`TasksMax` 1..64、空 capability 语法、`%N` 使用、无 shell 拼接、`systemctl show` 输出解析、状态映射表逐行 |
-| `test_supervisor.py` | 用 fake runner 测 launch/stop/cleanup 状态机、竞态（完成 vs 停止、撤销写失败、启动超时、停止超时）、错误码；逐行验证 `completed`/`failed` → `process_gone=true, stop_confirmed=false`、`not_started` → `never_started=true`、`timed_out`/`cancelled` → `stop_confirmed=true`、`cleanup` 前置条件 |
+| `test_supervisor.py` | 用 fake runner 测 launch/stop/cleanup 状态机、竞态（完成 vs 停止按 `ExecMainExitTimestamp` 与停止请求时间排序、撤销写失败、启动超时、停止超时）、错误码；逐行验证 `completed`/`failed` → `process_gone=true, stop_confirmed=false`、`not_started` → `never_started=true`、`timed_out`/`cancelled` → `stop_confirmed=true`、`cleanup` 前置条件 |
 
 ### 16.3 真实隔离负向矩阵
 
