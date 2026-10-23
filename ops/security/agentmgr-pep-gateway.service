@@ -1,8 +1,14 @@
 [Unit]
-Description=AgentMgr policy enforcement point gateway (managed execution)
+Description=AgentMgr policy enforcement point gateway (managed execution; #83 placeholder)
 Documentation=file:///usr/local/share/doc/agentmgr/security/README.md
 After=network.target
-Before=agentmgr-task@*.service
+# This template is a #83 placeholder: #83 must supply a production
+# GrantStatusProvider adapter and create this enable marker first.  Until then
+# ``python -m app.security.gateway`` exits 2 without binding a socket, so the
+# unit fails closed by design.  There is deliberately no ordering dependency on
+# the transient ``agentmgr-task@`` units: the controller starts those on demand
+# and they are not ordered against this unit.
+ConditionPathExists=/etc/agentmgr/pep-gateway.enabled
 
 [Service]
 Type=simple
@@ -12,7 +18,7 @@ WorkingDirectory=<install-root>
 RuntimeDirectory=agentmgr-exec
 RuntimeDirectoryMode=0700
 ExecStart=/usr/bin/python3 -m app.security.gateway --socket /run/agentmgr-exec/gateway.sock
-Restart=on-failure
+Restart=no
 RestartSec=2
 
 # The gateway owns the Unix socket and the revocation store under

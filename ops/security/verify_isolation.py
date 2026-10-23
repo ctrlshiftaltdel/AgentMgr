@@ -11,14 +11,17 @@ The harness is the only entry point that produces §16.4 evidence.  It
 4. probes both network profiles (§8.4), then launches two distinct tasks and
    drives the §16.3 matrix (unit-side probes plus controller-side gateway and
    systemd probes),
-5. always stops units, closes the gateway, closes the audit sink and removes
+5. always stops units, closes the gateway, closes both audit sinks and removes
    every directory it created, then writes evidence to
    ``$AGENTMGR_ISOLATION_EVIDENCE`` (outside the repository).
 
 There is no ``gateway.pid`` and no standalone gateway process: the listener and
-its thread belong to this process and are closed before the audit sink, because
+its thread belong to this process and are closed before the audit sinks, because
 daemon handler threads can outlive ``GatewayServer.stop()`` for up to the
-read/write timeout.
+read/write timeout.  Gateway (``security.exec.gateway.*``) and supervisor
+(``security.exec.supervisor.*``) events go to separate in-memory sinks so the
+gateway evidence can never be polluted by a supervisor stop reason such as
+``manual_stop``.
 
 The bearer token stays inside the supervisor; a recording wrapper around the
 issuer lets controller-side probes reuse the *unit's own* credential without
@@ -302,7 +305,7 @@ class HarnessConfig:
 
 
 class _AuditSink:
-    """In-memory audit sink closed only after the gateway has stopped."""
+    """In-memory audit sink, closed after every writer has stopped."""
 
     def __init__(self) -> None:
         self._events: list[dict[str, object]] = []
@@ -450,7 +453,10 @@ class _Harness:
         self.user = pwd.getpwuid(os.getuid()).pw_name
         self.group = grp.getgrgid(os.getgid()).gr_name
         self.ops = SudoSystemdOps()
-        self.audit = _AuditSink()
+        #: Gateway and supervisor events never share a sink: the gateway audit
+        #: snapshot must contain ``security.exec.gateway.*`` events only.
+        self.gateway_audit = _AuditSink()
+        self.supervisor_audit = _AuditSink()
         self.provider = _GrantProvider()
         self.store = InMemoryRevocationStore(_clock)
         keyring = {"k1": os.urandom(32)}
@@ -644,7 +650,7 @@ class _Harness:
             validator=self.validator,
             revocation_store=self.store,
             grant_provider=self.provider,
-            audit_sink=self.audit,
+            audit_sink=self.gateway_audit,
             limits=self.config.gateway_limits,
             clock=_clock,
         )
@@ -663,7 +669,7 @@ class _Harness:
             self.provider,
             self.recording_issuer,  # type: ignore[arg-type]
             self.store,
-            self.audit,
+            self.supervisor_audit,
         )
 
     # -- unit lifecycle ---------------------------------------------------
@@ -800,8 +806,9 @@ class _Harness:
                     {"stage": "gateway_stop", "error": _safe_error(exc)}
                 )
         # Daemon request threads can live for the read/write timeout, so the
-        # sink is closed only after the listener itself has stopped.
-        self.audit.close()
+        # sinks are closed only after the listener itself has stopped.
+        self.gateway_audit.close()
+        self.supervisor_audit.close()
 
         targets: list[Path] = []
         if self.created_run_root:
@@ -1384,7 +1391,7 @@ class _Harness:
         requested: int,
     ) -> None:
         effective = None
-        for event in self.audit.snapshot():
+        for event in self.supervisor_audit.snapshot():
             if event.get("event") == AUDIT_EVENT_LAUNCH and event.get("unit") == unit:
                 effective = event.get("ttl_seconds")
         ttl = evidence.setdefault("ttl", {})  # type: ignore[union-attr]
@@ -1545,7 +1552,7 @@ class _Harness:
         return entry
 
     def record_gateway_evidence(self, evidence: dict[str, object]) -> None:
-        events = self.audit.snapshot()
+        events = self.gateway_audit.snapshot()
         serialized = json.dumps(events, sort_keys=True)
         reasons = sorted(
             {
@@ -1553,6 +1560,10 @@ class _Harness:
                 for event in events
                 if event.get("reason") is not None
             }
+        )
+        gateway_only = all(
+            str(event.get("event", "")).startswith("security.exec.gateway.")
+            for event in events
         )
         limits = self.config.gateway_limits
         gateway = evidence["gateway"]
@@ -1569,7 +1580,23 @@ class _Harness:
         gateway["audit"] = {
             "events": len(events),
             "token_absent": "agx1." not in serialized,
+            "gateway_events_only": gateway_only,
             "deny_reasons": reasons,
+        }
+        # Supervisor events are recorded separately: they are controller-side
+        # evidence, not gateway decisions, and never belong in ``deny_reasons``.
+        supervisor_events = self.supervisor_audit.snapshot()
+        supervisor_serialized = json.dumps(supervisor_events, sort_keys=True)
+        evidence["supervisor_audit"] = {
+            "events": len(supervisor_events),
+            "token_absent": "agx1." not in supervisor_serialized,
+            "event_names": sorted(
+                {
+                    str(event.get("event"))
+                    for event in supervisor_events
+                    if event.get("event") is not None
+                }
+            ),
         }
 
     # -- cleanup evidence -------------------------------------------------
@@ -1692,6 +1719,7 @@ def _new_evidence(repo_root: Path, started: datetime) -> dict[str, object]:
         "run_directory": {},
         "probes": [],
         "cleanup": {},
+        "supervisor_audit": {},
         "evidence_self_check": {},
         "result": "fail",
         "failures": [],
@@ -1794,6 +1822,8 @@ def _overall_result(evidence: dict[str, object]) -> bool:
         gateway.get("mode") == "in_process_harness"
         and gateway.get("grant_provider") == "in_memory_live"
         and gateway_audit.get("token_absent") is True
+        and gateway_audit.get("gateway_events_only") is True
+        and "manual_stop" not in (gateway_audit.get("deny_reasons") or [])
     )
     cleanup_clean = bool(
         cleanup.get("units_remaining") == 0

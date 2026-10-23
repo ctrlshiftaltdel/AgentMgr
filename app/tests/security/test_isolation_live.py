@@ -305,6 +305,13 @@ class TestLiveIsolation:
         gateway = evidence.get("gateway")
         assert isinstance(gateway, dict)
         assert gateway["audit"]["token_absent"] is True
+        # Gateway and supervisor audit are separate sinks: a supervisor stop
+        # reason such as ``manual_stop`` is not a gateway deny reason.
+        assert gateway["audit"]["gateway_events_only"] is True
+        assert "manual_stop" not in gateway["audit"]["deny_reasons"]
+        supervisor_audit = evidence.get("supervisor_audit")
+        assert isinstance(supervisor_audit, dict)
+        assert supervisor_audit["token_absent"] is True
 
 
 def test_smoke_workload_gateway_call_round_trip(tmp_path: Path) -> None:
@@ -591,7 +598,11 @@ def _passing_evidence() -> dict[str, object]:
             "mode": "in_process_harness",
             "grant_provider": "in_memory_live",
             "probes": [{"passed": True}],
-            "audit": {"token_absent": True},
+            "audit": {
+                "token_absent": True,
+                "gateway_events_only": True,
+                "deny_reasons": ["grant_revoked", "resource_scope_denied"],
+            },
         },
         "failures": [],
         "cleanup": {
@@ -668,6 +679,24 @@ def test_overall_result_allows_only_flagged_preexisting_state() -> None:
         ("ttl", "matrix_effective_seconds", "240"),
         ("profile_probes", "x", []),
         ("gateway", "audit", {"token_absent": False}),
+        (
+            "gateway",
+            "audit",
+            {
+                "token_absent": True,
+                "gateway_events_only": False,
+                "deny_reasons": [],
+            },
+        ),
+        (
+            "gateway",
+            "audit",
+            {
+                "token_absent": True,
+                "gateway_events_only": True,
+                "deny_reasons": ["manual_stop"],
+            },
+        ),
         ("cleanup", "remaining_state_dirs", ["agentmgr-task-aaaaaaaaaaaa"]),
         ("cleanup", "units_remaining", 1),
         ("cleanup", "state_clean", False),
@@ -687,3 +716,41 @@ def test_overall_result_rejects_a_failed_recorded_check(
         assert isinstance(evidence[section], dict)
         evidence[section][key] = value
     assert harness._overall_result(evidence) is False
+
+
+def test_harness_keeps_gateway_and_supervisor_audit_apart(
+    tmp_path: Path,
+) -> None:
+    harness = importlib.import_module("ops.security.verify_isolation")
+    config = harness.HarnessConfig(
+        repo_root=REPO_ROOT,
+        run_root=tmp_path / "run",
+        resources_root=tmp_path / "resources",
+        evidence_path=tmp_path / "evidence.json",
+    )
+    instance = harness._Harness(config, tmp_path / "staging")
+    instance.supervisor("private_netns")
+
+    assert instance.gateway_audit is not instance.supervisor_audit
+    instance.supervisor_audit.record(
+        {"event": "security.exec.supervisor.stop", "reason": "manual_stop"}
+    )
+    assert instance.gateway_audit.snapshot() == []
+
+    evidence: dict[str, object] = {"gateway": {}}
+    instance.gateway_audit.record(
+        {"event": "security.exec.gateway.deny", "reason": "busy"}
+    )
+    instance.record_gateway_evidence(evidence)
+
+    gateway = evidence["gateway"]
+    assert isinstance(gateway, dict)
+    audit = gateway["audit"]
+    assert isinstance(audit, dict)
+    assert audit["deny_reasons"] == ["busy"]
+    assert audit["gateway_events_only"] is True
+    assert "manual_stop" not in audit["deny_reasons"]
+    supervisor = evidence["supervisor_audit"]
+    assert isinstance(supervisor, dict)
+    assert supervisor["events"] == 1
+    assert supervisor["event_names"] == ["security.exec.supervisor.stop"]

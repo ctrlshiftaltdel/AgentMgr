@@ -338,18 +338,35 @@ def test_boundary_claim_contains_all_three_sections() -> None:
         assert isinstance(section, tuple)
         assert section
         assert all(isinstance(item, str) and "/" not in item for item in section)
-    assert {
+    assert set(claim.enforced) == {
         "per_task_dynamic_uid",
+        "filesystem_read_only",
         "no_host_home_access",
+        "separate_private_tmp",
+        "no_capabilities",
+        "no_new_privileged_namespaces",
         "no_ip_network",
-        "gateway_socket_only_external_entry",
+        "resource_and_time_limits",
+        "cross_task_state_isolation",
         "task_bound_revocable_credential",
-    } <= set(claim.enforced)
-    assert {
+        "stop_and_exit_evidence_separated",
+        "gateway_admission_limits",
+        "execution_mode_cross_checked",
+    }
+    assert "gateway_socket_only_external_entry" not in claim.enforced
+    assert set(claim.bypassable) == {
         "host_root_or_controller_sudo",
         "systemd_or_kernel_vulnerability",
+        "side_channels",
+        "physical_access",
         "gateway_backend_defect",
-    } <= set(claim.bypassable)
+        "resource_path_without_gateway",
+        "same_host_user_gateway_socket_connect",
+        "same_uid_child_processes",
+        "uid_reuse_window",
+        "host_unix_sockets_outside_masked_dirs",
+        "host_world_readable_files",
+    }
     assert {
         "hermes_internal_tools_in_sandbox",
         "model_provider_egress",

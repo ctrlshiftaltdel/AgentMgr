@@ -602,9 +602,79 @@ def test_launch_start_timeout_with_unit_present_stops_and_returns_unknown(
     assert ops.credentials
     assert ops.credentials[0] not in str(caught.value)
     assert ops.remove_sources_calls == [UNIT]
-    # Preflight + one deadline-bounded poll + one final inspection.  The old
-    # iteration-bound loop would have called show ~101 times.
-    assert len(ops.show_calls) == 3
+    # Preflight + one deadline-bounded poll + one final inspection + one
+    # post-stop residue poll.  The old iteration-bound loop would have called
+    # show ~101 times.
+    assert len(ops.show_calls) == 4
+
+
+def test_launch_failure_after_activation_cleans_up_residue(
+    tmp_path: Path,
+) -> None:
+    """A failure after activation must not leave a retained unit behind."""
+
+    ops = FakeOps()
+    ops.show_plan = [_show_not_found(), _show_active()]
+    # SIGTERM/SIGKILL leave the unit retained as ``active/exited``.
+    ops.default_show = _show_active_exited(NOW + timedelta(seconds=1))
+
+    def fail_remove_sources(unit: str) -> None:
+        raise SecurityError("unknown", "remove_sources_failed")
+
+    ops.remove_sources = fail_remove_sources  # type: ignore[method-assign]
+    harness = _build(tmp_path, ops=ops)
+
+    with pytest.raises(SecurityError) as caught:
+        harness.supervisor.launch(_spec())
+
+    assert caught.value.code == "unit_start_failed"
+    assert caught.value.detail == "unit_outcome_unknown"
+    assert ops.stop_calls == [UNIT]
+    assert ops.kill_calls == [UNIT]
+    # The residue is cleaned by the failed launch itself: the caller receives
+    # an error without a handle and could never clean it up.
+    assert ops.cleanup_calls == [UNIT]
+    assert harness.supervisor.residue_markers == 0
+    assert [
+        event
+        for event in harness.sink.events
+        if event.get("event") == AUDIT_EVENT_STOP_UNCONFIRMED
+    ] == []
+
+
+def test_launch_failure_with_retained_unit_reports_unconfirmed_stop(
+    tmp_path: Path,
+) -> None:
+    """A unit that stays present is marked, not silently abandoned."""
+
+    ops = FakeOps()
+    ops.show_plan = [_show_not_found(), _show_active()]
+    ops.default_show = _show_deactivating()
+
+    def fail_remove_sources(unit: str) -> None:
+        raise SecurityError("unknown", "remove_sources_failed")
+
+    ops.remove_sources = fail_remove_sources  # type: ignore[method-assign]
+    harness = _build(tmp_path, ops=ops)
+
+    with pytest.raises(SecurityError) as caught:
+        harness.supervisor.launch(_spec())
+
+    assert caught.value.code == "unit_stop_unconfirmed"
+    assert caught.value.detail == "unit_outcome_unknown"
+    assert ops.stop_calls == [UNIT]
+    assert ops.kill_calls == [UNIT]
+    # Cleanup is refused while the unit is still present.
+    assert ops.cleanup_calls == []
+    assert harness.supervisor.residue_markers == 1
+    markers = [
+        event
+        for event in harness.sink.events
+        if event.get("event") == AUDIT_EVENT_STOP_UNCONFIRMED
+    ]
+    assert len(markers) == 1
+    assert markers[0]["reason"] == "launch_failed"
+    assert markers[0]["unit"] == UNIT
 
 
 @pytest.mark.parametrize(

@@ -1,6 +1,7 @@
 """PEP gateway, admission limits, audit redaction and file backend tests (#82).
 
-The gateway is the only external entry a managed task may reach.  These tests
+The gateway is the intended resource entry a managed task may use; the sandbox
+does not claim to block every other host entry (design §15.2).  These tests
 pin the validation order and stable reason codes of design §10.4, the admission
 and rate limits of §10.1, the fail-closed audit rule of §10.6 and the
 filesystem backend's traversal defences of §10.5.
@@ -25,6 +26,7 @@ from pathlib import Path
 
 import pytest
 
+from app.security import gateway
 from app.security.boundary import GrantStatus, ResourceScope
 from app.security.credentials import (
     CredentialIssuer,
@@ -715,3 +717,24 @@ def test_startup_fails_closed_without_readable_backends(tmp_path: Path) -> None:
         _build(tmp_path / "store", revocation=_UnreadableStore())
     assert raised.value.code == "unknown"
     assert raised.value.detail == "revocation_store_unavailable"
+
+
+def test_standalone_main_fails_closed_without_a_grant_adapter(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    socket_path = tmp_path / "gateway.sock"
+
+    exit_code = gateway.main(
+        [
+            "--socket",
+            str(socket_path),
+            "--resources-root",
+            str(tmp_path / "resources"),
+        ]
+    )
+
+    assert exit_code == 2
+    assert not socket_path.exists()
+    captured = capsys.readouterr()
+    assert gateway.ADAPTER_REQUIRED_MESSAGE in captured.err
+    assert "#83" in captured.err

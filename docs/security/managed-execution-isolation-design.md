@@ -1,7 +1,7 @@
 # 受控执行隔离设计（Managed Execution 隔离基座，#82）
 
-- 状态：**Draft，待所有者评审**。本文是设计草案，**不是实现、不是验证证据**；文中所有测试与证据均为 `planned / not run`。
-- 日期：2026-10-23
+- 状态：**已实现（合成隔离基座）**。`app/security/**`、`ops/security/**` 与 `app/tests/security/**` 已按本文落地；合成基座在 `4175a3da45a00ff2be79c5f467cedc714c9df6d4` 有真实 live 证据（见[受控执行边界记录](managed-execution-boundary.md)）。Hermes 入沙箱与真实业务运行时属于 **#83**，仍未验证。
+- 日期：2026-10-23；实现与 live 证据更新：2026-10-24
 - 关联 Issue：#82（Epic：#74）；依赖 #77（威胁模型）、#78（PDP/PEP）、#81（Runtime Adapter，均已 VERIFIED）
 - 契约版本：1.0.0（Phase 0 冻结候选，尚未发布）；凭据格式 `agx1`；网关协议版本 `1.0.0`
 - 首批受控目标：**隔离基座 + 合成 Agent 负载**。Hermes 入沙箱与端到端受控执行属于 **#83**，不在本文范围。
@@ -17,11 +17,11 @@
 | `部分（未按本契约验证）` | 现有资产可部分复用，但未按本契约做负向验证 |
 | `已实现/已验证` | 有当前提交 SHA、真实命令与退出码的可复现证据 |
 
-本轮交付**只有本文档**：没有新增 `app/security`、`ops/security`、`app/tests/security` 代码，没有在测试主机执行任何特权命令，没有启动任何隔离单元。因此：
+本文最初作为设计基线提交；当前分支已经包含对应实现、单元测试和一次真实 live 运行。阅读时请注意：
 
-- 任何“受控执行已实现/已验证”的表述都不成立；
-- 本文中的命令、单元属性、负向用例是**待实现的验收规格**；
-- 真实隔离测试只有在所有者批准本文与对应实现后才运行。
+- 文中命令、单元属性与负向用例仍是**验收规格**；只有 `4175a3da45a00ff2be79c5f467cedc714c9df6d4` 上有记录的部分才算已验证；
+- 未在该次运行中覆盖的能力（Hermes、模型出口、真实业务连接器、生产网关形态）保持 `未验证`，不得据本文外推；
+- 证据绑定 head：head 变化后必须按 §16 重跑，旧结论不自动沿用。
 
 ## 2. 背景与目标
 
@@ -56,7 +56,7 @@
 | D2 | 测试机允许临时非交互 sudo 启动/停止 transient unit、创建/清理 `/run/agentmgr-exec` 与 systemd StateDirectory | 仅测试机、仅本轮之后的实现阶段执行；不新建持久用户、不装包、不改 nftables/防火墙、不写现有 Hermes Profile；测试后清理 |
 | D3 | 隔离方案 = 每任务 transient unit + `DynamicUser` + 沙箱属性 + Unix-socket PEP 网关 + 任务级短期凭据 + Grant 失效即停止 | 见 §6–§11 |
 | D4 | 不新增 Python 依赖、不新增数据库迁移、不修改 `app/governance`、`app/tasks`、`app/runtime` | 凭据签名使用标准库 `hmac`/`hashlib`/`json`；网关不读写数据库 |
-| D5 | 本轮（设计阶段）只写本文档，不改代码、不运行测试机命令 | 证据状态全部为 planned |
+| D5（历史，设计轮次） | 设计轮次只写本文档，不改代码、不运行测试机命令 | 实现与 live 证据已在后续轮次补齐；证据状态见状态行、§5.2、§16、§17 |
 
 ## 4. 非目标与产品声明限制
 
@@ -95,10 +95,10 @@
 
 | #82 验收条目 | 本基座对应机制 | 证据状态 |
 |---|---|---|
-| 受控 Agent 无法读取其他主体的凭据或访问未授权资源 | 独立 UID、StateDirectory 0700、凭据目录 `root:root 0700` 且仅 `LoadCredential` 读取、网关 token/scope/cross-task 校验 | planned / not run |
-| Grant 到期或撤销后，后续受控调用失败 | 凭据 `exp = min(provider.expires_at, iat + ttl_seconds)` 且 `exp - iat ≤ 300`；网关每次调用实时读取撤销存储与 `GrantStatusProvider`（无缓存）；Supervisor 停止单元并验证 `process_gone` | planned / not run |
-| 绕行测试有真实命令、退出码和证据 | §16 的负向矩阵、`verify_isolation.sh`（环境检查）+ `verify_isolation.py`（同进程 harness）、证据 JSON | planned / not run |
-| 无法强制治理的能力有明确风险记录与产品声明限制 | §4、§15、§17 | 本文（设计层）；运行证据 planned |
+| 受控 Agent 无法读取其他主体的凭据或访问未授权资源 | 独立 UID、StateDirectory 0700、凭据目录 `root:root 0700` 且仅 `LoadCredential` 读取、网关 token/scope/cross-task 校验 | 合成基座 verified at `4175a3d`；Hermes/真实业务未验证 |
+| Grant 到期或撤销后，后续受控调用失败 | 凭据 `exp = min(provider.expires_at, iat + ttl_seconds)` 且 `exp - iat ≤ 300`；网关每次调用实时读取撤销存储与 `GrantStatusProvider`（无缓存）；Supervisor 停止单元并验证 `process_gone` | 合成基座 verified at `4175a3d`；生产 Grant 存储未验证 |
+| 绕行测试有真实命令、退出码和证据 | §16 的负向矩阵、`verify_isolation.sh`（环境检查）+ `verify_isolation.py`（同进程 harness）、证据 JSON | verified：32 passed，exit 0，见[边界记录](managed-execution-boundary.md) |
+| 无法强制治理的能力有明确风险记录与产品声明限制 | §4、§15、§17 | 设计层已记录；`4175a3d` 运行证据见边界记录；#83 能力仍未验证 |
 
 ## 6. 架构
 
@@ -157,7 +157,7 @@
                        │  RuntimeMaxSec / MemoryMax / CPUQuota / TasksMax / LimitNOFILE           │
                        └──────────────────────────────────────────────────────────────────────────┘
                                       │ 单元内（不受信）：合成负载
-                                      └─ 可写：$STATE_DIRECTORY、私有 /tmp；其余只读或不可见
+                                      └─ 可写：$STATE_DIRECTORY、私有 /tmp；其余只读或显式屏蔽（world-readable 宿主文件仍可读）
 ```
 
 ### 6.3 目录、所有权与生命周期
@@ -337,7 +337,7 @@ class BoundaryClaim:
 | `TasksMax=` | `<tasks_max>` | 进程/线程上限；spec 默认 **32**，范围 **1..64** |
 | `LimitNOFILE=` | `256` | 文件描述符上限 |
 | `LoadCredential=` | `task-credential:/run/agentmgr-exec/credentials/<unit>.json` | 令牌只经 systemd 注入 |
-| `BindReadOnlyPaths=` | `/run/agentmgr-exec/gateway.sock:/run/agentmgr/gateway.sock` | 唯一可达的网关入口 |
+| `BindReadOnlyPaths=` | `/run/agentmgr-exec/gateway.sock:/run/agentmgr/gateway.sock` | 网关 socket 的唯一挂载点（不是“宿主的唯一可达入口”） |
 | 同上 | `/run/agentmgr-exec/workload.py:/workload.py` | 固定负载脚本，只读 |
 | `ExecStart=` | `/usr/bin/python3 /workload.py` | 固定命令，无参数、无 shell |
 
@@ -464,7 +464,7 @@ unit = "agentmgr-task-" + sha256(("agentmgr-task:v1:" + task_id).encode("utf-8")
 | `$STATE_DIRECTORY`（`/var/lib/agentmgr-exec/<unit>`） | 该 UID 可读写，父级不可遍历 | 唯一持久可写区 |
 | `/tmp`、`/var/tmp` | 私有 tmpfs，可写 | 单元停止即消失 |
 | `/workload.py`、`/run/agentmgr/gateway.sock` | 只读 bind mount | 不可修改 |
-| 其余（`/etc`、`/usr`、`/var`、`/home`、`/root`、`/srv`、`/opt`、`/var/lib/postgresql`） | 只读或不可见 | 写入返回 `EROFS`/`EACCES` |
+| 其余（`/etc`、`/usr`、`/var`、`/home`、`/root`、`/srv`、`/opt`、`/var/lib/postgresql`） | 只读或受 `InaccessiblePaths` 显式屏蔽 | 写入返回 `EROFS`/`EACCES`；**只读不等于不可读**：world-readable 宿主文件仍可能可读（§15.2） |
 
 `$STATE_DIRECTORY` 是唯一可写区；`ManagedTaskSpec` 不含任何路径字段（无 `workspace`/`state`）。workload 可在其中自行创建子目录，Supervisor 不创建也不解析任务内路径。
 
@@ -667,8 +667,8 @@ class GrantStatus:
 | `grant_revoked` | Grant `status=revoked/consumed` 或 `usable=false` |
 | `execution_mode_mismatch` | Grant 非 `managed_execution` |
 | `capability_not_granted` | 能力不在令牌/`Grant` 的 allowed 中，或 `denied` 命中 |
-| `resource_scope_denied` | 资源不在范围，或命中 `exclude_resource_ids` |
-| `cross_task_denied` | 令牌 `task_id`/`grant_id` 与 Grant 或资源归属不一致 |
+| `resource_scope_denied` | 资源不在本凭据/Grant 范围、命中 `exclude_resource_ids`，或使用另一任务的资源 ID（资源归属按范围判定，见 §14.3/§16.3 #18） |
+| `cross_task_denied` | 令牌 `task_id`/`grant_id`/`subject_id` 与实时 Grant 不一致 |
 | `resource_denied` | backend 明确拒绝（不允许的资源 ID、非普通文件、越界） |
 | `backend_error` | backend 内部失败（消息脱敏） |
 | `timeout` | 读/写/处理超时 |
@@ -851,7 +851,7 @@ class ResourceBackend(Protocol):
 - 测试机上 `/run/agentmgr-exec` 由 controller 服务用户 `agents` 拥有（`0700`）；controller/gateway 在其中创建 `gateway.sock` 与 `revoked/`；`credentials/`、`specs/` 由 root helper 以 `root:root 0700` 创建。不新增持久用户；
 - 不新建持久用户、不安装软件包、不改 nftables/防火墙、不写现有 Hermes Profile；
 - 测试结束执行 §18.1 清理；
-- **本轮（设计阶段）不安装任何 sudo 规则、不执行任何命令。**
+- 实现轮次只在所有者批准的测试机上以 `sudo -n` 启动/停止 transient 单元；**不安装本文的持久 sudoers 规则、不创建持久用户、不写现有 Hermes Profile**。生产模板的安装仍是部署动作，不属于 #82 的验证范围。
 
 ### 12.3 生产模板：窄助手 + 固定 sudoers
 
@@ -1009,19 +1009,20 @@ Supervisor.cleanup(handle):
 | 不变量 | 强制点 |
 |---|---|
 | 每任务独立 UID | `DynamicUser=yes` |
-| 文件系统只读（除状态目录与私有 tmp） | `ProtectSystem=strict`、`ProtectHome=yes`、`InaccessiblePaths=` |
+| 宿主文件系统只读（状态目录与私有 tmp 除外） | `ProtectSystem=strict`、`ProtectHome=yes`、`InaccessiblePaths=`；受权限保护的文件被拒绝；**world-readable 宿主文件仍可能可读**，不声称宿主文件系统整体不可读 |
 | 无宿主 home/Profile 访问 | `ProtectHome=yes` |
 | 独立 TMPDIR | `PrivateTmp=yes` |
 | 无 capability | 空 `CapabilityBoundingSet=`/`AmbientCapabilities=`、`NoNewPrivileges=yes` |
 | 禁止新建 namespace | `RestrictNamespaces=yes` |
 | 无 IP 网络 | `PrivateNetwork=yes`（默认）、`RestrictAddressFamilies=AF_UNIX`、`IPAddressDeny=any` |
-| 唯一外部入口为网关 socket | 只读 bind mount 一个 socket；`TemporaryFileSystem=/run/systemd`、`/run/dbus` 遮蔽宿主 systemd/D-Bus 目录 |
 | 资源与时间上限 | `MemoryMax`、`CPUQuota`、`TasksMax`、`LimitNOFILE`、`RuntimeMaxSec` |
 | 跨任务状态隔离 | 独立 UID + `StateDirectory=agentmgr-exec/<unit>`（`StateDirectoryMode=0700`） |
 | 凭据任务绑定/短时/可撤销 | `task_id`/`grant_id` claims、`exp ≤ GrantStatusProvider 剩余`、`RevocationStore` |
 | 停止/退出区分 | `process_gone` = 单元不再运行（含 `active/exited`）；`stop_confirmed` 仅在 terminate/stop/cancel/timeout 取得退出证据时为 true；`RemainAfterExit` 保留成功退出证据，`ExitType=cgroup` 证明 cgroup 为空；`cleanup` 用 `process_gone \|\| never_started` |
 | 网关准入上限 | per-task 8 连接 / 16 req/s、global 64 连接 / 200 req/s、单请求 64 KiB、读写 5s |
 | 模式一致 | spec 与 Grant 双重校验 `managed_execution` |
+
+**`enforced` 不包含“网关是唯一外部入口”。** 网关是**预期的资源入口**：任务访问部署资源只能经它，且每次调用都重验。但沙箱并不声称阻断宿主的其它入口；宿主 `AF_UNIX` socket 与 world-readable 文件仍按 §15.2 列为可绕行路径。
 
 ### 15.2 无法由本基座消除（`BoundaryClaim.bypassable`）
 
@@ -1036,6 +1037,8 @@ Supervisor.cleanup(handle):
 | 同宿主其它用户连接 `gateway.sock` | MVP 测试模式 `0666`：若知道路径可 `connect()`（目录 `0700` 通常已阻断遍历） | socket 模式不是授权；无有效 token 仍被 `token_invalid` 拒绝；生产可改 `0660` + 专用组 |
 | 同 UID 内的子进程 | 任务可派生子进程共享凭据 | 任务级而非进程级凭据；`KillMode=control-group` 兜底 |
 | UID 复用窗口 | 停止后状态目录残留 | `process_gone`（或 `never_started`）后立即 cleanup；残留告警 |
+| 宿主 `AF_UNIX` socket（`/run/systemd`、`/run/dbus` 之外） | 沙箱与宿主共享挂载命名空间；`TemporaryFileSystem` 只遮蔽这两个目录，其它宿主 Unix socket 若任务知道路径且文件权限允许，就**可能**可连接。本基座不声称阻断它们 | 部署基线检查（不在单元内依赖其它宿主 socket）；`RestrictAddressFamilies=AF_UNIX` 仍禁止 IP；审计与最小宿主服务面 |
+| 宿主 world-readable 文件 | 只读不等于不可读：`ProtectSystem=strict`、`ProtectHome=yes` 与 `InaccessiblePaths` 阻止写入和特定路径，但 `0444`/`0644` 等 world-readable 宿主文件仍可能被读取。单元内 `read-etc-shadow` 只验证文件权限基线（`EACCES`），**不证明**宿主文件系统整体不可读 | 部署基线（不在宿主放置可由任务读取的敏感 world-readable 文件）；敏感文件用权限保护；需要更强只读/不可见边界时由 #83 评估 `InaccessiblePaths`/`TemporaryFileSystem` 扩展并重跑 live 探针 |
 
 ### 15.3 延后 / 未验证（`BoundaryClaim.deferred`）
 
@@ -1079,7 +1082,7 @@ Supervisor.cleanup(handle):
 
 | # | 探针 | 期望 | 分类码 |
 |---|---|---|---|
-| 1 | 读 `/etc/shadow` | 拒绝（`EACCES`/`ENOENT`） | `filesystem_denied` |
+| 1 | 读 `/etc/shadow` | 拒绝（`EACCES`；这是**文件权限基线**检查，不证明宿主文件系统整体不可读） | `filesystem_denied` |
 | 2 | 读 `<test-host-home>/.hermes` 下 Profile | 拒绝（`ProtectHome=yes`） | `filesystem_denied` |
 | 3 | 读 `/var/lib/postgresql` | 拒绝（`InaccessiblePaths`） | `filesystem_denied` |
 | 4 | 读另一任务的 StateDirectory | 拒绝（不同 UID + 0700） | `cross_task_denied` |
@@ -1114,6 +1117,7 @@ Supervisor.cleanup(handle):
 - 第 15 项成功后必须验证返回体**不含**其它资源内容。
 - 第 18 项区分两种拒绝：令牌/凭据身份（`task_id`/`grant_id`/`subject_id`）与实时 Grant 不一致才是 `cross_task_denied`；另一任务的资源 ID 属于资源范围判定，返回 `resource_scope_denied`，不要为它增加重复的资源归属检查。
 - 第 25/26 项验证 **per-task** 上限；全局上限（64 连接 / 200 req/s）由 `test_gateway.py` 的 fake clock/计数器覆盖，不在单机 live 矩阵中制造 64 个并发任务。两项都必须核对：超限响应后连接立即关闭，进程/文件描述符没有泄漏。
+- 第 1–5、10–14 项是**单元内合成负载自报**的结果：探针计划（`plan.json`）与结果（`result.json`）位于该任务可写的状态目录。协作式合成负载不会伪造，但恶意任务可以；这些探针因此是**协作式负向验证**，不是对抗性证明。控制器侧的网关判定（#15–#26）与 `systemctl show` 状态证据不经该通道，独立于任务自报。#83 若要处理对抗性隔离声明，必须使用可信验证器或只读 plan 通道。
 
 ### 16.4 证据 JSON
 
@@ -1183,7 +1187,7 @@ Supervisor.cleanup(handle):
 - 证据写入 `$AGENTMGR_ISOLATION_EVIDENCE`（仓库外路径），**不提交**到仓库；
 - `probes[]` 覆盖 §16.3 的 #6–#9 网络拒绝，`observed` 记录 `errno` 名称与错误类别，不记录目标主机真实地址；
 - `gateway.mode` / `gateway.grant_provider` 记录本次形态：MVP 固定为 `in_process_harness` + `in_memory_live`；独立网关进程 + 文件撤销存储是生产/#83 的形态，需如实标注；
-- `gateway.limits` 记录本次运行实际生效的部署限额，必须与网关启动配置一致；`gateway.probes[]` 对应 §16.3 的 #25/#26，`observed` 只在真实运行后填写，本轮为 planned / not run；
+- `gateway.limits` 记录本次运行实际生效的部署限额，必须与网关启动配置一致；`gateway.probes[]` 对应 §16.3 的 #25/#26，`observed` 只记录真实运行值，未重跑前不得预填；
 - `systemd_properties` 由 `systemctl show` 原样读取，`process` 由单元内探针读取；
 - `uid` 只记录数值（示例中的 `61000` 是结构示意，不是真实分配值）；`unit` 已由哈希派生；
 - 不含宿主名、用户名、绝对 home 路径、IP、令牌、密钥、Profile 内容；
@@ -1200,20 +1204,20 @@ Supervisor.cleanup(handle):
 5. **teardown（无论断言成败都执行）**：停止所有 `agentmgr-task-<hex>` 单元 → `systemctl reset-failed` → harness 关闭自己持有的网关线程与监听 socket、unlink socket 文件（该线程/套接字归 harness 所有，没有独立网关 PID）→ 由 root helper 删除 `/run/agentmgr-exec` 与 `/var/lib/private/agentmgr-exec` → 核对残留；
 6. harness 写出证据 JSON，任一断言失败即非零退出。
 
-**生产形态**：独立 `agentmgr-pep-gateway.service`（`python -m app.security.gateway`）是 **#83** 路径，必须接真实 Grant 存储的实时适配器；它不是本 MVP 的验证入口。
+**生产形态**：独立 `agentmgr-pep-gateway.service`（`python -m app.security.gateway`）是 **#83** 路径，必须接真实 Grant 存储的实时适配器；它不是本 MVP 的验证入口。当前该入口在没有生产 `GrantStatusProvider` 适配器时会以稳定消息退出 `2` 且**不绑定 socket**，服务模板也由 enable marker 与 `Restart=no` 门控，避免“空配置却启动成功”。
 
 **真实测试只有在所有者批准后才可运行。** 本文档所属的设计基线轮次未运行 live 测试；合成隔离基座的 live 证据已在 `4175a3da45a00ff2be79c5f467cedc714c9df6d4` 执行，记录见[受控执行边界记录](managed-execution-boundary.md)。Hermes、模型供应商出口与真实业务的声明仍未验证。
 
 ## 17. 验收映射
 
-| # | #82 验收条目 | 设计落点 | 证据状态（2026-10-23） |
+| # | #82 验收条目 | 设计落点 | 证据状态 |
 |---|---|---|---|
-| 1 | 受控 Agent 无法读取其他主体的凭据或访问未授权资源 | §6.3 目录权限、§8 沙箱属性、§10.4 校验链、§10.1 准入限额、§16.3 #4/#5/#15/#18/#19/#25/#26 | **planned / not run** |
-| 2 | Grant 到期或撤销后，后续受控调用失败 | §9.6 实时双重校验（不缓存）、§11.4 stop/cleanup、§14.4/§14.5、§16.3 #16/#17/#21/#23 | **planned / not run** |
-| 3 | 绕行测试有真实命令、退出码和证据 | §16.3 全部 26 项、§16.4 证据格式、`verify_isolation.sh` + `verify_isolation.py` | **planned / not run** |
-| 4 | 无法强制治理的能力有明确风险记录和对应产品声明限制 | §4、§15.2、§15.3、`BoundaryClaim` | 设计层已记录；运行证据 **planned** |
+| 1 | 受控 Agent 无法读取其他主体的凭据或访问未授权资源 | §6.3 目录权限、§8 沙箱属性、§10.4 校验链、§10.1 准入限额、§16.3 #4/#5/#15/#18/#19/#25/#26 | **verified at `4175a3d`**（合成基座）；Hermes/真实业务/生产 Grant 存储未验证 |
+| 2 | Grant 到期或撤销后，后续受控调用失败 | §9.6 实时双重校验（不缓存）、§11.4 stop/cleanup、§14.4/§14.5、§16.3 #16/#17/#21/#23 | **verified at `4175a3d`**（内存实时 Grant provider）；持久化撤销与生产适配器未验证 |
+| 3 | 绕行测试有真实命令、退出码和证据 | §16.3 全部 26 项、§16.4 证据格式、`verify_isolation.sh` + `verify_isolation.py` | **verified：32 passed，exit 0**（[边界记录](managed-execution-boundary.md)） |
+| 4 | 无法强制治理的能力有明确风险记录和对应产品声明限制 | §4、§15.2、§15.3、`BoundaryClaim` | 设计层已记录；`4175a3d` 运行证据与残余限制见边界记录；#83 能力仍为未验证 |
 
-补充：本文不满足、也不声称满足 #82 的“已实现”条件；它只固定实现与验证的验收规格。
+补充：本文档对应的实现已在当前分支落地；上表“verified”仅绑定 `4175a3da45a00ff2be79c5f467cedc714c9df6d4` 的合成基座 live 证据。head 变化（含本轮边界措辞与审计 sink 修复）后必须按 §16 重跑，未重跑前不得把该证据当作当前 head 的证据。Hermes Managed Execution 与真实业务运行时仍未验证。
 
 ## 18. 上线与回滚
 

@@ -71,14 +71,30 @@ platform's normal account tooling if the deployment does not already have one.
    - both paths are fixed in the helper and bind-mounted into the task as
      `/workload.py` and `/run/agentmgr/gateway.sock`.
 
-5. Install a service template only if the deployment needs a persistent unit
-   definition. Replace `<controller-user>`, `<controller-group>` and
-   `<install-root>` in `agentmgr-pep-gateway.service` first:
+5. `agentmgr-pep-gateway.service` is a **#83 placeholder**, not a working
+   production unit. Replace `<controller-user>`, `<controller-group>` and
+   `<install-root>` first, but do **not** enable it unconditionally:
 
    ```sh
    sudo systemctl daemon-reload
+   ```
+
+   The template is gated by `ConditionPathExists=/etc/agentmgr/pep-gateway.enabled`
+   and sets `Restart=no`. `python -m app.security.gateway` currently exits `2`
+   with a stable message and **does not bind a socket**, because no production
+   `GrantStatusProvider` adapter exists yet (#83). Enable the unit only after
+   #83 supplies that adapter, the adapter has been reviewed, and the operator
+   has created the enable marker:
+
+   ```sh
+   # #83 only, after the live Grant adapter is installed and reviewed:
+   sudo install -o root -g root -m 0600 /dev/null /etc/agentmgr/pep-gateway.enabled
    sudo systemctl enable --now agentmgr-pep-gateway.service
    ```
+
+   The unit deliberately has no ordering dependency on the transient
+   `agentmgr-task@` units: the controller starts those on demand, so they are
+   not ordered against the gateway.
 
 ## Ownership and permissions
 
@@ -183,7 +199,10 @@ are retained under the deployment's normal retention policy.
 - `agentmgr-pep-gateway.service` is a **#83** template. Issue #82's live
   harness runs the gateway in-process with an in-memory live
   `GrantStatusProvider`; it does not start this unit, does not write a
-  `gateway.pid`, and does not claim a production gateway was verified.
+  `gateway.pid`, and does not claim a production gateway was verified. The
+  standalone `python -m app.security.gateway` entry point fails closed with
+  exit code `2` until #83 supplies a production Grant adapter; it never binds a
+  socket today.
 - Not covered here: a real Grant store adapter, file-backed cross-process
   revocation, real business resource backends, model-provider egress,
   browser/terminal governance, multi-host or multi-tenant scheduling, and

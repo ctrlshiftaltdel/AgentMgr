@@ -105,7 +105,6 @@ ENFORCED_BOUNDARY: tuple[str, ...] = (
     "no_capabilities",
     "no_new_privileged_namespaces",
     "no_ip_network",
-    "gateway_socket_only_external_entry",
     "resource_and_time_limits",
     "cross_task_state_isolation",
     "task_bound_revocable_credential",
@@ -125,6 +124,8 @@ BYPASSABLE_BOUNDARY: tuple[str, ...] = (
     "same_host_user_gateway_socket_connect",
     "same_uid_child_processes",
     "uid_reuse_window",
+    "host_unix_sockets_outside_masked_dirs",
+    "host_world_readable_files",
 )
 
 #: Design §15.3: capabilities deferred to #83 or otherwise unverified.

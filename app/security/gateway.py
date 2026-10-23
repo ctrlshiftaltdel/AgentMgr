@@ -1,6 +1,11 @@
 """Unix-socket policy enforcement point for managed execution (Issue #82).
 
-The gateway is the only external entry a managed task may use.  It speaks
+The gateway is the **intended** resource entry for a managed task: it is the
+only way a task can reach a deployment-provided resource, and every call is
+revalidated.  It is not, however, the only entry the sandbox leaves reachable:
+host ``AF_UNIX`` sockets outside ``/run/systemd`` and ``/run/dbus`` are not
+masked, and world-readable host files remain readable (see design §15.2 and
+:data:`app.security.boundary.BYPASSABLE_BOUNDARY`).  The gateway speaks
 newline-delimited JSON over ``AF_UNIX``, serves exactly one request per
 connection and answers with ``{"ok":true,"result":...}`` or
 ``{"ok":false,"reason":<stable code>}``.  It never listens on an IP port.
@@ -37,6 +42,7 @@ the store; the probe is a liveness check, not a mount guarantee.
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -44,6 +50,7 @@ import socket
 import socketserver
 import stat
 import struct
+import sys
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -61,6 +68,7 @@ from app.security.credentials import (
 from app.security.errors import SECURITY_ERROR_CODES, SecurityError
 
 __all__ = [
+    "ADAPTER_REQUIRED_MESSAGE",
     "AUDIT_EVENT_ALLOW",
     "AUDIT_EVENT_DENY",
     "AUDIT_FIELDS",
@@ -80,10 +88,17 @@ __all__ = [
     "LimitDecision",
     "RateLimiter",
     "ResourceBackend",
+    "main",
 ]
 
 #: Wire protocol version carried in every request (design §10.2).
 GATEWAY_PROTOCOL_VERSION = "1.0.0"
+
+#: Stable fail-closed message for the standalone entry point (#83).
+ADAPTER_REQUIRED_MESSAGE = (
+    "agentmgr PEP gateway: no production GrantStatusProvider adapter is "
+    "configured (#83); refusing to bind a socket"
+)
 
 #: One resource file may not exceed this size (design §10.5).
 MAX_RESOURCE_BYTES = 1024 * 1024
@@ -993,3 +1008,42 @@ class _UnixGatewayServer(socketserver.ThreadingUnixStreamServer):
         finally:
             # Always release, even when handler setup failed.
             self._owner._limiter.release_connection(peer_uid)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Standalone entry point for the #83 gateway service (fail closed today).
+
+    The #82 gateway is constructed in-process by the isolation harness with a
+    live in-memory Grant provider.  A standalone process has no production
+    ``GrantStatusProvider`` adapter, so this entry point parses its deployment
+    arguments and then refuses to serve **before** binding any socket.  #83
+    must supply the adapter (and its enable marker) before serving starts.
+    """
+
+    parser = argparse.ArgumentParser(
+        prog="python -m app.security.gateway",
+        description=(
+            "Managed execution PEP gateway (#82 substrate; production wiring "
+            "is #83)."
+        ),
+    )
+    parser.add_argument(
+        "--socket",
+        required=True,
+        type=Path,
+        help="absolute path of the AF_UNIX socket to serve",
+    )
+    parser.add_argument(
+        "--resources-root",
+        type=Path,
+        default=Path("/srv/agentmgr-exec-resources"),
+        help="read-only root of deployment-provided resources",
+    )
+    parser.parse_args(argv)
+    # No production Grant adapter exists yet: do not bind, do not serve.
+    print(ADAPTER_REQUIRED_MESSAGE, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

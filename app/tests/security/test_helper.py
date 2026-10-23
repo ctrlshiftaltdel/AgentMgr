@@ -630,6 +630,18 @@ def test_service_templates_use_hardening_and_unix_socket() -> None:
     ):
         assert directive in gateway
     assert "\nUser=root" not in gateway
+    # #83 placeholder: never order against transient task units, never restart
+    # into a missing adapter, and gate on an explicit enable marker.
+    assert "Before=" not in gateway
+    assert "CollectMode" not in gateway
+    assert "Restart=no" in gateway
+    assert "Restart=on-failure" not in gateway
+    assert "ConditionPathExists=/etc/agentmgr/pep-gateway.enabled" in gateway
+    lowered_gateway = gateway.lower()
+    assert "#83" in gateway
+    assert "placeholder" in lowered_gateway
+    assert "enable marker" in lowered_gateway
+    assert "grantstatusprovider adapter" in lowered_gateway
 
     task = _read_template("agentmgr-task@.service")
     for directive in (

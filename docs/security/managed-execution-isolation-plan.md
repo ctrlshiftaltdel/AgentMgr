@@ -23,7 +23,7 @@
 - `process_gone`, `stop_confirmed`, and `never_started` are distinct facts. `stop_confirmed=true` only for a requested stop/cancel or systemd timeout with verified evidence. Natural `completed`/`failed` are not stop confirmations.
 - Test host changes are temporary and reversible: `sudo -n` transient units, `/run/agentmgr-exec`, `/var/lib/private/agentmgr-exec`; no persistent users, packages, firewall/nftables changes, or writes to existing Hermes profiles. Clean up all units/dirs after tests.
 - Repo/public text uses `<test-host>`, `<test-host-home>`, `<metadata-endpoint>`, `203.0.113.10`, `127.0.0.1` (test only); no real hostnames, usernames, keys, profiles, or absolute home paths.
-- All live evidence is `planned / not run` until Task 8. Do not claim Hermes or any real business runtime is managed-execution verified.
+- All live evidence is `planned / not run` until Task 8 (historical plan constraint; Task 8's first run passed at `4175a3d`, and any new head must be rerun). Do not claim Hermes or any real business runtime is managed-execution verified.
 - Every task ends with a commit. Run `python3 scripts/check_privacy.py --ci` before the final push.
 
 ## Review Focus
@@ -309,6 +309,8 @@ git commit -m "feat(security): add systemd sandbox argv and observation mapping"
 - `test_natural_completion_race_keeps_completed`: exit timestamp before stop request; stop is idempotent; result completed, stop_confirmed false.
 - `test_stop_timeout_unconfirmed_does_not_cleanup`: show deactivating/MainPID 0; stop returns `unit_stop_unconfirmed`, cleanup raises, no state deletion.
 - `test_cleanup_requires_process_gone_or_never_started`: process_gone false/never_started false → `unit_stop_unconfirmed`; true → reset-failed, remove sources/state, result.
+- `test_launch_failure_after_activation_cleans_up_residue`: `remove_sources` fails after the unit is active; stop/kill, poll `process_gone`, then `ops.cleanup(unit)` and return `unit_start_failed`/`unit_outcome_unknown`.
+- `test_launch_failure_with_retained_unit_reports_unconfirmed_stop`: unit stays `deactivating`; no cleanup, `residue_markers` increments, a `stop_unconfirmed` audit event with reason `launch_failed` is recorded, and the error is `unit_stop_unconfirmed`/`unit_outcome_unknown`.
 - `test_token_absent_from_audit_and_exception`: no token in audit JSON or error text.
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -318,7 +320,7 @@ Expected: FAIL with missing module.
 
 - [ ] **Step 3: Implement `app/security/supervisor.py`**
 
-`launch`: validate spec; live `provider.status`; verify `provider.subject_id` matches `^(prin|svc|rt)_` and use it in the credential; compute TTL `min(spec.ttl_seconds, (expires_at-now).total_seconds(), 300)`, reject <1; unit name; issue credential; call `ops.launch(config, spec_text=json.dumps(spec.as_dict()), credential_text=token)`; poll active up to 10s; on timeout inspect and stop if present; on active call `remove_sources`; on launch-audit failure stop/cleanup the unreturned unit before raising; return handle + claim. `stop`: revoke jti first; `ops.terminate` with the dispatch time; poll `active/exited`/exit evidence up to 10s; `ops.kill`; poll 3s; if still not process_gone → `unit_stop_unconfirmed`, no cleanup; audit. `cleanup`: only process_gone or never_started; `ops.cleanup(unit)` (idempotent stop, reset-failed, removes state/sources); prune revocation store; return result. Never write task state machine.
+`launch`: validate spec; live `provider.status`; verify `provider.subject_id` matches `^(prin|svc|rt)_` and use it in the credential; compute TTL `min(spec.ttl_seconds, (expires_at-now).total_seconds(), 300)`, reject <1; unit name; issue credential; call `ops.launch(config, spec_text=json.dumps(spec.as_dict()), credential_text=token)`; poll active up to 10s; on timeout inspect and stop if present; on active call `remove_sources`; on a launch-audit failure or any post-activation launch error, stop/kill the unreturned unit, poll up to 3s for `process_gone`, then call `ops.cleanup(unit)` best-effort; if the unit is still present, increment `residue_markers`, record a `stop_unconfirmed` event with reason `launch_failed`, and return `unit_stop_unconfirmed`/`unit_outcome_unknown` — never a bare error while a retained `active/exited` unit has no handle; return handle + claim. `stop`: revoke jti first; `ops.terminate` with the dispatch time; poll `active/exited`/exit evidence up to 10s; `ops.kill`; poll 3s; if still not process_gone → `unit_stop_unconfirmed`, no cleanup; audit. `cleanup`: only process_gone or never_started; `ops.cleanup(unit)` (idempotent stop, reset-failed, removes state/sources); prune revocation store; return result. Never write task state machine.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -459,7 +461,7 @@ Expected: PASS; live tests skipped without env.
 
 - [ ] **Step 2: Run the real harness on the approved test host and record evidence**
 
-Run the Task 6 command; save evidence outside the repo. Record the exact command, exit code, `commit_sha`, systemd/kernel version, profile, and a short probe summary in `docs/security/managed-execution-boundary.md`. Mark only what actually passed; keep `partially_verified`/`unverified` labels for anything not covered. Explicitly state Hermes Managed Execution is not verified.
+Run the Task 6 command; save evidence outside the repo. Record the exact command, exit code, `commit_sha`, systemd/kernel version, profile, and a short probe summary in `docs/security/managed-execution-boundary.md`. Mark only what actually passed; keep `partially_verified`/`unverified` labels for anything not covered. Explicitly state Hermes Managed Execution is not verified. The record must not claim the gateway is the only reachable external entry, must describe the host filesystem as **read-only** (permission-protected files denied, world-readable files may remain readable) rather than unreadable, and must label unit-level probes as cooperative self-reported evidence. Do not publish audit/probe counts until the Master has rerun on the final head.
 
 - [ ] **Step 3: Update threat-model status notes**
 

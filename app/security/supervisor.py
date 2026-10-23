@@ -230,6 +230,10 @@ class ManagedExecutionSupervisor:
         #: Public markers so an unauditable stop/cleanup is never silent.
         self.audit_failures = 0
         self.last_audit_failed = False
+        #: Count of failed launches whose unit could not be proven gone.  The
+        #: raised error carries no handle, so this marker is the operator's
+        #: signal that residue must be inspected.
+        self.residue_markers = 0
 
     # ------------------------------------------------------------------
     # Public lifecycle
@@ -574,7 +578,16 @@ class ManagedExecutionSupervisor:
         observation: RuntimeObservation | None = None,
         had_start_evidence: bool = False,
     ) -> SecurityError:
-        """Revoke and terminate a partially started unit, returning the error."""
+        """Revoke and terminate a partially started unit, returning the error.
+
+        A failed ``systemd-run`` can still leave a unit behind (a command
+        timeout, or a failure after activation such as ``remove_sources``).
+        ``RemainAfterExit=yes`` keeps a successful exit loaded as
+        ``active/exited``, so a stop/kill *request* is not residue evidence:
+        the unit is polled for ``process_gone`` and only then cleaned up.  A
+        unit that is still present is reported as an unconfirmed stop with a
+        recorded marker, never as a bare error while it has no handle.
+        """
 
         revoked = self._revoke(handle, "manual_stop", self._now())
         try:
@@ -597,18 +610,69 @@ class ManagedExecutionSupervisor:
                 except Exception:
                     pass
 
+            # Bounded wait for the retained unit to become process-gone.  A
+            # stop/kill request alone must not be treated as residue removal.
+            deadline = self._monotonic() + KILL_TIMEOUT_SECONDS
+            while True:
+                try:
+                    observation = self._observe(
+                        handle.unit, had_start_evidence=had_start_evidence
+                    )
+                except SecurityError:
+                    observation = None
+                if observation is not None and observation.process_gone:
+                    break
+                remaining = deadline - self._monotonic()
+                if remaining <= 0:
+                    break
+                self._config.sleep(min(POLL_INTERVAL_SECONDS, remaining))
+
+            if observation is not None and observation.never_started:
+                # The unit never started after all: no residue to clean or mark.
+                pass
+            elif observation is not None and observation.process_gone:
+                # Best effort: the caller has no handle and can never cleanup.
+                try:
+                    self._ops.cleanup(handle.unit)
+                except Exception:
+                    pass
+            else:
+                # A retained unit has no handle: leave an auditable marker and
+                # report the stop as unconfirmed.
+                self.residue_markers += 1
+                self._try_audit(
+                    {
+                        "ts": self._now().isoformat(),
+                        "event": AUDIT_EVENT_STOP_UNCONFIRMED,
+                        "task_id": handle.task_id,
+                        "grant_id": handle.grant_id,
+                        "credential_jti": handle.jti,
+                        "unit": handle.unit,
+                        "reason": "launch_failed",
+                        "state": (
+                            observation.state
+                            if observation is not None
+                            else "unknown"
+                        ),
+                        "result": "unit_stop_unconfirmed",
+                        "process_gone": False,
+                        "stop_confirmed": False,
+                        "never_started": False,
+                    }
+                )
+
         if not revoked:
             return SecurityError("unknown", "credential_revoke_failed")
         if present:
             if launch_error.code == "timeout" or observation is None:
                 return SecurityError("unknown", "launch_outcome_unknown")
+            if observation.never_started:
+                return SecurityError("unit_start_failed", "unit_not_started")
             if observation.process_gone:
                 # The unit has process evidence: it may have run.  Never report
                 # "not started"/safe-to-retry.
                 return SecurityError("unit_start_failed", "unit_outcome_unknown")
-            return SecurityError(
-                "unit_start_failed", "unit_present_after_launch_error"
-            )
+            return SecurityError("unit_stop_unconfirmed", "unit_outcome_unknown")
         if launch_error.code == "privilege_required":
             return SecurityError("privilege_required", "launch_unavailable")
         return SecurityError("unit_start_failed", "unit_not_started")
