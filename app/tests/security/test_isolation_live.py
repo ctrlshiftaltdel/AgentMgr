@@ -177,10 +177,11 @@ class TestLiveIsolation:
             _probe(evidence, "gateway-cross-task-identity")["observed"]
             == "cross_task_denied"
         )
-        assert (
-            _probe(evidence, "gateway-cross-task-resource")["observed"]
-            == "resource_scope_denied"
-        )
+        # Another task's resource is outside this credential's resource scope;
+        # identity (task/grant/subject) mismatch is the separate cross_task case.
+        cross_resource = _probe(evidence, "gateway-cross-task-resource")
+        assert cross_resource["observed"] == "resource_scope_denied"
+        assert "scope" in cross_resource.get("note", "")
         assert (
             _probe(evidence, "gateway-out-of-scope-resource")["observed"]
             == "resource_scope_denied"
@@ -265,9 +266,18 @@ class TestLiveIsolation:
         assert isinstance(cleanup, dict)
         assert cleanup["units_remaining"] == 0
         assert cleanup["remaining_unit_names"] == []
+        assert cleanup["remaining_state_dirs"] == []
         assert cleanup["run_dir_present"] is False
-        assert cleanup["state_dir_present"] is False
         assert cleanup["resources_dir_present"] is False
+        assert cleanup["state_clean"] is True
+        # The harness removes the shared state roots only when it created them;
+        # on a host where a root pre-existed it must be left in place.
+        assert cleanup["state_dir_present"] is False or (
+            cleanup["state_root_preexisting"] is True
+        )
+        assert cleanup["state_link_present"] is False or (
+            cleanup["state_link_preexisting"] is True
+        )
 
     def test_live_evidence_has_no_token_or_host_path(
         self, evidence: dict[str, object]
@@ -277,6 +287,9 @@ class TestLiveIsolation:
         assert self_check["token_absent"] is True
         assert self_check["home_path_absent"] is True
         assert self_check["ipv4_absent"] is True
+        gateway = evidence.get("gateway")
+        assert isinstance(gateway, dict)
+        assert gateway["audit"]["token_absent"] is True
 
 
 def test_smoke_workload_gateway_call_round_trip(tmp_path: Path) -> None:
@@ -362,3 +375,274 @@ def test_harness_refuses_evidence_path_inside_repository(
 
     with pytest.raises(harness.HarnessError):
         harness.validate_evidence_path(REPO_ROOT / "evidence.json", REPO_ROOT)
+
+
+def _unit_harness(tmp_path: Path):
+    harness = importlib.import_module("ops.security.verify_isolation")
+    config = harness.HarnessConfig(
+        repo_root=REPO_ROOT,
+        run_root=tmp_path / "run",
+        resources_root=tmp_path / "resources",
+        evidence_path=tmp_path / "evidence.json",
+    )
+    staging = tmp_path / "staging"
+    staging.mkdir(exist_ok=True)
+    return harness, harness._Harness(config, staging)
+
+
+def _completed(
+    argv: list[str] | tuple[str, ...], returncode: int = 0
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(list(argv), returncode, "", "")
+
+
+def test_optional_inaccessible_targets_strip_prefix(tmp_path: Path) -> None:
+    harness, instance = _unit_harness(tmp_path)
+
+    assert harness.optional_inaccessible_targets(
+        ["-/etc/agentmgr", "-/run/dbus", "/srv"]
+    ) == ("/etc/agentmgr", "/run/dbus", "/srv")
+
+    raw = instance._inaccessible_path_entries()
+    assert raw and all(entry.startswith("-/") for entry in raw)
+    stripped = instance._inaccessible_paths()
+    assert stripped == list(harness.optional_inaccessible_targets(raw))
+    assert all(not path.startswith("-") for path in stripped)
+
+
+def test_preflight_allows_absent_optional_paths(
+    tmp_path: Path, monkeypatch
+) -> None:
+    harness, instance = _unit_harness(tmp_path)
+    absent = {"/etc/agentmgr", "/var/lib/agentmgr"}
+    not_yet_created = {str(instance.run_root), str(instance.resources_root)}
+
+    def fake_run(argv, timeout=60.0):
+        if len(argv) > 1 and argv[1] == "--version":
+            return subprocess.CompletedProcess(
+                list(argv), 0, "systemd 257 (257.7-1)\n", ""
+            )
+        return _completed(argv)
+
+    def fake_exists(path) -> bool:
+        text = str(path)
+        return text not in absent and text not in not_yet_created
+
+    monkeypatch.setattr(harness.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+    monkeypatch.setattr(harness.Path, "is_dir", lambda self: True)
+    monkeypatch.setattr(harness, "_run", fake_run)
+    monkeypatch.setattr(harness, "_sudo", lambda *args, **kwargs: _completed(args))
+    monkeypatch.setattr(harness, "_sudo_exists", fake_exists)
+
+    evidence = harness._new_evidence(REPO_ROOT, harness.datetime.now(harness.UTC))
+    instance.preflight(evidence)  # must not raise on absent optional paths
+
+    assert evidence["preflight"]["inaccessible_paths_optional"] is True
+    assert evidence["preflight"]["inaccessible_paths_absent"] == [
+        "/etc/agentmgr",
+        "/var/lib/agentmgr",
+    ]
+    assert instance.state_checked is True
+    assert instance.state_root_preexisting is True
+
+
+def test_remaining_units_fails_closed(tmp_path: Path, monkeypatch) -> None:
+    harness, instance = _unit_harness(tmp_path)
+
+    monkeypatch.setattr(
+        harness,
+        "_sudo",
+        lambda *args, **kwargs: _completed(args, returncode=5),
+    )
+    with pytest.raises(harness.HarnessError) as failure:
+        instance._remaining_units()
+    assert str(failure.value) == "unit_list_failed"
+    with pytest.raises(harness.HarnessError):
+        instance.record_cleanup({})
+
+    evidence = _passing_evidence()
+    evidence["cleanup"] = {}
+    assert harness._overall_result(evidence) is False
+
+
+def test_teardown_removes_only_created_roots(
+    tmp_path: Path, monkeypatch
+) -> None:
+    harness, instance = _unit_harness(tmp_path)
+    calls: list[list[str]] = []
+
+    def fake_sudo(*args, **kwargs):
+        calls.append(list(args))
+        return _completed(args)
+
+    monkeypatch.setattr(harness, "_sudo", fake_sudo)
+
+    instance.created_run_root = True
+    instance.created_resources_root = True
+    instance.state_checked = True
+    instance.state_root_preexisting = True
+    instance.state_link_preexisting = True
+    instance.teardown()
+
+    removals = [call for call in calls if call[:3] == ["rm", "-rf", "--"]]
+    assert len(removals) == 1
+    removed = {Path(item) for item in removals[0][3:]}
+    assert instance.run_root in removed
+    assert instance.resources_root in removed
+    assert harness.DEFAULT_STATE_ROOT not in removed
+    assert harness.DEFAULT_STATE_LINK_ROOT not in removed
+
+
+def test_teardown_does_not_touch_state_before_preflight(
+    tmp_path: Path, monkeypatch
+) -> None:
+    harness, instance = _unit_harness(tmp_path)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        harness, "_sudo", lambda *args, **kwargs: calls.append(list(args)) or _completed(args)
+    )
+
+    instance.teardown()
+
+    assert [call for call in calls if call[:3] == ["rm", "-rf", "--"]] == []
+
+
+def test_partial_setup_tracks_only_created_run_root(
+    tmp_path: Path, monkeypatch
+) -> None:
+    harness, instance = _unit_harness(tmp_path)
+    calls: list[list[str]] = []
+
+    def fake_sudo(*args, **kwargs):
+        calls.append(list(args))
+        if (
+            args[0] == "install"
+            and "-d" in args
+            and Path(args[-1]) == instance.resources_root
+        ):
+            return _completed(args, returncode=1)
+        return _completed(args)
+
+    monkeypatch.setattr(harness, "_sudo", fake_sudo)
+
+    with pytest.raises(harness.HarnessError) as failure:
+        instance.prepare_filesystem()
+    assert str(failure.value) == "install_directory_failed"
+    assert instance.created_run_root is True
+    assert instance.created_resources_root is False
+
+    # Teardown after the failed setup removes the run root it created, but not
+    # the resources root or the shared state roots.
+    instance.teardown()
+    removals = [call for call in calls if call[:3] == ["rm", "-rf", "--"]]
+    assert len(removals) == 1
+    removed = {Path(item) for item in removals[0][3:]}
+    assert instance.run_root in removed
+    assert instance.resources_root not in removed
+    assert harness.DEFAULT_STATE_ROOT not in removed
+    assert harness.DEFAULT_STATE_LINK_ROOT not in removed
+
+
+def _passing_evidence() -> dict[str, object]:
+    return {
+        "probes": [{"passed": True}],
+        "gateway": {
+            "mode": "in_process_harness",
+            "grant_provider": "in_memory_live",
+            "probes": [{"passed": True}],
+            "audit": {"token_absent": True},
+        },
+        "failures": [],
+        "cleanup": {
+            "units_remaining": 0,
+            "remaining_unit_names": [],
+            "remaining_state_dirs": [],
+            "run_dir_present": False,
+            "resources_dir_present": False,
+            "state_dir_present": False,
+            "state_root_preexisting": False,
+            "state_link_present": False,
+            "state_link_preexisting": False,
+            "state_clean": True,
+        },
+        "run_directory": {
+            "owner_matches_controller": True,
+            "mode": "0700",
+            "gateway_socket_owner_matches": True,
+            "credential_source_present_after_active": False,
+            "spec_source_present_after_active": False,
+            "unit_cannot_traverse": True,
+        },
+        "ttl": {
+            "matrix_requested_seconds": 300,
+            "matrix_effective_seconds": 240,
+            "timeout_requested_seconds": 2,
+            "timeout_effective_seconds": 2,
+        },
+        "network_profile": "private_netns",
+        "profile_probes": [
+            {"profile": "private_netns", "used": True, "gateway_connect": True},
+            {
+                "profile": "af_unix_only_fallback",
+                "used": False,
+                "gateway_connect": True,
+            },
+        ],
+        "evidence_self_check": {
+            "token_absent": True,
+            "home_path_absent": True,
+            "ipv4_absent": True,
+        },
+    }
+
+
+def test_overall_result_accepts_a_complete_pass() -> None:
+    harness = importlib.import_module("ops.security.verify_isolation")
+    assert harness._overall_result(_passing_evidence()) is True
+
+
+def test_overall_result_allows_only_flagged_preexisting_state() -> None:
+    harness = importlib.import_module("ops.security.verify_isolation")
+
+    evidence = _passing_evidence()
+    evidence["cleanup"]["state_dir_present"] = True
+    evidence["cleanup"]["state_root_preexisting"] = True
+    evidence["cleanup"]["state_clean"] = True
+    assert harness._overall_result(evidence) is True
+
+    evidence["cleanup"]["state_root_preexisting"] = False
+    evidence["cleanup"]["state_clean"] = False
+    assert harness._overall_result(evidence) is False
+
+
+@pytest.mark.parametrize(
+    "section,key,value",
+    [
+        ("run_directory", "mode", "0755"),
+        ("run_directory", "owner_matches_controller", False),
+        ("run_directory", "credential_source_present_after_active", True),
+        ("run_directory", "unit_cannot_traverse", False),
+        ("ttl", "matrix_effective_seconds", 301),
+        ("ttl", "timeout_effective_seconds", 3),
+        ("ttl", "matrix_effective_seconds", "240"),
+        ("profile_probes", "x", []),
+        ("gateway", "audit", {"token_absent": False}),
+        ("cleanup", "remaining_state_dirs", ["agentmgr-task-aaaaaaaaaaaa"]),
+        ("cleanup", "units_remaining", 1),
+        ("cleanup", "state_clean", False),
+        ("probes", "x", [{"passed": False}]),
+    ],
+)
+def test_overall_result_rejects_a_failed_recorded_check(
+    section: str, key: str, value: object
+) -> None:
+    harness = importlib.import_module("ops.security.verify_isolation")
+    evidence = _passing_evidence()
+    if section == "profile_probes":
+        evidence[section] = value
+    elif section == "probes":
+        evidence[section] = value
+    else:
+        assert isinstance(evidence[section], dict)
+        evidence[section][key] = value
+    assert harness._overall_result(evidence) is False

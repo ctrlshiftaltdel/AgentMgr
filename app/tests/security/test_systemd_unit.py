@@ -109,14 +109,16 @@ def _expected_properties(config: SystemdUnitConfig) -> list[str]:
     credential = str(config.credential_source)
     gateway = str(config.gateway_socket_source)
     workload = str(config.workload_source)
+    # Optional-path syntax: ``-`` lets systemd ignore an absent path while a
+    # present path remains inaccessible.
     inaccessible = [
-        "/etc/agentmgr",
-        "/var/lib/agentmgr",
-        "/var/lib/postgresql",
-        "/srv",
-        "/opt",
-        "/run/systemd",
-        "/run/dbus",
+        "-/etc/agentmgr",
+        "-/var/lib/agentmgr",
+        "-/var/lib/postgresql",
+        "-/srv",
+        "-/opt",
+        "-/run/systemd",
+        "-/run/dbus",
     ]
     private_netns = config.network_profile == "private_netns"
     return [
@@ -186,8 +188,17 @@ def test_systemd_argv_exact_properties(
     assert properties == _expected_properties(config)
     # Both profiles hide the host systemd private socket and D-Bus so the
     # bound gateway socket remains the only AF_UNIX entry point.
-    assert "--property=InaccessiblePaths=/run/systemd" in properties
-    assert "--property=InaccessiblePaths=/run/dbus" in properties
+    assert "--property=InaccessiblePaths=-/run/systemd" in properties
+    assert "--property=InaccessiblePaths=-/run/dbus" in properties
+    prefix = "--property=InaccessiblePaths="
+    inaccessible = [
+        item[len(prefix) :] for item in properties if item.startswith(prefix)
+    ]
+    assert inaccessible
+    # Every entry uses optional-path syntax; none may be an unconditional path
+    # that would make systemd refuse to start on a host without that directory.
+    assert all(path.startswith("-") and len(path) > 1 for path in inaccessible)
+
     if profile == "private_netns":
         assert "--property=PrivateNetwork=yes" in properties
     else:

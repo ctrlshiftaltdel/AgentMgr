@@ -44,7 +44,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -54,6 +54,7 @@ from app.security.boundary import (
     EXECUTION_MODE_MANAGED,
     NETWORK_PROFILE_AF_UNIX_ONLY_FALLBACK,
     NETWORK_PROFILE_PRIVATE_NETNS,
+    NETWORK_PROFILES,
     GrantStatus,
     ManagedTaskSpec,
     ResourceScope,
@@ -91,6 +92,7 @@ __all__ = [
     "HarnessError",
     "RESOURCES_ROOT",
     "main",
+    "optional_inaccessible_targets",
     "run_harness",
     "validate_evidence_path",
 ]
@@ -229,8 +231,12 @@ def _sudo_check(*args: str, token: str, timeout: float = 60.0) -> None:
 
 def _sudo_exists(path: Path | str) -> bool:
     # ``test`` has no portable end-of-options marker; every path used here is
-    # absolute and derived by the harness.
-    completed = _sudo("test", "-e", str(path))
+    # absolute and derived by the harness.  Strip systemd's optional-path
+    # prefix if a raw property value is passed in.
+    text = str(path)
+    if text.startswith("-/"):
+        text = text[1:]
+    completed = _sudo("test", "-e", text)
     if completed.returncode == 0:
         return True
     if completed.returncode == 1:
@@ -243,6 +249,22 @@ def _sudo_read_text(path: Path | str) -> str | None:
     if completed.returncode != 0:
         return None
     return completed.stdout
+
+
+def optional_inaccessible_targets(entries: Iterable[str]) -> tuple[str, ...]:
+    """Strip systemd's optional-path ``-`` prefix from ``InaccessiblePaths``.
+
+    systemd ignores a prefixed path only when it does not exist; a present path
+    is still made inaccessible.  The harness therefore checks the real path,
+    never the prefixed spelling.
+    """
+
+    targets: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, str) or not entry:
+            continue
+        targets.append(entry[1:] if entry.startswith("-/") else entry)
+    return tuple(targets)
 
 
 def validate_evidence_path(path: Path, repo_root: Path) -> Path:
@@ -439,10 +461,14 @@ class _Harness:
         self.handles: list[tuple[ManagedExecutionSupervisor, object]] = []
         self.failures: list[dict[str, str]] = []
         self.systemd_line = ""
-        #: Set once this run may own /run/agentmgr-exec and the resources root;
-        #: before that (for example a preflight refusal) teardown must not touch
-        #: directories that belong to someone else.
-        self.filesystem_prepared = False
+        #: Roots are removed only when this run actually created them.  The
+        #: state roots are shared, host-wide locations: a pre-existing one may
+        #: belong to another deployment and must never be deleted here.
+        self.created_run_root = False
+        self.created_resources_root = False
+        self.state_checked = False
+        self.state_root_preexisting = False
+        self.state_link_preexisting = False
 
     # -- commands ---------------------------------------------------------
     @property
@@ -529,9 +555,11 @@ class _Harness:
         if _sudo("systemctl", "--version").returncode != 0:
             raise HarnessError("sudo_unavailable")
 
-        if os.path.exists(self.run_root):
+        # Check as root: a foreign directory may be mode 0700 and invisible to
+        # the controller, and taking it over would be destructive.
+        if _sudo_exists(self.run_root):
             raise HarnessError("run_root_present")
-        if os.path.exists(self.resources_root):
+        if _sudo_exists(self.resources_root):
             raise HarnessError("resources_root_present")
 
         residue = _sudo(
@@ -549,12 +577,21 @@ class _Harness:
         if residue.returncode not in (0, 1):
             raise HarnessError("state_probe_failed")
 
-        missing = [path for path in self._inaccessible_paths() if not _sudo_exists(path)]
-        if missing:
-            evidence["preflight"] = {"missing_inaccessible_paths": missing}
-            raise HarnessError("inaccessible_path_missing")
+        self.state_root_preexisting = _sudo_exists(DEFAULT_STATE_ROOT)
+        self.state_link_preexisting = _sudo_exists(DEFAULT_STATE_LINK_ROOT)
+        self.state_checked = True
 
-    def _inaccessible_paths(self) -> list[str]:
+        targets = list(optional_inaccessible_targets(self._inaccessible_path_entries()))
+        absent = [path for path in targets if not _sudo_exists(path)]
+        evidence["preflight"] = {
+            "inaccessible_paths_optional": True,
+            "inaccessible_path_targets": targets,
+            "inaccessible_paths_absent": absent,
+            "state_root_preexisting": self.state_root_preexisting,
+            "state_link_preexisting": self.state_link_preexisting,
+        }
+
+    def _inaccessible_path_entries(self) -> list[str]:
         spec = _spec(
             "task_iso_preflight", "grnt_iso_preflight", (RESOURCE_A,), ttl_seconds=30
         )
@@ -574,12 +611,15 @@ class _Harness:
             if item.startswith(prefix)
         ]
 
+    def _inaccessible_paths(self) -> list[str]:
+        return list(optional_inaccessible_targets(self._inaccessible_path_entries()))
+
     # -- filesystem and gateway ------------------------------------------
     def prepare_filesystem(self) -> None:
-        self.filesystem_prepared = True
         self._install_directory(
             self.run_root, mode="0700", owner=self.user, group=self.group
         )
+        self.created_run_root = True
         for name in ("credentials", "specs"):
             self._install_directory(
                 self.run_root / name, mode="0700", owner="root", group="root"
@@ -587,6 +627,7 @@ class _Harness:
         self._install_directory(
             self.resources_root, mode="0755", owner="root", group="root"
         )
+        self.created_resources_root = True
         self._install(
             self.config.repo_root / "ops" / "security" / "smoke_workload.py",
             self.run_root / "workload.py",
@@ -762,9 +803,18 @@ class _Harness:
         # sink is closed only after the listener itself has stopped.
         self.audit.close()
 
-        if self.filesystem_prepared:
-            self._sudo_remove(self.run_root, self.resources_root)
-            self._sudo_remove(DEFAULT_STATE_ROOT, DEFAULT_STATE_LINK_ROOT)
+        targets: list[Path] = []
+        if self.created_run_root:
+            targets.append(self.run_root)
+        if self.created_resources_root:
+            targets.append(self.resources_root)
+        if self.state_checked:
+            if not self.state_root_preexisting:
+                targets.append(DEFAULT_STATE_ROOT)
+            if not self.state_link_preexisting:
+                targets.append(DEFAULT_STATE_LINK_ROOT)
+        if targets:
+            self._sudo_remove(*targets)
 
     # -- probes -----------------------------------------------------------
     def _gateway_request(
@@ -1166,7 +1216,7 @@ class _Harness:
                 probe_id="gateway-cross-task-resource",
                 expected="resource_scope_denied",
                 resource=RESOURCE_B,
-                note="resource ownership is enforced through the resource scope",
+                note="another task's resource is outside this credential's scope (identity mismatch is cross_task_denied)",
             )
         )
         evidence["probes"].append(  # type: ignore[union-attr]
@@ -1525,13 +1575,22 @@ class _Harness:
     # -- cleanup evidence -------------------------------------------------
     def record_cleanup(self, evidence: dict[str, object]) -> None:
         remaining = self._remaining_units()
+        remaining_state_dirs = self._remaining_state_dirs()
+        state_present = _sudo_exists(DEFAULT_STATE_ROOT)
+        link_present = _sudo_exists(DEFAULT_STATE_LINK_ROOT)
+        state_clean = (not state_present) or self.state_root_preexisting
+        link_clean = (not link_present) or self.state_link_preexisting
         cleanup = {
             "units_remaining": len(remaining),
             "remaining_unit_names": remaining,
-            "run_dir_present": os.path.exists(self.run_root),
-            "resources_dir_present": os.path.exists(self.resources_root),
-            "state_dir_present": _sudo_exists(DEFAULT_STATE_ROOT),
-            "state_link_present": _sudo_exists(DEFAULT_STATE_LINK_ROOT),
+            "remaining_state_dirs": remaining_state_dirs,
+            "run_dir_present": _sudo_exists(self.run_root),
+            "resources_dir_present": _sudo_exists(self.resources_root),
+            "state_dir_present": state_present,
+            "state_root_preexisting": self.state_root_preexisting,
+            "state_link_present": link_present,
+            "state_link_preexisting": self.state_link_preexisting,
+            "state_clean": bool(state_clean and link_clean),
         }
         evidence["cleanup"] = cleanup
         probes = evidence.get("probes")
@@ -1544,10 +1603,10 @@ class _Harness:
                     "observed": dict(cleanup),
                     "passed": (
                         cleanup["units_remaining"] == 0
+                        and cleanup["remaining_state_dirs"] == []
                         and cleanup["run_dir_present"] is False
                         and cleanup["resources_dir_present"] is False
-                        and cleanup["state_dir_present"] is False
-                        and cleanup["state_link_present"] is False
+                        and cleanup["state_clean"] is True
                     ),
                 }
             )
@@ -1563,7 +1622,8 @@ class _Harness:
             "agentmgr-task-*",
         )
         if completed.returncode != 0:
-            return []
+            # Fail closed: an empty list is never proof that nothing is left.
+            raise HarnessError("unit_list_failed")
         names: list[str] = []
         for line in completed.stdout.splitlines():
             fields = line.split()
@@ -1573,6 +1633,27 @@ class _Harness:
             if matched is not None:
                 names.append(matched.group(1))
         return sorted(set(names))
+
+    def _remaining_state_dirs(self) -> list[str]:
+        completed = _sudo(
+            "find",
+            str(DEFAULT_STATE_ROOT),
+            "-maxdepth",
+            "1",
+            "-name",
+            "agentmgr-task-*",
+            "-print",
+        )
+        if completed.returncode != 0:
+            if not _sudo_exists(DEFAULT_STATE_ROOT):
+                return []
+            raise HarnessError("state_list_failed")
+        names = {
+            Path(line.strip()).name
+            for line in completed.stdout.splitlines()
+            if line.strip()
+        }
+        return sorted(name for name in names if _UNIT_LINE.fullmatch(f"{name}.service"))
 
 
 def _commit_sha(repo_root: Path) -> str:
@@ -1641,27 +1722,97 @@ def _write_evidence(path: Path, evidence: dict[str, object]) -> None:
 
 
 def _overall_result(evidence: dict[str, object]) -> bool:
+    """Return whether every recorded check passed.
+
+    The shell entrypoint trusts only this result, so it must cover every
+    section the evidence records: probes, gateway probes/audit, run-directory
+    ownership and source removal, the effective TTLs, the chosen network
+    profile and both profile probes, cleanup, the no-secret self-check and any
+    harness failure.
+    """
+
     probes = evidence.get("probes")
     probes = probes if isinstance(probes, list) else []
     gateway = evidence.get("gateway")
     gateway = gateway if isinstance(gateway, dict) else {}
     gateway_probes = gateway.get("probes")
     gateway_probes = gateway_probes if isinstance(gateway_probes, list) else []
+    gateway_audit = gateway.get("audit")
+    gateway_audit = gateway_audit if isinstance(gateway_audit, dict) else {}
     cleanup = evidence.get("cleanup")
     cleanup = cleanup if isinstance(cleanup, dict) else {}
+    run_directory = evidence.get("run_directory")
+    run_directory = run_directory if isinstance(run_directory, dict) else {}
+    ttl = evidence.get("ttl")
+    ttl = ttl if isinstance(ttl, dict) else {}
+    profile_probes = evidence.get("profile_probes")
+    profile_probes = profile_probes if isinstance(profile_probes, list) else []
     failures = evidence.get("failures")
     failures = failures if isinstance(failures, list) else []
     self_check = evidence.get("evidence_self_check")
     self_check = self_check if isinstance(self_check, dict) else {}
+
+    run_clean = bool(
+        run_directory.get("owner_matches_controller") is True
+        and run_directory.get("mode") == "0700"
+        and run_directory.get("gateway_socket_owner_matches") is True
+        and run_directory.get("credential_source_present_after_active") is False
+        and run_directory.get("spec_source_present_after_active") is False
+        and run_directory.get("unit_cannot_traverse") is True
+    )
+    matrix_requested = ttl.get("matrix_requested_seconds")
+    matrix_effective = ttl.get("matrix_effective_seconds")
+    timeout_requested = ttl.get("timeout_requested_seconds")
+    timeout_effective = ttl.get("timeout_effective_seconds")
+    ttl_clean = bool(
+        type(matrix_requested) is int
+        and type(matrix_effective) is int
+        and type(timeout_requested) is int
+        and type(timeout_effective) is int
+        and 1 <= matrix_effective <= matrix_requested
+        and timeout_effective == timeout_requested
+        and timeout_effective >= 1
+    )
+    used_profiles = [
+        item
+        for item in profile_probes
+        if isinstance(item, dict) and item.get("used") is True
+    ]
+    profile_clean = bool(
+        evidence.get("network_profile") in NETWORK_PROFILES
+        and profile_probes
+        and all(
+            isinstance(item, dict)
+            and item.get("profile") in NETWORK_PROFILES
+            for item in profile_probes
+        )
+        and len(used_profiles) == 1
+        and used_profiles[0].get("gateway_connect") is True
+        and used_profiles[0].get("profile") == evidence.get("network_profile")
+    )
+    gateway_clean = bool(
+        gateway.get("mode") == "in_process_harness"
+        and gateway.get("grant_provider") == "in_memory_live"
+        and gateway_audit.get("token_absent") is True
+    )
+    cleanup_clean = bool(
+        cleanup.get("units_remaining") == 0
+        and cleanup.get("remaining_unit_names") == []
+        and cleanup.get("remaining_state_dirs") == []
+        and cleanup.get("run_dir_present") is False
+        and cleanup.get("resources_dir_present") is False
+        and cleanup.get("state_clean") is True
+    )
     return bool(
         probes
         and all(item.get("passed") is True for item in probes)
         and all(item.get("passed") is True for item in gateway_probes)
         and not failures
-        and cleanup.get("units_remaining") == 0
-        and cleanup.get("run_dir_present") is False
-        and cleanup.get("state_dir_present") is False
-        and cleanup.get("resources_dir_present") is False
+        and run_clean
+        and ttl_clean
+        and profile_clean
+        and gateway_clean
+        and cleanup_clean
         and self_check.get("token_absent") is True
         and self_check.get("home_path_absent") is True
         and self_check.get("ipv4_absent") is True

@@ -303,7 +303,7 @@ class BoundaryClaim:
 | `SendSIGKILL=` | `yes` | 允许 SIGKILL 兜底 |
 | `ProtectSystem=` | `strict` | `/usr`、`/boot`、`/etc`、`/var` 等只读 |
 | `ProtectHome=` | `yes` | `/home`、`/root`、`/run/user` 不可访问 |
-| `InaccessiblePaths=` | `/etc/agentmgr /var/lib/agentmgr /var/lib/postgresql /srv /opt` | 显式屏蔽控制面、数据库与业务目录 |
+| `InaccessiblePaths=` | `-/etc/agentmgr -/var/lib/agentmgr -/var/lib/postgresql -/srv -/opt` | 显式屏蔽控制面、数据库与业务目录；`-` 为可选路径语法（不存在则忽略，存在则仍屏蔽） |
 | `PrivateTmp=` | `yes` | 独立 `/tmp` 与 `/var/tmp`，跨任务不可见 |
 | `PrivateDevices=` | `yes` | 无原始设备节点 |
 | `PrivateNetwork=` | `yes` | 独立网络命名空间；默认 profile |
@@ -340,11 +340,13 @@ class BoundaryClaim:
 
 说明：`MemoryMax`/`CPUQuota`/`TasksMax` 不是固定常量，而是由 §7.2 校验过的 spec 整数渲染成上表占位形式；未显式给值时取默认值。范围之外的取值在校验阶段即 `invalid_spec`，不会启动单元。表格其余属性（含 `StateDirectory=agentmgr-exec/%N`）是固定常量，任务输入不能覆盖。
 
+所有 `InaccessiblePaths=` 条目都使用 systemd 的**可选路径语法** `-<path>`：目标路径不存在时 systemd 忽略该条（因此 `/etc/agentmgr`、`/var/lib/agentmgr` 等部署目录尚未创建的精简测试机仍能启动单元），目标路径存在时仍被设为不可访问。该前缀只影响“路径不存在时是否拒绝启动”，不放宽任何已存在路径的沙箱属性；不得为了兼容主机而删掉条目或改用不带 `-` 的普通路径。
+
 同一 profile 内的附加加固（不改变上表语义）：
 
 | 附加属性 | 值 | 说明 |
 |---|---|---|
-| `InaccessiblePaths=`（追加） | `/run/systemd /run/dbus` | 屏蔽宿主 systemd 私有 socket 与 D-Bus，降低 `AF_UNIX` 可达面 |
+| `InaccessiblePaths=`（追加） | `-/run/systemd -/run/dbus` | 屏蔽宿主 systemd 私有 socket 与 D-Bus，降低 `AF_UNIX` 可达面；`-` 为可选路径语法 |
 | `SystemCallErrorNumber=` | `EPERM` | 被过滤 syscall 返回 EPERM 而非 SIGSYS，避免异常路径差异 |
 
 版本前提：**systemd ≥ 249**（其中 `ProtectProc`/`ProcSubset` 需 ≥ 247，`LoadCredential` 需 ≥ 244，`%N` 需 ≥ 240；249 是本属性集合的安全基线），内核支持 cgroup v2 与 BPF cgroup IP 过滤。运行时不满足时**启动失败**（fail closed），不得降级为一组“尽力而为”的属性。
@@ -362,11 +364,11 @@ systemd-run --unit=agentmgr-task-<12hex> --description=agentmgr-exec \
   --property=SendSIGKILL=yes \
   --property=ProtectSystem=strict \
   --property=ProtectHome=yes \
-  --property=InaccessiblePaths=/etc/agentmgr \
-  --property=InaccessiblePaths=/var/lib/agentmgr \
-  --property=InaccessiblePaths=/var/lib/postgresql \
-  --property=InaccessiblePaths=/srv \
-  --property=InaccessiblePaths=/opt \
+  --property=InaccessiblePaths=-/etc/agentmgr \
+  --property=InaccessiblePaths=-/var/lib/agentmgr \
+  --property=InaccessiblePaths=-/var/lib/postgresql \
+  --property=InaccessiblePaths=-/srv \
+  --property=InaccessiblePaths=-/opt \
   --property=PrivateTmp=yes \
   --property=PrivateDevices=yes \
   --property=PrivateNetwork=yes \
@@ -421,13 +423,13 @@ systemd-run --unit=agentmgr-task-<12hex> --description=agentmgr-exec \
 | profile | 属性 | 何时使用 |
 |---|---|---|
 | `private_netns`（默认） | `PrivateNetwork=yes` + `RestrictAddressFamilies=AF_UNIX` + `IPAddressDeny=any` | 主机探测通过（socket 可连接） |
-| `af_unix_only_fallback` | 去掉 `PrivateNetwork=yes`，保留 `RestrictAddressFamilies=AF_UNIX` + `IPAddressDeny=any`，并追加 `InaccessiblePaths=/run/systemd /run/dbus` | 默认 profile 下 bind mount 的 Unix socket 无法连接（例如宿主/内核限制） |
+| `af_unix_only_fallback` | 去掉 `PrivateNetwork=yes`，保留 `RestrictAddressFamilies=AF_UNIX` + `IPAddressDeny=any`，并追加 `InaccessiblePaths=-/run/systemd -/run/dbus`（可选路径语法） | 默认 profile 下 bind mount 的 Unix socket 无法连接（例如宿主/内核限制） |
 
 规则：
 
 - 探测在**主机级**执行一次（启动时或 harness 首次运行）：用同一 profile 启动一个只做 `connect()` 的最小单元；成功即 `private_netns`，失败即 `af_unix_only_fallback`；结果缓存到进程内并写入审计。
 - 回退**不是**“放宽网络”：`AF_INET`/`AF_INET6` 仍被 `RestrictAddressFamilies` 拒绝，IP 出口仍被 `IPAddressDeny=any` 拒绝。失去的是“独立 netns”这一层纵深防御，不是“无 IP”不变量。
-- 回退时新增的 `InaccessiblePaths` 用于缩小 `AF_UNIX` 可达面（宿主 systemd 私有 socket、D-Bus）。
+- 回退时新增的 `InaccessiblePaths` 用于缩小 `AF_UNIX` 可达面（宿主 systemd 私有 socket、D-Bus）；条目使用可选路径语法，路径不存在时不影响启动，存在时仍不可访问。
 - 回退必须出现在 `BoundaryClaim.network_profile` 与证据 JSON 中；不得静默切换。
 - 两个分支都必须用真实 `connect()` 探针在目标主机上验证（默认分支与回退分支各一次），不得只凭文档假设；结果写入证据 JSON（§16.4）。
 - 每个任务不得单独选择 profile；同一主机同一时刻只使用一种。
@@ -933,9 +935,9 @@ Supervisor → root 助手: remove-sources <unit>；返回 handle + BoundaryClai
 | 令牌无效/过期 | 错误 MAC、过期 `exp` | `token_invalid` / `credential_expired` |
 | 凭据已撤销 | Supervisor 已撤销 `jti` | `credential_revoked` |
 | Grant 已撤销/过期 | 状态源返回 revoked/expired | `grant_revoked` / `grant_expired` |
-| 跨任务 | 令牌 `task_id` 与资源归属不一致 | `cross_task_denied` |
+| 跨任务（身份） | 令牌的 `task_id`/`grant_id`/`subject_id` 与实时 Grant 投影不一致 | `cross_task_denied` |
 | 能力不足 | `resource.write@1.0.0` 不在 allowed | `capability_not_granted` |
-| 范围外 | `res_synthetic_9999` 不在 `resource_ids` | `resource_scope_denied` |
+| 范围外 / 另一任务资源 | 资源 ID 不在本凭据/本 Grant 的 `resource_ids`（含另一任务的资源） | `resource_scope_denied` |
 | 资源不允许 | backend 允许清单外/非普通文件 | `resource_denied` |
 | 并发超限 | 每任务 >8 或全局 >64 个并发连接 | `busy` |
 | 速率超限 | 每任务 >16/s 或全局 >200/s | `rate_limited` |
@@ -1070,7 +1072,7 @@ Supervisor.cleanup(handle):
 | 15 | 经网关读允许资源 | `ok:true`，`resource_id` 匹配 | 允许路径 |
 | 16 | 过期凭据（TTL 2s 后调用） | `credential_expired` | `credential_expired` |
 | 17 | 撤销后调用 | `credential_revoked` | `credential_revoked` |
-| 18 | 跨任务资源 ID | `cross_task_denied` | `cross_task_denied` |
+| 18 | 凭据/Grant 身份不匹配（task/grant/subject）与另一任务的资源 ID | 身份不匹配 → `cross_task_denied`；另一任务的资源 ID 不在本凭据范围 → `resource_scope_denied` | `cross_task_denied` / `resource_scope_denied` |
 | 19 | 范围外资源 ID | `resource_scope_denied` | `resource_scope_denied` |
 | 20 | 未授予能力 | `capability_not_granted` | `capability_not_granted` |
 | 21 | Grant 撤销后网关调用（单元尚在停止中） | `grant_revoked` | `grant_revoked` |
@@ -1086,6 +1088,7 @@ Supervisor.cleanup(handle):
 - 第 22 项的时间上限包含 systemd 运行时检查粒度；断言使用 `≤8s`，避免把调度抖动误判为缺陷。
 - 第 12 项 `unshare` 的失败原因可能是 `RestrictNamespaces=yes` 或 `SystemCallFilter`；证据需记录 `errno` 原文。`namespace_denied` 只是证据 JSON 中的观测标签，不属于网关原因码集合。
 - 第 15 项成功后必须验证返回体**不含**其它资源内容。
+- 第 18 项区分两种拒绝：令牌/凭据身份（`task_id`/`grant_id`/`subject_id`）与实时 Grant 不一致才是 `cross_task_denied`；另一任务的资源 ID 属于资源范围判定，返回 `resource_scope_denied`，不要为它增加重复的资源归属检查。
 - 第 25/26 项验证 **per-task** 上限；全局上限（64 连接 / 200 req/s）由 `test_gateway.py` 的 fake clock/计数器覆盖，不在单机 live 矩阵中制造 64 个并发任务。两项都必须核对：超限响应后连接立即关闭，进程/文件描述符没有泄漏。
 
 ### 16.4 证据 JSON
