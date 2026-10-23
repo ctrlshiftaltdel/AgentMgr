@@ -33,7 +33,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, tzinfo
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 from app.security.boundary import (
     MAX_CPU_QUOTA_PERCENT,
@@ -44,6 +44,9 @@ from app.security.boundary import (
     MIN_MEMORY_MAX_MB,
     MIN_TASKS_MAX,
     MIN_TTL_SECONDS,
+    NETWORK_PROFILE_AF_UNIX_ONLY_FALLBACK,
+    NETWORK_PROFILE_PRIVATE_NETNS,
+    NETWORK_PROFILES,
     ManagedTaskSpec,
     RuntimeObservation,
     unit_name_for_task,
@@ -56,6 +59,7 @@ __all__ = [
     "DEFAULT_STATE_ROOT",
     "RUN_TIMEOUT_SECONDS",
     "HelperSystemdOps",
+    "NetworkProfile",
     "SudoSystemdOps",
     "SystemdOps",
     "SystemdUnitConfig",
@@ -86,16 +90,22 @@ _SHOW_PROPERTIES = (
     "ActiveEnterTimestamp,ExecMainStartTimestamp,ExecMainExitTimestamp"
 )
 
-#: Inaccessible control-plane/data paths (design §8.1).
-_INACCESSIBLE_PATHS: tuple[str, ...] = (
+#: Inaccessible control-plane/data paths common to both network profiles.
+_BASE_INACCESSIBLE_PATHS: tuple[str, ...] = (
     "/etc/agentmgr",
     "/var/lib/agentmgr",
     "/var/lib/postgresql",
     "/srv",
     "/opt",
+)
+
+#: Extra paths added only by the AF_UNIX-only fallback profile (design §8.4).
+_FALLBACK_INACCESSIBLE_PATHS: tuple[str, ...] = (
     "/run/systemd",
     "/run/dbus",
 )
+
+NetworkProfile = Literal["private_netns", "af_unix_only_fallback"]
 
 Runner = Callable[[list[str], str | None], subprocess.CompletedProcess[str]]
 
@@ -128,13 +138,19 @@ def _validated_path(value: object) -> Path:
 
 @dataclass(frozen=True, slots=True)
 class SystemdUnitConfig:
-    """Everything needed to start one unit, with no untrusted path field."""
+    """Everything needed to start one unit, with no untrusted path field.
+
+    ``network_profile`` selects design §8.4's default private netns or the
+    AF_UNIX-only fallback.  Both keep the same filesystem, capability and
+    syscall sandbox; only the network properties differ.
+    """
 
     unit: str
     spec: ManagedTaskSpec
     credential_source: Path
     workload_source: Path
     gateway_socket_source: Path
+    network_profile: NetworkProfile = NETWORK_PROFILE_PRIVATE_NETNS
 
     def __post_init__(self) -> None:
         unit = _validate_unit(self.unit)
@@ -142,6 +158,8 @@ class SystemdUnitConfig:
             raise SecurityError("invalid_spec", "spec_invalid")
         if unit_name_for_task(self.spec.task_id) != unit:
             raise SecurityError("invalid_spec", "unit_name_mismatch")
+        if self.network_profile not in NETWORK_PROFILES:
+            raise SecurityError("invalid_spec", "network_profile_invalid")
         _validated_path(self.credential_source)
         _validated_path(self.workload_source)
         _validated_path(self.gateway_socket_source)
@@ -179,6 +197,10 @@ def build_systemd_run_argv(config: SystemdUnitConfig) -> list[str]:
     credential = _validated_path(config.credential_source)
     workload = _validated_path(config.workload_source)
     gateway = _validated_path(config.gateway_socket_source)
+    private_netns = config.network_profile == NETWORK_PROFILE_PRIVATE_NETNS
+    inaccessible = [*_BASE_INACCESSIBLE_PATHS]
+    if config.network_profile == NETWORK_PROFILE_AF_UNIX_ONLY_FALLBACK:
+        inaccessible.extend(_FALLBACK_INACCESSIBLE_PATHS)
 
     properties = [
         "--property=DynamicUser=yes",
@@ -192,11 +214,11 @@ def build_systemd_run_argv(config: SystemdUnitConfig) -> list[str]:
         "--property=ProtectHome=yes",
         *(
             f"--property=InaccessiblePaths={path}"
-            for path in _INACCESSIBLE_PATHS
+            for path in inaccessible
         ),
         "--property=PrivateTmp=yes",
         "--property=PrivateDevices=yes",
-        "--property=PrivateNetwork=yes",
+        *(["--property=PrivateNetwork=yes"] if private_netns else []),
         "--property=RestrictAddressFamilies=AF_UNIX",
         "--property=IPAddressDeny=any",
         "--property=NoNewPrivileges=yes",

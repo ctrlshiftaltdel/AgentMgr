@@ -21,6 +21,7 @@ from app.security.boundary import ManagedTaskSpec, unit_name_for_task
 from app.security.errors import SecurityError
 from app.security.systemd import (
     HelperSystemdOps,
+    NetworkProfile,
     SudoSystemdOps,
     SystemdUnitConfig,
     build_systemctl_show_argv,
@@ -64,7 +65,12 @@ def _spec(**overrides: object) -> ManagedTaskSpec:
     return spec
 
 
-def _config(root: Path, *, spec: ManagedTaskSpec | None = None) -> SystemdUnitConfig:
+def _config(
+    root: Path,
+    *,
+    spec: ManagedTaskSpec | None = None,
+    network_profile: NetworkProfile = "private_netns",
+) -> SystemdUnitConfig:
     resolved = spec if spec is not None else _spec()
     unit = unit_name_for_task(resolved.task_id)
     return SystemdUnitConfig(
@@ -73,6 +79,7 @@ def _config(root: Path, *, spec: ManagedTaskSpec | None = None) -> SystemdUnitCo
         credential_source=root / "credentials" / f"{unit}.json",
         workload_source=root / "workload.py",
         gateway_socket_source=root / "gateway.sock",
+        network_profile=network_profile,
     )
 
 
@@ -98,6 +105,16 @@ def _expected_properties(config: SystemdUnitConfig) -> list[str]:
     credential = str(config.credential_source)
     gateway = str(config.gateway_socket_source)
     workload = str(config.workload_source)
+    inaccessible = [
+        "/etc/agentmgr",
+        "/var/lib/agentmgr",
+        "/var/lib/postgresql",
+        "/srv",
+        "/opt",
+    ]
+    private_netns = config.network_profile == "private_netns"
+    if not private_netns:
+        inaccessible.extend(["/run/systemd", "/run/dbus"])
     return [
         "--property=DynamicUser=yes",
         "--property=StateDirectory=agentmgr-exec/%N",
@@ -108,16 +125,13 @@ def _expected_properties(config: SystemdUnitConfig) -> list[str]:
         "--property=SendSIGKILL=yes",
         "--property=ProtectSystem=strict",
         "--property=ProtectHome=yes",
-        "--property=InaccessiblePaths=/etc/agentmgr",
-        "--property=InaccessiblePaths=/var/lib/agentmgr",
-        "--property=InaccessiblePaths=/var/lib/postgresql",
-        "--property=InaccessiblePaths=/srv",
-        "--property=InaccessiblePaths=/opt",
-        "--property=InaccessiblePaths=/run/systemd",
-        "--property=InaccessiblePaths=/run/dbus",
+        *(
+            f"--property=InaccessiblePaths={path}"
+            for path in inaccessible
+        ),
         "--property=PrivateTmp=yes",
         "--property=PrivateDevices=yes",
-        "--property=PrivateNetwork=yes",
+        *(["--property=PrivateNetwork=yes"] if private_netns else []),
         "--property=RestrictAddressFamilies=AF_UNIX",
         "--property=IPAddressDeny=any",
         "--property=NoNewPrivileges=yes",
@@ -151,19 +165,42 @@ def _expected_properties(config: SystemdUnitConfig) -> list[str]:
     ]
 
 
-def test_systemd_argv_exact_properties(tmp_path: Path) -> None:
-    config = _config(tmp_path / "run")
+@pytest.mark.parametrize(
+    "profile", ["private_netns", "af_unix_only_fallback"]
+)
+def test_systemd_argv_exact_properties(
+    tmp_path: Path, profile: NetworkProfile
+) -> None:
+    config = _config(tmp_path / "run", network_profile=profile)
 
     argv = build_systemd_run_argv(config)
 
     assert argv[0] == "systemd-run"
     assert f"--unit={UNIT}" in argv
     assert "--description=agentmgr-exec" in argv
-    assert [item for item in argv if item.startswith("--property=")] == (
-        _expected_properties(config)
-    )
+    properties = [item for item in argv if item.startswith("--property=")]
+    assert properties == _expected_properties(config)
+    if profile == "private_netns":
+        assert "--property=PrivateNetwork=yes" in properties
+        assert "--property=InaccessiblePaths=/run/systemd" not in properties
+        assert "--property=InaccessiblePaths=/run/dbus" not in properties
+    else:
+        assert "--property=PrivateNetwork=yes" not in properties
+        assert "--property=InaccessiblePaths=/run/systemd" in properties
+        assert "--property=InaccessiblePaths=/run/dbus" in properties
+        # The AF_UNIX-only fallback must keep the no-IP invariants.
+        assert "--property=RestrictAddressFamilies=AF_UNIX" in properties
+        assert "--property=IPAddressDeny=any" in properties
     # Fixed ExecStart, no shell and no caller-supplied command.
     assert argv[-2:] == ["/usr/bin/python3", "/workload.py"]
+
+
+def test_unknown_network_profile_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(SecurityError) as excinfo:
+        _config(tmp_path / "run", network_profile="open_netns")  # type: ignore[arg-type]
+
+    assert excinfo.value.code == "invalid_spec"
+    assert excinfo.value.detail == "network_profile_invalid"
 
 
 def test_argv_contains_no_user_string_command_or_shell(tmp_path: Path) -> None:
