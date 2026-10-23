@@ -1052,6 +1052,8 @@ Supervisor.cleanup(handle):
 
 ## 16. 测试计划
 
+> **Live evidence（2026-10-24）**：合成隔离基座已在 `4175a3da45a00ff2be79c5f467cedc714c9df6d4` 按 §16.3 真实运行并通过（32 passed，exit 0）；证据与剩余风险见[受控执行边界记录](managed-execution-boundary.md)。本文仍是设计基线；Hermes 与真实业务运行时未验证。
+
 ### 16.1 分层
 
 | 层 | 位置 | 数据库 | 默认运行 |
