@@ -1,6 +1,6 @@
 # 威胁模型（Phase 0，v1.0.0）
 
-- 状态：Phase 0 冻结候选；**本文件不声称任何缓解已实现或已实测**
+- 状态：Phase 0 冻结候选；**除 `docs/security/managed-execution-boundary.md` 记录的合成基座证据外，本文件不声称任何缓解已实现或已实测**
 - 契约版本：1.0.0（尚未冻结发布的候选版本）
 - 关联：Issue #77、[ADR-001](../architecture/ADR-001-product-boundary.md)、[governance-decision](../contracts/governance-decision.schema.json)、[task-envelope](../contracts/task-envelope.schema.json)、[execution-grant](../contracts/execution-grant.schema.json)、[runtime-adapter](../contracts/runtime-adapter.md)、[task-state-machine](../architecture/task-state-machine.md)
 

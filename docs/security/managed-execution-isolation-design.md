@@ -349,7 +349,7 @@ class BoundaryClaim:
 
 **`StateDirectory` 在 transient 单元中使用显式单元名。** `systemd-run -p` 不会展开 `%N`、`%i` 等 specifier；写成 `StateDirectory=agentmgr-exec/%N` 会在已批准测试机上创建一个字面目录 `/var/lib/private/agentmgr-exec/%N`，而 harness 查找的 `<unit>` 目录并不存在。因此 `build_systemd_run_argv` 渲染 `StateDirectory=agentmgr-exec/<unit>`（`<unit>` 已匹配 `^agentmgr-task-[0-9a-f]{12}$`）。单元文件模板不经过 `systemd-run -p`，可以继续使用模板自己的 `%i`（§8.5）。
 
-**`RemainAfterExit=yes` 保留成功退出的证据。** 普通 transient 单元退出后会被 systemd 回收，`systemctl show` 只剩 `LoadState=not-found`，`ExecMainExitTimestamp`/`Result` 随之丢失，导致 stop-on-revoke 无法证明停止。`RemainAfterExit=yes` 让成功退出的单元保留为 `active/exited`；failed/timeout 单元按 systemd 默认 GC 仍为 `failed` 并保持 loaded。**不设置 `CollectMode=`**：它的默认值 `inactive` 会在单元进入 inactive 时卸载单元，不能作为证据保留机制；显式写 `CollectMode=inactive` 与默认值等价，inactive 单元仍会被卸载。`ExitType=cgroup` 使 `MainPID=0`/`active/exited` 表示整个 cgroup 已为空。该保留行为待 Master 在已批准测试机上按 §16 重跑验证；清理时 `reset-failed` 对已回收单元必须视为 no-op。
+**`RemainAfterExit=yes` 保留成功退出的证据。** 普通 transient 单元退出后会被 systemd 回收，`systemctl show` 只剩 `LoadState=not-found`，`ExecMainExitTimestamp`/`Result` 随之丢失，导致 stop-on-revoke 无法证明停止。`RemainAfterExit=yes` 让成功退出的单元保留为 `active/exited`；failed/timeout 单元按 systemd 默认 GC 仍为 `failed` 并保持 loaded。**不设置 `CollectMode=`**：它的默认值 `inactive` 会在单元进入 inactive 时卸载单元，不能作为证据保留机制；显式写 `CollectMode=inactive` 与默认值等价，inactive 单元仍会被卸载。`ExitType=cgroup` 使 `MainPID=0`/`active/exited` 表示整个 cgroup 已为空。该保留行为已在 `4175a3d` 的合成基座 live run 中验证；见[受控执行边界记录](managed-execution-boundary.md)。清理时 `reset-failed` 对已回收单元必须视为 no-op。
 
 同一 profile 内的附加加固（不改变上表语义）：
 
@@ -1202,7 +1202,7 @@ Supervisor.cleanup(handle):
 
 **生产形态**：独立 `agentmgr-pep-gateway.service`（`python -m app.security.gateway`）是 **#83** 路径，必须接真实 Grant 存储的实时适配器；它不是本 MVP 的验证入口。
 
-**真实测试只有在所有者批准本文与实现后才运行；本轮未运行。**
+**真实测试只有在所有者批准后才可运行。** 本文档所属的设计基线轮次未运行 live 测试；合成隔离基座的 live 证据已在 `4175a3da45a00ff2be79c5f467cedc714c9df6d4` 执行，记录见[受控执行边界记录](managed-execution-boundary.md)。Hermes、模型供应商出口与真实业务的声明仍未验证。
 
 ## 17. 验收映射
 
