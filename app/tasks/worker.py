@@ -162,6 +162,7 @@ def claim_task(
     *,
     worker_id: str,
     actor: GovernancePrincipal | None = None,
+    execution_mode: str | None = None,
     lease_seconds: int = DEFAULT_LEASE_SECONDS,
     now: datetime | None = None,
 ) -> LeaseClaim | None:
@@ -172,6 +173,10 @@ def claim_task(
     unsatisfied ``blocks`` dependency are skipped.  Owner account status is
     re-read from the directory: a disabled/unbound owner is never claimed, it
     is escalated to ``needs_human`` with ``owner_escalation``.
+
+    ``execution_mode`` narrows the candidate scan to one mode so a dispatcher
+    only ever leases work it can execute.  ``None`` keeps the unfiltered scan
+    used by the generic worker pool.
     """
     timestamp = now or _utcnow()
     if not worker_id:
@@ -180,11 +185,17 @@ def claim_task(
             "worker_id is required",
             context={"field": "worker_id"},
         )
+    candidate_query = select(Task).where(Task.state == "queued")
+    if execution_mode is not None:
+        # The filter belongs in the locked scan, not after it: a different
+        # mode's older rows must not consume the bounded window and hide a
+        # claimable row of the requested mode.
+        candidate_query = candidate_query.where(
+            Task.execution_mode == execution_mode
+        )
     candidates = list(
         session.scalars(
-            select(Task)
-            .where(Task.state == "queued")
-            .order_by(Task.created_at, Task.id)
+            candidate_query.order_by(Task.created_at, Task.id)
             .limit(CLAIM_SCAN_LIMIT)
             .with_for_update(skip_locked=True)
         )
