@@ -87,6 +87,10 @@ def _timestamp(moment: datetime) -> str:
     return moment.astimezone(UTC).strftime("%a %Y-%m-%d %H:%M:%S UTC")
 
 
+def _timestamp_precise(moment: datetime) -> str:
+    return moment.astimezone(UTC).strftime("%a %Y-%m-%d %H:%M:%S.%f UTC")
+
+
 class FakeRunner:
     """Capture every argv/stdin pair and return a successful process."""
 
@@ -111,10 +115,10 @@ def _expected_properties(config: SystemdUnitConfig) -> list[str]:
         "/var/lib/postgresql",
         "/srv",
         "/opt",
+        "/run/systemd",
+        "/run/dbus",
     ]
     private_netns = config.network_profile == "private_netns"
-    if not private_netns:
-        inaccessible.extend(["/run/systemd", "/run/dbus"])
     return [
         "--property=DynamicUser=yes",
         "--property=StateDirectory=agentmgr-exec/%N",
@@ -180,14 +184,14 @@ def test_systemd_argv_exact_properties(
     assert "--description=agentmgr-exec" in argv
     properties = [item for item in argv if item.startswith("--property=")]
     assert properties == _expected_properties(config)
+    # Both profiles hide the host systemd private socket and D-Bus so the
+    # bound gateway socket remains the only AF_UNIX entry point.
+    assert "--property=InaccessiblePaths=/run/systemd" in properties
+    assert "--property=InaccessiblePaths=/run/dbus" in properties
     if profile == "private_netns":
         assert "--property=PrivateNetwork=yes" in properties
-        assert "--property=InaccessiblePaths=/run/systemd" not in properties
-        assert "--property=InaccessiblePaths=/run/dbus" not in properties
     else:
         assert "--property=PrivateNetwork=yes" not in properties
-        assert "--property=InaccessiblePaths=/run/systemd" in properties
-        assert "--property=InaccessiblePaths=/run/dbus" in properties
         # The AF_UNIX-only fallback must keep the no-IP invariants.
         assert "--property=RestrictAddressFamilies=AF_UNIX" in properties
         assert "--property=IPAddressDeny=any" in properties
@@ -389,7 +393,19 @@ def test_show_parser_and_state_table() -> None:
                 if key != "ExecMainExitTimestamp"
             },
             {"stop_requested_at": stop_at},
-            ("unknown", True, False, False),
+            ("unknown", False, False, False),
+        ),
+        (
+            {
+                "ActiveState": "inactive",
+                "SubState": "dead",
+                "MainPID": "0",
+                "Result": "success",
+                "ExecMainStatus": "0",
+                "LoadState": "loaded",
+            },
+            {},
+            ("unknown", False, False, False),
         ),
         (
             {
@@ -452,6 +468,19 @@ def test_show_parser_and_state_table() -> None:
                 "LoadState": "not-found",
             },
             {"had_start_evidence": True},
+            ("unknown", True, False, False),
+        ),
+        (
+            {
+                "ActiveState": "inactive",
+                "SubState": "dead",
+                "MainPID": "0",
+                "Result": "success",
+                "ExecMainStatus": "0",
+                "LoadState": "not-found",
+                "ExecMainStartTimestamp": _timestamp(NOW - timedelta(seconds=1)),
+            },
+            {},
             ("unknown", True, False, False),
         ),
         ({"ActiveState": "unknown", "LoadState": "loaded"}, {}, ("unknown", False, False, False)),
@@ -527,10 +556,108 @@ def test_missing_fields_do_not_claim_completion_or_stop() -> None:
     )
 
     assert observation.state == "unknown"
-    assert observation.process_gone is True
+    assert observation.process_gone is False
     assert observation.stop_confirmed is False
     assert observation.never_started is False
     assert observation.exec_main_status is None
+
+
+def test_loaded_unit_without_start_evidence_is_not_completed() -> None:
+    observation = observation_from_show(
+        {
+            "ActiveState": "inactive",
+            "SubState": "dead",
+            "MainPID": "0",
+            "Result": "success",
+            "ExecMainStatus": "0",
+            "LoadState": "loaded",
+        }
+    )
+
+    assert observation.state == "unknown"
+    assert observation.process_gone is False
+    assert observation.stop_confirmed is False
+    assert observation.never_started is False
+
+
+def test_same_second_whole_second_exit_is_ambiguous() -> None:
+    stop_at = NOW.replace(microsecond=100_000)
+    show = {
+        "ActiveState": "inactive",
+        "SubState": "dead",
+        "MainPID": "0",
+        "Result": "success",
+        "ExecMainStatus": "0",
+        "LoadState": "loaded",
+        "ExecMainExitTimestamp": _timestamp(stop_at),
+    }
+
+    observation = observation_from_show(show, stop_requested_at=stop_at)
+
+    assert observation.state == "unknown"
+    assert observation.process_gone is True
+    assert observation.stop_confirmed is False
+
+
+def test_same_second_precise_stop_first_is_cancelled() -> None:
+    stop_at = NOW.replace(microsecond=100_000)
+    show = {
+        "ActiveState": "inactive",
+        "SubState": "dead",
+        "MainPID": "0",
+        "Result": "success",
+        "ExecMainStatus": "0",
+        "LoadState": "loaded",
+        "ExecMainExitTimestamp": _timestamp_precise(
+            stop_at.replace(microsecond=200_000)
+        ),
+    }
+
+    observation = observation_from_show(show, stop_requested_at=stop_at)
+
+    assert observation.state == "cancelled"
+    assert observation.process_gone is True
+    assert observation.stop_confirmed is True
+
+
+def test_same_second_precise_natural_exit_is_completed() -> None:
+    stop_at = NOW.replace(microsecond=900_000)
+    show = {
+        "ActiveState": "inactive",
+        "SubState": "dead",
+        "MainPID": "0",
+        "Result": "success",
+        "ExecMainStatus": "0",
+        "LoadState": "loaded",
+        "ExecMainExitTimestamp": _timestamp_precise(
+            stop_at.replace(microsecond=100_000)
+        ),
+    }
+
+    observation = observation_from_show(show, stop_requested_at=stop_at)
+
+    assert observation.state == "completed"
+    assert observation.process_gone is True
+    assert observation.stop_confirmed is False
+
+
+def test_naive_stop_request_is_rejected() -> None:
+    show = {
+        "ActiveState": "inactive",
+        "MainPID": "0",
+        "Result": "success",
+        "ExecMainStatus": "0",
+        "LoadState": "loaded",
+        "ExecMainExitTimestamp": _timestamp(NOW),
+    }
+
+    with pytest.raises(SecurityError) as excinfo:
+        observation_from_show(
+            show, stop_requested_at=datetime(2026, 1, 1, 12, 0)
+        )
+
+    assert excinfo.value.code == "invalid_spec"
+    assert excinfo.value.detail == "stop_requested_invalid"
 
 
 def test_helper_ops_sends_stdin_and_never_token_argv(tmp_path: Path) -> None:
@@ -610,6 +737,71 @@ def test_sudo_ops_writes_root_only_sources_without_token_argv(
         ["sudo", "-n", *build_systemd_run_argv(config)],
         None,
     )
+
+
+def test_sudo_ops_discards_tee_echo_for_credential(tmp_path: Path) -> None:
+    class EchoingRunner:
+        def __init__(self) -> None:
+            self.records: list[subprocess.CompletedProcess[str]] = []
+
+        def __call__(
+            self, argv: list[str], input_text: str | None = None
+        ) -> subprocess.CompletedProcess[str]:
+            completed = subprocess.CompletedProcess(
+                argv, 0, input_text or "", ""
+            )
+            self.records.append(completed)
+            return completed
+
+    runner = EchoingRunner()
+    runtime = tmp_path / "run"
+    ops = SudoSystemdOps(
+        runner=runner,
+        runtime_root=runtime,
+        state_root=tmp_path / "state",
+        state_link_root=tmp_path / "state-link",
+    )
+    config = _config(runtime)
+
+    ops.launch(config, spec_text="{}", credential_text=TOKEN)
+
+    assert all(TOKEN not in (record.stdout or "") for record in runner.records)
+
+
+def test_runner_failure_does_not_chain_token_or_paths(
+    tmp_path: Path,
+) -> None:
+    runtime = tmp_path / "run"
+    config = _config(runtime)
+    spec_text = json.dumps(config.spec.as_dict(), sort_keys=True)
+
+    class FailingRunner:
+        def __call__(
+            self, argv: list[str], input_text: str | None = None
+        ) -> subprocess.CompletedProcess[str]:
+            raise subprocess.CalledProcessError(
+                1,
+                argv,
+                output=TOKEN,
+                stderr=f"tee failed {TOKEN} {argv[-1]}",
+            )
+
+    ops = SudoSystemdOps(
+        runner=FailingRunner(),
+        runtime_root=runtime,
+        state_root=tmp_path / "state",
+        state_link_root=tmp_path / "state-link",
+    )
+
+    with pytest.raises(SecurityError) as excinfo:
+        ops.launch(config, spec_text=spec_text, credential_text=TOKEN)
+
+    error = excinfo.value
+    assert TOKEN not in str(error)
+    assert str(runtime) not in str(error)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert error.__suppress_context__ is True
 
 
 def test_sudo_ops_uses_fixed_systemctl_argv(tmp_path: Path) -> None:

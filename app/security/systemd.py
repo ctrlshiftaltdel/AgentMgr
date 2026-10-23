@@ -44,7 +44,6 @@ from app.security.boundary import (
     MIN_MEMORY_MAX_MB,
     MIN_TASKS_MAX,
     MIN_TTL_SECONDS,
-    NETWORK_PROFILE_AF_UNIX_ONLY_FALLBACK,
     NETWORK_PROFILE_PRIVATE_NETNS,
     NETWORK_PROFILES,
     ManagedTaskSpec,
@@ -91,16 +90,14 @@ _SHOW_PROPERTIES = (
 )
 
 #: Inaccessible control-plane/data paths common to both network profiles.
+#: ``/run/systemd`` and ``/run/dbus`` close the host systemd private socket and
+#: D-Bus to ``AF_UNIX`` connects in both profiles (design §8.1/§15.1).
 _BASE_INACCESSIBLE_PATHS: tuple[str, ...] = (
     "/etc/agentmgr",
     "/var/lib/agentmgr",
     "/var/lib/postgresql",
     "/srv",
     "/opt",
-)
-
-#: Extra paths added only by the AF_UNIX-only fallback profile (design §8.4).
-_FALLBACK_INACCESSIBLE_PATHS: tuple[str, ...] = (
     "/run/systemd",
     "/run/dbus",
 )
@@ -199,8 +196,6 @@ def build_systemd_run_argv(config: SystemdUnitConfig) -> list[str]:
     gateway = _validated_path(config.gateway_socket_source)
     private_netns = config.network_profile == NETWORK_PROFILE_PRIVATE_NETNS
     inaccessible = [*_BASE_INACCESSIBLE_PATHS]
-    if config.network_profile == NETWORK_PROFILE_AF_UNIX_ONLY_FALLBACK:
-        inaccessible.extend(_FALLBACK_INACCESSIBLE_PATHS)
 
     properties = [
         "--property=DynamicUser=yes",
@@ -405,6 +400,14 @@ def observation_from_show(
     if not isinstance(show, Mapping):
         raise ValueError("show must be a mapping")
 
+    if stop_requested_at is not None:
+        if (
+            not isinstance(stop_requested_at, datetime)
+            or stop_requested_at.utcoffset() is None
+        ):
+            raise SecurityError("invalid_spec", "stop_requested_invalid")
+        stop_requested_at = stop_requested_at.astimezone(UTC)
+
     active_state = _text(show, "ActiveState")
     load_state = _text(show, "LoadState")
     result = _text(show, "Result") or "unknown"
@@ -412,8 +415,19 @@ def observation_from_show(
     main_pid = main_pid_value if main_pid_value is not None else 0
     exec_main_status = _int_or_none(_text(show, "ExecMainStatus"))
 
+    exit_text = _text(show, "ExecMainExitTimestamp")
+    exit_at = parse_systemd_timestamp(exit_text)
+    start_evidence = had_start_evidence or any(
+        moment is not None
+        for moment in (
+            parse_systemd_timestamp(_text(show, "ActiveEnterTimestamp")),
+            parse_systemd_timestamp(_text(show, "ExecMainStartTimestamp")),
+            exit_at,
+        )
+    )
+
     if load_state == "not-found":
-        if had_start_evidence:
+        if start_evidence:
             return _observation(
                 "unknown", True, False, False, main_pid, result, exec_main_status
             )
@@ -439,15 +453,13 @@ def observation_from_show(
             "unknown", False, False, False, main_pid, result, exec_main_status
         )
 
-    # The unit is gone.  The remaining question is *why* it ended, which uses
-    # the exit timestamp only to order a requested stop against a natural end.
-    exit_at = parse_systemd_timestamp(_text(show, "ExecMainExitTimestamp"))
-    natural_end = (
-        exit_at is not None
-        and stop_requested_at is not None
-        and exit_at < stop_requested_at
-    )
-    stop_observed = stop_requested_at is not None and not natural_end
+    # An inactive/dead unit with no start or exit timestamp is indistinguishable
+    # from a unit that never started; do not claim it ran (and do not report
+    # ``not_started`` for a loaded unit).
+    if not start_evidence:
+        return _observation(
+            "unknown", False, False, False, main_pid, result, exec_main_status
+        )
 
     if result == "timeout":
         return _observation(
@@ -461,6 +473,31 @@ def observation_from_show(
         return _observation(
             "unknown", True, False, False, main_pid, result, exec_main_status
         )
+
+    ambiguous = False
+    if stop_requested_at is not None and exit_at is not None:
+        same_second = exit_at.replace(microsecond=0) == stop_requested_at.replace(
+            microsecond=0
+        )
+        # Classic systemd timestamps are whole-second.  If the stop landed in
+        # that same second, the true order is unknowable; an exact tie is
+        # equally ambiguous.  Never guess either way.
+        exit_has_subsecond = "." in exit_text
+        ambiguous = same_second and (
+            not exit_has_subsecond or exit_at == stop_requested_at
+        )
+
+    if ambiguous:
+        return _observation(
+            "unknown", True, False, False, main_pid, result, exec_main_status
+        )
+
+    natural_end = (
+        exit_at is not None
+        and stop_requested_at is not None
+        and exit_at < stop_requested_at
+    )
+    stop_observed = stop_requested_at is not None and not natural_end
 
     if result == "success" and active_state == "inactive":
         if exec_main_status == 0:
@@ -523,20 +560,30 @@ def _invoke(
     code: str,
     detail: str,
 ) -> subprocess.CompletedProcess[str]:
-    """Run through ``runner`` and translate failures into stable errors."""
+    """Run through ``runner`` and translate failures into stable errors.
 
+    The original exception is deliberately **not** chained: ``CalledProcessError``
+    and ``TimeoutExpired`` carry ``cmd``/``stdout``/``stderr``, which can contain
+    root paths and (for ``tee``) the echoed credential.  The raise happens after
+    the ``except`` block so neither ``__cause__`` nor ``__context__`` retains it.
+    """
+
+    failure: tuple[str, str] | None = None
+    completed: subprocess.CompletedProcess[str] | None = None
     try:
         completed = runner(argv, input_text)
-    except subprocess.TimeoutExpired as exc:
-        raise SecurityError("timeout", "command_timeout") from exc
-    except subprocess.CalledProcessError as exc:
-        raise SecurityError(code, detail) from exc
-    except OSError as exc:
-        raise SecurityError("unknown", "command_unavailable") from exc
+    except subprocess.TimeoutExpired:
+        failure = ("timeout", "command_timeout")
+    except subprocess.CalledProcessError:
+        failure = (code, detail)
+    except OSError:
+        failure = ("unknown", "command_unavailable")
+    if failure is not None:
+        raise SecurityError(*failure) from None
     if not isinstance(completed, subprocess.CompletedProcess):
         raise SecurityError("unknown", "command_invalid")
     if completed.returncode != 0:
-        raise SecurityError(code, detail)
+        raise SecurityError(code, detail) from None
     return completed
 
 
@@ -602,13 +649,17 @@ class SudoSystemdOps:
         return self._runtime_root / "specs"
 
     def _write_source(self, path: Path, text: str, detail: str) -> None:
-        _invoke(
+        completed = _invoke(
             self._runner,
             ["sudo", "-n", "tee", "--", str(path)],
             text,
             code="privilege_required",
             detail=detail,
         )
+        # ``tee`` echoes its stdin to stdout; for credential writes that is the
+        # token.  Never retain it beyond this call.
+        completed.stdout = ""
+        completed.stderr = ""
         _invoke(
             self._runner,
             ["sudo", "-n", "chmod", "600", "--", str(path)],
