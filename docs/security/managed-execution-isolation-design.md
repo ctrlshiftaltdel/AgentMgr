@@ -785,7 +785,7 @@ class ResourceBackend(Protocol):
 3. 轮询 `inspect` 直到取得退出证据（`ActiveState=active` 且 `SubState=exited` 且有 `ExecMainExitTimestamp`，或 `ActiveState ∈ {inactive, failed}` 且 `MainPID=0`），上限 **10s**；
 4. 若进程仍在运行：调用 `systemctl kill --signal=SIGKILL --kill-whom=all <unit>`，再轮询 3s；
 5. 仍无退出证据 → 返回 `unit_stop_unconfirmed`（`process_gone=false`、`stop_confirmed=false`），写 `security.exec.supervisor.stop_unconfirmed` 审计并告警；**不得**报告已停止；
-6. 取得证据后调用 `stop <unit>`（`systemctl stop`）结束保留的 `active/exited` unit，再进入 cleanup；
+6. 取得证据后返回 stop 结果；保留的 `active/exited` unit 由随后的 `cleanup` 第 2 步 `systemctl stop` 收集，**不在取证前调用 `stop`**；
 7. 写 stop 审计（含 `process_gone=true`、`stop_confirmed=true`、`Result`、`ExecMainStatus`）。
 
 `cleanup(handle)`：
@@ -802,11 +802,11 @@ class ResourceBackend(Protocol):
 
 | 竞态 | 处理 |
 |---|---|
-| 完成 vs 停止 | 以最终 `Result`/`ExecMainStatus` 与时间戳为准：`Result=success` 且 `ExecMainStatus=0` 且退出早于停止请求 → 保持 `completed`（`process_gone=true`、`stop_confirmed=false`），`systemctl stop` 视为幂等空操作；不得把自然完成降级为 `cancelled` |
-| 停止请求与自然完成竞争 | 用 `ExecMainExitTimestamp` 与停止请求时间排序：退出早于请求 → `completed`（`stop_confirmed=false`）；请求早于退出 → `cancelled`（`process_gone=true`、`stop_confirmed=true`）。不得仅凭“发过 stop 请求”声明停止成功，也不得把已确认的停止降级为自然完成 |
+| 完成 vs 停止 | 以最终 `Result`/`ExecMainStatus` 与时间戳为准：`Result=success` 且 `ExecMainStatus=0` 且退出早于终止请求 → 保持 `completed`（`process_gone=true`、`stop_confirmed=false`）；`terminate`/`kill` 不改变已取得的 `completed` 证据，保留的 `active/exited` unit 由 `cleanup` 的 `systemctl stop` 收集；不得把自然完成降级为 `cancelled` |
+| 停止请求与自然完成竞争 | 用 `ExecMainExitTimestamp` 与 `terminate` 请求时间排序：退出早于请求 → `completed`（`stop_confirmed=false`）；请求早于退出 → `cancelled`（`process_gone=true`、`stop_confirmed=true`）。不得仅凭“发过 `terminate` 请求”声明停止成功，也不得把已确认的停止降级为自然完成 |
 | 凭据撤销写失败 | 写失败重试一次；launch 阶段失败则**不启动**（返回 `unknown`）；stop 阶段失败仍继续停止，标记 `credential_revoke_failed`，告警，且网关对 `GrantStatusProvider` 的实时检查仍会拒绝 |
 | 撤销存储与 Grant 状态源均不可用 | 网关拒绝全部调用（`unknown`），触发告警 |
-| `systemd-run` 超时 | 视为“可能已启动”：`inspect` 确认；存在则 stop + 取证，不存在（`LoadState=not-found` 且无时间戳）才返回 `unit_start_failed` |
+| `systemd-run` 超时 | 视为“可能已启动”：`inspect` 确认；存在则终止并返回 `unit_start_failed`/`unknown`，不签发“已隔离”声明；不存在（`LoadState=not-found` 且无时间戳）才返回 `unit_start_failed` |
 | 单元启动失败（属性不支持） | `inspect` 读取 `Result`/`ExecMainStatus`，返回 `unit_start_failed`，不签发“已隔离”声明，不重试降级 |
 | 单元名冲突 | `invalid_spec`（`unit_name_collision`），不覆盖已有单元 |
 
@@ -973,7 +973,7 @@ Supervisor → RevocationStore.revoke(jti)
 Supervisor → 助手 terminate → systemctl kill --signal=SIGTERM --kill-whom=all
 Supervisor → systemctl show: active/exited + ExecMainExitTimestamp（或 inactive/failed 且 MainPID=0）→ process_gone=true
 Supervisor → 已发起 terminate 且有上述证据 → stop_confirmed=true
-Supervisor → 助手 stop → systemctl stop（结束保留的 active/exited unit）
+Supervisor → cleanup → 助手 stop → systemctl stop（收集保留的 active/exited unit）
 Supervisor → 审计 stop + 告警（如涉及 unconfirmed）
 Supervisor → cleanup（process_gone=true）: reset-failed（not-found no-op）+ 删除状态目录
 ```

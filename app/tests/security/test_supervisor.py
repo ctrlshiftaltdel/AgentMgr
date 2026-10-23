@@ -234,6 +234,21 @@ def _show_completed(exit_at: datetime) -> dict[str, str]:
     )
 
 
+def _show_active_exited(exit_at: datetime) -> dict[str, str]:
+    """A successfully finished unit retained by ``RemainAfterExit=yes``."""
+
+    return _show(
+        active_state="active",
+        sub_state="exited",
+        main_pid="0",
+        result="success",
+        exec_main_status="0",
+        enter=NOW - timedelta(seconds=2),
+        start=NOW - timedelta(seconds=2),
+        exit=exit_at,
+    )
+
+
 def _show_failed(exit_at: datetime) -> dict[str, str]:
     return _show(
         active_state="failed",
@@ -291,11 +306,13 @@ class FakeOps:
         self.spec_texts: list[str] = []
         self.credentials: list[str] = []
         self.stop_calls: list[str] = []
+        self.terminate_calls: list[str] = []
         self.kill_calls: list[str] = []
         self.show_calls: list[str] = []
         self.reset_failed_calls: list[str] = []
         self.remove_sources_calls: list[str] = []
         self.cleanup_calls: list[str] = []
+        self.cleaned = False
         self.show_plan: list[Mapping[str, str] | Exception] = []
         self.default_show: Mapping[str, str] = _show_not_found()
         self.show_hook: Callable[[], None] | None = None
@@ -303,6 +320,7 @@ class FakeOps:
         self.launch_error: Exception | None = None
         self.launch_error_with_token = False
         self.stop_error: Exception | None = None
+        self.terminate_error: Exception | None = None
 
     def launch(self, config: object, *, spec_text: str, credential_text: str) -> None:
         self.launch_calls.append(config)
@@ -317,6 +335,11 @@ class FakeOps:
         self.stop_calls.append(unit)
         if self.stop_error is not None:
             raise self.stop_error
+
+    def terminate(self, unit: str) -> None:
+        self.terminate_calls.append(unit)
+        if self.terminate_error is not None:
+            raise self.terminate_error
 
     def kill(self, unit: str) -> None:
         self.kill_calls.append(unit)
@@ -342,6 +365,7 @@ class FakeOps:
 
     def cleanup(self, unit: str) -> None:
         self.cleanup_calls.append(unit)
+        self.cleaned = True
 
 
 class FakeProvider:
@@ -597,6 +621,13 @@ def test_launch_start_timeout_with_unit_present_stops_and_returns_unknown(
             False,
         ),
         (
+            _show_active_exited(NOW - timedelta(seconds=1)),
+            "completed",
+            True,
+            False,
+            False,
+        ),
+        (
             _show_timed_out(NOW - timedelta(seconds=1)),
             "timed_out",
             True,
@@ -641,6 +672,7 @@ def test_check_and_stop_keeps_running_while_grant_active(tmp_path: Path) -> None
 
     assert observation.state == "running"
     assert harness.revocation.lookup(handle.jti) is None
+    assert ops.terminate_calls == []
     assert ops.stop_calls == []
 
 
@@ -652,8 +684,8 @@ def test_grant_revoke_stops_and_confirms(tmp_path: Path) -> None:
     handle = harness.supervisor.launch(_spec())
 
     harness.provider.grant = _grant(status="revoked")
-    ops.show_plan = [_show_completed(NOW + timedelta(seconds=1))]
-    ops.default_show = _show_completed(NOW + timedelta(seconds=1))
+    ops.show_plan = [_show_active_exited(NOW + timedelta(seconds=1))]
+    ops.default_show = _show_active_exited(NOW + timedelta(seconds=1))
 
     observation = harness.supervisor.check_and_stop(handle)
 
@@ -661,7 +693,8 @@ def test_grant_revoke_stops_and_confirms(tmp_path: Path) -> None:
     assert observation.process_gone is True
     assert observation.stop_confirmed is True
     assert observation.never_started is False
-    assert ops.stop_calls == [UNIT]
+    assert ops.terminate_calls == [UNIT]
+    assert ops.stop_calls == []
 
     record = harness.revocation.lookup(handle.jti)
     assert record is not None
@@ -693,7 +726,8 @@ def test_natural_completion_race_keeps_completed(tmp_path: Path) -> None:
     # A second stop is an idempotent no-op and must not downgrade the evidence.
     second = harness.supervisor.stop(handle, "grant_revoked")
     assert second == first
-    assert len(ops.stop_calls) == 2
+    assert len(ops.terminate_calls) == 2
+    assert ops.stop_calls == []
 
     record = harness.revocation.lookup(handle.jti)
     assert record is not None
@@ -732,7 +766,8 @@ def test_stop_continues_when_revocation_write_fails(tmp_path: Path) -> None:
 
     assert result.process_gone is True
     assert result.stop_confirmed is True
-    assert ops.stop_calls == [UNIT]
+    assert ops.terminate_calls == [UNIT]
+    assert ops.stop_calls == []
     # Design §11.5: one retry, then continue stopping and flag the audit.
     assert len(store.revoke_calls) == 2
 
@@ -757,13 +792,37 @@ def test_stop_timeout_unconfirmed_does_not_cleanup(tmp_path: Path) -> None:
     assert result.result == "unit_stop_unconfirmed"
     assert result.process_gone is False
     assert result.stop_confirmed is False
+    assert ops.terminate_calls == [UNIT]
     assert ops.kill_calls == [UNIT]
+    assert ops.stop_calls == []
 
     with pytest.raises(SecurityError) as caught:
         harness.supervisor.cleanup(handle)
     assert caught.value.code == "unit_stop_unconfirmed"
     assert ops.cleanup_calls == []
     assert ops.reset_failed_calls == []
+
+
+def test_stop_uses_terminate_and_preserves_exit_evidence(tmp_path: Path) -> None:
+    ops = FakeOps()
+    ops.show_plan = [_show_not_found(), _show_active()]
+    ops.default_show = _show_active()
+    harness = _build(tmp_path, ops=ops)
+    handle = harness.supervisor.launch(_spec())
+
+    # RemainAfterExit keeps a SIGTERM'd unit loaded as active/exited; the
+    # supervisor reads that evidence instead of collecting it with stop.
+    ops.default_show = _show_active_exited(NOW + timedelta(seconds=1))
+
+    result = harness.supervisor.stop(handle, "manual_stop")
+
+    assert result.stop_confirmed is True
+    assert result.result == "cancelled"
+    assert ops.terminate_calls == [UNIT]
+    assert ops.stop_calls == []
+    assert ops.kill_calls == []
+    assert ops.cleanup_calls == []
+    assert ops.cleaned is False
 
 
 def test_cleanup_requires_process_gone_or_never_started(tmp_path: Path) -> None:
@@ -777,7 +836,7 @@ def test_cleanup_requires_process_gone_or_never_started(tmp_path: Path) -> None:
     assert refused_ops.cleanup_calls == []
 
     completed_ops = FakeOps()
-    completed_ops.default_show = _show_completed(NOW - timedelta(seconds=1))
+    completed_ops.default_show = _show_active_exited(NOW - timedelta(seconds=1))
     completed = _build(tmp_path, ops=completed_ops)
 
     result = completed.supervisor.cleanup(_handle())
@@ -785,6 +844,9 @@ def test_cleanup_requires_process_gone_or_never_started(tmp_path: Path) -> None:
     assert result.state_dir_removed is True
     assert result.credential_removed is True
     assert completed_ops.cleanup_calls == [UNIT]
+    assert completed_ops.cleaned is True
+    assert completed_ops.stop_calls == []
+    assert completed_ops.terminate_calls == []
     assert any(
         event["event"] == AUDIT_EVENT_CLEANUP for event in completed.sink.events
     )
@@ -976,7 +1038,8 @@ def test_check_and_stop_stops_revoked_grant_when_show_fails(
 
     assert observation.state == "unknown"
     assert observation.process_gone is False
-    assert ops.stop_calls == [UNIT]
+    assert ops.terminate_calls == [UNIT]
+    assert ops.stop_calls == []
     record = harness.revocation.lookup(handle.jti)
     assert record is not None
     assert record.reason == "grant_revoked"
@@ -1011,7 +1074,9 @@ def test_failed_stop_command_does_not_confirm_cancelled(tmp_path: Path) -> None:
     harness = _build(tmp_path, ops=ops)
     handle = harness.supervisor.launch(_spec())
 
-    ops.stop_error = SecurityError("unit_stop_unconfirmed", "stop_failed")
+    ops.terminate_error = SecurityError(
+        "unit_stop_unconfirmed", "terminate_failed"
+    )
     ops.default_show = _show_completed(NOW + timedelta(seconds=1))
 
     result = harness.supervisor.stop(handle, "manual_stop")
@@ -1033,7 +1098,9 @@ def test_failed_stop_command_keeps_timeout_confirmed(tmp_path: Path) -> None:
     harness = _build(tmp_path, ops=ops)
     handle = harness.supervisor.launch(_spec())
 
-    ops.stop_error = SecurityError("unit_stop_unconfirmed", "stop_failed")
+    ops.terminate_error = SecurityError(
+        "unit_stop_unconfirmed", "terminate_failed"
+    )
     ops.default_show = _show_timed_out(NOW + timedelta(seconds=1))
 
     result = harness.supervisor.stop(handle, "manual_stop")
@@ -1104,5 +1171,6 @@ def test_launch_audit_failure_stops_and_sets_marker(tmp_path: Path) -> None:
 
     assert caught.value.code == "unknown"
     assert caught.value.detail == "audit_unavailable"
-    assert ops.stop_calls == [UNIT]
+    assert ops.terminate_calls == [UNIT]
+    assert ops.stop_calls == []
     assert harness.supervisor.last_audit_failed is True

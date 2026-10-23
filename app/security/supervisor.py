@@ -207,6 +207,7 @@ class ManagedExecutionSupervisor:
         for attribute, owner in (
             ("launch", ops),
             ("stop", ops),
+            ("terminate", ops),
             ("kill", ops),
             ("show", ops),
             ("reset_failed", ops),
@@ -610,18 +611,23 @@ class ManagedExecutionSupervisor:
             raise SecurityError("invalid_spec", "stop_reason_invalid")
 
         # Revocation can be slow; the stop dispatch time is captured only
-        # immediately before the stop command so exit ordering is not skewed.
+        # immediately before the terminate request so exit ordering is not
+        # skewed.
         revoked_at = self._now()
         revoked = self._revoke(handle, reason, revoked_at)
         dispatch_at = self._now()
 
-        stop_failed = False
+        terminate_failed = False
         try:
-            self._ops.stop(unit)
+            # SIGTERM to the whole cgroup; the unit may remain loaded as
+            # active/exited so its exit evidence can be read.  Collection is
+            # left to ops.cleanup after evidence is captured.
+            self._ops.terminate(unit)
         except Exception:
-            # The evidence loop below decides the outcome; a failed stop
-            # command is not proof that the process is still running.
-            stop_failed = True
+            # The evidence loop below decides the outcome; a failed terminate
+            # request is not proof that the process is still running.  Do not
+            # issue the collecting stop before reading evidence.
+            terminate_failed = True
 
         observation: RuntimeObservation | None = None
         deadline = self._monotonic() + STOP_TIMEOUT_SECONDS
@@ -655,9 +661,10 @@ class ManagedExecutionSupervisor:
         if observation.process_gone:
             stop_confirmed = observation.stop_confirmed
             result_name = observation.state
-            if stop_failed and result_name == "cancelled":
-                # A failed stop command must not be reported as a confirmed
-                # cancellation.  Genuine timeout evidence keeps ``timed_out``.
+            if terminate_failed and result_name == "cancelled":
+                # A failed terminate request must not be reported as a
+                # confirmed cancellation.  Genuine timeout evidence keeps
+                # ``timed_out``.
                 stop_confirmed = False
                 result_name = "unknown"
             result = StopResult(
@@ -691,7 +698,7 @@ class ManagedExecutionSupervisor:
             "stop_confirmed": result.stop_confirmed,
             "never_started": observation.never_started,
             "credential_revoke_failed": not revoked,
-            "stop_command_failed": stop_failed,
+            "stop_command_failed": terminate_failed,
         }
         if result.exec_main_status is not None:
             event["exec_main_status"] = result.exec_main_status

@@ -122,8 +122,9 @@ exited unit remains loaded as `active/exited` until the supervisor reads
 systemd's default GC. `ExitType=cgroup` makes `MainPID=0`/`active-exited` mean
 the whole cgroup is empty. `CollectMode` is left at its default (`inactive`);
 it is not a retention mechanism and inactive units are still unloaded. The
-supervisor then uses `stop`/`cleanup`, and `reset-failed` on a collected
-(`LoadState=not-found`) unit is a no-op.
+supervisor requests SIGTERM with `terminate`, reads the exit evidence, and
+leaves collection to `cleanup` (whose `stop` handles a loaded `active/exited`
+unit); `reset-failed` on a collected (`LoadState=not-found`) unit is a no-op.
 
 Unit names must match `^agentmgr-task-[0-9a-f]{12}$`. The unit is re-derived
 from the validated task ID, so a client cannot select an arbitrary unit. The
