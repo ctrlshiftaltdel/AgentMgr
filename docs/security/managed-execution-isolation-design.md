@@ -95,9 +95,9 @@
 
 | #82 验收条目 | 本基座对应机制 | 证据状态 |
 |---|---|---|
-| 受控 Agent 无法读取其他主体的凭据或访问未授权资源 | 独立 UID、StateDirectory 0700、凭据目录 0700 且仅 `LoadCredential` 读取、网关 token/scope/cross-task 校验 | planned / not run |
+| 受控 Agent 无法读取其他主体的凭据或访问未授权资源 | 独立 UID、StateDirectory 0700、凭据目录 `root:root 0700` 且仅 `LoadCredential` 读取、网关 token/scope/cross-task 校验 | planned / not run |
 | Grant 到期或撤销后，后续受控调用失败 | 凭据 `exp = min(provider.expires_at, iat + ttl_seconds)` 且 `exp - iat ≤ 300`；网关每次调用实时读取撤销存储与 `GrantStatusProvider`（无缓存）；Supervisor 停止单元并验证 `process_gone` | planned / not run |
-| 绕行测试有真实命令、退出码和证据 | §16 的负向矩阵、`verify_isolation.sh`、证据 JSON | planned / not run |
+| 绕行测试有真实命令、退出码和证据 | §16 的负向矩阵、`verify_isolation.sh`（环境检查）+ `verify_isolation.py`（同进程 harness）、证据 JSON | planned / not run |
 | 无法强制治理的能力有明确风险记录与产品声明限制 | §4、§15、§17 | 本文（设计层）；运行证据 planned |
 
 ## 6. 架构
@@ -106,13 +106,14 @@
 
 | 组件 | 计划路径 | 职责 | 信任级别 |
 |---|---|---|---|
-| Controller / Supervisor | `app/security/supervisor.py` | 校验 spec、解析 Grant 状态、签发凭据、调用特权助手启停单元、轮询与停止确认、清理 | 受信（与网关同进程或同宿主） |
+| Controller / Supervisor | `app/security/supervisor.py` | 校验 spec、解析 Grant 状态、签发凭据、调用特权助手启停单元、轮询与停止确认、清理 | 受信（MVP 与网关同进程） |
 | Spec / 边界模型 | `app/security/boundary.py` | `ManagedTaskSpec`、`BoundaryClaim`、单元名派生、路径与限额校验 | 受信 |
 | 凭据签发/校验 | `app/security/credentials.py` | `agx1` 令牌、HMAC-SHA256、kid 轮换、`RevocationStore`、`GrantStatusProvider` | 受信（密钥只在控制器内存/受限环境） |
-| PEP 网关 | `app/security/gateway.py` | Unix socket 上的 NDJSON 请求处理、令牌与 Grant 校验、能力/范围/跨任务判定、`FileResourceBackend`、审计 | 受信边界 B3 |
+| PEP 网关 | `app/security/gateway.py` | Unix socket 上的 NDJSON 请求处理、令牌与 Grant 校验、能力/范围/跨任务判定、`FileResourceBackend`、审计 | 受信边界 B3（MVP 为同进程线程内 server；独立服务属生产/#83） |
+| 验证 harness | `ops/security/verify_isolation.py` | 在**同一进程**启动网关线程、注入内存实时 `GrantStatusProvider`、驱动 §16.3 探针、写出证据 JSON | 受信（仅测试机实现阶段） |
 | systemd 适配 | `app/security/systemd.py` | 生成 `systemd-run`/`systemctl` 参数、解析 `systemctl show` 证据、状态映射 | 受信 |
 | 错误码 | `app/security/errors.py` | 稳定错误码与安全错误消息（无内部路径/密钥） | 受信 |
-| 特权助手（生产模板） | `ops/security/agentmgr-exec` | 唯一允许 root 执行的窄接口：`launch/stop/inspect/cleanup` | root，参数强校验 |
+| 特权助手（生产模板） | `ops/security/agentmgr-exec` | 唯一允许 root 执行的窄接口：`launch/remove-sources/stop/inspect/cleanup` | root，参数强校验 |
 | 合成负载 | `ops/security/smoke_workload.py` | 只读凭据、发起允许/拒绝调用、执行负向探针、退出码编码结果 | **不受信（任务代码）** |
 
 关系说明（避免与现有 PEP 混淆）：
@@ -124,18 +125,20 @@
 ### 6.2 文本架构图
 
 ```
-                       ┌──────────────────────────── 受信域（controller） ───────────────────────────┐
+                       ┌──────────────────────── 受信域（controller，MVP 同进程） ─────────────────────┐
                        │                                                                          │
   ManagedTaskSpec ───► │  Supervisor ──► BoundaryValidator ──► UnitName(agentmgr-task-<12hex>)     │
   (JSON, strict)       │      │                    │                                             │
-                       │      │                    └──► /run/agentmgr-exec/specs/<unit>.json      │
+                       │      │                    └──► root helper 写 specs/<unit>.json（0700 目录）│
                        │      ▼                                                                  │
-  GrantStatusProvider ─┤  CredentialIssuer ──► token(agx1) ──► /run/agentmgr-exec/credentials/   │
+  GrantStatusProvider ─┤  CredentialIssuer ──► token(agx1) ──► root helper 写 credentials/       │
   (live, no cache)     │      │                                <unit>.json (0600, 启动后删除)     │
                        │      ▼                                                                  │
-                       │  RevocationStore (memory + /run/agentmgr-exec/revoked/<jti>.json)        │
+                       │  RevocationStore (MVP: memory; file store 供 #83 跨进程)                  │
                        │      ▲                                                                  │
-                       │  PEP Gateway  ◄──── NDJSON over /run/agentmgr-exec/gateway.sock (0666)   │
+                       │  PEP Gateway (MVP: 同进程 harness 线程)                                  │
+                       │      ◄── NDJSON over /run/agentmgr-exec/gateway.sock                     │
+                       │          (0666 MVP test; socket mode 不授权，token 才授权)                │
                        │      │                                                                  │
                        │      └──► FileResourceBackend (/srv/agentmgr-exec-resources, 只读)       │
                        │                                                                          │
@@ -161,16 +164,26 @@
 
 | 路径 | 宿主属主/权限 | 单元内可见性 | 生命周期 |
 |---|---|---|---|
-| `/run/agentmgr-exec` | `root:root 0700` | 不可见（仅通过 bind mount 暴露单个文件） | 实现阶段创建；清理时删除 |
-| `/run/agentmgr-exec/gateway.sock` | `root:root 0666`（socket 文件） | 只读 bind mount 到 `/run/agentmgr/gateway.sock` | 网关启动时创建；网关停止时删除 |
-| `/run/agentmgr-exec/credentials/<unit>.json` | `root:root 0600` | 不直接可见；由 systemd 读取后放入 `$CREDENTIALS_DIRECTORY/task-credential`（0400，单元 UID） | 单元 active 后立即删除源文件 |
-| `/run/agentmgr-exec/revoked/<jti>.json` | `root:root 0600` | 不可见 | 超过最大凭据 TTL 后 prune |
-| `/run/agentmgr-exec/specs/<unit>.json` | `root:root 0600` | 不可见 | 单元启动后删除 |
-| `/run/agentmgr-exec/workload.py` | `root:root 0555` | 只读 bind mount 到 `/workload.py` | 由 `verify_isolation.sh` 部署；清理时删除 |
+| `/run/agentmgr-exec` | controller/gateway 服务用户 `0700`（测试机 `agents`；生产 `<controller-user>`） | 不可见：目录 `0700` 且属主为服务用户，单元不能遍历；单元只看到 bind mount 的目标文件 | controller/helper 在实现阶段创建；清理时删除 |
+| `/run/agentmgr-exec/gateway.sock` | controller/gateway 服务用户所有；MVP 测试模式 `0666`，生产可用 `0660` + 专用组 | 只读 bind mount 到 `/run/agentmgr/gateway.sock` | 网关（MVP 为同进程 harness 线程）启动时创建；停止时删除 |
+| `/run/agentmgr-exec/revoked/` | controller/gateway 服务用户 `0700` | 不可见 | 撤销存储首次使用时创建；清理时删除 |
+| `/run/agentmgr-exec/revoked/<jti>.json` | controller/gateway 服务用户 `0600`（`FileRevocationStore` 必须可读写） | 不可见 | 超过最大凭据 TTL 后 prune |
+| `/run/agentmgr-exec/credentials/` | `root:root 0700` | 不直接可见；由 systemd 读取后只把副本放入 `$CREDENTIALS_DIRECTORY` | 由 root helper 创建/清理 |
+| `/run/agentmgr-exec/credentials/<unit>.json` | `root:root 0600` | 不直接可见；systemd 读取后放入 `$CREDENTIALS_DIRECTORY/task-credential`（`0400`，单元 UID） | 单元 active 后由 root helper 删除源文件 |
+| `/run/agentmgr-exec/specs/` | `root:root 0700` | 不可见 | 由 root helper 创建/清理 |
+| `/run/agentmgr-exec/specs/<unit>.json` | `root:root 0600` | 不可见 | 单元启动后由 root helper 删除 |
+| `/run/agentmgr-exec/workload.py` | `root:root 0555` | 只读 bind mount 到 `/workload.py` | 由 harness（经 `sudo -n`）部署；清理时删除 |
 | `/var/lib/agentmgr-exec/<unit>` → `/var/lib/private/agentmgr-exec/<unit>` | 动态 UID（由 systemd 设置） `0700` | `$STATE_DIRECTORY`，可写 | 单元停止后保留，cleanup 删除 |
 | `/srv/agentmgr-exec-resources` | `root:root 0755`，文件 `0444` | 不可见（backend 在控制器侧读取） | 部署资源；不由单元挂载 |
 
 > `DynamicUser=yes` 与 `StateDirectory=` 组合时，systemd 把真实目录放在 `/var/lib/private/` 下，并在 `/var/lib/` 建立指向它的符号链接；单元命名空间内 `$STATE_DIRECTORY` 指向 `/var/lib/agentmgr-exec/<unit>`。这是 systemd 的既定行为，不是本设计的额外约定。
+
+所有权要点：
+
+- `/run/agentmgr-exec` 归 **controller/gateway 服务用户**所有（测试机 `agents`；生产 `<controller-user>` 占位符），`0700`；该用户因此能创建 `gateway.sock`、创建并读写 `revoked/`：gateway 创建 `gateway.sock`，controller 写 `revoked/`，而动态 UID 的任务不能遍历该目录。bind mount 由 root/PID1 在进入单元命名空间前建立，单元只看到挂载目标文件，不能借挂载点遍历父目录。
+- `gateway.sock` 归 controller/gateway 服务用户所有；**MVP 测试模式 `0666`**，生产可改为 `0660` + 专用组。socket 文件模式只决定谁能 `connect()`，**不是资源授权**；授权始终由 token claims + 实时 Grant 状态决定。同宿主其它用户若知道路径可能能连接（MVP `0666`），但没有有效 token 会被 `token_invalid` 拒绝。
+- `revoked/` 与记录文件归 controller/gateway 服务用户，目录 `0700`、记录 `0600`；这样 `FileRevocationStore` 的读写方（gateway/controller）与属主一致。不得写成 `root:root 0600`，否则非 root gateway 读不到。
+- `credentials/`、`specs/` 为 `root:root 0700`，由 root helper 写入和删除；`workload.py` 为 `root:root 0555`。controller 不直接写这些 root-only 目录。
 
 ### 6.4 信任边界
 
@@ -179,7 +192,7 @@
 | 受信控制器 | Supervisor、凭据签发、网关 | 宿主 root 等价能力；代码受审查；**不与任务代码共享进程** |
 | 不受信任任务代码 | `smoke_workload.py` 及其子进程（同一单元/UID） | 可被篡改、可尝试任意系统调用；只能通过内核强制边界被约束 |
 | 外部资源 | `FileResourceBackend` 根目录 | 只读；网关负责范围判定，backend 负责真实路径校验 |
-| 凭据 | `/run/agentmgr-exec/credentials` | 仅 root 可读；单元只能通过 `LoadCredential` 获得副本 |
+| 凭据 | `/run/agentmgr-exec/credentials` | 目录 `root:root 0700`、文件 `0600`；仅 root helper 写入；单元只能通过 `LoadCredential` 获得副本 |
 | 审计 | controller 侧审计 sink | 任务无法写审计；拒绝与放行都记录 |
 
 ## 7. `ManagedTaskSpec` 与校验
@@ -412,7 +425,7 @@ systemd-run --unit=agentmgr-task-<12hex> --description=agentmgr-exec \
 
 规则：
 
-- 探测在**主机级**执行一次（启动时或 `verify_isolation.sh` 首次运行）：用同一 profile 启动一个只做 `connect()` 的最小单元；成功即 `private_netns`，失败即 `af_unix_only_fallback`；结果缓存到进程内并写入审计。
+- 探测在**主机级**执行一次（启动时或 harness 首次运行）：用同一 profile 启动一个只做 `connect()` 的最小单元；成功即 `private_netns`，失败即 `af_unix_only_fallback`；结果缓存到进程内并写入审计。
 - 回退**不是**“放宽网络”：`AF_INET`/`AF_INET6` 仍被 `RestrictAddressFamilies` 拒绝，IP 出口仍被 `IPAddressDeny=any` 拒绝。失去的是“独立 netns”这一层纵深防御，不是“无 IP”不变量。
 - 回退时新增的 `InaccessiblePaths` 用于缩小 `AF_UNIX` 可达面（宿主 systemd 私有 socket、D-Bus）。
 - 回退必须出现在 `BoundaryClaim.network_profile` 与证据 JSON 中；不得静默切换。
@@ -500,9 +513,10 @@ MAC 覆盖**编码后的段**而不是重新序列化后的对象，避免“解
 
 ### 9.4 注入
 
-- Supervisor 把 token 字节写入 `/run/agentmgr-exec/credentials/<unit>.json`：`O_CREAT|O_EXCL|O_WRONLY`，`0600`，`root:root`，内容为 token + `\n`；
+- Supervisor 生成 token 后，**不把 token 放进 argv 或环境变量**；它把已校验的 spec 与 token 经 stdin 交给 root helper；
+- root helper 在 `/run/agentmgr-exec/credentials/`（`root:root 0700`）内以 `O_CREAT|O_EXCL|O_WRONLY` 写入 `<unit>.json`（`0600`，`root:root`），内容为 token + `\n`；
 - systemd 在启动前以 root 读取该文件，放入单元的 `$CREDENTIALS_DIRECTORY/task-credential`（`0400`，属主为动态 UID）；
-- **单元进入 `active` 后**，Supervisor 删除源文件；systemd 已完成读取，删除不影响运行中的单元；
+- **单元进入 `active` 后**，Supervisor 调用 helper `remove-sources <unit>` 删除源文件；systemd 已完成读取，删除不影响运行中的单元；
 - 负载只从 `$CREDENTIALS_DIRECTORY/task-credential` 读取并 `strip()`；
 - 明确禁止：环境变量、命令行参数、任务输入、提示词、stdout/stderr、审计详情、错误消息。
 
@@ -517,8 +531,8 @@ class RevocationStore(Protocol):
 
 | 实现 | 用途 | 语义 |
 |---|---|---|
-| `InMemoryRevocationStore` | 单元测试、单进程默认 | 加锁 dict；`lookup` 返回记录或 None；进程重启即丢失 |
-| `FileRevocationStore` | 跨进程/崩溃恢复 | `/run/agentmgr-exec/revoked/<jti>.json`；写临时文件 → `fsync` → `os.replace` → `fsync(dir)`；`0600`；按 `revoked_at + 2*max_ttl` prune |
+| `InMemoryRevocationStore` | 单元测试、单进程 MVP 默认 | 加锁 dict；`lookup` 返回记录或 None；进程重启即丢失 |
+| `FileRevocationStore` | 跨进程/崩溃恢复（生产独立网关、#83） | `/run/agentmgr-exec/revoked/<jti>.json`，属主为 controller/gateway 服务用户（测试 `agents`；生产 `<controller-user>`），记录 `0600`、目录 `0700`；写临时文件 → `fsync` → `os.replace` → `fsync(dir)`；按 `revoked_at + 2*max_ttl` prune。MVP 同进程 harness 可使用内存实现，本文件实现为可选，但语义保持不变 |
 
 原子性要求：reader 只能看到完整文件；半写文件（`*.tmp`）被忽略并清理。`revoke` 幂等：同一 `jti` 重复撤销保留首次 `reason` 与时间。
 
@@ -548,14 +562,14 @@ class GrantStatus:
 
 这样即使 Supervisor 尚未完成停止（或停止失败），一个已撤销的 Grant 也会在**下一次调用**被拒绝。两个来源任一不可用 → 拒绝（fail closed，`unknown`），不得回退为“只看令牌”。
 
-`GrantStatusProvider` 必须是**实时只读适配器**：网关在每次调用上重新调用 `status()`，不缓存、不复用上一次结果、不接受 spec 自带的过期时间；实现只能读取授权状态，不能签发或修改 Grant。合成测试使用内存实现的**实时**状态（测试可改变其返回值，下一次调用立即生效）；#83 再把该协议接到真实 Grant 存储，网关仍不直接读数据库。
+`GrantStatusProvider` 必须是**实时只读适配器**：网关在每次调用上重新调用 `status()`，不缓存、不复用上一次结果、不接受 spec 自带的过期时间；实现只能读取授权状态，不能签发或修改 Grant。**MVP 验证形态**是 `ops/security/verify_isolation.py` harness 在**同一进程**启动网关线程，并注入内存实时 `GrantStatusProvider`（测试可改变其返回值，下一次调用立即生效）；这满足“每次调用实时读取、无缓存”。独立 `agentmgr-pep-gateway.service` 是**生产/#83** 路径，必须接真实 Grant 存储的实时适配器；网关在任何形态下都不直接读数据库。
 
 ### 9.7 传播边界与残余风险
 
 | 场景 | 传播延迟 | 残余 |
 |---|---|---|
-| 同进程网关（MVP） | 立即（同一调用栈） | 无跨进程延迟 |
-| 文件撤销存储 + 独立网关进程 | 每次调用读文件（无缓存） | 文件系统不可用 → 拒绝 |
+| 同进程网关（MVP 验证 harness） | 立即（同一调用栈） | 无跨进程延迟；撤销存储可用内存实现，`FileRevocationStore` 可选 |
+| 文件撤销存储 + 独立网关进程（生产/#83） | 每次调用读文件（无缓存） | 文件系统不可用 → 拒绝 |
 | Grant 状态源不可达 | 立即拒绝 | 业务可用性下降（fail closed 的代价） |
 | 停止与撤销之间 | 撤销先生效，停止随后 | 窗口内任务仍可运行，但无法通过网关取得新结果 |
 | 令牌已泄漏给同单元内的子进程 | 同 UID 内无法隔离 | 该单元的一切进程共享同一授权；这是任务级而非进程级凭据 |
@@ -564,7 +578,9 @@ class GrantStatus:
 
 ### 10.1 传输
 
-- 监听：`AF_UNIX`，`/run/agentmgr-exec/gateway.sock`，`SOCK_STREAM`，文件模式 `0666`（父目录 `0700` 限制真实可达性；bind mount 暴露给单元）；
+- 监听：`AF_UNIX`，`/run/agentmgr-exec/gateway.sock`，`SOCK_STREAM`；socket 文件归 controller/gateway 服务用户所有（测试机 `agents`；生产 `<controller-user>`）。**MVP 测试模式 `0666`**；生产可用 `0660` + 专用组。父目录 `/run/agentmgr-exec` 为服务用户 `0700`，只把 socket bind mount 暴露给单元。
+- **socket 模式不是授权**：它只决定谁可以 `connect()`；资源授权始终由 token claims + 实时 `GrantStatusProvider` 决定。即使同宿主其它用户知道路径并能连接（MVP `0666`），没有有效 token 也会被 `token_invalid` 拒绝；目录 `0700` 通常已阻断遍历，`0660` + 专用组是生产的收紧选项。
+- **MVP 形态**：网关在 `ops/security/verify_isolation.py` harness 内以线程方式与 controller 同进程运行（同一内存 `GrantStatusProvider`）；独立 `agentmgr-pep-gateway.service` 是生产/#83 路径。
 - 编码：**newline-delimited JSON**，一个连接一个请求、一个响应，随后关闭；
 - 不接受流水线、不接受多请求连接、不接受空行之外的空请求；
 - 网关只读 Unix socket，不监听任何 IP 端口。
@@ -729,12 +745,11 @@ class ResourceBackend(Protocol):
 2. 实时读取 `GrantStatusProvider.status()`：校验存在、未过期、`active`、`usable`、`execution_mode=managed_execution`、`task_id`/`grant_id` 一致。**过期时间只取本次返回的 `expires_at`**；spec 不提供过期时间。
 3. 计算有效 TTL：`min(spec.ttl_seconds, provider.expires_at - now, 300)`，且 ≥ 1。
 4. 计算单元名（§8.5），确认不与运行中单元冲突。
-5. 生成 `jti`/`nonce`，签发 token，写入凭据文件（`0600`，`O_EXCL`）。
-6. 写 spec 文件 `/run/agentmgr-exec/specs/<unit>.json`（`0600`，root）。
-7. 通过 `PrivilegedRunner` 调用 `launch`（§12）；助手执行 `systemd-run`。
-8. 轮询 `inspect` 直到 `ActiveState=active`，上限 **10s**；超时：进入“可能已启动”处理（§11.5）。
-9. 删除凭据源文件与 spec 文件；返回 handle（含 `network_profile`、`BoundaryClaim`、`expires_at`）。
-10. 写 `security.exec.supervisor.launch` 审计（含单元名、uid、TTL、profile、claim 版本；不含 token）。
+5. 生成 `jti`/`nonce`，签发 token。
+6. 通过 `PrivilegedRunner` 把已校验的 spec 与 token（经 stdin，不进 argv/env）交给 root helper；helper 校验后在 `specs/` 与 `credentials/`（`root:root 0700`）写入 `<unit>.json`（`0600`，`O_EXCL`），再执行 `systemd-run`（§12）。
+7. 轮询 `inspect` 直到 `ActiveState=active`，上限 **10s**；超时：进入“可能已启动”处理（§11.5）。
+8. 调用 helper `remove-sources <unit>` 删除凭据源文件与 spec 文件；返回 handle（含 `network_profile`、`BoundaryClaim`、`expires_at`）。
+9. 写 `security.exec.supervisor.launch` 审计（含单元名、uid、TTL、profile、claim 版本；不含 token）。
 
 ### 11.3 轮询
 
@@ -759,7 +774,7 @@ class ResourceBackend(Protocol):
 1. 仅当 `process_gone=true` 或 `never_started=true` 时执行；两者都为 false（例如停止未确认）时拒绝清理并返回 `unit_stop_unconfirmed`，不得删除状态目录或凭据残留；
 2. `systemctl reset-failed <unit>`（清理失败态残留）；
 3. 删除 `/var/lib/private/agentmgr-exec/<unit>`（及 `/var/lib/agentmgr-exec/<unit>` 符号链接，若仍存在）；
-4. 删除残留凭据/spec 文件；
+4. 由 root helper 删除残留凭据/spec 文件（`credentials/`、`specs/` 为 `root:root 0700`）；
 5. prune 过期撤销记录；
 6. 返回 `CleanupResult`（`units_remaining=0`、`state_dir_removed=true`、`credential_removed=true`）。
 
@@ -803,7 +818,7 @@ class ResourceBackend(Protocol):
 
 ### 12.1 信任模型
 
-- **controller 受信**：它持有凭据密钥、能写 `/run/agentmgr-exec`、能调用特权助手。它等价于宿主 root 能力的一部分。
+- **controller 受信**：它持有凭据密钥、拥有并写入 `/run/agentmgr-exec`（`gateway.sock`、`revoked/`；`credentials/` 与 `specs/` 由 root helper 写）、能调用特权助手。它等价于宿主 root 能力的一部分。
 - **任务代码不受信**：`smoke_workload.py` 及其子进程只能通过内核强制边界被约束；它们永远不持有 sudo、不持有密钥、不控制单元属性。
 - 因此本设计**不试图**防御“controller 被完全攻陷”；那等价于宿主 root 失陷，属于 §15.2 的绕行清单。
 
@@ -811,6 +826,7 @@ class ResourceBackend(Protocol):
 
 - 使用所有者已授权的非交互 sudo；实现阶段开始前先用只读命令确认 `sudo -n` 可用，不可用则返回 `privilege_required`，不尝试其它提权方式；
 - 只操作 `agentmgr-task-[0-9a-f]{12}` 单元，以及 `/run/agentmgr-exec`、`/var/lib/private/agentmgr-exec` 路径；
+- 测试机上 `/run/agentmgr-exec` 由 controller 服务用户 `agents` 拥有（`0700`）；controller/gateway 在其中创建 `gateway.sock` 与 `revoked/`；`credentials/`、`specs/` 由 root helper 以 `root:root 0700` 创建。不新增持久用户；
 - 不新建持久用户、不安装软件包、不改 nftables/防火墙、不写现有 Hermes Profile；
 - 测试结束执行 §18.1 清理；
 - **本轮（设计阶段）不安装任何 sudo 规则、不执行任何命令。**
@@ -818,12 +834,13 @@ class ResourceBackend(Protocol):
 ### 12.3 生产模板：窄助手 + 固定 sudoers
 
 - 助手路径：`/usr/local/libexec/agentmgr-exec`（`root:root 0755`）；
-- sudoers 只固定一个可执行文件：`agentmgr ALL=(root) NOPASSWD: /usr/local/libexec/agentmgr-exec`。sudoers **不限制参数**，也不承担参数校验；它只回答“这个用户能不能执行这个 helper”。
-- 所有参数校验（unit 名称正则、spec 路径/属主/模式、字段白名单、子命令与参数个数）都在 root-owned helper 内完成，任何不符合的输入 fail closed。
+- sudoers 只固定一个可执行文件：`agentmgr ALL=(root) NOPASSWD: /usr/local/libexec/agentmgr-exec`。**模板中的 `agentmgr` 是 controller 服务用户的占位符**（测试机为 `agents`；生产替换为 `<controller-user>`），不是仓库账号，也不是本设计新增的持久用户。sudoers **不限制参数**，也不承担参数校验；它只回答“这个用户能不能执行这个 helper”。
+- 所有参数校验（unit 名称正则、spec 字段白名单、子命令与参数个数）都在 root-owned helper 内完成，任何不符合的输入 fail closed。
 
 | 子命令 | 参数 | 行为 |
 |---|---|---|
-| `launch` | `--spec <path>` | 读取 root 拥有的 spec 文件，校验字段白名单，构造固定 `systemd-run` argv |
+| `launch` | stdin JSON（`spec` + `credential`） | 校验后把 spec/凭据写入 `root:root 0700` 的 `specs/`、`credentials/`（`0600`），再构造固定 `systemd-run` argv；token 不进入 argv/env |
+| `remove-sources` | `<unit>` | 删除该单元的 `credentials/<unit>.json` 与 `specs/<unit>.json`（单元 active 后或清理时） |
 | `stop` | `<unit>` | `systemctl stop`，返回结构化结果 |
 | `inspect` | `<unit>` | `systemctl show -p ActiveState,SubState,MainPID,Result,ExecMainStatus,ActiveEnterTimestamp,ExecMainStartTimestamp,ExecMainExitTimestamp,LoadState` |
 | `cleanup` | `<unit>` | `reset-failed` + 删除经校验的状态目录与残留文件 |
@@ -831,7 +848,7 @@ class ResourceBackend(Protocol):
 助手的强制校验：
 
 - 单元名必须匹配 `^agentmgr-task-[0-9a-f]{12}$`，否则拒绝；
-- spec 路径必须在 `/run/agentmgr-exec/specs/` 下、属主 root、模式 `0600`、非符号链接；内容只接受 §7.1 的字段集合，**不得**包含 `ExecStart`、`User`、`Environment`、`BindPaths` 等属性；
+- 只从 stdin 读取请求 JSON（不进 argv/env），只接受 §7.1 的字段集合与一个短 token，**不得**包含 `ExecStart`、`User`、`Environment`、`BindPaths` 等属性；写入的 `specs/`、`credentials/` 目录必须是 `root:root 0700`，文件以 `O_CREAT|O_EXCL` 创建、`0600`、非符号链接；
 - 所有 systemd 属性值来自常量模板或经范围校验的整数/枚举，不接受任意字符串拼接；
 - 不调用 shell（无 `sh -c`），argv 数组直接 `execve`；
 - 不继承调用方环境变量（`env -i` 等价）；
@@ -845,7 +862,7 @@ class ResourceBackend(Protocol):
 app/security/__init__.py
 app/security/boundary.py          # ManagedTaskSpec, ResourceScope, BoundaryClaim, 单元名
 app/security/credentials.py       # agx1, HMAC/JCS, RevocationStore, GrantStatusProvider
-app/security/gateway.py           # NDJSON 协议, 准入/限流, 校验链, FileResourceBackend, 审计; 含 `python -m app.security.gateway` 入口
+app/security/gateway.py           # NDJSON 协议, 准入/限流, 校验链, FileResourceBackend, 审计; `python -m app.security.gateway` 仅作生产独立服务入口（#83），不是 MVP 验证入口
 app/security/systemd.py           # systemd-run/systemctl argv, 状态解析与映射
 app/security/supervisor.py        # launch/poll/stop/inspect/cleanup, 竞态与监控循环
 app/security/errors.py            # 稳定错误码与安全错误消息
@@ -862,7 +879,8 @@ ops/security/agentmgr-exec                 # 生产窄助手（root 拥有）
 ops/security/agentmgr-exec.sudoers         # 固定一行 sudoers 模板
 ops/security/agentmgr-pep-gateway.service  # 网关单元模板（生产）
 ops/security/agentmgr-task@.service        # 受控任务模板（备选；默认 transient）
-ops/security/verify_isolation.sh           # 真实隔离验证入口，输出证据 JSON
+ops/security/verify_isolation.sh           # 真实隔离验证入口：只做环境检查并调用 harness
+ops/security/verify_isolation.py           # 同进程 harness：网关线程 + 内存实时 GrantStatusProvider + §16.3 探针 + 证据 JSON
 ops/security/smoke_workload.py             # 合成负载与负向探针
 ops/security/README.md                     # 安装、验证、回滚说明
 
@@ -884,13 +902,13 @@ docs/security/managed-execution-boundary.md           # 部署时生成的边界
 Supervisor → BoundaryValidator: 结构/模式/时间/限额
 Supervisor → GrantStatusProvider: status(grant_id, task_id)   [信任边界：受信→受信]
 Supervisor → CredentialIssuer: issue(claims) → token(agx1)
-Supervisor → /run/agentmgr-exec/credentials/<unit>.json (0600)
-Supervisor → PrivilegedRunner: launch(spec_path)              [受信→root 助手]
+Supervisor → PrivilegedRunner: launch(spec, token) via stdin   [受信→root 助手]
+root 助手 → specs/<unit>.json + credentials/<unit>.json (root:root 0700, 0600)
 root 助手 → systemd-run: 固定属性 + LoadCredential + BindReadOnlyPaths
 systemd → 单元: DynamicUser/只读 FS/私有 netns/AF_UNIX/限额
 单元 → /workload.py: 读取 $CREDENTIALS_DIRECTORY/task-credential
 Supervisor → systemctl show: 直到 ActiveState=active
-Supervisor: 删除源凭据与 spec 文件；返回 handle + BoundaryClaim
+Supervisor → root 助手: remove-sources <unit>；返回 handle + BoundaryClaim
 ```
 
 ### 14.2 允许的调用
@@ -954,7 +972,7 @@ Supervisor → 撤销 jti（幂等）→ cleanup（process_gone=true）
 Supervisor.cleanup(handle):
   前置: process_gone=true 或 never_started=true（否则拒绝）
   reset-failed → 删除 /var/lib/private/agentmgr-exec/<unit>
-  删除残留 credentials/specs 文件
+  由 root helper 删除残留 credentials/specs 文件
   prune 过期撤销记录
   证据: units_remaining=0, state_dir_removed=true
 ```
@@ -990,6 +1008,7 @@ Supervisor.cleanup(handle):
 | 物理访问 | 控制台、磁盘、内存 | 物理安全与磁盘加密（部署要求） |
 | 网关 backend 缺陷 | 范围校验错误、路径处理错误 | 代码评审 + 负向测试；backend 内重复校验 |
 | 未经网关的资源路径 | 若部署把资源挂进单元或网络可达 | 部署基线检查；本设计不挂载业务资源 |
+| 同宿主其它用户连接 `gateway.sock` | MVP 测试模式 `0666`：若知道路径可 `connect()`（目录 `0700` 通常已阻断遍历） | socket 模式不是授权；无有效 token 仍被 `token_invalid` 拒绝；生产可改 `0660` + 专用组 |
 | 同 UID 内的子进程 | 任务可派生子进程共享凭据 | 任务级而非进程级凭据；`KillMode=control-group` 兜底 |
 | UID 复用窗口 | 停止后状态目录残留 | `process_gone`（或 `never_started`）后立即 cleanup；残留告警 |
 
@@ -1013,7 +1032,7 @@ Supervisor.cleanup(handle):
 | 层 | 位置 | 数据库 | 默认运行 |
 |---|---|---|---|
 | 单元测试（纯内存、无特权） | `app/tests/security/test_boundary.py`、`test_credentials.py`、`test_gateway.py`、`test_systemd_unit.py`、`test_supervisor.py` | 不需要 | 是 |
-| 真实隔离测试 | `app/tests/security/test_isolation_live.py` + `ops/security/verify_isolation.sh` | 不需要 | **否**（skip） |
+| 真实隔离测试 | `app/tests/security/test_isolation_live.py` + `ops/security/verify_isolation.sh`（环境检查）→ `ops/security/verify_isolation.py`（同进程 harness） | 不需要 | **否**（skip） |
 
 真实测试开关：`AGENTMGR_ISOLATION_TEST=1` **且** `AGENTMGR_ISOLATION_SUDO=1`；缺一即 `pytest.skip`，原因写明所需变量。真实测试只在所有者批准的隔离测试机运行。
 
@@ -1037,7 +1056,7 @@ Supervisor.cleanup(handle):
 | 2 | 读 `<test-host-home>/.hermes` 下 Profile | 拒绝（`ProtectHome=yes`） | `filesystem_denied` |
 | 3 | 读 `/var/lib/postgresql` | 拒绝（`InaccessiblePaths`） | `filesystem_denied` |
 | 4 | 读另一任务的 StateDirectory | 拒绝（不同 UID + 0700） | `cross_task_denied` |
-| 5 | 读另一任务的凭据源文件 | 拒绝（目录 0700、文件已删除） | `cross_task_denied` |
+| 5 | 读另一任务的凭据源文件 | 拒绝（目录 `root:root 0700`、文件已删除） | `cross_task_denied` |
 | 6 | `socket(AF_INET, SOCK_STREAM)` | 失败（`EAFNOSUPPORT`/`EPERM`） | `network_denied` |
 | 7 | `connect 127.0.0.1:5432` | 失败（同上；无 IP 能力） | `network_denied` |
 | 8 | `connect 203.0.113.10:443` | 失败（同上） | `network_denied` |
@@ -1097,6 +1116,8 @@ Supervisor.cleanup(handle):
     "no_new_privs": "1"
   },
   "gateway": {
+    "mode": "in_process_harness",
+    "grant_provider": "in_memory_live",
     "limits": {
       "per_task_connections": 8,
       "per_task_requests_per_second": 16,
@@ -1133,6 +1154,7 @@ Supervisor.cleanup(handle):
 
 - 证据写入 `$AGENTMGR_ISOLATION_EVIDENCE`（仓库外路径），**不提交**到仓库；
 - `probes[]` 覆盖 §16.3 的 #6–#9 网络拒绝，`observed` 记录 `errno` 名称与错误类别，不记录目标主机真实地址；
+- `gateway.mode` / `gateway.grant_provider` 记录本次形态：MVP 固定为 `in_process_harness` + `in_memory_live`；独立网关进程 + 文件撤销存储是生产/#83 的形态，需如实标注；
 - `gateway.limits` 记录本次运行实际生效的部署限额，必须与网关启动配置一致；`gateway.probes[]` 对应 §16.3 的 #25/#26，`observed` 只在真实运行后填写，本轮为 planned / not run；
 - `systemd_properties` 由 `systemctl show` 原样读取，`process` 由单元内探针读取；
 - `uid` 只记录数值（示例中的 `61000` 是结构示意，不是真实分配值）；`unit` 已由哈希派生；
@@ -1141,14 +1163,16 @@ Supervisor.cleanup(handle):
 
 ### 16.5 运行入口
 
-`ops/security/verify_isolation.sh` 负责：
+`ops/security/verify_isolation.sh` **只做环境检查并调用 harness**，不自己启动网关进程：
 
 1. 前置检查：`AGENTMGR_ISOLATION_TEST=1`、`AGENTMGR_ISOLATION_SUDO=1`、`systemd ≥ 249`、`systemd-run`/`systemctl` 可用；
-2. 创建 `/run/agentmgr-exec` 与资源目录，部署 `workload.py`；
-3. 启动**独立网关进程**：`python -m app.security.gateway --socket /run/agentmgr-exec/gateway.sock --resources-root /srv/agentmgr-exec-resources`，并通过 `AGENTMGR_EXEC_CREDENTIAL_KEYRING` / `AGENTMGR_EXEC_CREDENTIAL_ACTIVE_KID` 注入测试用临时 keyring；脚本把 PID 写入 `$RUN_DIR/gateway.pid`。网关只监听该 Unix socket，不监听 IP 端口；单元通过只读 bind mount 的 `/run/agentmgr/gateway.sock` 访问。真实矩阵必须走独立进程；单测可以用 socketpair/线程内 server，但不得把两者混称为“内存网关”；
-4. 依次执行 §16.3 探针；
-5. **teardown（无论断言成败都执行）**：停止所有 `agentmgr-task-<hex>` 单元 → `systemctl reset-failed` → 按 `gateway.pid` 停止网关（先 `kill <pid>` 并 `wait`，超时再 SIGKILL）→ 删除 socket 文件、`/run/agentmgr-exec` 与 `/var/lib/private/agentmgr-exec` → 核对残留；
-6. 写出证据 JSON，任一断言失败即非零退出。
+2. harness 以 root/`sudo -n` 创建 `/run/agentmgr-exec`（属主 controller/gateway 服务用户，`0700`）与资源目录，把 `workload.py` 部署为 `root:root 0555`；
+3. 调用 `python3 ops/security/verify_isolation.py`。harness 在**同一进程**启动网关线程（Unix socket `/run/agentmgr-exec/gateway.sock`，MVP `0666`），并注入**内存实时** `GrantStatusProvider`；**不**启动独立 `python -m app.security.gateway` 进程，也**不**写 `gateway.pid`。systemd 单元仍由 `sudo -n` 启动；
+4. harness 依次执行 §16.3 探针；
+5. **teardown（无论断言成败都执行）**：停止所有 `agentmgr-task-<hex>` 单元 → `systemctl reset-failed` → harness 关闭自己持有的网关线程与监听 socket、unlink socket 文件（该线程/套接字归 harness 所有，没有独立网关 PID）→ 由 root helper 删除 `/run/agentmgr-exec` 与 `/var/lib/private/agentmgr-exec` → 核对残留；
+6. harness 写出证据 JSON，任一断言失败即非零退出。
+
+**生产形态**：独立 `agentmgr-pep-gateway.service`（`python -m app.security.gateway`）是 **#83** 路径，必须接真实 Grant 存储的实时适配器；它不是本 MVP 的验证入口。
 
 **真实测试只有在所有者批准本文与实现后才运行；本轮未运行。**
 
@@ -1158,7 +1182,7 @@ Supervisor.cleanup(handle):
 |---|---|---|---|
 | 1 | 受控 Agent 无法读取其他主体的凭据或访问未授权资源 | §6.3 目录权限、§8 沙箱属性、§10.4 校验链、§10.1 准入限额、§16.3 #4/#5/#15/#18/#19/#25/#26 | **planned / not run** |
 | 2 | Grant 到期或撤销后，后续受控调用失败 | §9.6 实时双重校验（不缓存）、§11.4 stop/cleanup、§14.4/§14.5、§16.3 #16/#17/#21/#23 | **planned / not run** |
-| 3 | 绕行测试有真实命令、退出码和证据 | §16.3 全部 26 项、§16.4 证据格式、`verify_isolation.sh` | **planned / not run** |
+| 3 | 绕行测试有真实命令、退出码和证据 | §16.3 全部 26 项、§16.4 证据格式、`verify_isolation.sh` + `verify_isolation.py` | **planned / not run** |
 | 4 | 无法强制治理的能力有明确风险记录和对应产品声明限制 | §4、§15.2、§15.3、`BoundaryClaim` | 设计层已记录；运行证据 **planned** |
 
 补充：本文不满足、也不声称满足 #82 的“已实现”条件；它只固定实现与验证的验收规格。
@@ -1175,11 +1199,15 @@ sudo -n systemctl reset-failed agentmgr-task-<12hex>
 # 2. 确认无残留
 systemctl list-units --all 'agentmgr-task-*' --no-legend
 
-# 3. 停止网关进程（verify_isolation.sh 启动的独立进程）
-kill "$(cat "$RUN_DIR/gateway.pid")" && wait "$(cat "$RUN_DIR/gateway.pid")"
-# 超时未退出再 SIGKILL 该 PID；随后删除 socket 文件
+# 3. 网关：MVP 由 verify_isolation.py harness 持有线程与 socket
+#    harness 正常退出/teardown 时自行关闭网关线程、关闭监听 socket 并 unlink socket 文件；
+#    没有 gateway.pid，也没有独立网关 PID 需要 kill。harness 异常终止时先确认无监听进程，
+#    再删除残留 socket；不要按名字 kill 任意进程。
+#    生产形态才使用：sudo -n systemctl stop agentmgr-pep-gateway.service
 
 # 4. 删除运行目录与状态目录
+#    /run/agentmgr-exec 属主为 controller/gateway 服务用户（测试机 agents，0700），
+#    其中 credentials/ 与 specs/ 为 root:root 0700；删除需 root helper 或 sudo。
 sudo -n rm -rf /run/agentmgr-exec
 sudo -n rm -rf /var/lib/private/agentmgr-exec
 sudo -n rm -f /var/lib/agentmgr-exec/* 2>/dev/null || true
@@ -1228,7 +1256,7 @@ sudo -n rm -f /var/lib/agentmgr-exec/* 2>/dev/null || true
 **无阻塞性开放问题。** 以下为设计阶段已作出的取舍，记录以备评审：
 
 1. `StateDirectory=agentmgr-exec/%N` 而非 `%i`：`%i` 只对模板实例化单元有值，本方案使用非模板 transient unit，`%N` 才能得到每任务目录（§8.5）。该写法**保持不变**。
-2. 网关在 MVP 可与 controller 同进程，也可独立进程；两种形态都要求**每次调用实时读取** `GrantStatusProvider`、无缓存，文件撤销存储用于跨进程/重启恢复（§9.6、§9.7）。#83 才接真实 Grant 存储。
+2. **MVP 验证固定为同进程**：`ops/security/verify_isolation.py` 在同一进程启动 gateway 线程并注入内存实时 `GrantStatusProvider`，因此“每次调用实时读取、无缓存”成立；`FileRevocationStore` 用于跨进程/重启恢复，在 MVP 中可选（内存实现即可），语义不变。独立网关服务是生产/#83 路径，必须接真实 Grant 存储适配器（§9.6、§9.7、§16.5）。
 3. 网络回退是**主机级**选择，不是每任务选择（§8.4）；避免同一主机出现两种声明。
 4. 停止语义拆成三个独立事实：`process_gone`（单元不再运行）、`stop_confirmed`（stop/cancel/timeout 已取得证据）、`never_started`（从未启动）。`completed`/`failed` 不等于 `stop_confirmed`；`cleanup` 的前置条件是 `process_gone || never_started`（§11.1、§11.4）。
 5. `network_denied`/`filesystem_denied` 仅作为证据分类码，不由 supervisor 抛出（§11.6）。
