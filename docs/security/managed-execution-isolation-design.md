@@ -757,6 +757,8 @@ class ResourceBackend(Protocol):
 
 `RuntimeObservation` 同时暴露这三个字段；`cleanup` 的前置条件是 `process_gone || never_started`（§11.4），不是 `stop_confirmed`。
 
+`systemctl show` 固定使用 `--timestamp=us`（`build_systemctl_show_argv`）保留微秒精度。默认的 whole-second 输出会把同一秒内的 terminate/exit 变成无法排序的 `unknown`；systemd 257 上该参数返回 `Thu 2026-10-22 22:05:33.385162 CST` 形式的微秒时间戳。
+
 ### 11.2 launch
 
 1. 解析并校验 `ManagedTaskSpec`（§7.2）；失败即返回 `invalid_spec` 等，无副作用。
@@ -863,9 +865,9 @@ class ResourceBackend(Protocol):
 | `remove-sources` | `<unit>` | 删除该单元的 `credentials/<unit>.json` 与 `specs/<unit>.json`（单元 active 后或清理时） |
 | `stop` | `<unit>` | `systemctl stop`，返回结构化结果 |
 | `terminate` | `<unit>` | 固定 `systemctl kill --signal=SIGTERM --kill-whom=all <unit>`，用于保留退出证据 |
-| `inspect` | `<unit>` | `systemctl show -p ActiveState,SubState,MainPID,Result,ExecMainStatus,ActiveEnterTimestamp,ExecMainStartTimestamp,ExecMainExitTimestamp,LoadState` |
+| `inspect` | `<unit>` | `systemctl show --timestamp=us -p ActiveState,SubState,MainPID,Result,ExecMainStatus,ActiveEnterTimestamp,ExecMainStartTimestamp,ExecMainExitTimestamp,LoadState` |
 | `reset-failed` | `<unit>` | `systemctl reset-failed`；`LoadState=not-found` 时 no-op |
-| `cleanup` | `<unit>` | `reset-failed` + 删除经校验的状态目录与残留文件 |
+| `cleanup` | `<unit>` | 幂等 `systemctl stop` + `reset-failed` + 删除经校验的状态目录与残留文件 |
 
 助手的强制校验：
 

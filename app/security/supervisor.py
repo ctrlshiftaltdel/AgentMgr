@@ -347,7 +347,20 @@ class ManagedExecutionSupervisor:
             }
         ):
             # No audit, no execution: stop and revoke before reporting failure.
-            self._stop(handle, "manual_stop")
+            result, _ = self._stop(handle, "manual_stop")
+            try:
+                # RemainAfterExit keeps the unit loaded after this stop, so the
+                # unreturned launch must also collect its residue.  The sink is
+                # known down; these best-effort calls must not mask the audit
+                # failure.
+                if not result.process_gone:
+                    try:
+                        self._ops.stop(unit)
+                    except Exception:
+                        pass
+                self._ops.cleanup(unit)
+            except Exception:
+                pass
             raise SecurityError("unknown", "audit_unavailable") from None
         return handle
 

@@ -393,12 +393,23 @@ def test_commands_use_only_fixed_argv(sandbox: SimpleNamespace) -> None:
     ]
 
     show = "ActiveState=active\nMainPID=61000\nResult=success\n"
-    inspection = helper.inspect(UNIT, runner=RecordingRunner(stdout=show))
+    inspect_runner = RecordingRunner(stdout=show)
+    inspection = helper.inspect(UNIT, runner=inspect_runner)
     assert inspection == {
         "ActiveState": "active",
         "MainPID": "61000",
         "Result": "success",
     }
+    assert inspect_runner.calls == [
+        [
+            "/usr/bin/systemctl",
+            "show",
+            "--timestamp=us",
+            "-p",
+            helper.SHOW_PROPERTIES,
+            UNIT,
+        ]
+    ]
 
 
 def test_reset_failed_is_noop_for_collected_unit(
@@ -418,7 +429,12 @@ def test_reset_failed_is_noop_for_collected_unit(
     helper.reset_failed(UNIT, runner=runner)
 
     assert runner.calls[0] == ["/usr/bin/systemctl", "reset-failed", UNIT]
-    assert runner.calls[1][:3] == ["/usr/bin/systemctl", "show", "-p"]
+    assert runner.calls[1][:4] == [
+        "/usr/bin/systemctl",
+        "show",
+        "--timestamp=us",
+        "-p",
+    ]
 
     def loaded_runner(argv) -> subprocess.CompletedProcess[str]:
         if "reset-failed" in argv:
@@ -645,6 +661,7 @@ def test_service_templates_use_hardening_and_unix_socket() -> None:
     assert "transient" in task.lower()
     assert "InaccessiblePaths=-/run/systemd" not in task
     assert "InaccessiblePaths=-/run/dbus" not in task
+    assert "CollectMode" not in task
 
 
 # --------------------------------------------------------------------------

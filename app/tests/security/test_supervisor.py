@@ -1173,4 +1173,24 @@ def test_launch_audit_failure_stops_and_sets_marker(tmp_path: Path) -> None:
     assert caught.value.detail == "audit_unavailable"
     assert ops.terminate_calls == [UNIT]
     assert ops.stop_calls == []
+    assert ops.cleanup_calls == [UNIT]
     assert harness.supervisor.last_audit_failed is True
+
+
+def test_launch_audit_failure_unconfirmed_stops_and_cleans_up(
+    tmp_path: Path,
+) -> None:
+    ops = FakeOps()
+    ops.show_plan = [_show_not_found(), _show_active()]
+    ops.default_show = _show_active()
+    harness = _build(tmp_path, ops=ops)
+    harness.sink.fail = True
+
+    with pytest.raises(SecurityError) as caught:
+        harness.supervisor.launch(_spec())
+
+    assert caught.value.code == "unknown"
+    assert caught.value.detail == "audit_unavailable"
+    assert ops.terminate_calls == [UNIT]
+    assert ops.stop_calls == [UNIT]
+    assert ops.cleanup_calls == [UNIT]

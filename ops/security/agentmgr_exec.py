@@ -685,8 +685,10 @@ def _parse_show(text: str) -> dict[str, str]:
 def inspect(unit: object, *, runner: Runner = run_checked) -> dict[str, str]:
     validate_unit(unit)
     assert isinstance(unit, str)
+    # Microsecond timestamps keep same-second terminate/exit ordering readable.
     completed = _run(
-        [SYSTEMCTL, "show", "-p", SHOW_PROPERTIES, unit], runner=runner
+        [SYSTEMCTL, "show", "--timestamp=us", "-p", SHOW_PROPERTIES, unit],
+        runner=runner,
     )
     return _parse_show(completed.stdout or "")
 

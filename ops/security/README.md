@@ -111,10 +111,10 @@ environment or a log.
 | `stop` | `command`, `unit` | Fixed `systemctl stop <unit>`. |
 | `terminate` | `command`, `unit` | Fixed `systemctl kill --signal=SIGTERM --kill-whom=all <unit>`; keeps exit evidence available. |
 | `kill` | `command`, `unit` | Fixed `systemctl kill --signal=SIGKILL --kill-whom=all <unit>`. |
-| `inspect` | `command`, `unit` | Fixed `systemctl show` property projection; returns `{"show": {<property>: <value>}}`. |
+| `inspect` | `command`, `unit` | Fixed `systemctl show --timestamp=us` property projection; returns `{"show": {<property>: <value>}}`. |
 | `reset-failed` | `command`, `unit` | Fixed `systemctl reset-failed <unit>`; `LoadState=not-found` is a no-op. |
 | `remove-sources` | `command`, `unit` | Deletes only `credentials/<unit>.json` and `specs/<unit>.json`. |
-| `cleanup` | `command`, `unit` | `reset-failed`, then deletes only the unit's derived source files, state directory and compatibility symlink. |
+| `cleanup` | `command`, `unit` | Idempotent `systemctl stop`, `reset-failed`, then deletes only the unit's derived source files, state directory and compatibility symlink. |
 
 Transient units are launched with `RemainAfterExit=yes`, so a successfully
 exited unit remains loaded as `active/exited` until the supervisor reads

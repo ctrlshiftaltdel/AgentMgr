@@ -284,9 +284,20 @@ def build_systemd_run_argv(config: SystemdUnitConfig) -> list[str]:
 
 
 def build_systemctl_show_argv(unit: str) -> list[str]:
-    """Return the fixed ``systemctl show`` argv used for evidence."""
+    """Return the fixed ``systemctl show`` argv used for evidence.
 
-    return ["systemctl", "show", "-p", _SHOW_PROPERTIES, _validate_unit(unit)]
+    ``--timestamp=us`` is required: whole-second timestamps cannot order a
+    terminate and exit that happen in the same second.
+    """
+
+    return [
+        "systemctl",
+        "show",
+        "--timestamp=us",
+        "-p",
+        _SHOW_PROPERTIES,
+        _validate_unit(unit),
+    ]
 
 
 def parse_systemctl_show(text: str) -> dict[str, str]:

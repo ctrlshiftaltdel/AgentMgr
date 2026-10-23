@@ -322,6 +322,7 @@ def test_show_argv_is_fixed_and_unit_validated() -> None:
     assert argv == [
         "systemctl",
         "show",
+        "--timestamp=us",
         "-p",
         (
             "ActiveState,SubState,MainPID,Result,ExecMainStatus,LoadState,"
@@ -627,6 +628,73 @@ def test_active_exited_keeps_main_pid_zero_and_exit_evidence() -> None:
     assert observation.stop_confirmed is False
     assert observation.main_pid == 0
     assert observation.exec_main_status == 0
+
+
+def test_active_exited_microsecond_timestamp_orders_stop() -> None:
+    stop_at = datetime(2026, 10, 22, 22, 5, 33, 300000, tzinfo=UTC)
+    show = {
+        "ActiveState": "active",
+        "SubState": "exited",
+        "MainPID": "0",
+        "Result": "success",
+        "ExecMainStatus": "15",
+        "LoadState": "loaded",
+        "ExecMainExitTimestamp": _timestamp_precise(
+            stop_at + timedelta(milliseconds=85)
+        ),
+    }
+
+    observation = observation_from_show(show, stop_requested_at=stop_at)
+
+    assert observation.state == "cancelled"
+    assert observation.process_gone is True
+    assert observation.stop_confirmed is True
+
+
+def test_active_exited_exit_before_stop_is_completed() -> None:
+    stop_at = datetime(2026, 10, 22, 22, 5, 33, 500000, tzinfo=UTC)
+    show = {
+        "ActiveState": "active",
+        "SubState": "exited",
+        "MainPID": "0",
+        "Result": "success",
+        "ExecMainStatus": "0",
+        "LoadState": "loaded",
+        "ExecMainExitTimestamp": _timestamp_precise(
+            stop_at - timedelta(milliseconds=150)
+        ),
+    }
+
+    observation = observation_from_show(show, stop_requested_at=stop_at)
+
+    assert observation.state == "completed"
+    assert observation.process_gone is True
+    assert observation.stop_confirmed is False
+
+
+@pytest.mark.parametrize("exit_value", [None, "", "n/a", "not-a-timestamp"])
+def test_active_exited_missing_or_invalid_timestamp_is_unknown(
+    exit_value: str | None,
+) -> None:
+    show = {
+        "ActiveState": "active",
+        "SubState": "exited",
+        "MainPID": "0",
+        "Result": "success",
+        "ExecMainStatus": "15",
+        "LoadState": "loaded",
+    }
+    if exit_value is not None:
+        show["ExecMainExitTimestamp"] = exit_value
+
+    observation = observation_from_show(
+        show,
+        stop_requested_at=datetime(2026, 10, 22, 22, 5, 33, 300000, tzinfo=UTC),
+    )
+
+    assert observation.state == "unknown"
+    assert observation.process_gone is True
+    assert observation.stop_confirmed is False
 
 
 def test_natural_completion_is_not_stop_confirmed() -> None:
@@ -1078,6 +1146,33 @@ def test_sudo_cleanup_stops_loaded_active_exited_unit_first(
     assert calls[0][:4] == ["sudo", "-n", "systemctl", "stop"]
     assert calls[1][:4] == ["sudo", "-n", "systemctl", "reset-failed"]
     assert calls[2][:5] == ["sudo", "-n", "rm", "-rf", "--"]
+
+
+def test_sudo_cleanup_continues_when_unit_already_collected(
+    tmp_path: Path,
+) -> None:
+    calls: list[list[str]] = []
+
+    def runner(
+        argv: list[str], input_text: str | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(list(argv))
+        if "stop" in argv or "reset-failed" in argv:
+            return subprocess.CompletedProcess(argv, 1, "", "")
+        return subprocess.CompletedProcess(argv, 0, "LoadState=not-found\n", "")
+
+    ops = SudoSystemdOps(
+        runner=runner,
+        runtime_root=tmp_path / "run",
+        state_root=tmp_path / "state",
+        state_link_root=tmp_path / "state-link",
+    )
+
+    ops.cleanup(UNIT)
+
+    assert calls[0][:4] == ["sudo", "-n", "systemctl", "stop"]
+    assert calls[2][:4] == ["sudo", "-n", "systemctl", "reset-failed"]
+    assert calls[4][:5] == ["sudo", "-n", "rm", "-rf", "--"]
 
 
 def test_sudo_ops_cleanup_only_removes_validated_unit_paths(
