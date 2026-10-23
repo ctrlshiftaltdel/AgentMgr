@@ -25,6 +25,7 @@ observations and stop evidence; task transitions belong to the core.
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 from collections.abc import Callable, Mapping
@@ -128,18 +129,10 @@ KILL_TIMEOUT_SECONDS = 3.0
 POLL_INTERVAL_SECONDS = 0.1
 
 _SUBJECT_PATTERN = re.compile(r"^(prin|svc|rt)_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$")
+_GRANT_PATTERN = re.compile(r"^grnt_[A-Za-z0-9][A-Za-z0-9_-]{2,95}$")
 _JTI_PATTERN = re.compile(r"^cred_[0-9a-f]{32}$")
 
 _T = TypeVar("_T")
-
-#: Module-level indirection so tests can make the bounded poll loops instant.
-_sleep: Callable[[float], None] = time.sleep
-
-
-def _iterations(seconds: float) -> int:
-    """Return a bounded iteration count for one poll window."""
-
-    return max(1, int(seconds / POLL_INTERVAL_SECONDS) + 1)
 
 
 def _require_source_path(value: object, detail: str) -> Path:
@@ -152,14 +145,32 @@ def _require_source_path(value: object, detail: str) -> Path:
     return value
 
 
+def _unknown_observation() -> RuntimeObservation:
+    return RuntimeObservation(
+        state="unknown",
+        process_gone=False,
+        stop_confirmed=False,
+        never_started=False,
+        main_pid=0,
+        result="unknown",
+        exec_main_status=None,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class SupervisorConfig:
-    """Fixed supervisor inputs; no task-supplied path is accepted here."""
+    """Fixed supervisor inputs; no task-supplied path is accepted here.
+
+    ``monotonic`` and ``sleep`` are injectable so deadline-bound poll windows
+    can be tested without wall-clock waits; production uses the stdlib.
+    """
 
     workload_source: Path
     gateway_socket_source: Path
     network_profile: NetworkProfile
     clock: Callable[[], datetime]
+    monotonic: Callable[[], float] = time.monotonic
+    sleep: Callable[[float], None] = time.sleep
 
     def __post_init__(self) -> None:
         _require_source_path(self.workload_source, "workload_source_invalid")
@@ -173,6 +184,10 @@ class SupervisorConfig:
             raise ValueError("network_profile_invalid")
         if not callable(self.clock):
             raise ValueError("clock must be callable")
+        if not callable(self.monotonic):
+            raise ValueError("monotonic must be callable")
+        if not callable(self.sleep):
+            raise ValueError("sleep must be callable")
 
 
 class ManagedExecutionSupervisor:
@@ -211,6 +226,9 @@ class ManagedExecutionSupervisor:
         self._issuer = issuer
         self._revocation_store = revocation_store
         self._audit_sink = audit_sink
+        #: Public markers so an unauditable stop/cleanup is never silent.
+        self.audit_failures = 0
+        self.last_audit_failed = False
 
     # ------------------------------------------------------------------
     # Public lifecycle
@@ -220,17 +238,23 @@ class ManagedExecutionSupervisor:
 
         if not isinstance(spec, ManagedTaskSpec):
             raise SecurityError("invalid_spec", "spec_invalid")
-        now = self._now()
-        spec.validate(now)
-        grant = self._require_grant(spec, now)
-        effective_ttl = self._effective_ttl(spec, grant, now)
+        spec.validate(self._now())
         unit = unit_name_for_task(spec.task_id)
 
         # A stale or live unit with the same derived name must not be reused;
         # ``systemd-run --unit`` would otherwise race or refuse unpredictably.
+        # This preflight does not need the Grant and may block, so it runs
+        # before the Grant is read and the TTL is computed.
         preflight = self._observe(unit)
         if preflight.state != "not_started":
             raise SecurityError("invalid_spec", "unit_name_collision")
+
+        # The Grant is read *after* the slow preflight: the expiry and the TTL
+        # must reflect the same fresh instant used for the credential.
+        now = self._now()
+        grant = self._require_grant(spec, now)
+        effective_ttl = self._effective_ttl(spec, grant, now)
+        effective_spec = replace(spec, ttl_seconds=effective_ttl)
 
         issued = self._issuer.issue(
             task_id=spec.task_id,
@@ -240,6 +264,11 @@ class ManagedExecutionSupervisor:
             resource_scope=spec.resource_scope,
             ttl_seconds=effective_ttl,
         )
+        # The issuer has its own clock.  Refuse to launch a credential whose
+        # absolute expiry is beyond the Grant expiry observed above.
+        if issued.claims.exp > int(grant.expires_at.timestamp()):
+            raise SecurityError("grant_expired", "grant_expiry_too_soon")
+
         handle = LaunchHandle(
             unit=unit,
             task_id=spec.task_id,
@@ -252,9 +281,9 @@ class ManagedExecutionSupervisor:
         )
         unit_config = SystemdUnitConfig(
             unit=unit,
-            # The enforced TTL is what ``RuntimeMaxSec`` is built from, so the
-            # unit cannot outlive the Grant even when the spec asks for longer.
-            spec=replace(spec, ttl_seconds=effective_ttl),
+            # The effective TTL is what ``RuntimeMaxSec`` is built from, and the
+            # same spec is sent to the helper, so neither can outlive the Grant.
+            spec=effective_spec,
             credential_source=(
                 DEFAULT_RUNTIME_ROOT / "credentials" / f"{unit}.json"
             ),
@@ -267,7 +296,7 @@ class ManagedExecutionSupervisor:
         try:
             self._ops.launch(
                 unit_config,
-                spec_text=json.dumps(spec.as_dict()),
+                spec_text=json.dumps(effective_spec.as_dict()),
                 credential_text=issued.token,
             )
         except SecurityError as exc:
@@ -275,9 +304,15 @@ class ManagedExecutionSupervisor:
         except Exception:
             failure = SecurityError("unit_start_failed", "launch_failed")
         if failure is not None:
-            raise self._fail_launch(handle, failure) from None
+            # A command timeout may have started the unit; other failures are
+            # treated as definitive and rely on the unit's own evidence.
+            raise self._fail_launch(
+                handle,
+                failure,
+                had_start_evidence=failure.code == "timeout",
+            ) from None
 
-        observation = self._await_active(handle)
+        observation = self._await_active(handle, had_start_evidence=True)
 
         # The credential source is only needed until systemd has injected the
         # credential copy; remove it as soon as the unit is provably active.
@@ -289,27 +324,27 @@ class ManagedExecutionSupervisor:
         except Exception:
             removed = SecurityError("unknown", "remove_sources_failed")
         if removed is not None:
-            raise self._fail_launch(handle, removed, observation=observation) from None
+            raise self._fail_launch(
+                handle,
+                removed,
+                observation=observation,
+                had_start_evidence=True,
+            ) from None
 
-        audit_failed = False
-        try:
-            self._audit(
-                {
-                    "ts": self._now().isoformat(),
-                    "event": AUDIT_EVENT_LAUNCH,
-                    "task_id": spec.task_id,
-                    "grant_id": spec.grant_id,
-                    "credential_jti": handle.jti,
-                    "unit": unit,
-                    "ttl_seconds": effective_ttl,
-                    "network_profile": self._config.network_profile,
-                    "contract_version": CONTRACT_VERSION,
-                    "main_pid": observation.main_pid,
-                }
-            )
-        except Exception:
-            audit_failed = True
-        if audit_failed:
+        if not self._try_audit(
+            {
+                "ts": self._now().isoformat(),
+                "event": AUDIT_EVENT_LAUNCH,
+                "task_id": spec.task_id,
+                "grant_id": spec.grant_id,
+                "credential_jti": handle.jti,
+                "unit": unit,
+                "ttl_seconds": effective_ttl,
+                "network_profile": self._config.network_profile,
+                "contract_version": CONTRACT_VERSION,
+                "main_pid": observation.main_pid,
+            }
+        ):
             # No audit, no execution: stop and revoke before reporting failure.
             self._stop(handle, "manual_stop")
             raise SecurityError("unknown", "audit_unavailable") from None
@@ -319,7 +354,7 @@ class ManagedExecutionSupervisor:
         """Return one factual observation; this never writes task state."""
 
         unit = self._validated_handle(handle)
-        return self._observe(unit)
+        return self._observe(unit, had_start_evidence=True)
 
     def stop(self, handle: LaunchHandle, reason: str) -> StopResult:
         """Revoke the credential, stop the unit and report stop evidence."""
@@ -331,7 +366,7 @@ class ManagedExecutionSupervisor:
         """Remove unit residue only after ``process_gone``/``never_started``."""
 
         unit = self._validated_handle(handle)
-        observation = self._observe(unit)
+        observation = self._observe(unit, had_start_evidence=True)
         if not (observation.process_gone or observation.never_started):
             raise SecurityError("unit_stop_unconfirmed", "cleanup_refused")
 
@@ -357,7 +392,7 @@ class ManagedExecutionSupervisor:
             state_dir_removed=True,
             credential_removed=True,
         )
-        self._audit_best_effort(
+        if not self._try_audit(
             {
                 "ts": self._now().isoformat(),
                 "event": AUDIT_EVENT_CLEANUP,
@@ -371,19 +406,28 @@ class ManagedExecutionSupervisor:
                 "state_dir_removed": result.state_dir_removed,
                 "credential_removed": result.credential_removed,
             }
-        )
+        ):
+            # Cleanup already happened; report that its audit evidence is
+            # missing instead of silently claiming success.
+            raise SecurityError("unknown", "audit_unavailable") from None
         return result
 
     def check_and_stop(self, handle: LaunchHandle) -> RuntimeObservation:
-        """Poll once and stop when the live Grant is revoked or expired."""
+        """Stop when the live Grant is revoked or expired.
+
+        The live Grant is read first: a revoked/expired Grant must enter the
+        stop flow even when ``show`` is unavailable.
+        """
 
         unit = self._validated_handle(handle)
-        observation = self._observe(unit)
         reason = self._revocation_reason(handle)
-        if reason is None:
-            return observation
-        _, stopped = self._stop(handle, reason)
-        return stopped
+        if reason is not None:
+            _, stopped = self._stop(handle, reason)
+            return stopped
+        try:
+            return self._observe(unit, had_start_evidence=True)
+        except SecurityError:
+            return _unknown_observation()
 
     # ------------------------------------------------------------------
     # Launch helpers
@@ -435,16 +479,28 @@ class ManagedExecutionSupervisor:
             raise SecurityError("grant_expired", "grant_expiry_too_soon")
         return effective
 
-    def _await_active(self, handle: LaunchHandle) -> RuntimeObservation:
+    def _await_active(
+        self, handle: LaunchHandle, *, had_start_evidence: bool
+    ) -> RuntimeObservation:
+        deadline = self._monotonic() + LAUNCH_TIMEOUT_SECONDS
         observation: RuntimeObservation | None = None
-        for _ in range(_iterations(LAUNCH_TIMEOUT_SECONDS)):
+        while True:
             try:
-                observation = self._observe(handle.unit)
+                observation = self._observe(
+                    handle.unit, had_start_evidence=had_start_evidence
+                )
             except SecurityError as exc:
-                raise self._fail_launch(handle, exc) from None
+                raise self._fail_launch(
+                    handle,
+                    exc,
+                    had_start_evidence=had_start_evidence,
+                ) from None
             if observation.state == "running" or observation.process_gone:
                 break
-            _sleep(POLL_INTERVAL_SECONDS)
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                break
+            self._config.sleep(min(POLL_INTERVAL_SECONDS, remaining))
 
         if observation is not None and observation.state == "running":
             return observation
@@ -453,6 +509,7 @@ class ManagedExecutionSupervisor:
                 handle,
                 SecurityError("unit_start_failed", "unit_not_active"),
                 observation=observation,
+                had_start_evidence=had_start_evidence,
             ) from None
 
         # The deadline passed while the unit was still starting.  Inspect once
@@ -461,7 +518,9 @@ class ManagedExecutionSupervisor:
         final = observation
         if final is None or not final.process_gone:
             try:
-                final = self._observe(handle.unit)
+                final = self._observe(
+                    handle.unit, had_start_evidence=had_start_evidence
+                )
             except SecurityError:
                 final = observation
 
@@ -470,23 +529,27 @@ class ManagedExecutionSupervisor:
                 handle,
                 SecurityError("timeout", "launch_timeout"),
                 observation=final,
+                had_start_evidence=had_start_evidence,
             ) from None
         if final is None or final.never_started:
             raise self._fail_launch(
                 handle,
                 SecurityError("unit_start_failed", "unit_not_started"),
                 observation=final,
+                had_start_evidence=had_start_evidence,
             ) from None
         if final.process_gone:
             raise self._fail_launch(
                 handle,
                 SecurityError("unit_start_failed", "unit_not_active"),
                 observation=final,
+                had_start_evidence=had_start_evidence,
             ) from None
         raise self._fail_launch(
             handle,
             SecurityError("timeout", "launch_timeout"),
             observation=final,
+            had_start_evidence=had_start_evidence,
         ) from None
 
     def _fail_launch(
@@ -495,6 +558,7 @@ class ManagedExecutionSupervisor:
         launch_error: SecurityError,
         *,
         observation: RuntimeObservation | None = None,
+        had_start_evidence: bool = False,
     ) -> SecurityError:
         """Revoke and terminate a partially started unit, returning the error."""
 
@@ -505,7 +569,9 @@ class ManagedExecutionSupervisor:
             pass
         if observation is None:
             try:
-                observation = self._observe(handle.unit)
+                observation = self._observe(
+                    handle.unit, had_start_evidence=had_start_evidence
+                )
             except SecurityError:
                 observation = None
 
@@ -522,6 +588,10 @@ class ManagedExecutionSupervisor:
         if present:
             if launch_error.code == "timeout" or observation is None:
                 return SecurityError("unknown", "launch_outcome_unknown")
+            if observation.process_gone:
+                # The unit has process evidence: it may have run.  Never report
+                # "not started"/safe-to-retry.
+                return SecurityError("unit_start_failed", "unit_outcome_unknown")
             return SecurityError(
                 "unit_start_failed", "unit_present_after_launch_error"
             )
@@ -538,8 +608,12 @@ class ManagedExecutionSupervisor:
         unit = self._validated_handle(handle)
         if reason not in STOP_REASONS:
             raise SecurityError("invalid_spec", "stop_reason_invalid")
-        stop_at = self._now()
-        revoked = self._revoke(handle, reason, stop_at)
+
+        # Revocation can be slow; the stop dispatch time is captured only
+        # immediately before the stop command so exit ordering is not skewed.
+        revoked_at = self._now()
+        revoked = self._revoke(handle, reason, revoked_at)
+        dispatch_at = self._now()
 
         stop_failed = False
         try:
@@ -550,39 +624,46 @@ class ManagedExecutionSupervisor:
             stop_failed = True
 
         observation: RuntimeObservation | None = None
-        for _ in range(_iterations(STOP_TIMEOUT_SECONDS)):
-            observation = self._stop_observation(unit, stop_at)
+        deadline = self._monotonic() + STOP_TIMEOUT_SECONDS
+        while True:
+            observation = self._stop_observation(unit, dispatch_at)
             if observation is not None and observation.process_gone:
                 break
-            _sleep(POLL_INTERVAL_SECONDS)
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                break
+            self._config.sleep(min(POLL_INTERVAL_SECONDS, remaining))
 
         if observation is None or not observation.process_gone:
             try:
                 self._ops.kill(unit)
             except Exception:
                 pass
-            for _ in range(_iterations(KILL_TIMEOUT_SECONDS)):
-                observation = self._stop_observation(unit, stop_at)
+            kill_deadline = self._monotonic() + KILL_TIMEOUT_SECONDS
+            while True:
+                observation = self._stop_observation(unit, dispatch_at)
                 if observation is not None and observation.process_gone:
                     break
-                _sleep(POLL_INTERVAL_SECONDS)
+                remaining = kill_deadline - self._monotonic()
+                if remaining <= 0:
+                    break
+                self._config.sleep(min(POLL_INTERVAL_SECONDS, remaining))
 
         if observation is None:
-            observation = RuntimeObservation(
-                state="unknown",
-                process_gone=False,
-                stop_confirmed=False,
-                never_started=False,
-                main_pid=0,
-                result="unknown",
-                exec_main_status=None,
-            )
+            observation = _unknown_observation()
 
         if observation.process_gone:
+            stop_confirmed = observation.stop_confirmed
+            result_name = observation.state
+            if stop_failed and result_name == "cancelled":
+                # A failed stop command must not be reported as a confirmed
+                # cancellation.  Genuine timeout evidence keeps ``timed_out``.
+                stop_confirmed = False
+                result_name = "unknown"
             result = StopResult(
-                stop_confirmed=observation.stop_confirmed,
+                stop_confirmed=stop_confirmed,
                 process_gone=True,
-                result=observation.state,
+                result=result_name,
                 exec_main_status=observation.exec_main_status,
             )
             event_name = AUDIT_EVENT_STOP
@@ -614,15 +695,15 @@ class ManagedExecutionSupervisor:
         }
         if result.exec_main_status is not None:
             event["exec_main_status"] = result.exec_main_status
-        self._audit_best_effort(event)
+        self._try_audit(event)
         return result, observation
 
     def _stop_observation(
-        self, unit: str, stop_at: datetime
+        self, unit: str, dispatch_at: datetime
     ) -> RuntimeObservation | None:
         try:
             return self._observe(
-                unit, stop_requested_at=stop_at, had_start_evidence=True
+                unit, stop_requested_at=dispatch_at, had_start_evidence=True
             )
         except SecurityError:
             # An unreadable state is not evidence that the process is gone;
@@ -661,6 +742,11 @@ class ManagedExecutionSupervisor:
         if unit != handle.unit:
             raise SecurityError("invalid_spec", "unit_name_mismatch")
         if (
+            not isinstance(handle.grant_id, str)
+            or _GRANT_PATTERN.fullmatch(handle.grant_id) is None
+        ):
+            raise SecurityError("invalid_spec", "grant_id_invalid")
+        if (
             not isinstance(handle.jti, str)
             or _JTI_PATTERN.fullmatch(handle.jti) is None
         ):
@@ -693,6 +779,12 @@ class ManagedExecutionSupervisor:
         if not isinstance(moment, datetime) or moment.utcoffset() is None:
             raise ValueError("clock must return a timezone-aware datetime")
         return moment.astimezone(UTC)
+
+    def _monotonic(self) -> float:
+        value = self._config.monotonic()
+        if not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ValueError("monotonic must return a finite number")
+        return float(value)
 
     def _observe(
         self,
@@ -757,10 +849,13 @@ class ManagedExecutionSupervisor:
             raise RuntimeError("audit event outside the whitelist")
         self._audit_sink.record(event)
 
-    def _audit_best_effort(self, event: dict[str, object]) -> None:
+    def _try_audit(self, event: dict[str, object]) -> bool:
+        """Record an event, exposing (never hiding) an audit failure."""
+
         try:
             self._audit(event)
+            return True
         except Exception:
-            # The stop/cleanup evidence is already established; an unauditable
-            # event must not be turned into a false "still running" claim.
-            pass
+            self.audit_failures += 1
+            self.last_audit_failed = True
+            return False

@@ -11,14 +11,14 @@ audit event or an exception.
 from __future__ import annotations
 
 import json
+import subprocess
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
-from app.security import supervisor
 from app.security.boundary import (
     BYPASSABLE_BOUNDARY,
     CONTRACT_VERSION,
@@ -44,12 +44,10 @@ from app.security.supervisor import (
     AUDIT_EVENT_LAUNCH,
     AUDIT_EVENT_STOP,
     AUDIT_EVENT_STOP_UNCONFIRMED,
-    LAUNCH_TIMEOUT_SECONDS,
-    POLL_INTERVAL_SECONDS,
     ManagedExecutionSupervisor,
     SupervisorConfig,
 )
-from app.security.systemd import build_systemd_run_argv
+from app.security.systemd import HelperSystemdOps, build_systemd_run_argv
 
 NOW = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
 KID = "k1"
@@ -65,6 +63,34 @@ UNIT = unit_name_for_task(TASK_ID)
 
 def _clock(moment: datetime) -> Callable[[], datetime]:
     return lambda: moment
+
+
+class FakeTime:
+    """Controllable wall clock, monotonic clock and sleep hook."""
+
+    def __init__(self, now: datetime) -> None:
+        self.now = now
+        self.mono = 0.0
+        self.sleeps: list[float] = []
+
+    def clock(self) -> datetime:
+        return self.now
+
+    def monotonic(self) -> float:
+        return self.mono
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.mono += max(0.0, seconds)
+
+    def advance(self, seconds: float) -> None:
+        """Simulate wall-clock and monotonic time passing (slow I/O)."""
+
+        self.now += timedelta(seconds=seconds)
+        self.mono += seconds
+
+    def advance_monotonic(self, seconds: float) -> None:
+        self.mono += seconds
 
 
 def _scope() -> ResourceScope:
@@ -272,8 +298,11 @@ class FakeOps:
         self.cleanup_calls: list[str] = []
         self.show_plan: list[Mapping[str, str] | Exception] = []
         self.default_show: Mapping[str, str] = _show_not_found()
+        self.show_hook: Callable[[], None] | None = None
+        self.show_error: Exception | None = None
         self.launch_error: Exception | None = None
         self.launch_error_with_token = False
+        self.stop_error: Exception | None = None
 
     def launch(self, config: object, *, spec_text: str, credential_text: str) -> None:
         self.launch_calls.append(config)
@@ -286,12 +315,18 @@ class FakeOps:
 
     def stop(self, unit: str) -> None:
         self.stop_calls.append(unit)
+        if self.stop_error is not None:
+            raise self.stop_error
 
     def kill(self, unit: str) -> None:
         self.kill_calls.append(unit)
 
     def show(self, unit: str) -> Mapping[str, str]:
         self.show_calls.append(unit)
+        if self.show_hook is not None:
+            self.show_hook()
+        if self.show_error is not None:
+            raise self.show_error
         if self.show_plan:
             item = self.show_plan.pop(0)
             if isinstance(item, Exception):
@@ -327,12 +362,15 @@ class FakeProvider:
 
 
 class RecordingSink:
-    """Audit sink that keeps a copy of every event."""
+    """Audit sink that keeps a copy of every event and can be made to fail."""
 
     def __init__(self) -> None:
         self.events: list[dict[str, object]] = []
+        self.fail = False
 
     def record(self, event: object) -> None:
+        if self.fail:
+            raise RuntimeError("audit sink unavailable")
         assert isinstance(event, dict)
         self.events.append(dict(event))
 
@@ -341,12 +379,25 @@ class FailingRevocationStore(InMemoryRevocationStore):
     """Store that never accepts a revocation write."""
 
     def __init__(self) -> None:
-        super().__init__(_clock(NOW))
+        super().__init__()
         self.revoke_calls: list[tuple[str, str]] = []
 
     def revoke(self, jti: str, *, reason: str, revoked_at: datetime) -> None:
         self.revoke_calls.append((jti, reason))
         raise SecurityError("unknown", "revocation_store_unwritable")
+
+
+class SlowRevocationStore(InMemoryRevocationStore):
+    """Store whose write takes ``seconds`` of wall-clock time."""
+
+    def __init__(self, fake: FakeTime, seconds: float) -> None:
+        super().__init__(fake.clock)
+        self.fake = fake
+        self.seconds = seconds
+
+    def revoke(self, jti: str, *, reason: str, revoked_at: datetime) -> None:
+        self.fake.advance(self.seconds)
+        super().revoke(jti, reason=reason, revoked_at=revoked_at)
 
 
 @dataclass(frozen=True)
@@ -356,6 +407,7 @@ class _Harness:
     provider: FakeProvider
     revocation: InMemoryRevocationStore
     sink: RecordingSink
+    time: FakeTime
 
 
 def _build(
@@ -365,29 +417,38 @@ def _build(
     provider: FakeProvider | None = None,
     grant: GrantStatus | None = None,
     revocation: InMemoryRevocationStore | None = None,
+    time_source: FakeTime | None = None,
+    issuer_clock: Callable[[], datetime] | None = None,
 ) -> _Harness:
     fake_ops = ops if ops is not None else FakeOps()
     live_provider = (
         provider if provider is not None else FakeProvider(grant or _grant())
     )
+    fake_time = time_source if time_source is not None else FakeTime(NOW)
     store = (
         revocation
         if revocation is not None
-        else InMemoryRevocationStore(_clock(NOW))
+        else InMemoryRevocationStore(fake_time.clock)
     )
     sink = RecordingSink()
     config = SupervisorConfig(
         workload_source=tmp_path / "workload.py",
         gateway_socket_source=tmp_path / "gateway.sock",
         network_profile="private_netns",
-        clock=_clock(NOW),
+        clock=fake_time.clock,
+        monotonic=fake_time.monotonic,
+        sleep=fake_time.sleep,
     )
     return _Harness(
         supervisor=ManagedExecutionSupervisor(
             config,
             fake_ops,  # type: ignore[arg-type]
             live_provider,
-            CredentialIssuer({KID: KEY}, KID, _clock(NOW)),
+            CredentialIssuer(
+                {KID: KEY},
+                KID,
+                issuer_clock if issuer_clock is not None else fake_time.clock,
+            ),
             store,
             sink,
         ),
@@ -395,14 +456,8 @@ def _build(
         provider=live_provider,
         revocation=store,
         sink=sink,
+        time=fake_time,
     )
-
-
-@pytest.fixture(autouse=True)
-def _no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep the 10s/3s poll windows instant; the loops stay iteration-bounded."""
-
-    monkeypatch.setattr(supervisor, "_sleep", lambda _seconds: None)
 
 
 def test_launch_rejects_non_managed_expired_revoked_and_task_mismatch(
@@ -443,7 +498,10 @@ def test_launch_rejects_non_managed_expired_revoked_and_task_mismatch(
             harness.supervisor.launch(spec)
         assert caught.value.code == expected
         assert harness.ops.launch_calls == []
-        assert harness.ops.show_calls == []
+        # The collision preflight happens before the live Grant read; a spec
+        # rejected by validate() makes no privileged call at all.
+        expected_shows = 1 if spec.execution_mode == "managed_execution" else 0
+        assert len(harness.ops.show_calls) == expected_shows
 
 
 def test_launch_issues_credential_and_removes_sources(tmp_path: Path) -> None:
@@ -473,9 +531,8 @@ def test_launch_issues_credential_and_removes_sources(tmp_path: Path) -> None:
     assert "--property=RuntimeMaxSec=30s" in build_systemd_run_argv(
         config  # type: ignore[arg-type]
     )
-    # The spec text remains the validated request; only the unit config carries
-    # the effective TTL.
-    assert json.loads(ops.spec_texts[0])["ttl_seconds"] == 60
+    # Both the systemd argv and the helper/spec payload carry the effective TTL.
+    assert json.loads(ops.spec_texts[0])["ttl_seconds"] == 30
 
     claims = CredentialValidator({KID: KEY}, _clock(NOW)).validate(ops.credentials[0])
     assert claims.task_id == TASK_ID
@@ -505,15 +562,13 @@ def test_launch_issues_credential_and_removes_sources(tmp_path: Path) -> None:
 def test_launch_start_timeout_with_unit_present_stops_and_returns_unknown(
     tmp_path: Path,
 ) -> None:
+    fake = FakeTime(NOW)
     ops = FakeOps()
-    launch_polls = int(LAUNCH_TIMEOUT_SECONDS / POLL_INTERVAL_SECONDS) + 1
-    ops.show_plan = [
-        _show_not_found(),
-        *([_show_activating()] * launch_polls),
-        _show_active(),
-    ]
+    ops.show_plan = [_show_not_found(), _show_activating(), _show_active()]
     ops.default_show = _show_completed(NOW - timedelta(seconds=1))
-    harness = _build(tmp_path, ops=ops)
+    # A single slow ``show`` consumes the whole 10s launch window.
+    ops.show_hook = lambda: fake.advance_monotonic(100)
+    harness = _build(tmp_path, ops=ops, time_source=fake)
 
     with pytest.raises(SecurityError) as caught:
         harness.supervisor.launch(_spec())
@@ -523,6 +578,9 @@ def test_launch_start_timeout_with_unit_present_stops_and_returns_unknown(
     assert ops.credentials
     assert ops.credentials[0] not in str(caught.value)
     assert ops.remove_sources_calls == [UNIT]
+    # Preflight + one deadline-bounded poll + one final inspection.  The old
+    # iteration-bound loop would have called show ~101 times.
+    assert len(ops.show_calls) == 3
 
 
 @pytest.mark.parametrize(
@@ -546,7 +604,9 @@ def test_launch_start_timeout_with_unit_present_stops_and_returns_unknown(
             False,
         ),
         (_show_failed(NOW - timedelta(seconds=1)), "failed", True, False, False),
-        (_show_not_found(), "not_started", False, False, True),
+        # A handle proves a launch attempt, so a vanished unit is ``unknown``
+        # with process evidence, never "never started"/safe-to-retry.
+        (_show_not_found(), "unknown", True, False, False),
         (_show_unknown(), "unknown", False, False, False),
     ],
 )
@@ -592,7 +652,7 @@ def test_grant_revoke_stops_and_confirms(tmp_path: Path) -> None:
     handle = harness.supervisor.launch(_spec())
 
     harness.provider.grant = _grant(status="revoked")
-    ops.show_plan = [_show_active(), _show_completed(NOW + timedelta(seconds=1))]
+    ops.show_plan = [_show_completed(NOW + timedelta(seconds=1))]
     ops.default_show = _show_completed(NOW + timedelta(seconds=1))
 
     observation = harness.supervisor.check_and_stop(handle)
@@ -729,13 +789,20 @@ def test_cleanup_requires_process_gone_or_never_started(tmp_path: Path) -> None:
         event["event"] == AUDIT_EVENT_CLEANUP for event in completed.sink.events
     )
 
-    never_started_ops = FakeOps()
-    never_started_ops.default_show = _show_not_found()
-    never_started = _build(tmp_path, ops=never_started_ops)
+    vanished_ops = FakeOps()
+    vanished_ops.default_show = _show_not_found()
+    vanished = _build(tmp_path, ops=vanished_ops)
 
-    result = never_started.supervisor.cleanup(_handle())
+    # A handle proves a launch attempt: a vanished unit is process evidence,
+    # not "never started".  Cleanup is therefore allowed (process_gone=true).
+    observation = vanished.supervisor.poll(_handle())
+    assert observation.state == "unknown"
+    assert observation.process_gone is True
+    assert observation.never_started is False
+
+    result = vanished.supervisor.cleanup(_handle())
     assert result.units_remaining == 0
-    assert never_started_ops.cleanup_calls == [UNIT]
+    assert vanished_ops.cleanup_calls == [UNIT]
 
 
 def test_token_absent_from_audit_and_exception(tmp_path: Path) -> None:
@@ -767,3 +834,275 @@ def test_token_absent_from_audit_and_exception(tmp_path: Path) -> None:
     assert leaked not in (error.detail or "")
     assert error.__cause__ is None
     assert error.__context__ is None
+
+
+def test_effective_ttl_bounded_by_fresh_grant_after_slow_preflight(
+    tmp_path: Path,
+) -> None:
+    fake = FakeTime(NOW)
+    ops = FakeOps()
+    ops.show_plan = [_show_not_found(), _show_active()]
+    ops.default_show = _show_active()
+    # A slow preflight show consumes 10s of wall-clock time before the Grant is
+    # read, so the effective TTL must be recomputed against the fresh expiry.
+    ops.show_hook = lambda: fake.advance(10)
+    grant = _grant(expires_at=NOW + timedelta(seconds=30))
+    harness = _build(tmp_path, ops=ops, grant=grant, time_source=fake)
+
+    handle = harness.supervisor.launch(_spec())  # spec ttl is 60
+
+    config = ops.launch_calls[0]
+    assert config.spec.ttl_seconds == 20  # type: ignore[attr-defined]
+    assert "--property=RuntimeMaxSec=20s" in build_systemd_run_argv(
+        config  # type: ignore[arg-type]
+    )
+    assert json.loads(ops.spec_texts[0])["ttl_seconds"] == 20
+
+    claims = CredentialValidator({KID: KEY}, fake.clock).validate(
+        ops.credentials[0]
+    )
+    assert claims.exp <= int(grant.expires_at.timestamp())
+    assert handle.expires_at <= grant.expires_at
+
+
+def test_credential_beyond_grant_expiry_is_rejected(tmp_path: Path) -> None:
+    fake = FakeTime(NOW)
+    issuer_fake = FakeTime(NOW + timedelta(seconds=10))
+    ops = FakeOps()
+    ops.show_plan = [_show_not_found(), _show_active()]
+    ops.default_show = _show_active()
+    harness = _build(
+        tmp_path,
+        ops=ops,
+        grant=_grant(expires_at=NOW + timedelta(seconds=30)),
+        time_source=fake,
+        issuer_clock=issuer_fake.clock,
+    )
+
+    with pytest.raises(SecurityError) as caught:
+        harness.supervisor.launch(_spec())
+
+    # Even though the effective TTL is 30s, the issuer clock is 10s ahead, so
+    # the credential would expire 10s after the Grant; refuse to launch.
+    assert caught.value.code == "grant_expired"
+    assert caught.value.detail == "grant_expiry_too_soon"
+    assert ops.launch_calls == []
+
+
+def test_helper_payload_uses_effective_ttl(tmp_path: Path) -> None:
+    ops = FakeOps()
+    ops.show_plan = [_show_not_found(), _show_active()]
+    ops.default_show = _show_active()
+    harness = _build(
+        tmp_path,
+        ops=ops,
+        grant=_grant(expires_at=NOW + timedelta(seconds=30)),
+    )
+    harness.supervisor.launch(_spec())  # spec ttl is 60
+
+    captured: list[tuple[list[str], str | None]] = []
+
+    def runner(
+        argv: list[str], input_text: str | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        captured.append((argv, input_text))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    helper = HelperSystemdOps(Path("/opt/example/agentmgr-exec"), runner=runner)
+    helper.launch(
+        ops.launch_calls[0],  # type: ignore[arg-type]
+        spec_text=ops.spec_texts[0],
+        credential_text="agx1.placeholder",
+    )
+
+    payload = json.loads(captured[0][1] or "{}")
+    assert payload["spec"]["ttl_seconds"] == 30
+    assert payload["spec"]["ttl_seconds"] != 60
+
+
+def test_launch_success_then_not_found_is_not_never_started(
+    tmp_path: Path,
+) -> None:
+    ops = FakeOps()
+    ops.show_plan = [_show_not_found(), _show_not_found()]
+    ops.default_show = _show_not_found()
+    harness = _build(tmp_path, ops=ops)
+
+    with pytest.raises(SecurityError) as caught:
+        harness.supervisor.launch(_spec())
+
+    assert caught.value.code == "unit_start_failed"
+    assert caught.value.detail == "unit_outcome_unknown"
+    assert ops.stop_calls == [UNIT]
+
+    observation = harness.supervisor.poll(_handle())
+    assert observation.state == "unknown"
+    assert observation.process_gone is True
+    assert observation.never_started is False
+
+
+def test_stop_window_uses_monotonic_deadline(tmp_path: Path) -> None:
+    fake = FakeTime(NOW)
+    ops = FakeOps()
+    ops.show_plan = [_show_not_found(), _show_active()]
+    ops.default_show = _show_active()
+    harness = _build(tmp_path, ops=ops, time_source=fake)
+    handle = harness.supervisor.launch(_spec())
+
+    before = len(ops.show_calls)
+    # One hung inspection consumes both the 10s stop and the 3s kill window.
+    ops.show_hook = lambda: fake.advance_monotonic(100)
+    ops.default_show = _show_deactivating()
+
+    result = harness.supervisor.stop(handle, "manual_stop")
+
+    assert result.result == "unit_stop_unconfirmed"
+    assert len(ops.show_calls) - before == 2
+
+
+def test_check_and_stop_stops_revoked_grant_when_show_fails(
+    tmp_path: Path,
+) -> None:
+    ops = FakeOps()
+    ops.show_plan = [_show_not_found(), _show_active()]
+    ops.default_show = _show_active()
+    harness = _build(tmp_path, ops=ops)
+    handle = harness.supervisor.launch(_spec())
+
+    harness.provider.grant = _grant(status="revoked")
+    ops.show_error = SecurityError("unknown", "show_failed")
+
+    observation = harness.supervisor.check_and_stop(handle)
+
+    assert observation.state == "unknown"
+    assert observation.process_gone is False
+    assert ops.stop_calls == [UNIT]
+    record = harness.revocation.lookup(handle.jti)
+    assert record is not None
+    assert record.reason == "grant_revoked"
+
+
+def test_slow_revocation_keeps_natural_completion(tmp_path: Path) -> None:
+    fake = FakeTime(NOW)
+    store = SlowRevocationStore(fake, seconds=10)
+    ops = FakeOps()
+    ops.show_plan = [_show_not_found(), _show_active()]
+    ops.default_show = _show_active()
+    harness = _build(
+        tmp_path, ops=ops, revocation=store, time_source=fake
+    )
+    handle = harness.supervisor.launch(_spec())
+
+    # The exit precedes the *dispatched* stop by 5s, even though the original
+    # stop call started before it; revoking took 10s.
+    ops.default_show = _show_completed(NOW + timedelta(seconds=5))
+
+    result = harness.supervisor.stop(handle, "grant_revoked")
+
+    assert result.result == "completed"
+    assert result.process_gone is True
+    assert result.stop_confirmed is False
+
+
+def test_failed_stop_command_does_not_confirm_cancelled(tmp_path: Path) -> None:
+    ops = FakeOps()
+    ops.show_plan = [_show_not_found(), _show_active()]
+    ops.default_show = _show_active()
+    harness = _build(tmp_path, ops=ops)
+    handle = harness.supervisor.launch(_spec())
+
+    ops.stop_error = SecurityError("unit_stop_unconfirmed", "stop_failed")
+    ops.default_show = _show_completed(NOW + timedelta(seconds=1))
+
+    result = harness.supervisor.stop(handle, "manual_stop")
+
+    assert result.process_gone is True
+    assert result.stop_confirmed is False
+    assert result.result == "unknown"
+    events = [
+        event for event in harness.sink.events if event["event"] == AUDIT_EVENT_STOP
+    ]
+    assert events
+    assert events[-1]["stop_command_failed"] is True
+
+
+def test_failed_stop_command_keeps_timeout_confirmed(tmp_path: Path) -> None:
+    ops = FakeOps()
+    ops.show_plan = [_show_not_found(), _show_active()]
+    ops.default_show = _show_active()
+    harness = _build(tmp_path, ops=ops)
+    handle = harness.supervisor.launch(_spec())
+
+    ops.stop_error = SecurityError("unit_stop_unconfirmed", "stop_failed")
+    ops.default_show = _show_timed_out(NOW + timedelta(seconds=1))
+
+    result = harness.supervisor.stop(handle, "manual_stop")
+
+    assert result.process_gone is True
+    assert result.stop_confirmed is True
+    assert result.result == "timed_out"
+
+
+def test_handle_grant_id_is_validated_before_use(tmp_path: Path) -> None:
+    harness = _build(tmp_path)
+    bad = replace(_handle(), grant_id="not_a_grant")
+
+    with pytest.raises(SecurityError) as caught:
+        harness.supervisor.poll(bad)
+
+    assert caught.value.code == "invalid_spec"
+    assert caught.value.detail == "grant_id_invalid"
+    assert harness.ops.show_calls == []
+
+
+def test_stop_audit_failure_sets_marker(tmp_path: Path) -> None:
+    ops = FakeOps()
+    ops.show_plan = [_show_not_found(), _show_active()]
+    ops.default_show = _show_active()
+    harness = _build(tmp_path, ops=ops)
+    handle = harness.supervisor.launch(_spec())
+
+    harness.sink.fail = True
+    ops.default_show = _show_completed(NOW + timedelta(seconds=1))
+
+    result = harness.supervisor.stop(handle, "manual_stop")
+
+    assert result.stop_confirmed is True
+    assert harness.supervisor.audit_failures >= 1
+    assert harness.supervisor.last_audit_failed is True
+
+
+def test_cleanup_audit_failure_is_not_silent(tmp_path: Path) -> None:
+    ops = FakeOps()
+    ops.show_plan = [_show_not_found(), _show_active()]
+    ops.default_show = _show_active()
+    harness = _build(tmp_path, ops=ops)
+    handle = harness.supervisor.launch(_spec())
+
+    ops.default_show = _show_completed(NOW + timedelta(seconds=1))
+    harness.sink.fail = True
+
+    with pytest.raises(SecurityError) as caught:
+        harness.supervisor.cleanup(handle)
+
+    assert caught.value.code == "unknown"
+    assert caught.value.detail == "audit_unavailable"
+    assert ops.cleanup_calls == [UNIT]
+    assert harness.supervisor.last_audit_failed is True
+
+
+def test_launch_audit_failure_stops_and_sets_marker(tmp_path: Path) -> None:
+    ops = FakeOps()
+    ops.show_plan = [_show_not_found(), _show_active()]
+    ops.default_show = _show_active()
+    harness = _build(tmp_path, ops=ops)
+    harness.sink.fail = True
+    ops.default_show = _show_completed(NOW + timedelta(seconds=1))
+
+    with pytest.raises(SecurityError) as caught:
+        harness.supervisor.launch(_spec())
+
+    assert caught.value.code == "unknown"
+    assert caught.value.detail == "audit_unavailable"
+    assert ops.stop_calls == [UNIT]
+    assert harness.supervisor.last_audit_failed is True
