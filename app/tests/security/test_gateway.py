@@ -323,8 +323,15 @@ def test_token_expired_revoked_and_wrong_audience(tmp_path: Path) -> None:
 
     tampered = _build(tmp_path / "tampered")
     prefix, segment, mac = tampered.token.split(".")
-    replacement = "A" if mac[-1] != "A" else "B"
-    broken = f"{prefix}.{segment}.{mac[:-1]}{replacement}"
+    # Flip a raw MAC byte instead of the last base64url character: that
+    # character carries padding bits, so replacing it can decode to the same
+    # 32 bytes and leave the token valid.  Byte 0 has no padding.
+    mac_bytes = bytearray(base64.urlsafe_b64decode(mac + "=" * (-len(mac) % 4)))
+    mac_bytes[0] ^= 0x01
+    flipped_mac = _b64url(bytes(mac_bytes))
+    broken = f"{prefix}.{segment}.{flipped_mac}"
+    assert segment == tampered.token.split(".")[1]  # payload is untouched
+    assert flipped_mac != mac and len(flipped_mac) == len(mac)
     assert tampered.call(_request(broken)).reason == "token_invalid"
 
 
