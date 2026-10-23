@@ -88,7 +88,7 @@
 | **TH-17** 凭据/日志泄漏 | 令牌只经 `LoadCredential` 注入；源文件 0600、启动后删除；审计字段白名单；错误响应不含令牌/路径/堆栈。 | 强制（宿主 root、崩溃转储、内核侧除外） | `设计（未实现）` |
 | **TH-18** 跨任务数据泄漏 | 独立 UID + StateDirectory 0700 + 凭据绑定 `task_id` + 网关跨任务拒绝；任务间无共享 TMPDIR。 | 强制（宿主 root、UID 复用窗口除外） | `设计（未实现）` |
 | **TH-19** 运行时隔离逃逸 | §7 的 systemd 属性集合；`RuntimeMaxSec`/资源上限；停止证据。 | 强制（内核/systemd 漏洞、侧信道、物理访问除外） | `设计（未实现）`；**不得**称已验证 |
-| **TH-24** 队列饥饿与资源耗尽 | 每单元 `MemoryMax`/`CPUQuota`/`TasksMax`/`RuntimeMaxSec`/`LimitNOFILE`；单任务无法跨单元争抢。全局并发上限由控制器策略控制，不是本基座属性。 | 单单元强制；全局部分 | `设计（未实现）` |
+| **TH-24** 队列饥饿与资源耗尽 | 每单元 `MemoryMax`/`CPUQuota`/`TasksMax`/`RuntimeMaxSec`/`LimitNOFILE`；网关另有每任务/全局并发连接与每秒请求上限（§10.1），单任务无法占满全局配额。 | 单单元强制；网关准入强制；全局部分 | `设计（未实现）` |
 | **TH-27** 模式混淆 | `ManagedTaskSpec.execution_mode` 只接受 `managed_execution`；启动前与 Grant 的 `execution_mode` 交叉校验；网关拒绝非 managed Grant。 | 强制（在 B3 入口） | `设计（未实现）` |
 
 ### 5.2 与 #82 验收条目的关系
@@ -96,7 +96,7 @@
 | #82 验收条目 | 本基座对应机制 | 证据状态 |
 |---|---|---|
 | 受控 Agent 无法读取其他主体的凭据或访问未授权资源 | 独立 UID、StateDirectory 0700、凭据目录 0700 且仅 `LoadCredential` 读取、网关 token/scope/cross-task 校验 | planned / not run |
-| Grant 到期或撤销后，后续受控调用失败 | 凭据 `exp = min(grant.exp, now+ttl)`；网关每次调用读取撤销存储与 `GrantStatusProvider`；Supervisor 停止单元并验证 | planned / not run |
+| Grant 到期或撤销后，后续受控调用失败 | 凭据 `exp = min(provider.expires_at, iat + ttl_seconds)` 且 `exp - iat ≤ 300`；网关每次调用实时读取撤销存储与 `GrantStatusProvider`（无缓存）；Supervisor 停止单元并验证 `process_gone` | planned / not run |
 | 绕行测试有真实命令、退出码和证据 | §16 的负向矩阵、`verify_isolation.sh`、证据 JSON | planned / not run |
 | 无法强制治理的能力有明确风险记录与产品声明限制 | §4、§15、§17 | 本文（设计层）；运行证据 planned |
 
@@ -192,13 +192,10 @@ class ManagedTaskSpec:
     task_id: str                 # ^task_[A-Za-z0-9][A-Za-z0-9_-]{2,95}$
     grant_id: str                # ^grnt_[A-Za-z0-9][A-Za-z0-9_-]{2,95}$
     execution_mode: Literal["managed_execution"]
-    grant_expires_at: datetime   # 必须带时区（UTC）
-    ttl_seconds: int             # 有效值 = min(ttl_seconds, grant 剩余, 900)
-    workspace: str               # 逻辑相对名，解析为 <STATE_DIRECTORY>/workspace
-    state: str                   # 逻辑相对名，解析为 <STATE_DIRECTORY>/state
-    cpu_quota_percent: int       # 默认 50，上限 100
-    memory_max_mb: int           # 默认 256，上限 1024
-    tasks_max: int               # 默认 32，上限 64
+    ttl_seconds: int             # 1..300；有效值 = min(ttl_seconds, provider 剩余, 300)
+    cpu_quota_percent: int       # 默认 50，范围 1..100
+    memory_max_mb: int           # 默认 256，范围 32..1024
+    tasks_max: int               # 默认 32，范围 1..64
     capabilities: tuple[str, ...]        # name@x.y.z，1..16 项
     resource_scope: ResourceScope        # 与 Grant 同构的冻结记录
     backend: Literal["file"]              # 唯一允许的 backend
@@ -206,17 +203,17 @@ class ManagedTaskSpec:
 
 `ResourceScope`（冻结记录）字段：`scope_type`、`resource_ids`、`connector_ids`、`data_classifications`、`exclude_resource_ids`，与 [execution-grant Schema](../contracts/execution-grant.schema.json) 的 `resource_scope` 同名同义；MVP 只接受 `scope_type="self"`、`connector_ids=()`、`data_classifications ⊆ {"internal"}`。
 
+spec **不提供** Grant 过期时间：`GrantStatusProvider.expires_at` 是唯一权威来源（§9.6）。spec 也不提供任何可写路径字段；单元内唯一可写区是 systemd 注入的 `$STATE_DIRECTORY`，其下的子目录由 workload 自行创建，Supervisor 不代建（§8.6）。
+
 ### 7.2 校验规则
 
 | 规则 | 拒绝原因 |
 |---|---|
-| JSON 只接受**精确字段集合**；未知字段、重复键、嵌套未知字段一律拒绝 | `invalid_spec` |
+| JSON 只接受**精确字段集合**；未知字段、重复键、嵌套未知字段一律拒绝（含 `grant_expires_at`、`workspace`、`state`） | `invalid_spec` |
 | 所有字符串必须是 `str`，禁止 NUL、控制字符；ID 必须匹配正则 | `invalid_spec` |
-| `workspace`/`state` 只接受 `^[a-z0-9][a-z0-9_-]{1,31}$`；含 `/`、`..`、绝对路径、空值、反斜杠一律拒绝 | `invalid_spec` |
 | `execution_mode != "managed_execution"` | `execution_mode_mismatch` |
 | `backend` 不在允许集合 | `invalid_spec` |
-| `grant_expires_at` 必须 > now + 1s，且 ≤ now + 24h | `grant_expired` / `invalid_spec` |
-| `ttl_seconds` ∉ [1, 900] | `invalid_spec` |
+| `ttl_seconds` ∉ [1, 300] | `invalid_spec` |
 | `cpu_quota_percent` ∉ [1, 100]、`memory_max_mb` ∉ [32, 1024]、`tasks_max` ∉ [1, 64] | `invalid_spec` |
 | `capabilities` 为空、重复、格式不符、或不是 Grant `capabilities.allowed` 的子集 | `capability_not_granted` |
 | `resource_scope` 不是 Grant 范围的子集（含新增资源、扩大 `scope_type`、去掉 `exclude_resource_ids`） | `resource_scope_denied` |
@@ -229,6 +226,8 @@ class ManagedTaskSpec:
 | 单元名与仍在运行的其它任务冲突 | `invalid_spec`（`detail="unit_name_collision"`） |
 
 校验顺序固定：**结构 → 模式 → 时间 → Grant 状态/绑定 → 能力 → 范围 → 限额 → 权限通道**。任何一步失败都不得签发凭据、不得启动单元。
+
+TTL 硬上限为 **300s**，与凭据 `exp - iat ≤ 300` 同一上限；需要更长任务或凭据刷新的场景由 **#83** 设计，本 MVP 不放开。
 
 ### 7.3 `BoundaryClaim`
 
@@ -260,10 +259,7 @@ class BoundaryClaim:
   "task_id": "task_synthetic_0001",
   "grant_id": "grnt_synthetic_0001",
   "execution_mode": "managed_execution",
-  "grant_expires_at": "2026-10-23T12:00:00Z",
   "ttl_seconds": 60,
-  "workspace": "ws1",
-  "state": "st1",
   "cpu_quota_percent": 50,
   "memory_max_mb": 256,
   "tasks_max": 32,
@@ -288,7 +284,7 @@ class BoundaryClaim:
 | `DynamicUser=` | `yes` | 每单元独立、非持久的 UID；停止后回收 |
 | `StateDirectory=` | `agentmgr-exec/%N` | 每单元可写状态目录；`%N` = 去后缀单元名（见 §8.5） |
 | `StateDirectoryMode=` | `0700` | 状态目录仅该 UID 可访问 |
-| `RuntimeMaxSec=` | `<ttl>`（秒，1..900） | 硬运行时长上限，超时由 systemd 终止 |
+| `RuntimeMaxSec=` | `<ttl>`（秒，1..300） | 硬运行时长上限，超时由 systemd 终止；上限与凭据 TTL 一致 |
 | `TimeoutStopSec=` | `5` | SIGTERM 后 5s 升级 SIGKILL |
 | `KillMode=` | `control-group` | 终止整个 cgroup，含子进程 |
 | `SendSIGKILL=` | `yes` | 允许 SIGKILL 兜底 |
@@ -320,14 +316,16 @@ class BoundaryClaim:
 | `ProtectProc=` | `invisible` | 隐藏其它进程 |
 | `ProcSubset=` | `pid` | `/proc` 只暴露 PID 相关条目 |
 | `UMask=` | `0077` | 新建文件默认 0600/0700 |
-| `MemoryMax=` | `256M` | 内存硬上限（可由 spec 调低，不超过 1024M） |
-| `CPUQuota=` | `50%` | CPU 带宽上限（可由 spec 调低，不超过 100%） |
-| `TasksMax=` | `32` | 进程/线程上限（可由 spec 调低，不超过 64） |
+| `MemoryMax=` | `<memory_max_mb>M` | 内存硬上限；spec 默认 **256**，范围 **32..1024** |
+| `CPUQuota=` | `<cpu_quota_percent>%` | CPU 带宽上限；spec 默认 **50**，范围 **1..100** |
+| `TasksMax=` | `<tasks_max>` | 进程/线程上限；spec 默认 **32**，范围 **1..64** |
 | `LimitNOFILE=` | `256` | 文件描述符上限 |
 | `LoadCredential=` | `task-credential:/run/agentmgr-exec/credentials/<unit>.json` | 令牌只经 systemd 注入 |
 | `BindReadOnlyPaths=` | `/run/agentmgr-exec/gateway.sock:/run/agentmgr/gateway.sock` | 唯一可达的网关入口 |
 | 同上 | `/run/agentmgr-exec/workload.py:/workload.py` | 固定负载脚本，只读 |
 | `ExecStart=` | `/usr/bin/python3 /workload.py` | 固定命令，无参数、无 shell |
+
+说明：`MemoryMax`/`CPUQuota`/`TasksMax` 不是固定常量，而是由 §7.2 校验过的 spec 整数渲染成上表占位形式；未显式给值时取默认值。范围之外的取值在校验阶段即 `invalid_spec`，不会启动单元。表格其余属性（含 `StateDirectory=agentmgr-exec/%N`）是固定常量，任务输入不能覆盖。
 
 同一 profile 内的附加加固（不改变上表语义）：
 
@@ -395,7 +393,7 @@ systemd-run --unit=agentmgr-task-<12hex> --description=agentmgr-exec \
 
 - `PrivateNetwork=yes` 创建**独立网络命名空间**，其中只有状态为 down 的 loopback；它不挂载或隔离文件系统路径。
 - Unix domain socket 是**文件系统对象**，`connect(2)` 走 VFS 而非 IP 路由。因此把 socket 文件 `BindReadOnlyPaths` 到单元内的固定路径（`/run/agentmgr/gateway.sock`）后，单元可以连接，而 IP 出口完全不存在。
-- 网关在 controller 侧监听同一 socket；连接的 `SO_PEERCRED` 提供对端 UID/PID/GID，MVP 只用于审计（单元 UID 在启动后才可知），不作为授权依据。
+- 网关在 controller 侧监听同一 socket；连接的 `SO_PEERCRED` 提供对端 UID/PID/GID，仅用于**准入计数与审计**（单元 UID 在启动后才可知），不作为资源授权依据；授权仍由 token claim + 范围判定决定（§10.1）。
 - `RestrictAddressFamilies=AF_UNIX` 使 `socket(AF_INET, ...)` 直接返回 `EAFNOSUPPORT`；即使属性被误删，`IPAddressDeny=any` 仍是第二道 cgroup 级出口阻断。
 
 ### 8.3 单任务 UID 与状态目录
@@ -403,7 +401,7 @@ systemd-run --unit=agentmgr-task-<12hex> --description=agentmgr-exec \
 - `DynamicUser=yes` 让 systemd 为每个单元分配一个未使用的 UID（通常在 `61184..65519` 的动态范围），并在停止后释放。
 - `StateDirectory=agentmgr-exec/%N` 创建 `/var/lib/private/agentmgr-exec/agentmgr-task-<hex>/`，权限 `0700`，属主为动态 UID；单元内 `$STATE_DIRECTORY` 指向它。
 - 任务之间因此没有共享可写路径：不同单元不同 UID、不同目录、不同私有 `/tmp`。
-- **UID 复用风险**：停止后状态目录不会自动删除；若同一数值 UID 之后被另一单元分配，旧目录可能被读到。缓解：Supervisor 的 `cleanup` 必须在停止确认后删除状态目录（§11.4），并把“清理残留”作为告警指标（§19）。
+- **UID 复用风险**：停止后状态目录不会自动删除；若同一数值 UID 之后被另一单元分配，旧目录可能被读到。缓解：Supervisor 的 `cleanup` 必须在 `process_gone=true`（或 `never_started=true`）后删除状态目录（§11.4），并把“清理残留”作为告警指标（§19）。
 
 ### 8.4 网络 profile 与回退
 
@@ -441,6 +439,8 @@ unit = "agentmgr-task-" + sha256(("agentmgr-task:v1:" + task_id).encode("utf-8")
 | `/workload.py`、`/run/agentmgr/gateway.sock` | 只读 bind mount | 不可修改 |
 | 其余（`/etc`、`/usr`、`/var`、`/home`、`/root`、`/srv`、`/opt`、`/var/lib/postgresql`） | 只读或不可见 | 写入返回 `EROFS`/`EACCES` |
 
+`$STATE_DIRECTORY` 是唯一可写区；`ManagedTaskSpec` 不含任何路径字段（无 `workspace`/`state`）。workload 可在其中自行创建子目录，Supervisor 不创建也不解析任务内路径。
+
 ## 9. 凭据模型
 
 ### 9.1 Claims
@@ -459,17 +459,24 @@ unit = "agentmgr-task-" + sha256(("agentmgr-task:v1:" + task_id).encode("utf-8")
 | `resource_scope` | object | 与 spec 同构；网关按此判定 |
 | `iat` | int | 签发时间（Unix 秒，UTC） |
 | `nbf` | int | `iat - 5`（允许 5s 时钟偏差） |
-| `exp` | int | `min(grant.expires_at, iat + ttl_seconds)`，且 `exp - iat ≤ 300` |
+| `exp` | int | `min(GrantStatusProvider.expires_at, iat + ttl_seconds)`，且 `exp - iat ≤ 300` |
 | `nonce` | str | `^[0-9a-f]{32}$`，每次 launch 随机；与单元名一同进入审计 |
 
-`exp` 必须**严格小于等于** Grant 的剩余有效期；不允许“凭据比授权活得久”。
+`exp` 必须**严格小于等于** `GrantStatusProvider` 在签发时刻返回的剩余有效期；不允许“凭据比授权活得久”。spec 不提供任何过期时间字段，调用方无法延长或伪造 Grant 生命周期。
 
 ### 9.2 序列化与签名
 
-1. 按 RFC 8785（JCS）规范化 claims，得到 UTF-8 字节；
+1. 用 `app/security/credentials.py::canonical_json()` 按 RFC 8785（JCS）规范化 claims，得到 UTF-8 字节。实现要求（必须有测试向量，见 §16.2）：
+   - 对象键必须是字符串，并按 **UTF-16 code units** 排序（不能依赖 Python `str` 的 code point 顺序，也不能只用 `json.dumps(sort_keys=True)`）；
+   - 字符串按 JSON 规则转义并保留非 ASCII（`ensure_ascii=False`）；控制字符、引号、反斜杠按 RFC 8785 转义；
+   - 数组保持输入顺序；
+   - 数字按 ECMAScript `Number` 文本形式输出（`-0` → `0`）；整数只在 `±(2^53-1)` 内可精确表示，超出即拒绝；拒绝 `NaN`/`Infinity`；
+   - 拒绝非 JSON 类型（`bytes`、`datetime`、`Decimal` 等）。
 2. Base64url（无填充）编码为 `payload_segment`；
 3. 计算 `mac = HMAC-SHA256(key, b"agx1." + payload_segment)`（即对 JCS/UTF-8 字节的编码形式签名）；
 4. token = `agx1.<payload_segment>.<base64url(mac)>`。
+
+**实现选择**：`app/security` 自带的规范化器只依赖标准库。虽然仓库已有经向量测试的 `app.governance.policies.canonical_json`，但它的导入链会拉入治理模型与 `app.db.base`（SQLAlchemy ORM），违反 §16.1 “安全单元测试不导入 `app.db`”的约束，也让安全基座依赖业务治理模块。若未来把 JCS 抽成 stdlib-only 共享模块，应改为复用并删除本地实现；在此之前禁止用 `json.dumps(sort_keys=True)` 冒充 JCS。
 
 校验：
 
@@ -541,7 +548,7 @@ class GrantStatus:
 
 这样即使 Supervisor 尚未完成停止（或停止失败），一个已撤销的 Grant 也会在**下一次调用**被拒绝。两个来源任一不可用 → 拒绝（fail closed，`unknown`），不得回退为“只看令牌”。
 
-MVP 中 `GrantStatusProvider` 由 controller 注入的只读快照实现（合成测试用内存实现；#83 接真实 Grant 存储时实现同一协议），网关不直接读数据库。
+`GrantStatusProvider` 必须是**实时只读适配器**：网关在每次调用上重新调用 `status()`，不缓存、不复用上一次结果、不接受 spec 自带的过期时间；实现只能读取授权状态，不能签发或修改 Grant。合成测试使用内存实现的**实时**状态（测试可改变其返回值，下一次调用立即生效）；#83 再把该协议接到真实 Grant 存储，网关仍不直接读数据库。
 
 ### 9.7 传播边界与残余风险
 
@@ -559,10 +566,27 @@ MVP 中 `GrantStatusProvider` 由 controller 注入的只读快照实现（合�
 
 - 监听：`AF_UNIX`，`/run/agentmgr-exec/gateway.sock`，`SOCK_STREAM`，文件模式 `0666`（父目录 `0700` 限制真实可达性；bind mount 暴露给单元）；
 - 编码：**newline-delimited JSON**，一个连接一个请求、一个响应，随后关闭；
-- 单请求上限 **64 KiB**（含换行）；超限立即 `payload_too_large` 并关闭，不读完剩余内容；
-- 读/写超时各 **5s**；超时 `timeout` 并关闭；
 - 不接受流水线、不接受多请求连接、不接受空行之外的空请求；
 - 网关只读 Unix socket，不监听任何 IP 端口。
+
+准入与速率限额（默认值，部署可配置）：
+
+| 限额 | 默认 | 作用域 | 超限原因码 |
+|---|---|---|---|
+| 并发连接 | **8** | 每任务（按 `SO_PEERCRED` UID 计数；一任务一 DynamicUser UID） | `busy` |
+| 并发连接 | **64** | 全局 | `busy` |
+| 请求速率 | **16/s** | 每任务（按 peer UID 计；连接建立后计数，不等待 token） | `rate_limited` |
+| 请求速率 | **200/s** | 全局 | `rate_limited` |
+| 单请求字节 | **64 KiB（65536，含换行）** | 每连接 | `payload_too_large` |
+| 读/写超时 | **5s** | 每连接 | `timeout` |
+
+规则：
+
+- 限额是**部署配置**（例如 `AGENTMGR_EXEC_GATEWAY_MAX_CONNECTIONS_PER_TASK`、`..._MAX_CONNECTIONS_GLOBAL`、`..._MAX_RPS_PER_TASK`、`..._MAX_RPS_GLOBAL`），在网关启动时校验；缺失、非法或非正数 → **启动失败**（fail closed），不得退化为“无限制”。任务输入、token claim、提示词都不能修改这些值。
+- 计数用单调时钟的令牌桶；`SO_PEERCRED` UID 只用于**准入计数与审计**，不参与资源授权（授权仍由 token claim + 范围判定决定）。同一单元内的子进程共享该 UID，因此共享同一份限额。空闲 UID 的桶在 300s 无活动后回收，避免无限增长。
+- 准入顺序是**先 per-peer-UID、后 global**：per-task 超限直接拒绝，不消耗全局配额。单个任务最多占 8 个连接 / 16 req/s，不能独占全局的 64 / 200。
+- 超限**立即拒绝并关闭**，不排队、不无限重试；连接槽在 `finally` 中释放，任何连接最多占用 **5s**。因此一个任务不能无限期饿死其它任务；全局配额被占满时，其它任务最多等待一个 5s 超时窗口后获得槽位，不会排队或静默丢弃。全局上限满时返回 `busy`（fail closed）。
+- 单请求读取超过 64 KiB 时立即 `payload_too_large` 并关闭，不读完剩余内容。
 
 ### 10.2 请求与响应
 
@@ -601,6 +625,8 @@ MVP 中 `GrantStatusProvider` 由 controller 注入的只读快照实现（合�
 | `bad_request` | JSON 非法、未知字段、重复键、字段类型错误 |
 | `unsupported_version` | `version` 不匹配 |
 | `payload_too_large` | 超过 64 KiB |
+| `rate_limited` | 超过每任务或全局每秒请求上限 |
+| `busy` | 超过每任务或全局并发连接上限（或全局准入已满） |
 | `token_invalid` | 格式/签名/kid/aud/iss/claim 集合错误 |
 | `token_not_yet_valid` | `nbf` 未到（含允许偏差） |
 | `credential_expired` | `exp` 已过 |
@@ -619,20 +645,21 @@ MVP 中 `GrantStatusProvider` 由 controller 注入的只读快照实现（合�
 
 ### 10.4 校验顺序
 
-1. 连接 `SO_PEERCRED` 记录（uid/pid，仅审计）；
-2. 行长度与 JSON 结构（`payload_too_large` / `bad_request`）；
-3. `version`；
-4. token 格式与 MAC（`token_invalid`）；
-5. claim 键集合、类型、`iss`/`aud`/`v`、`kid`；
-6. `nbf` / `exp`；
-7. 撤销存储（`credential_revoked`）；
-8. `GrantStatusProvider`（`grant_*`、`execution_mode_mismatch`）；
-9. 令牌与 Grant 的 `task_id`/`grant_id`/`subject_id` 一致性（`cross_task_denied`）；
-10. capability（`capability_not_granted`）；
-11. resource 格式、范围、`exclude`（`resource_scope_denied`）、backend 允许列表（`resource_denied`）；
-12. 调用 backend 并审计（`backend_error` / `timeout`）。
+1. 连接准入：先查 peer UID 并发连接 ≤8，再查全局 ≤64（`busy`）；
+2. `SO_PEERCRED` 记录（uid/pid，仅审计）并施加每秒请求限额：先查 peer UID ≤16/s，再查全局 ≤200/s（`rate_limited`）；
+3. 行长度与 JSON 结构（`payload_too_large` / `bad_request`）；
+4. `version`；
+5. token 格式与 MAC（`token_invalid`）；
+6. claim 键集合、类型、`iss`/`aud`/`v`、`kid`；
+7. `nbf` / `exp`；
+8. 撤销存储（`credential_revoked`）；
+9. 实时 `GrantStatusProvider`（`grant_*`、`execution_mode_mismatch`）；
+10. 令牌与 Grant 的 `task_id`/`grant_id`/`subject_id` 一致性（`cross_task_denied`）；
+11. capability（`capability_not_granted`）；
+12. resource 格式、范围、`exclude`（`resource_scope_denied`）、backend 允许列表（`resource_denied`）；
+13. 调用 backend 并审计（`backend_error` / `timeout`）。
 
-任何一步失败都**不产生副作用**，且写一条 deny 审计。
+任何一步失败都**不产生副作用**，且写一条 deny 审计。第 1–2 步在读取请求前发生，审计只有 `peer_uid` 与限额原因码，不含 token 或请求内容；第 3 步之后才可能记录 `task_id`/`grant_id`。
 
 ### 10.5 `FileResourceBackend` 与未来 `ResourceBackend`
 
@@ -666,6 +693,7 @@ class ResourceBackend(Protocol):
 | `decision` | `allow` / `deny` |
 | `reason` | 稳定原因码 |
 | `peer_uid` | 对端 UID（数值） |
+| `limit` | 触发限额的稳定名：`per_task_connections` / `per_task_rps` / `global_connections` / `global_rps`（仅限流拒绝时） |
 | `boundary_claim_version` / `network_profile` | 边界声明版本 |
 
 禁止字段：token、token 前缀/哈希以外的任何派生值、payload、异常文本、堆栈、绝对路径、宿主名、用户名。审计写入失败时：**拒绝调用**（fail closed）还是放行由部署策略决定，MVP 选择拒绝并告警，避免“无审计的执行”。
@@ -674,25 +702,32 @@ class ResourceBackend(Protocol):
 
 ### 11.1 状态与映射
 
-| 观测（`systemctl show`） | Supervisor 状态 | `stop_confirmed` |
-|---|---|---|
-| `ActiveState=activating` | `starting` | false |
-| `ActiveState=active` | `running` | false |
-| `ActiveState=deactivating` | `stopping` | false |
-| `ActiveState=inactive` 且 `MainPID=0` 且 `Result=success` 且 `ExecMainStatus=0` | `completed` | true |
-| `ActiveState=inactive/failed` 且 `MainPID=0` 且 `Result=timeout` | `timed_out` | true |
-| `ActiveState=failed` 且 `MainPID=0`（其它 `Result`） | `failed` | true |
-| 单元不存在（`LoadState=not-found`）且**已有启动证据** | `unknown` | false |
-| 单元不存在且**无启动证据** | `not_started` | true（可安全重试） |
-| `ActiveState=unknown` / 字段缺失 | `unknown` | false |
+| 观测（`systemctl show`） | Supervisor 状态 | `process_gone` | `stop_confirmed` | `never_started` |
+|---|---|---|---|---|
+| `ActiveState=activating` | `starting` | false | false | false |
+| `ActiveState=active` | `running` | false | false | false |
+| `ActiveState=deactivating` | `stopping` | false | false | false |
+| `ActiveState=inactive` 且 `MainPID=0` 且 `Result=success` 且 `ExecMainStatus=0` | `completed` | **true** | **false** | false |
+| `ActiveState=inactive/failed` 且 `MainPID=0` 且 `Result=timeout` | `timed_out` | **true** | **true** | false |
+| `ActiveState=inactive/failed` 且 `MainPID=0` 且**已发起 stop/cancel** 且 `Result` 非 `success`/`timeout` | `cancelled` | **true** | **true** | false |
+| `ActiveState=failed` 且 `MainPID=0` 且无 stop 请求（其它 `Result`） | `failed` | **true** | **false** | false |
+| 单元不存在（`LoadState=not-found`）且**已有启动证据** | `unknown` | **true** | false | false |
+| 单元不存在且**无启动证据** | `not_started` | false | **false** | **true**（可安全重试） |
+| `ActiveState=unknown` / 字段缺失 | `unknown` | false | false | false |
 
-**`stop_confirmed=true` 的必要条件**：`ActiveState ∈ {inactive, failed}` **且** `MainPID` 解析为整数 `0`。`deactivating`、`activating`、`unknown`、字段缺失一律为 false；`MainPID=0` 单独不足以证明停止（未启动的单元也是 0），因此必须结合启动证据与 `ActiveEnterTimestamp`/`ExecMainStartTimestamp`。
+三个布尔值语义不同，不能互相替代：
+
+- **`process_gone`**：单元已不在运行。判定为 `ActiveState ∈ {inactive, failed}` 且 `MainPID` 解析为整数 `0`，或 `LoadState=not-found` 且已有启动证据。`MainPID=0` 单独不足以证明“曾经运行过”——从未启动的单元也是 0，因此必须结合 `ActiveEnterTimestamp`/`ExecMainStartTimestamp`/`LoadState` 区分 `not_started`。
+- **`stop_confirmed`**：由 Supervisor 发起 stop/cancel，或由 `RuntimeMaxSec` 触发的 timeout 停止，并且已取得上述停止证据。自然 `completed`/`failed` 只说明进程结束，**不是**“停止请求已被证实”，一律为 false；`deactivating`、`activating`、`unknown`、字段缺失也为 false。
+- **`never_started`**：`LoadState=not-found` 且没有任何启动证据；它表示“从未开始”，不是“已停止”。
+
+`RuntimeObservation` 同时暴露这三个字段；`cleanup` 的前置条件是 `process_gone || never_started`（§11.4），不是 `stop_confirmed`。
 
 ### 11.2 launch
 
 1. 解析并校验 `ManagedTaskSpec`（§7.2）；失败即返回 `invalid_spec` 等，无副作用。
-2. 读取 `GrantStatusProvider.status()`：校验存在、未过期、`active`、`usable`、`execution_mode=managed_execution`、`task_id`/`grant_id` 一致。
-3. 计算有效 TTL：`min(spec.ttl_seconds, grant 剩余秒数, 900)`，且 ≥ 1。
+2. 实时读取 `GrantStatusProvider.status()`：校验存在、未过期、`active`、`usable`、`execution_mode=managed_execution`、`task_id`/`grant_id` 一致。**过期时间只取本次返回的 `expires_at`**；spec 不提供过期时间。
+3. 计算有效 TTL：`min(spec.ttl_seconds, provider.expires_at - now, 300)`，且 ≥ 1。
 4. 计算单元名（§8.5），确认不与运行中单元冲突。
 5. 生成 `jti`/`nonce`，签发 token，写入凭据文件（`0600`，`O_EXCL`）。
 6. 写 spec 文件 `/run/agentmgr-exec/specs/<unit>.json`（`0600`，root）。
@@ -714,14 +749,14 @@ class ResourceBackend(Protocol):
 
 1. 先在撤销存储写入 `jti`（reason = `grant_revoked`/`grant_expired`/`manual_stop`/`task_terminal`）；
 2. 调用助手 `stop <unit>`（等价 `systemctl stop`），`TimeoutStopSec=5`；
-3. 轮询 `inspect` 直到 `ActiveState ∈ {inactive, failed}` 且 `MainPID=0`，上限 **10s**；
+3. 轮询 `inspect` 直到 `process_gone=true`（`ActiveState ∈ {inactive, failed}` 且 `MainPID=0`），上限 **10s**；
 4. 若仍未确认：调用 `systemctl kill --signal=SIGKILL --kill-whom=all <unit>`，再轮询 3s；
-5. 仍无法确认 → 返回 `unit_stop_unconfirmed`（`stop_confirmed=false`），写 `security.exec.supervisor.stop_unconfirmed` 审计并告警；**不得**报告已停止；
-6. 确认后写 stop 审计（含 `stop_confirmed=true`、`Result`、`ExecMainStatus`）。
+5. 仍无法确认 → 返回 `unit_stop_unconfirmed`（`process_gone=false`、`stop_confirmed=false`），写 `security.exec.supervisor.stop_unconfirmed` 审计并告警；**不得**报告已停止；
+6. 确认后写 stop 审计（含 `process_gone=true`、`stop_confirmed=true`、`Result`、`ExecMainStatus`）。
 
 `cleanup(handle)`：
 
-1. 仅当 `stop_confirmed=true` 或单元从未启动时执行；
+1. 仅当 `process_gone=true` 或 `never_started=true` 时执行；两者都为 false（例如停止未确认）时拒绝清理并返回 `unit_stop_unconfirmed`，不得删除状态目录或凭据残留；
 2. `systemctl reset-failed <unit>`（清理失败态残留）；
 3. 删除 `/var/lib/private/agentmgr-exec/<unit>`（及 `/var/lib/agentmgr-exec/<unit>` 符号链接，若仍存在）；
 4. 删除残留凭据/spec 文件；
@@ -732,8 +767,8 @@ class ResourceBackend(Protocol):
 
 | 竞态 | 处理 |
 |---|---|
-| 完成 vs 停止 | 先读最终 `Result`/`ExecMainStatus`：已完成则保持 `completed`，`systemctl stop` 视为幂等空操作；不得把完成降级为 `cancelled` |
-| 停止请求在 SIGTERM 前完成 | 记录 `completed` + `stop_confirmed=true`（单元已 inactive、`MainPID=0`） |
+| 完成 vs 停止 | 以最终 `Result`/`ExecMainStatus` 为准：`Result=success` 且 `ExecMainStatus=0` → 保持 `completed`（`process_gone=true`、`stop_confirmed=false`），`systemctl stop` 视为幂等空操作；不得把自然完成降级为 `cancelled` |
+| 停止请求与自然完成竞争 | 若最终 `Result` 表明被信号终止 → `cancelled`（`process_gone=true`、`stop_confirmed=true`）；若仍为 `success`/`ExecMainStatus=0` → 按自然完成记 `completed`，`stop_confirmed=false`；不得仅凭“发过 stop 请求”声明停止成功 |
 | 凭据撤销写失败 | 写失败重试一次；launch 阶段失败则**不启动**（返回 `unknown`）；stop 阶段失败仍继续停止，标记 `credential_revoke_failed`，告警，且网关对 `GrantStatusProvider` 的实时检查仍会拒绝 |
 | 撤销存储与 Grant 状态源均不可用 | 网关拒绝全部调用（`unknown`），触发告警 |
 | `systemd-run` 超时 | 视为“可能已启动”：`inspect` 确认；存在则 stop + 取证，不存在（`LoadState=not-found` 且无时间戳）才返回 `unit_start_failed` |
@@ -744,7 +779,7 @@ class ResourceBackend(Protocol):
 
 | 错误码 | 含义 | 是否可重试 |
 |---|---|---|
-| `invalid_spec` | spec 结构/取值非法（含路径穿越、未知字段） | 否（修正输入） |
+| `invalid_spec` | spec 结构/取值非法（含未知字段如 `grant_expires_at`/`workspace`/`state`、超出范围） | 否（修正输入） |
 | `grant_missing` | 状态源无此 Grant | 否 |
 | `grant_expired` | Grant 已过期 | 否（需新 Grant） |
 | `grant_revoked` | Grant 已撤销/已消费/不可用 | 否 |
@@ -783,8 +818,8 @@ class ResourceBackend(Protocol):
 ### 12.3 生产模板：窄助手 + 固定 sudoers
 
 - 助手路径：`/usr/local/libexec/agentmgr-exec`（`root:root 0755`）；
-- sudoers：`agentmgr ALL=(root) NOPASSWD: /usr/local/libexec/agentmgr-exec`（**无通配符、无参数匹配**）；
-- 助手负责参数校验，而不是依赖 sudoers 的模式匹配。
+- sudoers 只固定一个可执行文件：`agentmgr ALL=(root) NOPASSWD: /usr/local/libexec/agentmgr-exec`。sudoers **不限制参数**，也不承担参数校验；它只回答“这个用户能不能执行这个 helper”。
+- 所有参数校验（unit 名称正则、spec 路径/属主/模式、字段白名单、子命令与参数个数）都在 root-owned helper 内完成，任何不符合的输入 fail closed。
 
 | 子命令 | 参数 | 行为 |
 |---|---|---|
@@ -802,7 +837,7 @@ class ResourceBackend(Protocol):
 - 不继承调用方环境变量（`env -i` 等价）；
 - stdout 只输出结构化 JSON；错误码稳定，不含内部路径。
 
-**为什么避免 sudoers 通配符**：`systemctl *` 等于“任意单元任意动作”，`systemd-run *` 等于“以 root 运行任意命令/任意属性”，两者都直接等价于 root shell。即使写成 `systemctl stop agentmgr-task-*`，通配符仍可被路径/参数技巧绕过。因此本设计把**全部**参数校验放进 root 拥有的助手，sudoers 只放行一个固定可执行文件。
+**为什么 sudoers 只放行固定可执行文件**：`systemctl *` 等于“任意单元任意动作”，`systemd-run *` 等于“以 root 运行任意命令/任意属性”，两者都直接等价于 root shell。即使写成 `systemctl stop agentmgr-task-*`，通配符仍可被路径/参数技巧绕过。sudoers 不是参数校验器，因此本设计**不用它表达参数约束**：它只固定一个可执行文件，全部参数校验由 root 拥有的助手完成。
 
 ## 13. 计划文件布局
 
@@ -810,7 +845,7 @@ class ResourceBackend(Protocol):
 app/security/__init__.py
 app/security/boundary.py          # ManagedTaskSpec, ResourceScope, BoundaryClaim, 单元名
 app/security/credentials.py       # agx1, HMAC/JCS, RevocationStore, GrantStatusProvider
-app/security/gateway.py           # NDJSON 协议, 校验链, FileResourceBackend, 审计
+app/security/gateway.py           # NDJSON 协议, 准入/限流, 校验链, FileResourceBackend, 审计; 含 `python -m app.security.gateway` 入口
 app/security/systemd.py           # systemd-run/systemctl argv, 状态解析与映射
 app/security/supervisor.py        # launch/poll/stop/inspect/cleanup, 竞态与监控循环
 app/security/errors.py            # 稳定错误码与安全错误消息
@@ -883,6 +918,8 @@ Supervisor: 删除源凭据与 spec 文件；返回 handle + BoundaryClaim
 | 能力不足 | `resource.write@1.0.0` 不在 allowed | `capability_not_granted` |
 | 范围外 | `res_synthetic_9999` 不在 `resource_ids` | `resource_scope_denied` |
 | 资源不允许 | backend 允许清单外/非普通文件 | `resource_denied` |
+| 并发超限 | 每任务 >8 或全局 >64 个并发连接 | `busy` |
+| 速率超限 | 每任务 >16/s 或全局 >200/s | `rate_limited` |
 | 协议错误 | 未知字段、>64 KiB | `bad_request` / `payload_too_large` |
 
 所有拒绝均无副作用，且写 deny 审计；不返回任何内部细节。
@@ -894,26 +931,28 @@ Supervisor: 删除源凭据与 spec 文件；返回 handle + BoundaryClaim
 Supervisor 监控循环(≤1s) → 发现 revoked/expired
 Supervisor → RevocationStore.revoke(jti)
 Supervisor → 助手 stop → systemctl stop (SIGTERM→5s→SIGKILL)
-Supervisor → systemctl show: ActiveState=inactive/failed 且 MainPID=0 → stop_confirmed=true
+Supervisor → systemctl show: ActiveState=inactive/failed 且 MainPID=0 → process_gone=true
+Supervisor → 已发起 stop 且有上述证据 → stop_confirmed=true
 Supervisor → 审计 stop + 告警（如涉及 unconfirmed）
-Supervisor → cleanup: reset-failed + 删除状态目录
+Supervisor → cleanup（process_gone=true）: reset-failed + 删除状态目录
 ```
 
-在停止完成之前，任何新调用都会在网关第 8 步被 `grant_revoked` 拒绝。
+在停止完成之前，任何新调用都会在网关第 9 步（实时 `GrantStatusProvider`）被 `grant_revoked` 拒绝。
 
 ### 14.5 TTL 到期
 
 ```
 凭据 exp 到点 → 网关拒绝新调用（credential_expired）
 systemd RuntimeMaxSec 到点 → SIGTERM→SIGKILL，Result=timeout
-Supervisor → 观测 timed_out（stop_confirmed=true）
-Supervisor → 撤销 jti（幂等）→ cleanup
+Supervisor → 观测 timed_out（process_gone=true, stop_confirmed=true）
+Supervisor → 撤销 jti（幂等）→ cleanup（process_gone=true）
 ```
 
 ### 14.6 清理
 
 ```
 Supervisor.cleanup(handle):
+  前置: process_gone=true 或 never_started=true（否则拒绝）
   reset-failed → 删除 /var/lib/private/agentmgr-exec/<unit>
   删除残留 credentials/specs 文件
   prune 过期撤销记录
@@ -936,8 +975,9 @@ Supervisor.cleanup(handle):
 | 唯一外部入口为网关 socket | 只读 bind mount 一个 socket；无 D-Bus/宿主 socket |
 | 资源与时间上限 | `MemoryMax`、`CPUQuota`、`TasksMax`、`LimitNOFILE`、`RuntimeMaxSec` |
 | 跨任务状态隔离 | 独立 UID + `StateDirectoryMode=0700` |
-| 凭据任务绑定/短时/可撤销 | `task_id`/`grant_id` claims、`exp ≤ grant 剩余`、`RevocationStore` |
-| 停止证据 | `ActiveState ∈ {inactive,failed}` 且 `MainPID=0` |
+| 凭据任务绑定/短时/可撤销 | `task_id`/`grant_id` claims、`exp ≤ GrantStatusProvider 剩余`、`RevocationStore` |
+| 停止/退出区分 | `process_gone` = 单元不再运行；`stop_confirmed` 仅在 stop/cancel/timeout 取得证据时为 true；`cleanup` 用 `process_gone \|\| never_started` |
+| 网关准入上限 | per-task 8 连接 / 16 req/s、global 64 连接 / 200 req/s、单请求 64 KiB、读写 5s |
 | 模式一致 | spec 与 Grant 双重校验 `managed_execution` |
 
 ### 15.2 无法由本基座消除（`BoundaryClaim.bypassable`）
@@ -951,7 +991,7 @@ Supervisor.cleanup(handle):
 | 网关 backend 缺陷 | 范围校验错误、路径处理错误 | 代码评审 + 负向测试；backend 内重复校验 |
 | 未经网关的资源路径 | 若部署把资源挂进单元或网络可达 | 部署基线检查；本设计不挂载业务资源 |
 | 同 UID 内的子进程 | 任务可派生子进程共享凭据 | 任务级而非进程级凭据；`KillMode=control-group` 兜底 |
-| UID 复用窗口 | 停止后状态目录残留 | 停止确认后立即 cleanup；残留告警 |
+| UID 复用窗口 | 停止后状态目录残留 | `process_gone`（或 `never_started`）后立即 cleanup；残留告警 |
 
 ### 15.3 延后 / 未验证（`BoundaryClaim.deferred`）
 
@@ -983,11 +1023,11 @@ Supervisor.cleanup(handle):
 
 | 测试 | 覆盖 |
 |---|---|
-| `test_boundary.py` | 未知字段/重复键/非法 JSON、路径穿越（`../`、绝对路径、`a/b`、NUL）、模式拒绝、限额边界、Grant 子集校验、`BoundaryClaim` 常量完整性、单元名确定性与正则、哈希碰撞分支 |
-| `test_credentials.py` | JCS 稳定性、MAC 校验、篡改/截断/错误 kid/过期/`nbf`、claim 键集合、短密钥与缺失密钥 fail closed、轮换窗口、`InMemoryRevocationStore`、`FileRevocationStore` 原子写入与并发读、prune |
-| `test_gateway.py` | NDJSON 单请求、64 KiB 边界、未知字段、版本、所有 deny 原因码、`SO_PEERCRED` 记录（用 socketpair/mock）、审计白名单（token 不出现）、backend 路径校验/符号链接拒绝、超时 |
-| `test_systemd_unit.py` | argv 构造精确匹配、属性值范围、空 capability 语法、`%N` 使用、无 shell 拼接、`systemctl show` 输出解析、状态映射表逐行 |
-| `test_supervisor.py` | 用 fake runner 测 launch/stop/cleanup 状态机、竞态（完成 vs 停止、撤销写失败、启动超时、停止超时）、错误码、`stop_confirmed` 仅在证据成立时为真 |
+| `test_boundary.py` | 未知字段/重复键/非法 JSON（显式覆盖 `grant_expires_at`/`workspace`/`state` 被拒）、NUL/控制字符、模式拒绝、`ttl_seconds` 的 1/300 边界、资源范围默认值与边界、Grant 子集校验、`BoundaryClaim` 常量完整性、单元名确定性与正则、哈希碰撞分支 |
+| `test_credentials.py` | **RFC 8785 JCS 向量**：UTF-8（`café`、非 BMP）、UTF-16 键序 vs code point 顺序、整数边界（`0`、`-0`、`2^53-1`、`2^53` 拒绝）、嵌套对象/数组、稳定重放；MAC 校验、篡改/截断/错误 kid/过期/`nbf`、claim 键集合、`exp - iat ≤ 300`、短密钥与缺失密钥 fail closed、轮换窗口、`InMemoryRevocationStore`、`FileRevocationStore` 原子写入与并发读、prune |
+| `test_gateway.py` | NDJSON 单请求、64 KiB 边界、未知字段、版本、所有 deny 原因码（含 `rate_limited`/`busy`）、per-UID/全局连接与速率限额、一个任务不能占满全局配额（fake clock/计数器）、超限不排队、`SO_PEERCRED` 记录（用 socketpair/mock）、审计白名单（token 不出现）、backend 路径校验/符号链接拒绝、超时 |
+| `test_systemd_unit.py` | argv 构造精确匹配、`RuntimeMaxSec` 1..300、`MemoryMax` 32..1024、`CPUQuota` 1..100、`TasksMax` 1..64、空 capability 语法、`%N` 使用、无 shell 拼接、`systemctl show` 输出解析、状态映射表逐行 |
+| `test_supervisor.py` | 用 fake runner 测 launch/stop/cleanup 状态机、竞态（完成 vs 停止、撤销写失败、启动超时、停止超时）、错误码；逐行验证 `completed`/`failed` → `process_gone=true, stop_confirmed=false`、`not_started` → `never_started=true`、`timed_out`/`cancelled` → `stop_confirmed=true`、`cleanup` 前置条件 |
 
 ### 16.3 真实隔离负向矩阵
 
@@ -1014,9 +1054,11 @@ Supervisor.cleanup(handle):
 | 19 | 范围外资源 ID | `resource_scope_denied` | `resource_scope_denied` |
 | 20 | 未授予能力 | `capability_not_granted` | `capability_not_granted` |
 | 21 | Grant 撤销后网关调用（单元尚在停止中） | `grant_revoked` | `grant_revoked` |
-| 22 | TTL=2s 的 `sleep 30` | unit 在 ≤8s 内终止，`Result=timeout` | `timeout` |
-| 23 | 撤销 Grant 后停止 `sleep 30` | ≤5s 内 `inactive/failed` 且 `MainPID=0`，`stop_confirmed=true` | 证据字段 |
-| 24 | 清理 | 无 `agentmgr-task-*` 单元、无 `/run/agentmgr-exec`、无 `/var/lib/private/agentmgr-exec` | 证据字段 |
+| 22 | TTL=2s 的 `sleep 30` | unit 在 ≤8s 内终止，`Result=timeout`；`process_gone=true`、`stop_confirmed=true` | `timeout` |
+| 23 | 撤销 Grant 后停止 `sleep 30` | ≤5s 内 `inactive/failed` 且 `MainPID=0`；`process_gone=true`、`stop_confirmed=true` | 证据字段 |
+| 24 | 清理 | `process_gone=true`（或 `never_started=true`）后清理；无 `agentmgr-task-*` 单元、无 `/run/agentmgr-exec`、无 `/var/lib/private/agentmgr-exec` | 证据字段 |
+| 25 | 同一任务在 1s 内发起 17 次允许调用 | 第 17 次起 `rate_limited`，连接立即关闭，前 16 次正常返回 | `rate_limited` |
+| 26 | 同一任务保持 9 个并发连接不发送请求 | 第 9 个连接收到 `busy` 并关闭；前 8 个在 5s 内超时关闭，不排队 | `busy` |
 
 说明：
 
@@ -1024,6 +1066,7 @@ Supervisor.cleanup(handle):
 - 第 22 项的时间上限包含 systemd 运行时检查粒度；断言使用 `≤8s`，避免把调度抖动误判为缺陷。
 - 第 12 项 `unshare` 的失败原因可能是 `RestrictNamespaces=yes` 或 `SystemCallFilter`；证据需记录 `errno` 原文。`namespace_denied` 只是证据 JSON 中的观测标签，不属于网关原因码集合。
 - 第 15 项成功后必须验证返回体**不含**其它资源内容。
+- 第 25/26 项验证 **per-task** 上限；全局上限（64 连接 / 200 req/s）由 `test_gateway.py` 的 fake clock/计数器覆盖，不在单机 live 矩阵中制造 64 个并发任务。两项都必须核对：超限响应后连接立即关闭，进程/文件描述符没有泄漏。
 
 ### 16.4 证据 JSON
 
@@ -1053,6 +1096,20 @@ Supervisor.cleanup(handle):
     "cap_eff": "0000000000000000",
     "no_new_privs": "1"
   },
+  "gateway": {
+    "limits": {
+      "per_task_connections": 8,
+      "per_task_requests_per_second": 16,
+      "global_connections": 64,
+      "global_requests_per_second": 200,
+      "max_request_bytes": 65536,
+      "read_write_timeout_seconds": 5
+    },
+    "probes": [
+      {"id": "gateway-rate-limit", "expected": "rate_limited", "observed": "<observed>"},
+      {"id": "gateway-busy", "expected": "busy", "observed": "<observed>"}
+    ]
+  },
   "probes": [
     {
       "id": "read-etc-shadow",
@@ -1068,7 +1125,7 @@ Supervisor.cleanup(handle):
     "run_dir_present": false,
     "state_dir_present": false
   },
-  "result": "pass"
+  "result": "<pass|fail>"
 }
 ```
 
@@ -1076,6 +1133,7 @@ Supervisor.cleanup(handle):
 
 - 证据写入 `$AGENTMGR_ISOLATION_EVIDENCE`（仓库外路径），**不提交**到仓库；
 - `probes[]` 覆盖 §16.3 的 #6–#9 网络拒绝，`observed` 记录 `errno` 名称与错误类别，不记录目标主机真实地址；
+- `gateway.limits` 记录本次运行实际生效的部署限额，必须与网关启动配置一致；`gateway.probes[]` 对应 §16.3 的 #25/#26，`observed` 只在真实运行后填写，本轮为 planned / not run；
 - `systemd_properties` 由 `systemctl show` 原样读取，`process` 由单元内探针读取；
 - `uid` 只记录数值（示例中的 `61000` 是结构示意，不是真实分配值）；`unit` 已由哈希派生；
 - 不含宿主名、用户名、绝对 home 路径、IP、令牌、密钥、Profile 内容；
@@ -1087,9 +1145,9 @@ Supervisor.cleanup(handle):
 
 1. 前置检查：`AGENTMGR_ISOLATION_TEST=1`、`AGENTMGR_ISOLATION_SUDO=1`、`systemd ≥ 249`、`systemd-run`/`systemctl` 可用；
 2. 创建 `/run/agentmgr-exec` 与资源目录，部署 `workload.py`；
-3. 启动内存网关（或由测试进程内提供 socket）；
+3. 启动**独立网关进程**：`python -m app.security.gateway --socket /run/agentmgr-exec/gateway.sock --resources-root /srv/agentmgr-exec-resources`，并通过 `AGENTMGR_EXEC_CREDENTIAL_KEYRING` / `AGENTMGR_EXEC_CREDENTIAL_ACTIVE_KID` 注入测试用临时 keyring；脚本把 PID 写入 `$RUN_DIR/gateway.pid`。网关只监听该 Unix socket，不监听 IP 端口；单元通过只读 bind mount 的 `/run/agentmgr/gateway.sock` 访问。真实矩阵必须走独立进程；单测可以用 socketpair/线程内 server，但不得把两者混称为“内存网关”；
 4. 依次执行 §16.3 探针；
-5. 停止单元、清理目录、核对残留；
+5. **teardown（无论断言成败都执行）**：停止所有 `agentmgr-task-<hex>` 单元 → `systemctl reset-failed` → 按 `gateway.pid` 停止网关（先 `kill <pid>` 并 `wait`，超时再 SIGKILL）→ 删除 socket 文件、`/run/agentmgr-exec` 与 `/var/lib/private/agentmgr-exec` → 核对残留；
 6. 写出证据 JSON，任一断言失败即非零退出。
 
 **真实测试只有在所有者批准本文与实现后才运行；本轮未运行。**
@@ -1098,9 +1156,9 @@ Supervisor.cleanup(handle):
 
 | # | #82 验收条目 | 设计落点 | 证据状态（2026-10-23） |
 |---|---|---|---|
-| 1 | 受控 Agent 无法读取其他主体的凭据或访问未授权资源 | §6.3 目录权限、§8 沙箱属性、§10.4 校验链、§16.3 #4/#5/#15/#18/#19 | **planned / not run** |
-| 2 | Grant 到期或撤销后，后续受控调用失败 | §9.6 双重校验、§11.4 stop、§14.4/§14.5、§16.3 #16/#17/#21/#23 | **planned / not run** |
-| 3 | 绕行测试有真实命令、退出码和证据 | §16.3 全部 24 项、§16.4 证据格式、`verify_isolation.sh` | **planned / not run** |
+| 1 | 受控 Agent 无法读取其他主体的凭据或访问未授权资源 | §6.3 目录权限、§8 沙箱属性、§10.4 校验链、§10.1 准入限额、§16.3 #4/#5/#15/#18/#19/#25/#26 | **planned / not run** |
+| 2 | Grant 到期或撤销后，后续受控调用失败 | §9.6 实时双重校验（不缓存）、§11.4 stop/cleanup、§14.4/§14.5、§16.3 #16/#17/#21/#23 | **planned / not run** |
+| 3 | 绕行测试有真实命令、退出码和证据 | §16.3 全部 26 项、§16.4 证据格式、`verify_isolation.sh` | **planned / not run** |
 | 4 | 无法强制治理的能力有明确风险记录和对应产品声明限制 | §4、§15.2、§15.3、`BoundaryClaim` | 设计层已记录；运行证据 **planned** |
 
 补充：本文不满足、也不声称满足 #82 的“已实现”条件；它只固定实现与验证的验收规格。
@@ -1117,8 +1175,9 @@ sudo -n systemctl reset-failed agentmgr-task-<12hex>
 # 2. 确认无残留
 systemctl list-units --all 'agentmgr-task-*' --no-legend
 
-# 3. 停止网关进程（若由脚本启动）
-kill <gateway_pid>   # 或 systemctl --user stop，取决于启动方式
+# 3. 停止网关进程（verify_isolation.sh 启动的独立进程）
+kill "$(cat "$RUN_DIR/gateway.pid")" && wait "$(cat "$RUN_DIR/gateway.pid")"
+# 超时未退出再 SIGKILL 该 PID；随后删除 socket 文件
 
 # 4. 删除运行目录与状态目录
 sudo -n rm -rf /run/agentmgr-exec
@@ -1155,6 +1214,8 @@ sudo -n rm -f /var/lib/agentmgr-exec/* 2>/dev/null || true
 | `agentmgr_exec_unit_failures_total{result}` | counter | 非 `timeout` 的失败 ≥1 |
 | `agentmgr_exec_stop_unconfirmed_total` | counter | ≥1（立即） |
 | `agentmgr_exec_gateway_denials_total{reason}` | counter | `token_invalid`/`cross_task_denied` 突增 |
+| `agentmgr_exec_gateway_throttled_total{reason,limit}` | counter | `rate_limited`/`busy` 持续出现，或单任务长期占满配额 |
+| `agentmgr_exec_gateway_connections{scope}` | gauge | 接近全局 64 上限（容量告警，不是越权） |
 | `agentmgr_exec_credential_revoke_failures_total` | counter | ≥1（立即） |
 | `agentmgr_exec_cleanup_leftovers` | gauge | >0 |
 | `agentmgr_exec_grant_status_unavailable_total` | counter | ≥1（网关 fail closed） |
@@ -1166,11 +1227,14 @@ sudo -n rm -f /var/lib/agentmgr-exec/* 2>/dev/null || true
 
 **无阻塞性开放问题。** 以下为设计阶段已作出的取舍，记录以备评审：
 
-1. `StateDirectory=agentmgr-exec/%N` 而非 `%i`：`%i` 只对模板实例化单元有值，本方案使用非模板 transient unit，`%N` 才能得到每任务目录（§8.5）。
-2. 网关在 MVP 与 controller 同进程：撤销即时生效；文件撤销存储用于跨进程/重启恢复（§9.7）。若拆分为独立服务，需增加“每次调用读取 + 无缓存”的约束。
+1. `StateDirectory=agentmgr-exec/%N` 而非 `%i`：`%i` 只对模板实例化单元有值，本方案使用非模板 transient unit，`%N` 才能得到每任务目录（§8.5）。该写法**保持不变**。
+2. 网关在 MVP 可与 controller 同进程，也可独立进程；两种形态都要求**每次调用实时读取** `GrantStatusProvider`、无缓存，文件撤销存储用于跨进程/重启恢复（§9.6、§9.7）。#83 才接真实 Grant 存储。
 3. 网络回退是**主机级**选择，不是每任务选择（§8.4）；避免同一主机出现两种声明。
-4. 停止证据以 `systemctl show` 的 `ActiveState` + `MainPID` + 时间戳为准，不以 `systemd-run` 返回或单元消失为准（§11.1）。
+4. 停止语义拆成三个独立事实：`process_gone`（单元不再运行）、`stop_confirmed`（stop/cancel/timeout 已取得证据）、`never_started`（从未启动）。`completed`/`failed` 不等于 `stop_confirmed`；`cleanup` 的前置条件是 `process_gone || never_started`（§11.1、§11.4）。
 5. `network_denied`/`filesystem_denied` 仅作为证据分类码，不由 supervisor 抛出（§11.6）。
+6. 凭据与任务 TTL 统一硬上限 **300s**（`exp - iat ≤ 300`、`RuntimeMaxSec ≤ 300`）；更长任务与凭据刷新由 **#83** 设计，本 MVP 不放开。
+7. JCS 规范化器放在 `app/security/credentials.py`（stdlib-only），不复用 `app.governance.policies.canonical_json`，避免安全单元测试导入 `app.db`/治理模型；向量测试见 §16.2。若未来出现 stdlib-only 共享实现，改为复用。
+8. 网关限额默认 per-task 8 连接 / 16 req/s、global 64 连接 / 200 req/s，是**部署可配置**的容量限制；调高必须重新评估 TH-24，不能关闭限额。per-task 限额按 peer UID 计数（一个单元一个 DynamicUser UID），仅用于准入，不参与授权。
 
 ## 21. 参考
 
