@@ -354,6 +354,7 @@ def test_stop_inspect_cleanup_reject_bad_units(sandbox: SimpleNamespace) -> None
     for bad in BAD_UNITS:
         for operation, kwargs in (
             (helper.stop, {"runner": runner}),
+            (helper.terminate, {"runner": runner}),
             (helper.kill, {"runner": runner}),
             (helper.inspect, {"runner": runner}),
             (helper.reset_failed, {"runner": runner}),
@@ -368,11 +369,19 @@ def test_stop_inspect_cleanup_reject_bad_units(sandbox: SimpleNamespace) -> None
 def test_commands_use_only_fixed_argv(sandbox: SimpleNamespace) -> None:
     runner = RecordingRunner()
     helper.stop(UNIT, runner=runner)
+    helper.terminate(UNIT, runner=runner)
     helper.kill(UNIT, runner=runner)
     helper.reset_failed(UNIT, runner=runner)
 
     assert runner.calls == [
         ["/usr/bin/systemctl", "stop", UNIT],
+        [
+            "/usr/bin/systemctl",
+            "kill",
+            "--signal=SIGTERM",
+            "--kill-whom=all",
+            UNIT,
+        ],
         [
             "/usr/bin/systemctl",
             "kill",
@@ -392,6 +401,34 @@ def test_commands_use_only_fixed_argv(sandbox: SimpleNamespace) -> None:
     }
 
 
+def test_reset_failed_is_noop_for_collected_unit(
+    sandbox: SimpleNamespace,
+) -> None:
+    class CollectedRunner:
+        def __init__(self) -> None:
+            self.calls: list[list[str]] = []
+
+        def __call__(self, argv) -> subprocess.CompletedProcess[str]:
+            self.calls.append(list(argv))
+            if "reset-failed" in argv:
+                return subprocess.CompletedProcess(argv, 1, "", "")
+            return subprocess.CompletedProcess(argv, 0, "LoadState=not-found\n", "")
+
+    runner = CollectedRunner()
+    helper.reset_failed(UNIT, runner=runner)
+
+    assert runner.calls[0] == ["/usr/bin/systemctl", "reset-failed", UNIT]
+    assert runner.calls[1][:3] == ["/usr/bin/systemctl", "show", "-p"]
+
+    def loaded_runner(argv) -> subprocess.CompletedProcess[str]:
+        if "reset-failed" in argv:
+            return subprocess.CompletedProcess(argv, 1, "", "")
+        return subprocess.CompletedProcess(argv, 0, "LoadState=loaded\n", "")
+
+    with pytest.raises(helper.HelperError):
+        helper.reset_failed(UNIT, runner=loaded_runner)
+
+
 def test_run_request_accepts_only_the_documented_commands(
     sandbox: SimpleNamespace,
 ) -> None:
@@ -399,7 +436,19 @@ def test_run_request_accepts_only_the_documented_commands(
     assert helper.run_request(
         {"command": "stop", "unit": UNIT}, runner=runner
     ) == {"ok": True, "unit": UNIT}
-    assert runner.calls == [["/usr/bin/systemctl", "stop", UNIT]]
+    assert helper.run_request(
+        {"command": "terminate", "unit": UNIT}, runner=runner
+    ) == {"ok": True, "unit": UNIT}
+    assert runner.calls == [
+        ["/usr/bin/systemctl", "stop", UNIT],
+        [
+            "/usr/bin/systemctl",
+            "kill",
+            "--signal=SIGTERM",
+            "--kill-whom=all",
+            UNIT,
+        ],
+    ]
 
     for payload in (
         {"command": "systemctl", "unit": UNIT},
@@ -545,6 +594,8 @@ def test_service_templates_use_hardening_and_unix_socket() -> None:
         "DynamicUser=yes",
         "StateDirectory=agentmgr-exec/agentmgr-task-%i",
         "StateDirectoryMode=0700",
+        "RemainAfterExit=yes",
+        "CollectMode=inactive",
         "NoNewPrivileges=yes",
         "ProtectSystem=strict",
         "ProtectHome=yes",
@@ -601,3 +652,5 @@ def test_helper_argv_matches_product_builder() -> None:
     # by `systemd-run -p` and would create a literal `%N`/`%i` directory.
     assert f"--property=StateDirectory=agentmgr-exec/{UNIT}" in ours
     assert not any("%N" in arg or "%i" in arg for arg in ours)
+    assert "--property=RemainAfterExit=yes" in ours
+    assert "--property=CollectMode=inactive" in ours

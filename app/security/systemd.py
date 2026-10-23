@@ -209,6 +209,9 @@ def build_systemd_run_argv(config: SystemdUnitConfig) -> list[str]:
     private_netns = config.network_profile == NETWORK_PROFILE_PRIVATE_NETNS
     inaccessible = [*_BASE_INACCESSIBLE_PATHS]
 
+    # `RemainAfterExit=yes` + `CollectMode=inactive` keep an exited transient
+    # unit loaded long enough to read ExecMainExitTimestamp/Result; otherwise
+    # systemd collects it immediately and stop evidence is lost.
     # systemd does not expand specifiers (%N, %i) in `systemd-run -p` values;
     # `%N` would create a literal directory.  Use the validated unit name.
     # Unit-file templates may use their own specifiers (see §8.5).
@@ -216,6 +219,8 @@ def build_systemd_run_argv(config: SystemdUnitConfig) -> list[str]:
         "--property=DynamicUser=yes",
         f"--property=StateDirectory=agentmgr-exec/{unit}",
         "--property=StateDirectoryMode=0700",
+        "--property=RemainAfterExit=yes",
+        "--property=CollectMode=inactive",
         f"--property=RuntimeMaxSec={ttl}s",
         "--property=TimeoutStopSec=5",
         "--property=KillMode=control-group",
@@ -382,6 +387,20 @@ def _int_or_none(value: str) -> int | None:
     return parsed if parsed >= 0 else None
 
 
+def _ambiguous_exit_order(
+    exit_at: datetime | None,
+    exit_text: str,
+    stop_requested_at: datetime | None,
+) -> bool:
+    """Return whether a whole-second exit cannot be ordered against a stop."""
+
+    if exit_at is None or stop_requested_at is None:
+        return False
+    if exit_at.replace(microsecond=0) != stop_requested_at.replace(microsecond=0):
+        return False
+    return "." not in exit_text or exit_at == stop_requested_at
+
+
 def _observation(
     state: str,
     process_gone: bool,
@@ -428,6 +447,7 @@ def observation_from_show(
         stop_requested_at = stop_requested_at.astimezone(UTC)
 
     active_state = _text(show, "ActiveState")
+    sub_state = _text(show, "SubState")
     load_state = _text(show, "LoadState")
     result = _text(show, "Result") or "unknown"
     main_pid_value = _int_or_none(_text(show, "MainPID"))
@@ -457,6 +477,28 @@ def observation_from_show(
     if active_state == "activating":
         return _observation(
             "starting", False, False, False, main_pid, result, exec_main_status
+        )
+    if active_state == "active" and sub_state == "exited" and main_pid_value == 0:
+        # `RemainAfterExit=yes` + `CollectMode=inactive` keep a finished unit
+        # loaded as active/exited so the exit evidence survives collection.
+        if stop_requested_at is None:
+            return _observation(
+                "completed", True, False, False, main_pid, result, exec_main_status
+            )
+        if exit_at is None:
+            return _observation(
+                "unknown", True, False, False, main_pid, result, exec_main_status
+            )
+        if _ambiguous_exit_order(exit_at, exit_text, stop_requested_at):
+            return _observation(
+                "unknown", True, False, False, main_pid, result, exec_main_status
+            )
+        if exit_at < stop_requested_at:
+            return _observation(
+                "completed", True, False, False, main_pid, result, exec_main_status
+            )
+        return _observation(
+            "cancelled", True, True, False, main_pid, result, exec_main_status
         )
     if active_state == "active":
         return _observation(
@@ -493,20 +535,7 @@ def observation_from_show(
             "unknown", True, False, False, main_pid, result, exec_main_status
         )
 
-    ambiguous = False
-    if stop_requested_at is not None and exit_at is not None:
-        same_second = exit_at.replace(microsecond=0) == stop_requested_at.replace(
-            microsecond=0
-        )
-        # Classic systemd timestamps are whole-second.  If the stop landed in
-        # that same second, the true order is unknowable; an exact tie is
-        # equally ambiguous.  Never guess either way.
-        exit_has_subsecond = "." in exit_text
-        ambiguous = same_second and (
-            not exit_has_subsecond or exit_at == stop_requested_at
-        )
-
-    if ambiguous:
+    if _ambiguous_exit_order(exit_at, exit_text, stop_requested_at):
         return _observation(
             "unknown", True, False, False, main_pid, result, exec_main_status
         )
@@ -618,6 +647,8 @@ class SystemdOps(Protocol):
     ) -> None: ...
 
     def stop(self, unit: str) -> None: ...
+
+    def terminate(self, unit: str) -> None: ...
 
     def kill(self, unit: str) -> None: ...
 
@@ -735,6 +766,23 @@ class SudoSystemdOps:
             detail="stop_failed",
         )
 
+    def terminate(self, unit: str) -> None:
+        _invoke(
+            self._runner,
+            [
+                "sudo",
+                "-n",
+                "systemctl",
+                "kill",
+                "--signal=SIGTERM",
+                "--kill-whom=all",
+                _validate_unit(unit),
+            ],
+            None,
+            code="unit_stop_unconfirmed",
+            detail="terminate_failed",
+        )
+
     def kill(self, unit: str) -> None:
         _invoke(
             self._runner,
@@ -763,13 +811,21 @@ class SudoSystemdOps:
         return parse_systemctl_show(completed.stdout or "")
 
     def reset_failed(self, unit: str) -> None:
-        _invoke(
-            self._runner,
-            ["sudo", "-n", "systemctl", "reset-failed", _validate_unit(unit)],
-            None,
-            code="unknown",
-            detail="reset_failed_failed",
-        )
+        resolved = _validate_unit(unit)
+        try:
+            _invoke(
+                self._runner,
+                ["sudo", "-n", "systemctl", "reset-failed", resolved],
+                None,
+                code="unknown",
+                detail="reset_failed_failed",
+            )
+        except SecurityError:
+            # Transient units may already be collected; reset-failed then exits
+            # non-zero.  `not-found` means there is nothing to reset: no-op.
+            if self.show(resolved).get("LoadState") == "not-found":
+                return
+            raise
 
     def remove_sources(self, unit: str) -> None:
         resolved = _validate_unit(unit)
@@ -791,13 +847,7 @@ class SudoSystemdOps:
 
     def cleanup(self, unit: str) -> None:
         resolved = _validate_unit(unit)
-        _invoke(
-            self._runner,
-            ["sudo", "-n", "systemctl", "reset-failed", resolved],
-            None,
-            code="unknown",
-            detail="reset_failed_failed",
-        )
+        self.reset_failed(resolved)
         _invoke(
             self._runner,
             [
@@ -892,6 +942,13 @@ class HelperSystemdOps:
             {"command": "stop", "unit": _validate_unit(unit)},
             code="unit_stop_unconfirmed",
             detail="helper_stop_failed",
+        )
+
+    def terminate(self, unit: str) -> None:
+        self._call(
+            {"command": "terminate", "unit": _validate_unit(unit)},
+            code="unit_stop_unconfirmed",
+            detail="helper_terminate_failed",
         )
 
     def kill(self, unit: str) -> None:

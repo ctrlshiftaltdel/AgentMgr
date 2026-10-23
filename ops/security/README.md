@@ -109,11 +109,18 @@ environment or a log.
 | --- | --- | --- |
 | `launch` | `command`, `spec`, `credential` | Validate the exact spec field set, write root-only `specs/<unit>.json` and `credentials/<unit>.json` with `O_CREAT|O_EXCL|O_NOFOLLOW` and `0600`, then run the fixed `systemd-run` argv. |
 | `stop` | `command`, `unit` | Fixed `systemctl stop <unit>`. |
+| `terminate` | `command`, `unit` | Fixed `systemctl kill --signal=SIGTERM --kill-whom=all <unit>`; keeps exit evidence available. |
 | `kill` | `command`, `unit` | Fixed `systemctl kill --signal=SIGKILL --kill-whom=all <unit>`. |
 | `inspect` | `command`, `unit` | Fixed `systemctl show` property projection; returns `{"show": {<property>: <value>}}`. |
-| `reset-failed` | `command`, `unit` | Fixed `systemctl reset-failed <unit>`. |
+| `reset-failed` | `command`, `unit` | Fixed `systemctl reset-failed <unit>`; `LoadState=not-found` is a no-op. |
 | `remove-sources` | `command`, `unit` | Deletes only `credentials/<unit>.json` and `specs/<unit>.json`. |
 | `cleanup` | `command`, `unit` | `reset-failed`, then deletes only the unit's derived source files, state directory and compatibility symlink. |
+
+Transient units are launched with `RemainAfterExit=yes` and
+`CollectMode=inactive`, so an exited unit remains loaded as `active/exited`
+until the supervisor reads `ExecMainExitTimestamp`/`Result`; it then uses
+`stop`/`cleanup`. `reset-failed` on a collected (`LoadState=not-found`) unit is
+a no-op.
 
 Unit names must match `^agentmgr-task-[0-9a-f]{12}$`. The unit is re-derived
 from the validated task ID, so a client cannot select an arbitrary unit. The

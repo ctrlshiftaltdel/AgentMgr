@@ -244,16 +244,16 @@ git commit -m "feat(security): add Unix-socket PEP gateway"
 - Produces: `parse_systemctl_show(text: str) -> dict[str, str]`.
 - Produces: `parse_systemd_timestamp(value: str) -> datetime | None`.
 - Produces: `observation_from_show(show: Mapping[str, str], *, stop_requested_at: datetime | None = None, had_start_evidence: bool = False) -> RuntimeObservation`.
-- Produces: `SystemdOps` Protocol: `launch(config, *, spec_text: str, credential_text: str)`, `stop(unit)`, `kill(unit)`, `show(unit) -> Mapping[str, str]`, `reset_failed(unit)`, `remove_sources(unit)`, `cleanup(unit)`.
+- Produces: `SystemdOps` Protocol: `launch(config, *, spec_text: str, credential_text: str)`, `stop(unit)`, `terminate(unit)`, `kill(unit)`, `show(unit) -> Mapping[str, str]`, `reset_failed(unit)`, `remove_sources(unit)`, `cleanup(unit)`.
 - Produces: `SudoSystemdOps(runner: Callable[[list[str], str | None], subprocess.CompletedProcess] = run_checked)` for the approved test host; it writes `specs/`/`credentials/` with `sudo -n tee` + `sudo -n chmod 600` (token only via stdin), launches with fixed `systemd-run` argv, and cleans up only validated paths. `HelperSystemdOps(helper_path: Path)` for production; it sends the same spec/credential JSON over stdin.
 - Produces: `run_checked(argv: list[str], input_text: str | None = None) -> subprocess.CompletedProcess` (no shell; timeout 15s).
 
 - [ ] **Step 1: Write failing systemd tests**
 
 `app/tests/security/test_systemd_unit.py`:
-- `test_systemd_argv_exact_properties`: assert `DynamicUser=yes`, `StateDirectory=agentmgr-exec/<unit>`, `StateDirectoryMode=0700`, `RuntimeMaxSec=60s`, `ProtectSystem=strict`, `ProtectHome=yes`, `InaccessiblePaths` entries, `PrivateTmp=yes`, `PrivateDevices=yes`, `PrivateNetwork=yes`, `RestrictAddressFamilies=AF_UNIX`, `IPAddressDeny=any`, `NoNewPrivileges=yes`, `CapabilityBoundingSet=` and `AmbientCapabilities=` empty, `SystemCallFilter=@system-service`, `SystemCallArchitectures=native`, `RestrictNamespaces=yes`, `LockPersonality=yes`, `MemoryDenyWriteExecute=yes`, `RestrictRealtime=yes`, `RestrictSUIDSGID=yes`, `RemoveIPC=yes`, `ProtectClock/KernelTunables/KernelModules/KernelLogs/ControlGroups/Hostname=yes`, `ProtectProc=invisible`, `ProcSubset=pid`, `UMask=0077`, `MemoryMax=256M`, `CPUQuota=50%`, `TasksMax=32`, `LimitNOFILE=256`, `LoadCredential=...`, both `BindReadOnlyPaths`, `ExecStart`.
+- `test_systemd_argv_exact_properties`: assert `DynamicUser=yes`, `StateDirectory=agentmgr-exec/<unit>`, `StateDirectoryMode=0700`, `RemainAfterExit=yes`, `CollectMode=inactive`, `RuntimeMaxSec=60s`, `ProtectSystem=strict`, `ProtectHome=yes`, `InaccessiblePaths` entries, `PrivateTmp=yes`, `PrivateDevices=yes`, `PrivateNetwork=yes`, `RestrictAddressFamilies=AF_UNIX`, `IPAddressDeny=any`, `NoNewPrivileges=yes`, `CapabilityBoundingSet=` and `AmbientCapabilities=` empty, `SystemCallFilter=@system-service`, `SystemCallArchitectures=native`, `RestrictNamespaces=yes`, `LockPersonality=yes`, `MemoryDenyWriteExecute=yes`, `RestrictRealtime=yes`, `RestrictSUIDSGID=yes`, `RemoveIPC=yes`, `ProtectClock/KernelTunables/KernelModules/KernelLogs/ControlGroups/Hostname=yes`, `ProtectProc=invisible`, `ProcSubset=pid`, `UMask=0077`, `MemoryMax=256M`, `CPUQuota=50%`, `TasksMax=32`, `LimitNOFILE=256`, `LoadCredential=...`, both `BindReadOnlyPaths`, `ExecStart`.
 - `test_argv_contains_no_user_string_command_or_shell`: no `sh`, `-c`, `bash`, `Environment`, `User=`, `ExecStart` from spec; unit must match regex.
-- `test_show_parser_and_state_table`: table-driven rows for activating/active/deactivating/completed/timed_out/cancelled/failed/not-found/unknown; assert `process_gone`, `stop_confirmed`, `never_started`.
+- `test_show_parser_and_state_table`: table-driven rows for activating/active/running/active-exited/deactivating/completed/timed_out/cancelled/failed/not-found/unknown; assert `process_gone`, `stop_confirmed`, `never_started`.
 - `test_natural_completion_is_not_stop_confirmed`: `Result=success`, `ExecMainStatus=0`, exit timestamp before stop request → `stop_confirmed=False`.
 - `test_stop_request_before_exit_is_cancelled`: stop request earlier than exit → `cancelled`, `stop_confirmed=True`.
 - `test_helper_ops_sends_stdin_and_never_token_argv`: fake runner captures argv/input; token is in stdin JSON, not argv; unit/path validation rejects bad names.
@@ -355,7 +355,7 @@ git commit -m "feat(security): add managed execution supervisor"
 - `test_live_filesystem_and_privilege_boundaries`: read `/etc/shadow`, `<test-host-home>/.hermes` (constructed at runtime, not committed), `/var/lib/postgresql`, other unit `$STATE_DIRECTORY`; all denied; `CapEff=0`, `NoNewPrivs=1`, `unshare` fails, `ps` only self.
 - `test_live_network_is_af_unix_only`: `socket(AF_INET)` fails; connect `127.0.0.1:5432`, `203.0.113.10:443`, `<metadata-endpoint>` fail; allowed gateway call succeeds.
 - `test_live_credential_expiry_revocation_scope_and_cross_task`: valid read succeeds; expired/revoked/cross-task/out-of-scope/ungranted capability denied; Grant revoked while unit running → next call `grant_revoked`, then stop verified.
-- `test_live_ttl_and_stop_confirmed`: `sleep 30` with TTL 2s ends ≤8s with `Result=timeout`, `process_gone=true`, `stop_confirmed=true`; stop on revoke ends ≤5s with MainPID 0.
+- `test_live_ttl_and_stop_confirmed`: `sleep 30` with TTL 2s ends ≤8s with `Result=timeout`, `process_gone=true`, `stop_confirmed=true`; stop on revoke ends ≤5s with retained `active/exited` exit evidence or `MainPID=0`.
 - `test_live_gateway_rate_limits`: 17 requests in 1s → 17th `rate_limited`; 9 idle connections → 9th `busy`; cleanup after.
 - `test_live_run_directory_ownership_and_source_removal`: `/run/agentmgr-exec` owner/mode is the controller/gateway user `0700`; `gateway.sock` owner matches; after the unit is active, `credentials/<unit>.json` is absent; the unit cannot traverse `/run/agentmgr-exec`.
 - `test_live_cleanup_leaves_no_units_or_dirs`: no `agentmgr-task-*`, no `/run/agentmgr-exec`, no `/var/lib/private/agentmgr-exec` after harness.
@@ -402,7 +402,7 @@ git commit -m "test(security): add live managed execution isolation harness"
 
 **Interfaces:**
 - `agentmgr_exec.py`: `validate_unit(unit) -> None`; `validate_spec_payload(payload) -> None`; `launch_from_stdin(stdin_text, *, runner=run_checked) -> dict`; `stop(unit)`, `inspect(unit)`, `cleanup(unit)`.
-- `HelperSystemdOps` in `app/security/systemd.py` already sends `{"command": ...}` via stdin; the helper accepts `launch`/`stop`/`inspect`/`cleanup`/`remove-sources`.
+- `HelperSystemdOps` in `app/security/systemd.py` already sends `{"command": ...}` via stdin; the helper accepts `launch`/`stop`/`terminate`/`kill`/`inspect`/`reset-failed`/`cleanup`/`remove-sources`.
 - `agentmgr-exec` wrapper: `#!/bin/sh` + `exec /usr/bin/python3 /usr/local/libexec/agentmgr_exec.py "$@"` (production install layout; repo wrapper is a template).
 - sudoers template: `# <controller-user> ALL=(root) NOPASSWD: /usr/local/libexec/agentmgr-exec`; note that the helper, not sudoers, validates arguments.
 - systemd templates: gateway service runs as a dedicated `<controller-user>` with `RuntimeDirectory=agentmgr-exec`, `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome=yes`, and a `--socket /run/agentmgr-exec/gateway.sock`; task template documents the same sandbox and says transient is the default.

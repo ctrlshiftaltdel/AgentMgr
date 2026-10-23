@@ -66,6 +66,7 @@ __all__ = [
     "run_checked",
     "run_request",
     "stop",
+    "terminate",
     "unit_for_task",
     "validate_spec_payload",
     "validate_unit",
@@ -469,12 +470,16 @@ def build_launch_argv(unit: str, spec: object) -> list[str]:
         raise HelperError("unit_name_mismatch")
 
     credential = _credentials_dir() / f"{unit}.json"
+    # Keep the exited transient unit loaded as active/exited until the supervisor
+    # reads ExecMainExitTimestamp/Result; systemd would otherwise collect it.
     # `systemd-run -p` does not expand `%N`/`%i`; use the validated unit name so
     # the state directory is `agentmgr-exec/<unit>`, not a literal `%N` path.
     properties = [
         "--property=DynamicUser=yes",
         f"--property=StateDirectory=agentmgr-exec/{unit}",
         "--property=StateDirectoryMode=0700",
+        "--property=RemainAfterExit=yes",
+        "--property=CollectMode=inactive",
         f"--property=RuntimeMaxSec={ttl}s",
         "--property=TimeoutStopSec=5",
         "--property=KillMode=control-group",
@@ -641,10 +646,26 @@ def kill(unit: object, *, runner: Runner = run_checked) -> None:
     )
 
 
+def terminate(unit: object, *, runner: Runner = run_checked) -> None:
+    validate_unit(unit)
+    assert isinstance(unit, str)
+    _run(
+        [SYSTEMCTL, "kill", "--signal=SIGTERM", "--kill-whom=all", unit],
+        runner=runner,
+    )
+
+
 def reset_failed(unit: object, *, runner: Runner = run_checked) -> None:
     validate_unit(unit)
     assert isinstance(unit, str)
-    _run([SYSTEMCTL, "reset-failed", unit], runner=runner)
+    try:
+        _run([SYSTEMCTL, "reset-failed", unit], runner=runner)
+    except HelperError:
+        # A collected transient unit is already gone; reset-failed returns
+        # non-zero for it.  `not-found` is a no-op, every other failure raises.
+        if inspect(unit, runner=runner).get("LoadState") == "not-found":
+            return
+        raise
 
 
 def _parse_show(text: str) -> dict[str, str]:
@@ -752,6 +773,7 @@ _UNIT_COMMANDS = {
     "remove-sources": remove_sources,
     "reset-failed": reset_failed,
     "stop": stop,
+    "terminate": terminate,
 }
 
 

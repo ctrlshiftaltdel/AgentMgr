@@ -123,6 +123,8 @@ def _expected_properties(config: SystemdUnitConfig) -> list[str]:
         "--property=DynamicUser=yes",
         f"--property=StateDirectory=agentmgr-exec/{config.unit}",
         "--property=StateDirectoryMode=0700",
+        "--property=RemainAfterExit=yes",
+        "--property=CollectMode=inactive",
         f"--property=RuntimeMaxSec={config.spec.ttl_seconds}s",
         "--property=TimeoutStopSec=5",
         "--property=KillMode=control-group",
@@ -426,6 +428,32 @@ def test_show_parser_and_state_table() -> None:
         ),
         (
             {
+                "ActiveState": "active",
+                "SubState": "exited",
+                "MainPID": "0",
+                "Result": "success",
+                "ExecMainStatus": "0",
+                "LoadState": "loaded",
+                "ExecMainExitTimestamp": _timestamp(NOW - timedelta(seconds=1)),
+            },
+            {},
+            ("completed", True, False, False),
+        ),
+        (
+            {
+                "ActiveState": "active",
+                "SubState": "exited",
+                "MainPID": "0",
+                "Result": "signal",
+                "ExecMainStatus": "15",
+                "LoadState": "loaded",
+                "ExecMainExitTimestamp": _timestamp(NOW + timedelta(seconds=1)),
+            },
+            {"stop_requested_at": stop_at},
+            ("cancelled", True, True, False),
+        ),
+        (
+            {
                 "ActiveState": "deactivating",
                 "SubState": "stop-sigterm",
                 "MainPID": "1234",
@@ -551,6 +579,26 @@ def test_show_parser_and_state_table() -> None:
 
     for show, kwargs, expected in rows:
         assert _observation_row(show, **kwargs) == expected, show
+
+
+def test_active_exited_keeps_main_pid_zero_and_exit_evidence() -> None:
+    observation = observation_from_show(
+        {
+            "ActiveState": "active",
+            "SubState": "exited",
+            "MainPID": "0",
+            "Result": "success",
+            "ExecMainStatus": "0",
+            "LoadState": "loaded",
+            "ExecMainExitTimestamp": _timestamp(NOW - timedelta(seconds=1)),
+        }
+    )
+
+    assert observation.state == "completed"
+    assert observation.process_gone is True
+    assert observation.stop_confirmed is False
+    assert observation.main_pid == 0
+    assert observation.exec_main_status == 0
 
 
 def test_natural_completion_is_not_stop_confirmed() -> None:
@@ -757,6 +805,24 @@ def test_helper_ops_show_parses_structured_output(tmp_path: Path) -> None:
     )
 
 
+def test_helper_ops_terminate_sends_fixed_command() -> None:
+    runner = FakeRunner()
+    ops = HelperSystemdOps(HELPER, runner=runner)
+
+    ops.terminate(UNIT)
+
+    assert runner.calls == [
+        (
+            ["sudo", "-n", str(HELPER)],
+            json.dumps(
+                {"command": "terminate", "unit": UNIT},
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+    ]
+
+
 def test_sudo_ops_writes_root_only_sources_without_token_argv(
     tmp_path: Path,
 ) -> None:
@@ -865,6 +931,7 @@ def test_sudo_ops_uses_fixed_systemctl_argv(tmp_path: Path) -> None:
     )
 
     ops.stop(UNIT)
+    ops.terminate(UNIT)
     ops.kill(UNIT)
     show = ops.show(UNIT)
     ops.reset_failed(UNIT)
@@ -873,6 +940,15 @@ def test_sudo_ops_uses_fixed_systemctl_argv(tmp_path: Path) -> None:
     assert show == {"ActiveState": "active"}
     assert [argv for argv, _ in runner.calls] == [
         ["sudo", "-n", "systemctl", "stop", UNIT],
+        [
+            "sudo",
+            "-n",
+            "systemctl",
+            "kill",
+            "--signal=SIGTERM",
+            "--kill-whom=all",
+            UNIT,
+        ],
         [
             "sudo",
             "-n",
@@ -897,7 +973,53 @@ def test_sudo_ops_uses_fixed_systemctl_argv(tmp_path: Path) -> None:
 
     with pytest.raises(SecurityError):
         ops.stop("agentmgr-task-XYZ")
-    assert len(runner.calls) == 5
+    assert len(runner.calls) == 6
+
+
+def test_sudo_reset_failed_is_noop_for_collected_unit(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    def runner(
+        argv: list[str], input_text: str | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(list(argv))
+        if "reset-failed" in argv:
+            return subprocess.CompletedProcess(argv, 1, "", "")
+        return subprocess.CompletedProcess(argv, 0, "LoadState=not-found\n", "")
+
+    ops = SudoSystemdOps(
+        runner=runner,
+        runtime_root=tmp_path / "run",
+        state_root=tmp_path / "state",
+        state_link_root=tmp_path / "state-link",
+    )
+
+    ops.reset_failed(UNIT)
+
+    assert calls[0] == ["sudo", "-n", "systemctl", "reset-failed", UNIT]
+    assert calls[1][:3] == ["sudo", "-n", "systemctl"]
+    assert any("LoadState" in part for part in calls[1])
+
+
+def test_sudo_reset_failed_still_raises_for_loaded_unit(tmp_path: Path) -> None:
+    def runner(
+        argv: list[str], input_text: str | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        if "reset-failed" in argv:
+            return subprocess.CompletedProcess(argv, 1, "", "")
+        return subprocess.CompletedProcess(argv, 0, "LoadState=loaded\n", "")
+
+    ops = SudoSystemdOps(
+        runner=runner,
+        runtime_root=tmp_path / "run",
+        state_root=tmp_path / "state",
+        state_link_root=tmp_path / "state-link",
+    )
+
+    with pytest.raises(SecurityError) as excinfo:
+        ops.reset_failed(UNIT)
+
+    assert excinfo.value.detail == "reset_failed_failed"
 
 
 def test_sudo_ops_cleanup_only_removes_validated_unit_paths(
