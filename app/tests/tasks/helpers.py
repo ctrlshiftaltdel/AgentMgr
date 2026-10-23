@@ -137,6 +137,12 @@ def submit_managed(
 ) -> Task:
     """Submit a task the runtime dispatcher owns instead of a client.
 
+    The default goal summary is deliberately distinct from ``submit_read``: the
+    duplicate classifier fingerprints the normalised goal, so two otherwise
+    identical submissions would be rejected as ``task_duplicate`` before any
+    claim filter could run.  Only the summary differs -- goal shape, scope and
+    capability stay the same as ``submit_read``.
+
     ``runtime_capabilities_verified`` only records that the capability evidence
     was checked by the test; every transition, grant and lease guard still
     applies exactly as in production.
@@ -146,7 +152,7 @@ def submit_managed(
         "owner": world.actors.owner,
         "executor": world.actors.executor,
         "idempotency_key": key,
-        "goal": goal(),
+        "goal": goal(summary="Read one synthetic managed expense"),
         "resource_scope": scope(),
         "requested_capabilities": [READ_CAPABILITY],
         "policy_set_id": world.policy.policy_set_id,
