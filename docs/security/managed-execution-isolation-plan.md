@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.13 repo code, stdlib only (`hmac`, `hashlib`, `json`, `socket`, `socketserver`, `subprocess`, `dataclasses`), pytest, systemd 257 on the approved test host, cgroup v2.
 
-**Spec:** `docs/security/managed-execution-isolation-design.md` (PR #94, head `0050b01`). The plan implements that approved design; do not broaden it.
+**Spec:** `docs/security/managed-execution-isolation-design.md` (PR #94; this plan's commit includes the `GrantStatus.subject_id` interface clarification). The plan implements that approved design; do not broaden it.
 
 ## Global Constraints
 
