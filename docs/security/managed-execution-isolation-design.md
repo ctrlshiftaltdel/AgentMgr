@@ -546,6 +546,7 @@ class GrantStatusProvider(Protocol):
 class GrantStatus:
     grant_id: str
     task_id: str
+    subject_id: str
     execution_mode: str
     status: Literal["active", "revoked", "consumed"]
     usable: bool
