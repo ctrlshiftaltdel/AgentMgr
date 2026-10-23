@@ -179,11 +179,24 @@ class TestLiveIsolation:
             _probe(evidence, "gateway-cross-task-identity")["observed"]
             == "cross_task_denied"
         )
-        # Another task's resource is outside this credential's resource scope;
-        # identity (task/grant/subject) mismatch is the separate cross_task case.
-        cross_resource = _probe(evidence, "gateway-cross-task-resource")
-        assert cross_resource["observed"] == "resource_scope_denied"
-        assert "scope" in cross_resource.get("note", "")
+        # Unit-level (task A and task B) and controller-level probes share this
+        # id and legitimately report the same denial, so do not depend on entry
+        # order.  Another task's resource is outside this credential's resource
+        # scope; identity mismatch is the separate cross_task case above.
+        cross_resources = [
+            item
+            for item in _probes(evidence)
+            if item.get("id") == "gateway-cross-task-resource"
+        ]
+        assert cross_resources
+        assert all(
+            item.get("expected") == "resource_scope_denied"
+            and item.get("observed") == "resource_scope_denied"
+            and item.get("passed") is True
+            for item in cross_resources
+        )
+        # The controller entry additionally explains why it is a scope denial.
+        assert any("scope" in item.get("note", "") for item in cross_resources)
         assert (
             _probe(evidence, "gateway-out-of-scope-resource")["observed"]
             == "resource_scope_denied"
