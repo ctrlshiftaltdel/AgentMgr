@@ -17,6 +17,7 @@ import hashlib
 import hmac
 import json
 import re
+import shutil
 import stat
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -461,6 +462,26 @@ def test_revocation_store_memory_and_file(tmp_path: Path) -> None:
     with pytest.raises(SecurityError) as raised:
         reloaded.lookup(JTI_3)
     assert raised.value.code == "unknown"
+
+
+def test_file_revocation_store_fails_closed_when_root_disappears(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "revoked"
+    store = FileRevocationStore(root, _clock(NOW))
+    store.revoke(JTI_1, reason="grant_revoked", revoked_at=NOW)
+    assert store.lookup(JTI_1) is not None
+
+    shutil.rmtree(root)
+
+    with pytest.raises(SecurityError) as raised:
+        store.lookup(JTI_1)
+    assert raised.value.code == "unknown"
+    assert raised.value.detail == "revocation_store_unreadable"
+
+    # A missing record under a readable root is still a legitimate absence.
+    store = FileRevocationStore(root, _clock(NOW))
+    assert store.lookup(JTI_2) is None
 
 
 def test_load_keyring_from_env_fails_closed() -> None:

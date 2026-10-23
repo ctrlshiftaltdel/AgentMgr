@@ -44,6 +44,7 @@ import json
 import os
 import re
 import secrets
+import stat
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -793,8 +794,9 @@ class FileRevocationStore:
     Each record lives at ``<root>/<jti>.json`` (mode ``0600``) under a ``0700``
     directory.  Writes go to an exclusive ``*.tmp`` file, are ``fsync``-ed, then
     ``os.replace``-d into place; the directory is ``fsync``-ed afterwards.
-    Readers never look at ``*.tmp``.  A corrupt record fails closed with
-    ``unknown`` rather than being treated as "not revoked".
+    Readers never look at ``*.tmp``.  A missing or non-directory store root and
+    any corrupt or unreadable record fail closed with ``unknown``; only a missing
+    record *under a readable root* means "not revoked".
     """
 
     def __init__(self, root: Path, clock: Callable[[], datetime]) -> None:
@@ -856,13 +858,47 @@ class FileRevocationStore:
         return removed
 
     def _read(self, jti: str) -> RevocationRecord | None:
-        path = self._root / f"{jti}{_RECORD_SUFFIX}"
+        # Open the root as a directory first: if the store is gone, unmounted or
+        # not visible in this mount namespace, revocation cannot be checked and
+        # the caller must deny.  Records are then opened relative to that fd so
+        # a replaced root path cannot redirect the read (no path TOCTOU).
         try:
-            raw = path.read_bytes()
-        except FileNotFoundError:
-            return None
+            root_fd = os.open(self._root, os.O_RDONLY | os.O_DIRECTORY)
         except OSError as exc:
-            raise SecurityError("unknown", "revocation_store_unreadable") from exc
+            raise SecurityError(
+                "unknown", "revocation_store_unreadable"
+            ) from exc
+        try:
+            try:
+                fd = os.open(
+                    f"{jti}{_RECORD_SUFFIX}",
+                    os.O_RDONLY | os.O_NOFOLLOW,
+                    dir_fd=root_fd,
+                )
+            except FileNotFoundError:
+                # The root opened as a directory, so only this record is absent.
+                return None
+            except OSError as exc:
+                raise SecurityError(
+                    "unknown", "revocation_store_unreadable"
+                ) from exc
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    raise SecurityError(
+                        "unknown", "revocation_store_corrupt"
+                    )
+                with os.fdopen(fd, "rb") as handle:
+                    fd = -1
+                    raw = handle.read()
+            except OSError as exc:
+                raise SecurityError(
+                    "unknown", "revocation_store_unreadable"
+                ) from exc
+            finally:
+                if fd != -1:
+                    os.close(fd)
+        finally:
+            os.close(root_fd)
         return _record_from_bytes(raw, expected_jti=jti)
 
     def _write(self, record: RevocationRecord) -> None:
