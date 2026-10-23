@@ -1,0 +1,80 @@
+# Managed task unit template (Issue #82).
+#
+# The supported default is a transient unit created by the root helper with
+# `systemd-run`; this template documents the same sandbox for deployments that
+# must keep a persistent unit definition.  Start an instance as
+# `agentmgr-task@<12 lowercase hex>.service`; the helper's transient name is
+# `agentmgr-task-<12 lowercase hex>`.
+#
+# Per-task limits (MemoryMax, CPUQuota, TasksMax, RuntimeMaxSec) are rendered
+# from the validated spec in transient mode.  The values below are the design
+# maxima and are documentation defaults only.
+#
+# The unit's only writable location is $STATE_DIRECTORY.  The credential is
+# injected by systemd from a root-only source; the gateway socket and the
+# workload are read-only bind mounts.
+
+[Unit]
+Description=AgentMgr managed task (%i)
+After=agentmgr-pep-gateway.service
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=agentmgr-exec/agentmgr-task-%i
+StateDirectoryMode=0700
+RuntimeMaxSec=300
+TimeoutStopSec=5
+KillMode=control-group
+SendSIGKILL=yes
+
+# Filesystem and network sandbox (design §8.1).
+ProtectSystem=strict
+ProtectHome=yes
+InaccessiblePaths=-/etc/agentmgr
+InaccessiblePaths=-/var/lib/agentmgr
+InaccessiblePaths=-/var/lib/postgresql
+InaccessiblePaths=-/srv
+InaccessiblePaths=-/opt
+InaccessiblePaths=-/run/systemd
+InaccessiblePaths=-/run/dbus
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+
+# Privileges and syscalls.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+UMask=0077
+
+# Resource limits (documentation maxima; transient mode uses spec values).
+MemoryMax=1024M
+CPUQuota=100%
+TasksMax=64
+LimitNOFILE=256
+
+# Fixed credential source and the only two bind mounts.
+LoadCredential=task-credential:/run/agentmgr-exec/credentials/agentmgr-task-%i.json
+BindReadOnlyPaths=/run/agentmgr-exec/gateway.sock:/run/agentmgr/gateway.sock
+BindReadOnlyPaths=/run/agentmgr-exec/workload.py:/workload.py
+ExecStart=/usr/bin/python3 /workload.py
