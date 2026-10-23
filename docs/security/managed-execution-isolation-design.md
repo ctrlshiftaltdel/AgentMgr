@@ -336,7 +336,7 @@ class BoundaryClaim:
 | `InaccessiblePaths=`（追加） | `/run/systemd /run/dbus` | 屏蔽宿主 systemd 私有 socket 与 D-Bus，降低 `AF_UNIX` 可达面 |
 | `SystemCallErrorNumber=` | `EPERM` | 被过滤 syscall 返回 EPERM 而非 SIGSYS，避免异常路径差异 |
 
-版本前提：**systemd ≥ 249**（`ProtectProc`/`ProcSubset`/`RestrictSUIDSGID`/`LoadCredential`/`%N` 均需该范围），内核支持 cgroup v2 与 BPF cgroup IP 过滤。运行时不满足时**启动失败**（fail closed），不得降级为一组“尽力而为”的属性。
+版本前提：**systemd ≥ 249**（其中 `ProtectProc`/`ProcSubset` 需 ≥ 247，`LoadCredential` 需 ≥ 244，`%N` 需 ≥ 240；249 是本属性集合的安全基线），内核支持 cgroup v2 与 BPF cgroup IP 过滤。运行时不满足时**启动失败**（fail closed），不得降级为一组“尽力而为”的属性。
 
 参数构造示例（由 `app/security/systemd.py` 生成，实际以 argv 数组传递，不经过 shell）：
 
@@ -1006,7 +1006,7 @@ Supervisor.cleanup(handle):
 | 11 | 同上 `NoNewPrivs` | `1` | 证据字段 |
 | 12 | `unshare(CLONE_NEWUSER\|CLONE_NEWNS)` | `EPERM` | 观测标签 `namespace_denied`（仅证据字段） |
 | 13 | `ps` / `/proc` 枚举 | 只看到本单元进程 | 证据字段 |
-| 14 | 写 `/etc`、`/usr`、`/var/lib`、`/srv` | `EROFS`/`EACCES` | `filesystem_denied` |
+| 14 | 写 `/etc`、`/usr`、`/var/lib`、`/srv` | `EROFS`/`EACCES`/`ENOENT` | `filesystem_denied` |
 | 15 | 经网关读允许资源 | `ok:true`，`resource_id` 匹配 | 允许路径 |
 | 16 | 过期凭据（TTL 2s 后调用） | `credential_expired` | `credential_expired` |
 | 17 | 撤销后调用 | `credential_revoked` | `credential_revoked` |
