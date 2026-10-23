@@ -117,8 +117,6 @@ def _expected_properties(config: SystemdUnitConfig) -> list[str]:
         "-/var/lib/postgresql",
         "-/srv",
         "-/opt",
-        "-/run/systemd",
-        "-/run/dbus",
     ]
     private_netns = config.network_profile == "private_netns"
     return [
@@ -135,6 +133,8 @@ def _expected_properties(config: SystemdUnitConfig) -> list[str]:
             f"--property=InaccessiblePaths={path}"
             for path in inaccessible
         ),
+        "--property=TemporaryFileSystem=/run/systemd",
+        "--property=TemporaryFileSystem=/run/dbus",
         "--property=PrivateTmp=yes",
         "--property=PrivateDevices=yes",
         *(["--property=PrivateNetwork=yes"] if private_netns else []),
@@ -186,10 +186,12 @@ def test_systemd_argv_exact_properties(
     assert "--description=agentmgr-exec" in argv
     properties = [item for item in argv if item.startswith("--property=")]
     assert properties == _expected_properties(config)
-    # Both profiles hide the host systemd private socket and D-Bus so the
-    # bound gateway socket remains the only AF_UNIX entry point.
-    assert "--property=InaccessiblePaths=-/run/systemd" in properties
-    assert "--property=InaccessiblePaths=-/run/dbus" in properties
+    # Both profiles mask the host systemd private socket and D-Bus with a
+    # private tmpfs so the bound gateway socket remains the only AF_UNIX entry.
+    assert "--property=TemporaryFileSystem=/run/systemd" in properties
+    assert "--property=TemporaryFileSystem=/run/dbus" in properties
+    assert "--property=InaccessiblePaths=-/run/systemd" not in properties
+    assert "--property=InaccessiblePaths=-/run/dbus" not in properties
     prefix = "--property=InaccessiblePaths="
     inaccessible = [
         item[len(prefix) :] for item in properties if item.startswith(prefix)
@@ -208,6 +210,23 @@ def test_systemd_argv_exact_properties(
         assert "--property=IPAddressDeny=any" in properties
     # Fixed ExecStart, no shell and no caller-supplied command.
     assert argv[-2:] == ["/usr/bin/python3", "/workload.py"]
+
+
+def test_whole_directory_inaccessible_paths_are_not_emitted(
+    tmp_path: Path,
+) -> None:
+    for profile in ("private_netns", "af_unix_only_fallback"):
+        config = _config(tmp_path / "run" / profile, network_profile=profile)
+        properties = {
+            item
+            for item in build_systemd_run_argv(config)
+            if item.startswith("--property=")
+        }
+
+        assert "--property=InaccessiblePaths=-/run/systemd" not in properties
+        assert "--property=InaccessiblePaths=-/run/dbus" not in properties
+        assert "--property=TemporaryFileSystem=/run/systemd" in properties
+        assert "--property=TemporaryFileSystem=/run/dbus" in properties
 
 
 def test_unknown_network_profile_is_rejected(tmp_path: Path) -> None:

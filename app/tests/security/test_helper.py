@@ -554,6 +554,8 @@ def test_service_templates_use_hardening_and_unix_socket() -> None:
         "IPAddressDeny=any",
         "CapabilityBoundingSet=",
         "InaccessiblePaths=-/etc/agentmgr",
+        "TemporaryFileSystem=/run/systemd",
+        "TemporaryFileSystem=/run/dbus",
         "LoadCredential=task-credential:"
         "/run/agentmgr-exec/credentials/agentmgr-task-%i.json",
         "BindReadOnlyPaths=/run/agentmgr-exec/gateway.sock:"
@@ -563,6 +565,8 @@ def test_service_templates_use_hardening_and_unix_socket() -> None:
         assert directive in task
     assert "\nUser=" not in task
     assert "transient" in task.lower()
+    assert "InaccessiblePaths=-/run/systemd" not in task
+    assert "InaccessiblePaths=-/run/dbus" not in task
 
 
 # --------------------------------------------------------------------------
@@ -587,3 +591,9 @@ def test_helper_argv_matches_product_builder() -> None:
     ]
     assert ours[1:3] == product[1:3]
     assert ours[-2:] == product[-2:]
+    # The duplicated helper must emit the tmpfs mask, never the whole-dir
+    # InaccessiblePaths that breaks systemd namespace setup on the approved host.
+    assert "--property=TemporaryFileSystem=/run/systemd" in ours
+    assert "--property=TemporaryFileSystem=/run/dbus" in ours
+    assert "--property=InaccessiblePaths=-/run/systemd" not in ours
+    assert "--property=InaccessiblePaths=-/run/dbus" not in ours

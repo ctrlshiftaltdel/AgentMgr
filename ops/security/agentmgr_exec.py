@@ -53,6 +53,7 @@ __all__ = [
     "STATE_ROOT",
     "SYSTEMCTL",
     "SYSTEMD_RUN",
+    "TEMPORARY_FILESYSTEM_PATHS",
     "WORKLOAD_PATH",
     "build_launch_argv",
     "cleanup",
@@ -120,15 +121,22 @@ SHOW_PROPERTIES = (
 
 #: Inaccessible control-plane/data paths (kept byte-identical to
 #: ``app.security.systemd._BASE_INACCESSIBLE_PATHS``).
+#:
+#: ``/run/systemd`` and ``/run/dbus`` are deliberately absent: a whole-dir
+#: ``InaccessiblePaths`` over ``/run/systemd`` fails namespace setup on the
+#: approved host (226/NAMESPACE).  They are masked with ``TemporaryFileSystem``
+#: below in both profiles.
 BASE_INACCESSIBLE_PATHS: tuple[str, ...] = (
     "-/etc/agentmgr",
     "-/var/lib/agentmgr",
     "-/var/lib/postgresql",
     "-/srv",
     "-/opt",
-    "-/run/systemd",
-    "-/run/dbus",
 )
+
+#: Private tmpfs mounts that mask the host systemd/D-Bus socket directories in
+#: both profiles (kept byte-identical to the product builder).
+TEMPORARY_FILESYSTEM_PATHS: tuple[str, ...] = ("/run/systemd", "/run/dbus")
 
 _SPEC_FIELDS = frozenset(
     {
@@ -474,6 +482,10 @@ def build_launch_argv(unit: str, spec: object) -> list[str]:
         *(
             f"--property=InaccessiblePaths={path}"
             for path in BASE_INACCESSIBLE_PATHS
+        ),
+        *(
+            f"--property=TemporaryFileSystem={path}"
+            for path in TEMPORARY_FILESYSTEM_PATHS
         ),
         "--property=PrivateTmp=yes",
         "--property=PrivateDevices=yes",

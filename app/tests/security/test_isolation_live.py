@@ -400,11 +400,14 @@ def test_optional_inaccessible_targets_strip_prefix(tmp_path: Path) -> None:
     harness, instance = _unit_harness(tmp_path)
 
     assert harness.optional_inaccessible_targets(
-        ["-/etc/agentmgr", "-/run/dbus", "/srv"]
-    ) == ("/etc/agentmgr", "/run/dbus", "/srv")
+        ["-/etc/agentmgr", "-/opt", "/srv"]
+    ) == ("/etc/agentmgr", "/opt", "/srv")
 
     raw = instance._inaccessible_path_entries()
     assert raw and all(entry.startswith("-/") for entry in raw)
+    # Host systemd/D-Bus directories are masked by TemporaryFileSystem, not by
+    # whole-directory InaccessiblePaths (which fails namespace setup).
+    assert not any("run/systemd" in entry or "run/dbus" in entry for entry in raw)
     stripped = instance._inaccessible_paths()
     assert stripped == list(harness.optional_inaccessible_targets(raw))
     assert all(not path.startswith("-") for path in stripped)

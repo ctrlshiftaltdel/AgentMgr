@@ -304,6 +304,7 @@ class BoundaryClaim:
 | `ProtectSystem=` | `strict` | `/usr`、`/boot`、`/etc`、`/var` 等只读 |
 | `ProtectHome=` | `yes` | `/home`、`/root`、`/run/user` 不可访问 |
 | `InaccessiblePaths=` | `-/etc/agentmgr -/var/lib/agentmgr -/var/lib/postgresql -/srv -/opt` | 显式屏蔽控制面、数据库与业务目录；`-` 为可选路径语法（不存在则忽略，存在则仍屏蔽） |
+| `TemporaryFileSystem=` | `/run/systemd /run/dbus` | 以私有 tmpfs 遮蔽宿主 systemd 私有 socket 与 D-Bus 目录；两种 profile 均为固定属性 |
 | `PrivateTmp=` | `yes` | 独立 `/tmp` 与 `/var/tmp`，跨任务不可见 |
 | `PrivateDevices=` | `yes` | 无原始设备节点 |
 | `PrivateNetwork=` | `yes` | 独立网络命名空间；默认 profile |
@@ -342,11 +343,12 @@ class BoundaryClaim:
 
 所有 `InaccessiblePaths=` 条目都使用 systemd 的**可选路径语法** `-<path>`：目标路径不存在时 systemd 忽略该条（因此 `/etc/agentmgr`、`/var/lib/agentmgr` 等部署目录尚未创建的精简测试机仍能启动单元），目标路径存在时仍被设为不可访问。该前缀只影响“路径不存在时是否拒绝启动”，不放宽任何已存在路径的沙箱属性；不得为了兼容主机而删掉条目或改用不带 `-` 的普通路径。
 
+**不得对 `/run/systemd` 目录整体使用 `InaccessiblePaths`。** 在已批准测试机上，`InaccessiblePaths=-/run/systemd` 会使 systemd 的命名空间设置失败，单元以 `226/NAMESPACE` 启动失败；只屏蔽 `/run/dbus` 或改用 `TemporaryFileSystem` 则可成功。对照 matrix 显示 `TemporaryFileSystem=/run/systemd` 与 `/run/dbus` 以私有 tmpfs 遮蔽宿主 socket 目录后能够启动，因此两者在**两种 profile** 中都作为固定属性使用。该结论仅基于已批准测试机，不外推到其它宿主；Master 仍需按 §16 重跑 live 验证。
+
 同一 profile 内的附加加固（不改变上表语义）：
 
 | 附加属性 | 值 | 说明 |
 |---|---|---|
-| `InaccessiblePaths=`（追加） | `-/run/systemd -/run/dbus` | 屏蔽宿主 systemd 私有 socket 与 D-Bus，降低 `AF_UNIX` 可达面；`-` 为可选路径语法 |
 | `SystemCallErrorNumber=` | `EPERM` | 被过滤 syscall 返回 EPERM 而非 SIGSYS，避免异常路径差异 |
 
 版本前提：**systemd ≥ 249**（其中 `ProtectProc`/`ProcSubset` 需 ≥ 247，`LoadCredential` 需 ≥ 244，`%N` 需 ≥ 240；249 是本属性集合的安全基线），内核支持 cgroup v2 与 BPF cgroup IP 过滤。运行时不满足时**启动失败**（fail closed），不得降级为一组“尽力而为”的属性。
@@ -369,6 +371,8 @@ systemd-run --unit=agentmgr-task-<12hex> --description=agentmgr-exec \
   --property=InaccessiblePaths=-/var/lib/postgresql \
   --property=InaccessiblePaths=-/srv \
   --property=InaccessiblePaths=-/opt \
+  --property=TemporaryFileSystem=/run/systemd \
+  --property=TemporaryFileSystem=/run/dbus \
   --property=PrivateTmp=yes \
   --property=PrivateDevices=yes \
   --property=PrivateNetwork=yes \
@@ -423,13 +427,13 @@ systemd-run --unit=agentmgr-task-<12hex> --description=agentmgr-exec \
 | profile | 属性 | 何时使用 |
 |---|---|---|
 | `private_netns`（默认） | `PrivateNetwork=yes` + `RestrictAddressFamilies=AF_UNIX` + `IPAddressDeny=any` | 主机探测通过（socket 可连接） |
-| `af_unix_only_fallback` | 去掉 `PrivateNetwork=yes`，保留 `RestrictAddressFamilies=AF_UNIX` + `IPAddressDeny=any`，并追加 `InaccessiblePaths=-/run/systemd -/run/dbus`（可选路径语法） | 默认 profile 下 bind mount 的 Unix socket 无法连接（例如宿主/内核限制） |
+| `af_unix_only_fallback` | 去掉 `PrivateNetwork=yes`，保留 `RestrictAddressFamilies=AF_UNIX` + `IPAddressDeny=any`；`TemporaryFileSystem=/run/systemd`、`/run/dbus` 与默认 profile 相同 | 默认 profile 下 bind mount 的 Unix socket 无法连接（例如宿主/内核限制） |
 
 规则：
 
 - 探测在**主机级**执行一次（启动时或 harness 首次运行）：用同一 profile 启动一个只做 `connect()` 的最小单元；成功即 `private_netns`，失败即 `af_unix_only_fallback`；结果缓存到进程内并写入审计。
 - 回退**不是**“放宽网络”：`AF_INET`/`AF_INET6` 仍被 `RestrictAddressFamilies` 拒绝，IP 出口仍被 `IPAddressDeny=any` 拒绝。失去的是“独立 netns”这一层纵深防御，不是“无 IP”不变量。
-- 回退时新增的 `InaccessiblePaths` 用于缩小 `AF_UNIX` 可达面（宿主 systemd 私有 socket、D-Bus）；条目使用可选路径语法，路径不存在时不影响启动，存在时仍不可访问。
+- 两种 profile 都以 `TemporaryFileSystem=/run/systemd` 与 `/run/dbus` 遮蔽宿主 systemd 私有 socket 与 D-Bus；回退不再追加 `InaccessiblePaths`，也不改变文件系统沙箱。
 - 回退必须出现在 `BoundaryClaim.network_profile` 与证据 JSON 中；不得静默切换。
 - 两个分支都必须用真实 `connect()` 探针在目标主机上验证（默认分支与回退分支各一次），不得只凭文档假设；结果写入证据 JSON（§16.4）。
 - 每个任务不得单独选择 profile；同一主机同一时刻只使用一种。
@@ -993,7 +997,7 @@ Supervisor.cleanup(handle):
 | 无 capability | 空 `CapabilityBoundingSet=`/`AmbientCapabilities=`、`NoNewPrivileges=yes` |
 | 禁止新建 namespace | `RestrictNamespaces=yes` |
 | 无 IP 网络 | `PrivateNetwork=yes`（默认）、`RestrictAddressFamilies=AF_UNIX`、`IPAddressDeny=any` |
-| 唯一外部入口为网关 socket | 只读 bind mount 一个 socket；无 D-Bus/宿主 socket |
+| 唯一外部入口为网关 socket | 只读 bind mount 一个 socket；`TemporaryFileSystem=/run/systemd`、`/run/dbus` 遮蔽宿主 systemd/D-Bus 目录 |
 | 资源与时间上限 | `MemoryMax`、`CPUQuota`、`TasksMax`、`LimitNOFILE`、`RuntimeMaxSec` |
 | 跨任务状态隔离 | 独立 UID + `StateDirectoryMode=0700` |
 | 凭据任务绑定/短时/可撤销 | `task_id`/`grant_id` claims、`exp ≤ GrantStatusProvider 剩余`、`RevocationStore` |

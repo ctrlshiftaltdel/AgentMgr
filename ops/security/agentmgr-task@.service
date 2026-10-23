@@ -28,7 +28,9 @@ TimeoutStopSec=5
 KillMode=control-group
 SendSIGKILL=yes
 
-# Filesystem and network sandbox (design §8.1).
+# Filesystem and network sandbox (design §8.1).  The host systemd and D-Bus
+# socket directories are masked with private tmpfs; whole-directory
+# InaccessiblePaths over /run/systemd fails namespace setup on the approved host.
 ProtectSystem=strict
 ProtectHome=yes
 InaccessiblePaths=-/etc/agentmgr
@@ -36,8 +38,8 @@ InaccessiblePaths=-/var/lib/agentmgr
 InaccessiblePaths=-/var/lib/postgresql
 InaccessiblePaths=-/srv
 InaccessiblePaths=-/opt
-InaccessiblePaths=-/run/systemd
-InaccessiblePaths=-/run/dbus
+TemporaryFileSystem=/run/systemd
+TemporaryFileSystem=/run/dbus
 PrivateTmp=yes
 PrivateDevices=yes
 PrivateNetwork=yes

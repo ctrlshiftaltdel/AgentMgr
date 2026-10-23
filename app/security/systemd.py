@@ -90,8 +90,6 @@ _SHOW_PROPERTIES = (
 )
 
 #: Inaccessible control-plane/data paths common to both network profiles.
-#: ``/run/systemd`` and ``/run/dbus`` close the host systemd private socket and
-#: D-Bus to ``AF_UNIX`` connects in both profiles (design §8.1/§15.1).
 #:
 #: Every entry carries systemd's optional-path ``-`` prefix: a path that does
 #: not exist on the host is ignored, while a path that *does* exist is still
@@ -99,15 +97,22 @@ _SHOW_PROPERTIES = (
 #: ``/var/lib/agentmgr`` are absent on a minimal test host; an unconditional
 #: entry would make ``systemd-run`` refuse to start the unit.  The prefix does
 #: not weaken the sandbox for any path that is present.
+#:
+#: Do **not** add ``/run/systemd`` or ``/run/dbus`` here.  On the approved test
+#: host a whole-directory ``InaccessiblePaths`` over ``/run/systemd`` makes
+#: systemd's namespace setup fail (unit result ``226/NAMESPACE``).  Those host
+#: socket directories are masked with a private tmpfs instead, in both profiles.
 _BASE_INACCESSIBLE_PATHS: tuple[str, ...] = (
     "-/etc/agentmgr",
     "-/var/lib/agentmgr",
     "-/var/lib/postgresql",
     "-/srv",
     "-/opt",
-    "-/run/systemd",
-    "-/run/dbus",
 )
+
+#: Private tmpfs mounts that hide the host systemd private socket and D-Bus
+#: directories in both profiles (design §8.1/§8.4).
+_TEMPORARY_FILESYSTEM_PATHS: tuple[str, ...] = ("/run/systemd", "/run/dbus")
 
 NetworkProfile = Literal["private_netns", "af_unix_only_fallback"]
 
@@ -217,6 +222,10 @@ def build_systemd_run_argv(config: SystemdUnitConfig) -> list[str]:
         *(
             f"--property=InaccessiblePaths={path}"
             for path in inaccessible
+        ),
+        *(
+            f"--property=TemporaryFileSystem={path}"
+            for path in _TEMPORARY_FILESYSTEM_PATHS
         ),
         "--property=PrivateTmp=yes",
         "--property=PrivateDevices=yes",
