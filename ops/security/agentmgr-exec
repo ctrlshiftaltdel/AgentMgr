@@ -1,0 +1,5 @@
+#!/bin/sh
+# Thin production wrapper, installed as /usr/local/libexec/agentmgr-exec
+# (root:root 0755).  The controller user reaches it only through sudo; the
+# helper accepts no arguments and reads its one JSON request from stdin.
+exec /usr/bin/python3 /usr/local/libexec/agentmgr_exec.py "$@"

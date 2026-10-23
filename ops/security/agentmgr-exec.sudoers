@@ -1,0 +1,13 @@
+# Managed execution privileged helper template (Issue #82).
+#
+# Install as /etc/sudoers.d/agentmgr-exec with mode 0440 and check it with
+# `visudo -c` before use.  Remove the file to revoke the permission.
+#
+# `agentmgr` is a placeholder for <controller-user>, the dedicated
+# controller/gateway service account.  It is not a repository account, and
+# this template does not create any persistent user.
+#
+# This policy fixes exactly one executable and does not constrain arguments.
+# The helper validates the unit name, the exact spec field set and the
+# subcommand, so the policy grants no wildcard command rule.
+agentmgr ALL=(root) NOPASSWD: /usr/local/libexec/agentmgr-exec
