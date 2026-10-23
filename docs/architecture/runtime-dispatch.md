@@ -51,10 +51,10 @@ client/trusted intake
 ### 3.1 `app/runtime/projection.py`（新增）
 
 ```python
-def project_runtime_grant(session: Session, task: Task) -> RuntimeGrant: ...
+def project_runtime_grant(task: object, grant: object, *, now: datetime) -> RuntimeGrant: ...
 ```
 
-只读服务端状态：
+调度器负责从 session 读取 `ExecutionGrant`，本函数只接受已加载的结构化对象；`app.runtime` 不导入 task models，避免反向依赖。只读服务端状态：
 
 - `task.grant_id` 必须存在，`task.execution_mode == "managed_execution"`；
 - `ExecutionGrant` 必须 `status=active`、`usable=true`、未过期、`grant.task_id == task.task_id`；
@@ -68,15 +68,16 @@ def project_runtime_grant(session: Session, task: Task) -> RuntimeGrant: ...
 @dataclass(frozen=True)
 class DispatcherConfig:
     worker_id: str
-    lease_seconds: int = ...
-    poll_interval: float = ...
-    health_backoff: float = ...
+    lease_seconds: int = 300
+    poll_interval: float = 0.5
+    health_backoff_seconds: float = 5.0
 
 class RuntimeDispatcher:
     def __init__(self, adapter: RuntimeAdapter, config: DispatcherConfig, *,
-                 service_principal: GovernancePrincipal): ...
+                 service_principal: GovernancePrincipal, session: Session): ...
     def run_once(self, *, now: datetime | None = None) -> DispatcherResult: ...
-    def run_forever(self, stop_event: threading.Event) -> None: ...
+    def run_forever(self, stop_event: threading.Event, *,
+                    session_factory: Callable[[], Session]) -> None: ...
 ```
 
 职责：
@@ -94,8 +95,10 @@ python -m app.tasks.execution --once --adapter <trusted-adapter-name>
 python -m app.tasks.execution --loop --adapter <trusted-adapter-name>
 ```
 
+- `main(argv=None, *, dispatcher_factory=None) -> int`；`dispatcher_factory` 只由受信启动器/测试注入。没有受信 adapter/session/service-principal 配置时，CLI 必须非零退出并说明 `#97 production dispatch configuration not supplied`，不得回退到 Fake/Advisory。
 - adapter 通过受信注册表/构造器解析，不从任务 payload、客户端参数或任意 import 字符串读取；未知/不可用 adapter fail closed，不提交。
 - 本 Issue 不提供默认生产 adapter；Fake Adapter 只在测试中注入。`--adapter hermes` 在 #97 完成前必须拒绝，因为 Hermes 尚未满足 managed 能力。
+- `run_once` 在调用方注入的 Session 上提交成功/领域拒绝、异常回滚；`run_forever` 使用 `session_factory` 为每次迭代创建新 Session。
 - 凭据只从部署层环境/Secret Manager 读取；不得进入 argv、日志、审计或错误。
 
 ### 3.4 可信 Managed intake
@@ -148,9 +151,9 @@ task_service.submit_task(..., execution_mode="managed_execution",
 | `stopped` + cancel_requested | `record_attempt_result(stopped, stop_confirmed=True)` |
 | `timed_out` + stop_confirmed | `record_attempt_result(timed_out, stop_confirmed=True)` |
 | `unknown` / `not_found` | `record_attempt_result(lost)`；任务 `unknown`，Grant 撤销；best-effort cancel；不恢复执行 |
-| `completed` 但 result/evidence 缺失或自报 | fail closed：`unknown` 或 `needs_human`，不得构造/伪造 `result_*`/`evidence:*` |
+| `completed` 但 result/evidence 缺失 | fail closed：`unknown`/`needs_human`，不得构造/伪造 `result_*`/`evidence:*` |
 
-`RuntimeResult` 的映射必须经过核心验证器；runtime 自报不是独立完成证据。Fake Adapter 的测试结果可以提供结构化 evidence；真实 Hermes 的缺口由 #97 处理。
+`RuntimeResult` 的映射必须经过核心验证器；dispatcher **从不调用** `complete_task`。runtime 自报不是独立完成证据；自报 evidence 由 `app.tasks.verification` 在后续验证阶段拒绝。Fake Adapter 的测试结果可以提供结构化 evidence；真实 Hermes 的缺口由 #97 处理。
 
 ### 4.4 取消与停止
 
