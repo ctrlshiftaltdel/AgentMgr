@@ -75,7 +75,9 @@ Lease recovery
 --------------
 :meth:`RuntimeDispatcher.recover_leases` wires
 :class:`RuntimeRecoveryChecker` into
-:func:`app.tasks.worker.recover_expired_leases`,
+:func:`app.tasks.worker.recover_expired_leases` in committed batches: the
+worker's fixed per-call window is drained until the backlog is empty, so a
+persistent set of expired leases cannot starve later rows.
 :meth:`RuntimeDispatcher.reconcile_cancel_requests` handles
 ``cancel_requested`` rows whose lease expired or whose process crashed, and
 :meth:`RuntimeDispatcher.cancel_unknown_runs` best-effort stops runs of tasks
@@ -95,6 +97,18 @@ confirmed stop saves evidence and escalates ``needs_human``, anything else
 records ``lost`` before releasing the lease.  A lost lease rolls the current
 unit of work back so the stable idempotency key lets lease recovery adopt the
 same run.
+
+Command line
+------------
+:func:`main` is the process entry point (``python -m app.tasks.execution``).
+It exposes only ``--once``/``--loop`` and an ``--adapter <name>`` looked up in a
+trusted launcher registry; it never imports a module named by an argument and
+has **no** default production adapter.  Without an injected
+``dispatcher_factory`` it exits nonzero with
+:data:`NO_DISPATCH_CONFIGURATION` (#97 owns the real Hermes configuration), and
+an unknown name exits with :data:`UNKNOWN_ADAPTER`.  The Fake adapter exists
+only in tests.  See ``docs/operations/runtime-dispatch.md`` for start/stop,
+lease/lifecycle, failure and recovery operations.
 
 This module never calls ``task_service.complete_task``: a runtime self-report
 can never become ``succeeded``.  The verification boundary is
@@ -135,8 +149,12 @@ runtime task.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
+import logging
 import re
+import signal
+import sys
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -209,6 +227,7 @@ __all__ = [
     "RuntimeRecoveryChecker",
     "build_runtime_idempotency_key",
     "build_runtime_prompt",
+    "main",
 ]
 
 #: Capabilities the adapter must report as ``verified`` before a managed task
@@ -343,6 +362,34 @@ _SENSITIVE_KEY_FRAGMENTS: tuple[str, ...] = (
     "sessionkey",
     "token",
 )
+
+#: Module logger.  Only stable codes and outcome names are logged: never a
+#: prompt, credential, task payload, host path or runtime-private URL.
+logger = logging.getLogger(__name__)
+
+#: Stable stderr message when no trusted launcher/configuration was supplied.
+#: The CLI deliberately has **no** default production adapter: #97 owns the
+#: real (Hermes) managed runtime and its deployment configuration.
+NO_DISPATCH_CONFIGURATION = "#97 production dispatch configuration not supplied"
+
+#: Stable stderr prefix for an adapter name the trusted registry does not know.
+UNKNOWN_ADAPTER = "unknown adapter"
+
+#: Errors a long-running loop retries with a bounded backoff instead of
+#: exiting.  Both are deterministic *domain* rejections (state conflicts,
+#: lease/fencing refusals, governance denials) that a later pass can recover
+#: from.  Programming errors (``TypeError``, ``AttributeError``, ...) are not
+#: caught here: a bug must surface, not be retried forever.
+RECOVERABLE_LOOP_ERRORS: tuple[type[BaseException], ...] = (
+    TaskError,
+    GovernanceError,
+)
+
+#: Rows recovered per ``worker.recover_expired_leases`` call by
+#: :meth:`RuntimeDispatcher.recover_leases`.  The pass drains batches until the
+#: backlog is empty, so this is a memory/transaction bound, not a starvation
+#: window: a row behind the first batch is reached in the same pass.
+_RECOVERY_BATCH_SIZE = 200
 
 
 class RuntimePromptTooLarge(ValueError):
@@ -520,12 +567,19 @@ class DispatcherConfig:
     own runtime budget and the live lease.  A test sets a small value so an
     unexpected non-terminal script fails closed quickly instead of sleeping out
     a 300 s runtime budget.
+
+    ``error_backoff_seconds``/``max_error_backoff_seconds`` pace
+    :meth:`RuntimeDispatcher.run_forever` after a recoverable domain/lease
+    error.  The delay doubles per consecutive failing pass and is capped, so a
+    persistent fault cannot busy-loop the worker.
     """
 
     worker_id: str
     lease_seconds: int = 300
     poll_interval: float = 0.5
     health_backoff_seconds: float = 5.0
+    error_backoff_seconds: float = 5.0
+    max_error_backoff_seconds: float = 60.0
     max_status_observations: int | None = None
 
 
@@ -587,6 +641,13 @@ class _DispatcherShutdown(Exception):
     is not cancelled: shutting the dispatcher down is not a core cancel
     request, and the stable idempotency key lets the next process adopt the
     same run without creating a second one.
+
+    Trade-off: the rolled-back unit of work leaves the claim lease live until
+    its ``lease_expires_at``, so the task is **not** claimable by another
+    worker for up to ``lease_seconds``.  Shortening or releasing that lease
+    here would make a still-running task look abandoned and invite a replay;
+    expiry plus lease recovery is the deliberate behaviour documented in
+    ``docs/operations/runtime-dispatch.md``.
     """
 
 
@@ -698,7 +759,13 @@ class RuntimeRecoveryChecker:
 
 
 class RuntimeDispatcher:
-    """Claim, submit and bind managed tasks for one :class:`RuntimeAdapter`."""
+    """Claim, submit and bind managed tasks for one :class:`RuntimeAdapter`.
+
+    ``session`` is the caller-owned session used by :meth:`run_once` and the
+    reconciliation passes.  ``session_factory`` is optional and only needed by
+    :meth:`run_forever` (a long-running process opens one fresh session per
+    iteration); a launcher that only calls :meth:`run_once` can omit it.
+    """
 
     def __init__(
         self,
@@ -708,6 +775,7 @@ class RuntimeDispatcher:
         service_principal: GovernancePrincipal,
         session: Session,
         stop_event: threading.Event | None = None,
+        session_factory: Callable[[], Session] | None = None,
     ) -> None:
         self._adapter = adapter
         self._config = config
@@ -716,6 +784,10 @@ class RuntimeDispatcher:
         #: Optional shutdown signal.  ``run_forever`` supplies its own event;
         #: a single pass behaves exactly as before without one.
         self._stop_event = stop_event
+        #: Optional fresh-session source for :meth:`run_forever`.  It is a
+        #: trusted launcher value (never task/client input) and must return a
+        #: new :class:`~sqlalchemy.orm.Session` bound to the same database.
+        self._session_factory = session_factory
 
     # -- public API ----------------------------------------------------------
 
@@ -740,7 +812,7 @@ class RuntimeDispatcher:
         self,
         stop_event: threading.Event,
         *,
-        session_factory: Callable[[], Session],
+        session_factory: Callable[[], Session] | None = None,
     ) -> None:
         """Poll :meth:`run_once` until ``stop_event`` is set.
 
@@ -764,11 +836,26 @@ class RuntimeDispatcher:
         A stop signal observed mid-drive is honoured between observations: the
         current unit of work rolls back (no fact under a half-driven run), the
         still-live lease lets lease recovery reconcile the run, and this loop
-        returns.  Error backoff remains Task 8's concern.
+        returns.  The runtime is not cancelled and the lease is left to expire
+        (see :class:`_DispatcherShutdown`).
+
+        A recoverable domain/lease error (:data:`RECOVERABLE_LOOP_ERRORS`) does
+        not kill the loop: the current session is rolled back, a stable error
+        code is logged, and the next pass waits an exponentially growing,
+        capped ``error_backoff_seconds`` delay.  Programming errors still
+        propagate so a bug is not retried forever.
         """
 
+        factory = session_factory or self._session_factory
+        if factory is None:
+            raise ValueError(
+                "run_forever requires a session_factory (constructor or call)"
+            )
+
+        consecutive_errors = 0
         while not stop_event.is_set():
-            with session_factory() as session:
+            delay: float
+            with factory() as session:
                 dispatcher = RuntimeDispatcher(
                     self._adapter,
                     self._config,
@@ -780,37 +867,78 @@ class RuntimeDispatcher:
                     dispatcher.recover_leases()
                     dispatcher.reconcile_cancel_requests()
                     result = dispatcher.run_once()
+                    dispatcher.cancel_unknown_runs()
                 except _DispatcherShutdown:
                     return
-                dispatcher.cancel_unknown_runs()
-            stop_event.wait(self._delay_for(result))
+                except RECOVERABLE_LOOP_ERRORS as exc:
+                    # A domain/lease rejection proves nothing about the runtime
+                    # and must not end the worker.  Only the stable reason code
+                    # (or the exception type) is logged -- never the message,
+                    # context or a task payload.
+                    session.rollback()
+                    consecutive_errors += 1
+                    code = (
+                        getattr(exc, "reason_code", None)
+                        or type(exc).__name__
+                    )
+                    delay = self._error_delay(consecutive_errors)
+                    logger.warning(
+                        "runtime_dispatch_pass_error code=%s "
+                        "consecutive_errors=%d backoff_seconds=%.3f",
+                        code,
+                        consecutive_errors,
+                        delay,
+                    )
+                else:
+                    consecutive_errors = 0
+                    delay = self._delay_for(result)
+            stop_event.wait(delay)
 
     def recover_leases(
         self,
         *,
         now: datetime | None = None,
-        limit: int = 50,
+        limit: int | None = None,
     ) -> list[worker.LeaseRecovery]:
-        """Recover expired leases with the runtime recovery checker.
+        """Recover expired leases in committed batches.
 
-        Committed on its own so recovery facts survive a later failing dispatch
-        pass.  The actor is the injected service principal and the checker is
-        the adapter-only :class:`RuntimeRecoveryChecker`.
+        ``worker.recover_expired_leases`` scans a fixed window per call, so a
+        single call with a small ``limit`` would starve every row behind the
+        first window.  This pass therefore drains the backlog: each batch is
+        committed before the next read, and the loop stops when a batch
+        recovers nothing (a lease skipped because another pass holds it cannot
+        make this spin) or when an explicit ``limit`` is reached.
+
+        ``limit=None`` (the default) means every expired lease.  The actor is
+        the injected service principal and the checker is the adapter-only
+        :class:`RuntimeRecoveryChecker`; no batch is rolled back by a later
+        failing dispatch pass.
         """
 
+        recovered: list[worker.LeaseRecovery] = []
+        batch_size = (
+            _RECOVERY_BATCH_SIZE if limit is None else max(1, int(limit))
+        )
         try:
             self._require_service_principal()
-            recovered = worker.recover_expired_leases(
-                self._session,
-                actor=self._service_principal,
-                checker=RuntimeRecoveryChecker(self._adapter),
-                now=now,
-                limit=limit,
-            )
+            checker = RuntimeRecoveryChecker(self._adapter)
+            while True:
+                batch = worker.recover_expired_leases(
+                    self._session,
+                    actor=self._service_principal,
+                    checker=checker,
+                    now=now,
+                    limit=batch_size,
+                )
+                self._session.commit()
+                recovered.extend(batch)
+                if not batch:
+                    break
+                if limit is not None and len(recovered) >= batch_size:
+                    break
         except Exception:
             self._session.rollback()
             raise
-        self._session.commit()
         return recovered
 
     def reconcile_cancel_requests(
@@ -1115,6 +1243,7 @@ class RuntimeDispatcher:
         )
         stop_ref = self._confirmed_stop_ref(task, handle, cancel, now=now)
         if stop_ref is not None:
+            evidence_ref, runtime_outcome = stop_ref
             # Runtime stop evidence only.  The task must stay ``unknown``: the
             # business side effects are a human decision (never auto-cancel).
             self._persist_reconciliation(
@@ -1123,8 +1252,8 @@ class RuntimeDispatcher:
                 idempotency_key=key,
                 cancel=cancel,
                 reason=reason,
-                stop_evidence_refs=(stop_ref,),
-                runtime_outcome=RuntimeState.STOPPED.value,
+                stop_evidence_refs=(evidence_ref,),
+                runtime_outcome=runtime_outcome,
                 now=now,
             )
         self._release(task, lease, now=now)
@@ -1840,10 +1969,11 @@ class RuntimeDispatcher:
             cancel = self._cancel_after_accept(
                 runtime_task_id, idempotency_key, task, reason=reason
             )
-        stop_ref = self._confirmed_stop_ref(
+        confirmed = self._confirmed_stop_ref(
             task, runtime_task_id, cancel, now=now
         )
-        if stop_ref is not None:
+        if confirmed is not None:
+            stop_ref, runtime_outcome = confirmed
             return self._escalate_with_stop(
                 task,
                 lease,
@@ -1852,7 +1982,7 @@ class RuntimeDispatcher:
                 cancel=cancel,
                 reason=reason,
                 stop_ref=stop_ref,
-                runtime_outcome="stopped",
+                runtime_outcome=runtime_outcome,
                 now=now,
             )
         self._persist_reconciliation(
@@ -1983,17 +2113,23 @@ class RuntimeDispatcher:
         cancel: Mapping[str, object],
         *,
         now: datetime,
-    ) -> str | None:
-        """Return a safe stop-evidence ref when the runtime confirmed a stop.
+    ) -> tuple[str, str] | None:
+        """Return ``(evidence_ref, runtime_outcome)`` for a confirmed stop.
 
         ``stop_confirmed`` is trusted from the cancel response, or from one
         follow-up status when the cancel only reported ``requested``.  The
-        reference is a hash of the observation, never a vendor string; when no
-        stop is confirmed nothing is returned and no stop is claimed.
+        reference is a hash of the observation, never a vendor string, and the
+        outcome is the runtime's own confirming label (``stopped``/``failed``/
+        ``timed_out``) so a reconciler never sees a hardcoded ``stopped`` for a
+        run that actually failed.  When no stop is confirmed nothing is
+        returned and no stop is claimed.
         """
 
         if bool(cancel.get("stop_confirmed")):
-            return _runtime_stop_evidence_ref(runtime_task_id, now, "cancel")
+            return (
+                _runtime_stop_evidence_ref(runtime_task_id, now, "cancel"),
+                RuntimeState.STOPPED.value,
+            )
         try:
             status = self._adapter.get_status(
                 runtime_task_id, task_id=task.task_id
@@ -2011,8 +2147,11 @@ class RuntimeDispatcher:
             )
         ):
             return None
-        return _runtime_stop_evidence_ref(
-            runtime_task_id, status.observed_at, "status"
+        return (
+            _runtime_stop_evidence_ref(
+                runtime_task_id, status.observed_at, "status"
+            ),
+            status.state.value,
         )
 
     def _ensure_running(
@@ -2409,7 +2548,7 @@ class RuntimeDispatcher:
             task,
             reason=RUNTIME_WAITING_INPUT,
         )
-        stop_ref = self._confirmed_stop_ref(
+        confirmed = self._confirmed_stop_ref(
             task, runtime_task_id, cancel, now=now
         )
         self._persist_reconciliation(
@@ -2418,10 +2557,11 @@ class RuntimeDispatcher:
             idempotency_key=idempotency_key,
             cancel=cancel,
             reason=RUNTIME_WAITING_INPUT,
-            stop_evidence_refs=(stop_ref,) if stop_ref else (),
+            stop_evidence_refs=(confirmed[0],) if confirmed else (),
+            runtime_outcome=confirmed[1] if confirmed else None,
             now=now,
         )
-        if stop_ref is None:
+        if confirmed is None:
             return self._record_lost(
                 task,
                 lease,
@@ -2429,6 +2569,7 @@ class RuntimeDispatcher:
                 reason=RUNTIME_WAITING_INPUT,
                 now=now,
             )
+        stop_ref = confirmed[0]
 
         task_service.escalate_task(
             self._session,
@@ -2627,7 +2768,15 @@ class RuntimeDispatcher:
         if submit_outcome is not None:
             document["submit_outcome"] = submit_outcome
         previous = (task.result or {}).get("runtime_reconciliation")
-        if isinstance(previous, Mapping):
+        # Only facts from the *same* runtime submission may be inherited.  The
+        # stable key is derived from task/grant/attempt, so a different key
+        # means a new attempt: the previous run's stop/lookup facts must not
+        # leak into it (a fresh run must never look already stopped, and a
+        # stale lookup answer must not decide the new submission).
+        if (
+            isinstance(previous, Mapping)
+            and previous.get("runtime_key") == idempotency_key
+        ):
             # A follow-up fact in the same pass (e.g. a found handle that could
             # not be bound, or a cancel attempt on an already-unknown task)
             # keeps the lookup/adoption/key evidence already gathered.
@@ -2857,3 +3006,187 @@ class RuntimeDispatcher:
         if result.outcome == "adapter_unavailable":
             return self._config.health_backoff_seconds
         return self._config.poll_interval
+
+    def _error_delay(self, consecutive_errors: int) -> float:
+        """Return the bounded, exponentially growing retry delay.
+
+        ``consecutive_errors`` counts failing passes in a row (>= 1).  The
+        first delay is ``error_backoff_seconds`` and doubles per failure up to
+        ``max_error_backoff_seconds``; a non-positive base (tests) stays ``0``
+        so a test never sleeps.
+        """
+
+        base = max(0.0, float(self._config.error_backoff_seconds))
+        cap = max(base, float(self._config.max_error_backoff_seconds))
+        exponent = max(0, int(consecutive_errors) - 1)
+        # Cap the exponent before ``2 ** exponent`` so a long outage cannot
+        # build a huge integer; the result is capped anyway.
+        return min(cap, base * (2 ** min(exponent, 16)))
+
+
+# -- command line ------------------------------------------------------------
+
+#: A trusted launcher's adapter registry: an operator-supplied ``--adapter``
+#: *name* maps to a fully configured dispatcher, or to ``None`` when the name is
+#: not registered.  Deployment code builds this mapping; the CLI never imports a
+#: module named by an argument, never reads an adapter from task/client input
+#: and never falls back to the Fake adapter.
+DispatcherFactory = Callable[[str], "RuntimeDispatcher | None"]
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    """Return the fixed CLI parser (flags are names only, never payloads)."""
+
+    parser = argparse.ArgumentParser(
+        prog="python -m app.tasks.execution",
+        description=(
+            "Managed Execution dispatcher.  There is no default production "
+            "adapter: #97 supplies the trusted adapter registry and session "
+            "configuration.  The Fake adapter is test-only."
+        ),
+    )
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
+        "--once",
+        action="store_true",
+        help="run one claim/submit/drive pass and exit",
+    )
+    mode.add_argument(
+        "--loop",
+        action="store_true",
+        help="poll until SIGTERM/SIGINT (one task at a time)",
+    )
+    parser.add_argument(
+        "--adapter",
+        required=True,
+        metavar="NAME",
+        help="name from the trusted adapter registry",
+    )
+    return parser
+
+
+def _install_stop_handlers(
+    stop_event: threading.Event,
+) -> Callable[[], None]:
+    """Translate SIGTERM/SIGINT into ``stop_event`` and return a restorer.
+
+    The dispatcher honours the event between observations, so a signal never
+    interrupts a fact write.  Handler installation is best effort: off the main
+    thread (tests) or on an unsupported platform the event can still be set by
+    the caller.  The previous handlers are restored on exit.
+    """
+
+    previous: dict[int, Any] = {}
+
+    def _stop(signum: int, frame: object) -> None:
+        stop_event.set()
+
+    for name in ("SIGTERM", "SIGINT"):
+        signum = getattr(signal, name, None)
+        if signum is None:
+            continue
+        try:
+            previous[signum] = signal.getsignal(signum)
+            signal.signal(signum, _stop)
+        except (ValueError, OSError):
+            previous.pop(signum, None)
+
+    def _restore() -> None:
+        for signum, handler in previous.items():
+            try:
+                signal.signal(signum, handler)
+            except (ValueError, OSError):  # pragma: no cover - thread/OS guard
+                pass
+
+    return _restore
+
+
+def _safe_exception_code(exc: BaseException) -> str:
+    """Return a stable, non-sensitive error code for stderr/logging.
+
+    Only the domain reason code (a closed vocabulary) or the exception type is
+    rendered: never the message, context, task payload or a path.
+    """
+
+    reason_code = getattr(exc, "reason_code", None)
+    if isinstance(reason_code, str) and reason_code:
+        return reason_code
+    return type(exc).__name__
+
+
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    dispatcher_factory: DispatcherFactory | None = None,
+) -> int:
+    """Run the Managed Execution dispatcher CLI and return an exit code.
+
+    ``dispatcher_factory`` is a **trusted** launcher/test injection.  It is the
+    only way to obtain an adapter: without it the CLI fails closed and prints
+    :data:`NO_DISPATCH_CONFIGURATION`, because #96 ships no production adapter
+    (the real Hermes managed runtime belongs to #97).  A name the factory does
+    not know is rejected with :data:`UNKNOWN_ADAPTER`; nothing is imported from
+    the name and nothing is submitted.
+
+    ``--once`` runs exactly one pass.  ``--loop`` runs
+    :meth:`RuntimeDispatcher.run_forever` until SIGTERM/SIGINT; the loop needs
+    the dispatcher to have been built with a ``session_factory``.  Both paths
+    print only a stable exception type/reason code on failure -- never a
+    credential, task payload, host path or runtime URL.
+    """
+
+    parser = _build_parser()
+    try:
+        args = parser.parse_args(list(argv) if argv is not None else None)
+    except SystemExit as exc:
+        # ``--help`` exits 0; invalid flags exit 2.  argparse has already
+        # printed usage, so ``main`` stays an int-returning entry point.
+        code = exc.code
+        return code if isinstance(code, int) else 2
+
+    if dispatcher_factory is None:
+        print(NO_DISPATCH_CONFIGURATION, file=sys.stderr)
+        return 2
+
+    try:
+        dispatcher = dispatcher_factory(args.adapter)
+    except Exception as exc:  # noqa: BLE001 - trusted launcher failure
+        print(
+            f"dispatch launcher failed: {_safe_exception_code(exc)}",
+            file=sys.stderr,
+        )
+        return 2
+
+    if dispatcher is None:
+        print(f"{UNKNOWN_ADAPTER}: {args.adapter}", file=sys.stderr)
+        return 2
+
+    if args.once:
+        try:
+            dispatcher.run_once()
+        except Exception as exc:  # noqa: BLE001 - report a safe code only
+            print(
+                f"dispatch pass failed: {_safe_exception_code(exc)}",
+                file=sys.stderr,
+            )
+            return 1
+        return 0
+
+    stop_event = threading.Event()
+    restore_handlers = _install_stop_handlers(stop_event)
+    try:
+        dispatcher.run_forever(stop_event)
+    except Exception as exc:  # noqa: BLE001 - report a safe code only
+        print(
+            f"dispatch loop failed: {_safe_exception_code(exc)}",
+            file=sys.stderr,
+        )
+        return 1
+    finally:
+        restore_handlers()
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - module entry point
+    raise SystemExit(main())
+

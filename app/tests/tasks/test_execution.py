@@ -26,6 +26,13 @@ task is escalated ``needs_human``; the dispatcher never writes
 ``worker.recover_expired_leases`` (managed tasks only, never replays a live
 runtime), a separate pass reconciles stranded ``cancel_requested`` rows, and
 ``unknown`` tasks that still carry a handle get a fenced best-effort stop.
+
+Task 8 adds the fail-closed CLI: ``main`` has no default production adapter,
+rejects unknown adapter names, and needs a trusted ``dispatcher_factory``;
+``--once``/``--loop`` are exercised with injected fake dispatchers.  The
+hardening cases pin recovery paging, the loop's bounded error backoff, and the
+attempt-scoped reconciliation facts.  Nothing here is a real runtime claim: the
+Fake adapter remains test-only evidence and #97 owns the Hermes configuration.
 """
 
 from __future__ import annotations
@@ -104,6 +111,7 @@ from app.tasks.execution import (
     RuntimeRecoveryChecker,
     build_runtime_idempotency_key,
     build_runtime_prompt,
+    main,
 )
 from app.tasks.models import Task, TaskAttempt, TaskEvent, TaskLease
 from app.tests.governance.helpers import make_service_identity
@@ -2521,6 +2529,37 @@ def test_unknown_with_confirmed_stop_keeps_unknown_and_saves_evidence(
     assert _leases(session, task)[-1].released_at is not None
 
 
+def test_unknown_best_effort_cancel_preserves_the_confirming_status(
+    session: Session, world: TaskWorld
+) -> None:
+    task = submit_managed(session, world)
+    session.commit()
+    adapter = FakeRuntimeAdapter(
+        status=[
+            _status(RuntimeState.RUNNING),
+            _status(RuntimeState.UNKNOWN),
+            _status(RuntimeState.FAILED, stop_confirmed=True),
+        ],
+    )
+    dispatcher = _dispatcher(session, world, adapter=adapter)
+    assert dispatcher.run_once().outcome == "unknown"
+
+    results = dispatcher.cancel_unknown_runs()
+
+    # The runtime's confirming status is kept as the evidence label; it must
+    # not be rewritten to "stopped" just because the cancel path produced it.
+    assert [item.outcome for item in results] == ["unknown"]
+    assert task.state == "unknown"
+    reconciliation = task.result["runtime_reconciliation"]
+    assert reconciliation["stop_confirmed"] is True
+    assert reconciliation["runtime_outcome"] == "failed"
+    assert reconciliation["stop_evidence_refs"][0].startswith(
+        "evidence:runtime_stop_"
+    )
+    assert len(adapter.cancel_calls) == 1
+    assert _leases(session, task)[-1].released_at is not None
+
+
 def _prepare_cancel_requested_task(
     session: Session,
     world: TaskWorld,
@@ -3214,3 +3253,383 @@ def test_run_forever_returns_immediately_when_the_stop_event_is_set(
     )
 
     assert opened == []
+
+
+# -- hardening: recovery paging, loop backoff, attempt-scoped facts -----------
+
+
+class _StubPrincipal:
+    """Minimal trusted-service actor for DB-free unit checks.
+
+    ``recover_leases`` and ``_persist_reconciliation`` only read the principal
+    type/id and call ``require_active``; no governance row is involved.
+    """
+
+    principal_type = "service"
+    principal_id = "svc_dispatcher_unit"
+
+    def require_active(self) -> None:
+        return None
+
+
+class _StubSession:
+    """Session stand-in for helpers that only commit/rollback."""
+
+    def __init__(self) -> None:
+        self.commits = 0
+        self.rollbacks = 0
+
+    def __enter__(self) -> "_StubSession":
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+    def commit(self) -> None:
+        self.commits += 1
+
+    def rollback(self) -> None:
+        self.rollbacks += 1
+
+
+def _unit_dispatcher(
+    session: object | None = None,
+    *,
+    config: DispatcherConfig | None = None,
+) -> RuntimeDispatcher:
+    return RuntimeDispatcher(
+        FakeRuntimeAdapter(),
+        config or DispatcherConfig(worker_id=WORKER_ID, poll_interval=0.0),
+        service_principal=_StubPrincipal(),  # type: ignore[arg-type]
+        session=session or _StubSession(),  # type: ignore[arg-type]
+    )
+
+
+def test_recover_leases_drains_every_batch_without_a_fixed_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pending = [object() for _ in range(5)]
+    limits: list[int] = []
+
+    def _recover(
+        db: object,
+        *,
+        actor: object = None,
+        checker: object = None,
+        now: object = None,
+        limit: int = 50,
+    ) -> list[object]:
+        limits.append(limit)
+        batch, pending[:] = pending[:2], pending[2:]
+        return batch
+
+    monkeypatch.setattr(worker, "recover_expired_leases", _recover)
+    session = _StubSession()
+
+    recovered = _unit_dispatcher(session).recover_leases()
+
+    # Two full batches plus the empty probe: every expired lease is reached in
+    # the same pass, and each batch is committed before the next read.
+    assert len(recovered) == 5
+    assert len(limits) == 4
+    assert len(set(limits)) == 1
+    assert limits[0] > 50
+    assert session.commits == 4
+    assert session.rollbacks == 0
+
+
+def test_recover_leases_honours_an_explicit_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[int] = []
+
+    def _recover(
+        db: object,
+        *,
+        actor: object = None,
+        checker: object = None,
+        now: object = None,
+        limit: int = 50,
+    ) -> list[object]:
+        calls.append(limit)
+        return [object() for _ in range(limit)]
+
+    monkeypatch.setattr(worker, "recover_expired_leases", _recover)
+
+    recovered = _unit_dispatcher().recover_leases(limit=3)
+
+    assert len(recovered) == 3
+    assert calls == [3]
+
+
+class _RecordingStopEvent(threading.Event):
+    """Stop event that records loop delays and stops after ``after`` waits."""
+
+    def __init__(self, after: int = 1) -> None:
+        super().__init__()
+        self.after = after
+        self.waits: list[float] = []
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self.waits.append(0.0 if timeout is None else timeout)
+        if len(self.waits) >= self.after:
+            self.set()
+        return self.is_set()
+
+
+def test_run_forever_backs_off_on_a_recoverable_error(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def _boom(self: RuntimeDispatcher, **kwargs: object) -> list[object]:
+        raise TaskError("task_not_found")
+
+    monkeypatch.setattr(RuntimeDispatcher, "recover_leases", _boom)
+    stop_event = _RecordingStopEvent(after=3)
+    config = DispatcherConfig(
+        worker_id=WORKER_ID,
+        poll_interval=0.0,
+        error_backoff_seconds=0.25,
+        max_error_backoff_seconds=10.0,
+    )
+
+    with caplog.at_level("WARNING", logger="app.tasks.execution"):
+        _unit_dispatcher(config=config).run_forever(
+            stop_event,
+            session_factory=lambda: _StubSession(),  # type: ignore[return-value]
+        )
+
+    # A domain/lease error is retried, not fatal: the delay doubles per
+    # consecutive failing pass (no busy loop) and only a safe code is logged.
+    assert stop_event.waits == [0.25, 0.5, 1.0]
+    assert "runtime_dispatch_pass_error" in caplog.text
+    assert "task_not_found" in caplog.text
+    assert "svc_dispatcher_unit" not in caplog.text
+
+
+def test_run_forever_propagates_a_programming_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _boom(self: RuntimeDispatcher, **kwargs: object) -> list[object]:
+        raise TypeError("dispatcher bug")
+
+    monkeypatch.setattr(RuntimeDispatcher, "recover_leases", _boom)
+    stop_event = _RecordingStopEvent(after=1)
+
+    with pytest.raises(TypeError, match="dispatcher bug"):
+        _unit_dispatcher().run_forever(
+            stop_event,
+            session_factory=lambda: _StubSession(),  # type: ignore[return-value]
+        )
+
+    assert stop_event.waits == []
+
+
+def test_run_forever_requires_a_session_factory() -> None:
+    with pytest.raises(ValueError, match="session_factory"):
+        _unit_dispatcher().run_forever(threading.Event())
+
+
+def test_reconciliation_facts_do_not_cross_attempts() -> None:
+    dispatcher = _unit_dispatcher()
+    task = SimpleNamespace(
+        result={
+            "runtime_reconciliation": {
+                "runtime_task_id": "rtask_old_0001",
+                "runtime_key": "idem_old_attempt",
+                "stop_confirmed": True,
+                "stop_evidence_refs": ["evidence:runtime_stop_old"],
+                "runtime_outcome": "stopped",
+                "lookup_outcome": "found",
+                "submit_outcome": "timeout",
+            }
+        }
+    )
+
+    dispatcher._persist_reconciliation(
+        task,  # type: ignore[arg-type]
+        runtime_task_id="rtask_new_0001",
+        idempotency_key="idem_new_attempt",
+        cancel={
+            "attempted": True,
+            "outcome": "requested",
+            "stop_confirmed": False,
+        },
+        reason="runtime_submit_timeout",
+        now=utcnow(),
+    )
+
+    document = task.result["runtime_reconciliation"]
+    assert document["runtime_task_id"] == "rtask_new_0001"
+    assert document["runtime_key"] == "idem_new_attempt"
+    # The previous attempt's stop/lookup facts must not make the fresh run
+    # look already stopped (or already decided) before it is submitted.
+    assert document["stop_confirmed"] is False
+    assert "stop_evidence_refs" not in document
+    assert "runtime_outcome" not in document
+    assert "lookup_outcome" not in document
+    assert "submit_outcome" not in document
+
+
+def test_reconciliation_keeps_same_attempt_facts() -> None:
+    dispatcher = _unit_dispatcher()
+    task = SimpleNamespace(
+        result={
+            "runtime_reconciliation": {
+                "runtime_task_id": "rtask_fake_0001",
+                "runtime_key": "idem_same_attempt",
+                "stop_confirmed": True,
+                "stop_evidence_refs": ["evidence:runtime_stop_same"],
+                "runtime_outcome": "failed",
+                "lookup_outcome": "found",
+            }
+        }
+    )
+
+    dispatcher._persist_reconciliation(
+        task,  # type: ignore[arg-type]
+        runtime_task_id="rtask_fake_0001",
+        idempotency_key="idem_same_attempt",
+        cancel={"attempted": True, "outcome": "requested"},
+        reason="runtime_execution_lost",
+        now=utcnow(),
+    )
+
+    document = task.result["runtime_reconciliation"]
+    assert document["stop_confirmed"] is True
+    assert document["stop_evidence_refs"] == ["evidence:runtime_stop_same"]
+    assert document["runtime_outcome"] == "failed"
+    assert document["lookup_outcome"] == "found"
+
+
+# -- CLI ---------------------------------------------------------------------
+
+
+def test_cli_without_trusted_configuration_fails_closed(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["--once", "--adapter", "fake"]) != 0
+
+    err = capsys.readouterr().err.lower()
+    assert "#97 production dispatch configuration not supplied" in err
+
+
+def test_cli_rejects_unknown_adapter(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert (
+        main(
+            ["--once", "--adapter", "unknown"],
+            dispatcher_factory=lambda name: None,
+        )
+        != 0
+    )
+
+    err = capsys.readouterr().err.lower()
+    assert "unknown adapter" in err
+    assert "unknown" in err
+
+
+def test_cli_once_uses_injected_dispatcher(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[str] = []
+
+    class _OnceDispatcher:
+        def run_once(self, **kwargs: object) -> DispatcherResult:
+            calls.append("run_once")
+            return DispatcherResult(outcome="idle")
+
+    def factory(name: str) -> object | None:
+        return _OnceDispatcher() if name == "fake" else None
+
+    assert (
+        main(
+            ["--once", "--adapter", "fake"],
+            dispatcher_factory=factory,  # type: ignore[arg-type]
+        )
+        == 0
+    )
+    assert calls == ["run_once"]
+    assert capsys.readouterr().err == ""
+
+
+def test_cli_loop_runs_until_the_dispatcher_stops(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[bool] = []
+
+    class _LoopDispatcher:
+        def run_forever(self, stop_event: threading.Event) -> None:
+            calls.append(stop_event.is_set())
+            stop_event.set()
+
+    def factory(name: str) -> object | None:
+        return _LoopDispatcher() if name == "fake" else None
+
+    assert (
+        main(
+            ["--loop", "--adapter", "fake"],
+            dispatcher_factory=factory,  # type: ignore[arg-type]
+        )
+        == 0
+    )
+    assert calls == [False]
+    assert capsys.readouterr().err == ""
+
+
+def test_cli_requires_exactly_one_mode(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    factory_calls: list[str] = []
+
+    def factory(name: str) -> object | None:
+        factory_calls.append(name)
+        return None
+
+    assert (
+        main(["--adapter", "fake"], dispatcher_factory=factory) != 0
+    )
+    assert (
+        main(
+            ["--once", "--loop", "--adapter", "fake"],
+            dispatcher_factory=factory,
+        )
+        != 0
+    )
+    # A malformed invocation never reaches the trusted launcher.
+    assert factory_calls == []
+    capsys.readouterr()
+
+
+def test_cli_failure_reports_only_a_safe_code(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class _FailingDispatcher:
+        def run_once(self, **kwargs: object) -> DispatcherResult:
+            raise RuntimeError("token=secret /srv/operator/state.sqlite3")
+
+    def factory(name: str) -> object | None:
+        return _FailingDispatcher() if name == "fake" else None
+
+    assert (
+        main(
+            ["--once", "--adapter", "fake"],
+            dispatcher_factory=factory,  # type: ignore[arg-type]
+        )
+        != 0
+    )
+
+    err = capsys.readouterr().err
+    assert "RuntimeError" in err
+    assert "secret" not in err
+    assert "/srv" not in err
+
+
+def test_cli_does_not_fall_back_to_a_fake_adapter(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # ``hermes`` is rejected before #97 supplies a real managed adapter: the
+    # CLI has no built-in registry entry for any name.
+    assert main(["--once", "--adapter", "hermes"]) != 0
+    assert "#97" in capsys.readouterr().err.lower()
