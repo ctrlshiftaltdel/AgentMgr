@@ -129,7 +129,10 @@ class FakeRuntimeAdapter:
         self.created_runtime_task_ids: list[str] = []
         self.lookup_calls: list[tuple[str, str, str, str | None]] = []
         self.status_calls: list[tuple[str, str | None]] = []
+        self.result_calls: list[tuple[str, str | None]] = []
         self.cancel_calls: list[dict[str, object]] = []
+        #: Returned cancel facts, parallel to :attr:`cancel_calls`.
+        self.cancel_results: list[CancelResult] = []
         self.event_calls: list[tuple[str, str | None]] = []
         self.input_calls: list[tuple[str, str, str]] = []
         self.capability_probes: list[bool] = []
@@ -271,6 +274,7 @@ class FakeRuntimeAdapter:
         *,
         task_id: str | None = None,
     ) -> RuntimeResult:
+        self.result_calls.append((runtime_task_id, task_id))
         if self._result is not None:
             return self._result
         return RuntimeResult(
@@ -306,12 +310,15 @@ class FakeRuntimeAdapter:
             }
         )
         if self._cancel is not None:
-            return self._cancel
-        return CancelResult(
-            outcome=CancelOutcome.REQUESTED,
-            stop_confirmed=False,
-            observed_at=self.now,
-        )
+            result = self._cancel
+        else:
+            result = CancelResult(
+                outcome=CancelOutcome.REQUESTED,
+                stop_confirmed=False,
+                observed_at=self.now,
+            )
+        self.cancel_results.append(result)
+        return result
 
     def provide_input(
         self,

@@ -43,13 +43,17 @@ from app.runtime.contract import (
     SubmitResult,
     VersionSource,
 )
+from app.tasks import execution as task_execution
 from app.tasks import service as task_service
 from app.tasks.errors import TaskError
 from app.tasks.execution import (
     DECISION_BINDING_MISMATCH,
+    GRANT_DOCUMENT_INVALID,
     MAX_RUNTIME_PROMPT_BYTES,
     RUNTIME_BIND_FAILED,
+    RUNTIME_PROMPT_INVALID,
     RUNTIME_PROMPT_TOO_LARGE,
+    RUNTIME_SUBMIT_HANDLE_INVALID,
     DispatcherConfig,
     DispatcherResult,
     RuntimeDispatcher,
@@ -135,6 +139,28 @@ def _runtime_grant() -> RuntimeGrant:
         resource_scope={"scope_type": "expense_claim"},
         expires_at=utcnow() + timedelta(hours=1),
     )
+
+
+def _assert_grant_document_rejected(
+    session: Session,
+    task: Task,
+    result: DispatcherResult,
+    adapter: FakeRuntimeAdapter,
+    *,
+    reason: str,
+) -> None:
+    assert result.outcome == "unavailable"
+    assert result.task_id == task.task_id
+    assert result.detail == f"{GRANT_DOCUMENT_INVALID}:{reason}"
+    assert adapter.capability_probes == []
+    assert adapter.health_calls == 0
+    assert adapter.submit_calls == []
+    assert task.state == "failed"
+    assert task.result["outcome"] == "unavailable"
+    assert task.result["error_code"] == GRANT_DOCUMENT_INVALID
+    assert task.result["no_side_effects"] is True
+    assert task.grant_status == "revoked"
+    _assert_lease_released(session, task)
 
 
 def _capabilities(
@@ -504,6 +530,56 @@ def test_grant_decision_binding_mismatch_never_submits(
     _assert_lease_released(session, task)
 
 
+# -- grant re-verification ----------------------------------------------------
+
+
+def test_tampered_grant_capabilities_never_reach_the_adapter(
+    session: Session, world: TaskWorld
+) -> None:
+    task = submit_managed(session, world)
+    session.commit()
+    grant = _grant(session, task)
+    grant.capabilities = [*grant.capabilities, "expense.admin@1.0.0"]
+    session.commit()
+    adapter = FakeRuntimeAdapter()
+
+    result = _dispatcher(session, world, adapter=adapter).run_once()
+
+    _assert_grant_document_rejected(
+        session,
+        task,
+        result,
+        adapter,
+        reason="capability_not_granted",
+    )
+
+
+def test_tampered_grant_resource_scope_never_reaches_the_adapter(
+    session: Session, world: TaskWorld
+) -> None:
+    task = submit_managed(session, world)
+    session.commit()
+    grant = _grant(session, task)
+    widened = dict(grant.resource_scope)
+    widened["resource_ids"] = [
+        *widened.get("resource_ids", []),
+        "res_out_of_scope_9999",
+    ]
+    grant.resource_scope = widened
+    session.commit()
+    adapter = FakeRuntimeAdapter()
+
+    result = _dispatcher(session, world, adapter=adapter).run_once()
+
+    _assert_grant_document_rejected(
+        session,
+        task,
+        result,
+        adapter,
+        reason="grant_scope_mismatch",
+    )
+
+
 # -- post-accept binding failure ---------------------------------------------
 
 
@@ -551,6 +627,79 @@ def test_binding_failure_cancels_and_enters_unknown(
             "task_id": task.task_id,
         }
     ]
+    reconciliation = task.result["runtime_reconciliation"]
+    assert reconciliation["runtime_task_id"] == "rtask_fake_0001"
+    assert reconciliation["runtime_key"] == submitted_key
+    assert reconciliation["reason"] == RUNTIME_BIND_FAILED
+    assert reconciliation["cancel_requested_at"] is not None
+    assert reconciliation["cancel_outcome"] == "requested"
+    assert reconciliation["stop_confirmed"] is False
+    _assert_lease_released(session, task)
+
+
+def test_malformed_runtime_handle_is_cancelled_and_reconciled(
+    session: Session, world: TaskWorld
+) -> None:
+    task = submit_managed(session, world)
+    session.commit()
+    malformed = "rtask_bad handle!"
+    adapter = FakeRuntimeAdapter(
+        submit=SubmitResult(
+            outcome=SubmitOutcome.ACCEPTED,
+            runtime_task_id=malformed,
+        )
+    )
+
+    result = _dispatcher(session, world, adapter=adapter).run_once()
+
+    assert result.outcome == "unknown"
+    assert result.detail == RUNTIME_SUBMIT_HANDLE_INVALID
+    assert task.state == "unknown"
+    assert task.attempt == 0
+    # The malformed handle never reaches the task row (no IntegrityError).
+    assert task.runtime_task_id is None
+    assert task.result["outcome"] == "unknown"
+    assert task.result["error_code"] == RUNTIME_SUBMIT_HANDLE_INVALID
+    assert task.grant_status == "revoked"
+    assert len(adapter.submit_calls) == 1
+    submitted_key = adapter.submit_calls[0][1]
+    assert adapter.cancel_calls == [
+        {
+            "runtime_task_id": malformed,
+            "reason": RUNTIME_BIND_FAILED,
+            "idempotency_key": submitted_key,
+            "task_id": task.task_id,
+        }
+    ]
+    reconciliation = task.result["runtime_reconciliation"]
+    assert reconciliation["runtime_task_id"] == malformed
+    assert reconciliation["runtime_key"] == submitted_key
+    assert reconciliation["reason"] == RUNTIME_SUBMIT_HANDLE_INVALID
+    assert reconciliation["cancel_requested_at"] is not None
+    _assert_lease_released(session, task)
+
+
+def test_prompt_canonicalization_error_is_rejected_without_submitting(
+    session: Session, world: TaskWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = submit_managed(session, world)
+    session.commit()
+    adapter = FakeRuntimeAdapter()
+
+    def _not_json(_task: object) -> str:
+        raise TypeError("governed document is not canonical JSON")
+
+    monkeypatch.setattr(
+        task_execution, "build_runtime_prompt", _not_json
+    )
+
+    result = _dispatcher(session, world, adapter=adapter).run_once()
+
+    assert result.outcome == "rejected"
+    assert result.detail == RUNTIME_PROMPT_INVALID
+    assert task.state == "failed"
+    assert task.result["error_code"] == RUNTIME_PROMPT_INVALID
+    assert adapter.submit_calls == []
     _assert_lease_released(session, task)
 
 

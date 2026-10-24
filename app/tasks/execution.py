@@ -16,16 +16,20 @@ lease:
    project it with :func:`app.runtime.projection.project_runtime_grant`;
 4. verify the persisted :class:`~app.governance.models.GovernanceDecisionRecord`
    binding **before any adapter call** (task, decision id/hash, task revision);
-5. require ``task.submit`` **and** ``task.status`` to be ``verified``;
-6. probe ``adapter.health()``;
-7. build the stable runtime idempotency key and the canonical, bounded,
+5. re-verify the whole Grant through the public
+   :func:`app.governance.grants.grant_document` serializer (capabilities,
+   resource scope, TTL, budget, gates) and fail closed on any mismatch;
+6. require ``task.submit`` **and** ``task.status`` to be ``verified``;
+7. probe ``adapter.health()``;
+8. build the stable runtime idempotency key and the canonical, bounded,
    credential-free prompt;
-8. call ``adapter.submit_task`` exactly once for this pass;
-9. on ``accepted``, bind the returned ``rtask_*`` handle through
-   :func:`app.tasks.service.start_attempt` and keep the lease for the later
-   status/result work.  If binding is rejected after acceptance, best-effort
-   cancel the runtime task and record an honest ``unknown`` outcome (never a
-   fake "rejected" and never a second submit).
+9. call ``adapter.submit_task`` exactly once for this pass;
+10. on ``accepted``, bind the returned ``rtask_*`` handle through
+    :func:`app.tasks.service.start_attempt` and keep the lease for the later
+    status/result work.  If binding is rejected after acceptance, best-effort
+    cancel the runtime task, persist the accepted handle/key for reconciliation
+    and record an honest ``unknown`` outcome (never a fake "rejected" and never
+    a second submit).
 
 Status polling, the full submit failure/lookup matrix (timeout/unknown/conflict
 adoption), result mapping and lease recovery are added by later tasks.  This
@@ -43,6 +47,7 @@ the supplied factory for every iteration.
 from __future__ import annotations
 
 import hashlib
+import re
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -52,6 +57,8 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.governance.errors import GovernanceError
+from app.governance.grants import grant_document
 from app.governance.models import ExecutionGrant, GovernanceDecisionRecord
 from app.governance.policies import canonical_json
 from app.governance.principal import GovernancePrincipal
@@ -75,10 +82,12 @@ from app.tasks.models import Task, TaskLease
 
 __all__ = [
     "DECISION_BINDING_MISMATCH",
+    "GRANT_DOCUMENT_INVALID",
     "MAX_RUNTIME_PROMPT_BYTES",
     "REQUIRED_CAPABILITIES",
     "RUNTIME_BIND_FAILED",
     "RUNTIME_CAPABILITY_UNVERIFIED",
+    "RUNTIME_PROMPT_INVALID",
     "RUNTIME_PROMPT_TOO_LARGE",
     "RUNTIME_SUBMIT_HANDLE_INVALID",
     "DispatcherConfig",
@@ -105,12 +114,21 @@ RUNTIME_CAPABILITY_UNVERIFIED = "runtime_capability_unverified"
 #: decision it claims to derive from.  The adapter is never called.
 DECISION_BINDING_MISMATCH = "decision_binding_mismatch"
 
+#: Stable reason recorded when the public Grant serializer rejects the grant
+#: (capabilities/scope/TTL/budget/gates not derivable from the decision).  The
+#: adapter is never called.
+GRANT_DOCUMENT_INVALID = "grant_document_invalid"
+
 #: Stable reason recorded when the runtime accepted a submission but the
 #: binding raised.  The task enters ``unknown``; it is never retried in place.
 RUNTIME_BIND_FAILED = "runtime_bind_failed"
 
 #: Stable reason recorded when an accepted result carried no usable handle.
 RUNTIME_SUBMIT_HANDLE_INVALID = "runtime_submit_handle_invalid"
+
+#: Stable reason recorded when the governed goal/payload cannot be rendered as
+#: canonical JSON.  The task is rejected locally instead of sending junk.
+RUNTIME_PROMPT_INVALID = "runtime_prompt_invalid"
 
 #: Stable reason recorded when the governed goal/payload cannot fit the prompt
 #: limit.  The task is rejected locally instead of sending an unbounded prompt.
@@ -121,6 +139,13 @@ RUNTIME_PROMPT_TOO_LARGE = "runtime_prompt_too_large"
 #: well inside the runtime boundary's per-request budget while leaving ample
 #: room for a normal task document.
 MAX_RUNTIME_PROMPT_BYTES = 16 * 1024
+
+#: The database constraint for a safe runtime handle.  Checking it here keeps a
+#: malformed adapter reply out of the task row (where it would raise an
+#: ``IntegrityError`` after the work was already accepted).
+_RUNTIME_TASK_ID_PATTERN = re.compile(
+    r"^rtask_[A-Za-z0-9][A-Za-z0-9_-]{3,63}$"
+)
 
 #: Principal types allowed to write Managed Execution facts.
 _SERVICE_PRINCIPAL_TYPES = frozenset({"service", "runtime"})
@@ -244,6 +269,22 @@ def _is_sensitive_key(key: str) -> bool:
     return any(fragment in normalised for fragment in _SENSITIVE_KEY_FRAGMENTS)
 
 
+def _valid_runtime_task_id(value: object) -> bool:
+    """Return whether ``value`` is a schema-safe ``rtask_*`` handle."""
+
+    return isinstance(value, str) and bool(
+        _RUNTIME_TASK_ID_PATTERN.fullmatch(value)
+    )
+
+
+def _rfc3339(value: datetime) -> str:
+    """Render a dispatcher-owned timestamp without host-specific formatting."""
+
+    return value.astimezone(UTC).isoformat(timespec="seconds").replace(
+        "+00:00", "Z"
+    )
+
+
 def _utcnow() -> datetime:
     return datetime.now(UTC)
 
@@ -284,7 +325,7 @@ class DispatcherResult:
 
 
 class RuntimeDispatcher:
-    """Claim and preflight managed tasks for one :class:`RuntimeAdapter`."""
+    """Claim, submit and bind managed tasks for one :class:`RuntimeAdapter`."""
 
     def __init__(
         self,
@@ -302,7 +343,7 @@ class RuntimeDispatcher:
     # -- public API ----------------------------------------------------------
 
     def run_once(self, *, now: datetime | None = None) -> DispatcherResult:
-        """Run one claim/preflight pass and commit its domain outcome.
+        """Run one claim/preflight/submit/bind pass and commit its outcome.
 
         Unexpected exceptions (including an adapter that raises instead of
         returning a health/status fact) roll the whole pass back and propagate;
@@ -342,7 +383,7 @@ class RuntimeDispatcher:
                 result = dispatcher.run_once()
             stop_event.wait(self._delay_for(result))
 
-    # -- preflight -----------------------------------------------------------
+    # -- dispatch ------------------------------------------------------------
 
     def _dispatch_one(self, timestamp: datetime) -> DispatcherResult:
         claimed = worker.claim_task(
@@ -399,6 +440,28 @@ class RuntimeDispatcher:
                 detail=f"{DECISION_BINDING_MISMATCH}:{binding_mismatch}",
             )
 
+        # The decision checks above are structural; the public Grant serializer
+        # additionally proves that the capabilities, resource scope, TTL,
+        # budget and gates are all derivable from that persisted decision.  A
+        # locally widened Grant must never reach the runtime.
+        try:
+            if grant is None:  # pragma: no cover - projection already failed
+                raise GovernanceError("grant_missing")
+            grant_document(grant)
+        except GovernanceError as exc:
+            self._record_failure(
+                task,
+                lease,
+                outcome="unavailable",
+                reason=GRANT_DOCUMENT_INVALID,
+                now=timestamp,
+            )
+            return DispatcherResult(
+                outcome="unavailable",
+                task_id=task.task_id,
+                detail=f"{GRANT_DOCUMENT_INVALID}:{exc.reason_code}",
+            )
+
         missing = self._unverified_capabilities()
         if missing:
             self._record_failure(
@@ -445,6 +508,22 @@ class RuntimeDispatcher:
                 outcome="rejected",
                 task_id=task.task_id,
                 detail=RUNTIME_PROMPT_TOO_LARGE,
+            )
+        except (TypeError, ValueError):
+            # A governed document that is not canonical JSON can never be sent
+            # safely.  Reject it locally instead of poisoning every retry with
+            # the same exception.
+            self._record_failure(
+                task,
+                lease,
+                outcome="rejected",
+                reason=RUNTIME_PROMPT_INVALID,
+                now=timestamp,
+            )
+            return DispatcherResult(
+                outcome="rejected",
+                task_id=task.task_id,
+                detail=RUNTIME_PROMPT_INVALID,
             )
 
         submission = self._adapter.submit_task(
@@ -548,13 +627,28 @@ class RuntimeDispatcher:
         """
 
         runtime_task_id = submission.runtime_task_id
-        if (
-            not isinstance(runtime_task_id, str)
-            or not runtime_task_id.startswith("rtask_")
-        ):
-            # The runtime says it accepted but returned no usable handle: there
-            # is nothing to bind and nothing to cancel by id.  The submission is
-            # ambiguous, so the task must reconcile instead of retrying.
+        if not _valid_runtime_task_id(runtime_task_id):
+            # The adapter says it accepted but its handle cannot be stored: the
+            # row constraint would raise IntegrityError only after the runtime
+            # had already started the work.  A malformed *string* is still a
+            # cancel target and a reconciliation fact; anything else is not.
+            cancel = None
+            if isinstance(runtime_task_id, str) and runtime_task_id:
+                cancel = self._cancel_after_accept(
+                    runtime_task_id, idempotency_key, task
+                )
+            self._persist_reconciliation(
+                task,
+                runtime_task_id=(
+                    runtime_task_id
+                    if isinstance(runtime_task_id, str)
+                    else None
+                ),
+                idempotency_key=idempotency_key,
+                cancel=cancel,
+                reason=RUNTIME_SUBMIT_HANDLE_INVALID,
+                now=now,
+            )
             self._record_failure(
                 task,
                 lease,
@@ -583,9 +677,18 @@ class RuntimeDispatcher:
             # The runtime already accepted the work.  A lease/fencing/state
             # rejection must not be recorded as "rejected" (that would claim no
             # side effect) and must never trigger a second submit.  Best-effort
-            # cancel, then enter the honest unknown/reconciliation state.
-            self._cancel_after_accept(
+            # cancel, persist the accepted handle/key for reconciliation, then
+            # enter the honest unknown state.
+            cancel = self._cancel_after_accept(
                 runtime_task_id, idempotency_key, task
+            )
+            self._persist_reconciliation(
+                task,
+                runtime_task_id=runtime_task_id,
+                idempotency_key=idempotency_key,
+                cancel=cancel,
+                reason=RUNTIME_BIND_FAILED,
+                now=now,
             )
             self._record_failure(
                 task,
@@ -612,25 +715,70 @@ class RuntimeDispatcher:
         runtime_task_id: str,
         idempotency_key: str,
         task: Task,
-    ) -> None:
+    ) -> dict[str, object]:
         """Ask the runtime to stop a submission we could not bind.
 
         Cancellation is best effort by contract: a ``requested`` result is not
-        a stop, and a failed cancel call must not hide the unknown outcome.
+        a stop, and a failed call must not hide the unknown outcome.  The
+        returned fact is folded into the persisted reconciliation record so a
+        later reconciler knows whether a stop is still owed.
         """
 
         try:
-            self._adapter.cancel_task(
+            result = self._adapter.cancel_task(
                 runtime_task_id,
                 reason=RUNTIME_BIND_FAILED,
                 idempotency_key=idempotency_key,
                 task_id=task.task_id,
             )
         except Exception:  # noqa: BLE001 - best-effort stop; unknown is recorded
-            # The runtime may already be unreachable.  The task still records
-            # ``unknown`` and its grant is invalidated, so no retry can reuse
-            # the accepted handle.
-            return
+            # The runtime may already be unreachable.  The handle/key remain in
+            # the task result, so reconciliation can retry the stop.
+            return {
+                "attempted": True,
+                "outcome": "error",
+                "stop_confirmed": False,
+            }
+        return {
+            "attempted": True,
+            "outcome": result.outcome.value,
+            "stop_confirmed": bool(result.stop_confirmed),
+        }
+
+    def _persist_reconciliation(
+        self,
+        task: Task,
+        *,
+        runtime_task_id: str | None,
+        idempotency_key: str,
+        cancel: Mapping[str, object] | None,
+        reason: str,
+        now: datetime,
+    ) -> None:
+        """Persist the accepted-but-unbound handle before entering unknown.
+
+        ``record_dispatch_failure`` merges the existing result document, so
+        these keys survive the transition.  Only the opaque handle, the stable
+        key, cancellation facts and a reason are stored -- never a prompt,
+        token or credential.
+        """
+
+        document: dict[str, object] = {
+            "runtime_task_id": runtime_task_id,
+            "runtime_key": idempotency_key,
+            "cancel_requested_at": (
+                _rfc3339(now)
+                if cancel is not None and cancel.get("attempted")
+                else None
+            ),
+            "cancel_outcome": (cancel or {}).get("outcome"),
+            "stop_confirmed": bool((cancel or {}).get("stop_confirmed", False)),
+            "reason": reason,
+        }
+        task.result = {
+            **dict(task.result or {}),
+            "runtime_reconciliation": document,
+        }
 
     def _record_submit_refusal(
         self,
