@@ -77,17 +77,27 @@ Lease recovery
 :class:`RuntimeRecoveryChecker` into
 :func:`app.tasks.worker.recover_expired_leases` in committed batches: the
 worker's fixed per-call window is drained until the backlog is empty, so a
-persistent set of expired leases cannot starve later rows.
+persistent set of expired leases cannot starve later rows.  The adapter is
+observed **before** the worker takes its task/lease row locks and the worker is
+handed a cached, no-network checker; an external ``cancel_requested`` can
+therefore commit while a recovery observation is in flight instead of blocking
+on the row lock.
 :meth:`RuntimeDispatcher.reconcile_cancel_requests` handles
 ``cancel_requested`` rows whose lease expired or whose process crashed, and
 :meth:`RuntimeDispatcher.cancel_unknown_runs` best-effort stops runs of tasks
 that are already ``unknown`` but still carry a persisted ``rtask_*`` handle.
 The checker answers only from adapter facts and only for managed tasks: a bound
 handle is observed with ``get_status`` (a live run is reported as ``running``
-and the worker never replays it), and ``not_accepted`` is only returned for a
-definite ``not_found`` lookup with **no** bound handle -- never from missing
-local state, and never for a run this boundary already bound.  None of these
-paths ever submits again.
+and the worker never replays it).  It never answers ``not_accepted``: the
+adapter contract has no explicit no-side-effect guarantee, and a missing run is
+not proof that none can still land, so every lookup answer other than a usable
+``found`` handle is ``unknown``.  None of these paths ever submits again.
+
+Managed state writes are fenced.  ``escalate_task`` carries no worker/fencing
+argument, so :meth:`RuntimeDispatcher._escalate_with_stop` re-reads and verifies
+the current lease under its row lock before writing evidence or escalating; a
+stale pass raises ``task_fencing_token_stale`` and rolls back.  Recovery-lease
+document writes are checked the same way before they are staged.
 
 The drive is **time/lease bounded**, not observation bounded: it waits
 ``poll_interval`` between observations, renews the lease at roughly half its
@@ -388,8 +398,10 @@ RECOVERABLE_LOOP_ERRORS: tuple[type[BaseException], ...] = (
 #: Rows recovered per ``worker.recover_expired_leases`` call by
 #: :meth:`RuntimeDispatcher.recover_leases`.  The pass drains batches until the
 #: backlog is empty, so this is a memory/transaction bound, not a starvation
-#: window: a row behind the first batch is reached in the same pass.
-_RECOVERY_BATCH_SIZE = 200
+#: window: a row behind the first batch is reached in the same pass.  Keep it
+#: small: each batch commits once and holds its row locks until then (the
+#: adapter observation itself already happens outside the lock).
+_RECOVERY_BATCH_SIZE = 10
 
 
 class RuntimePromptTooLarge(ValueError):
@@ -448,8 +460,10 @@ def build_runtime_prompt(task: object) -> str:
     The output is RFC 8785 JCS canonical JSON (UTF-8, sorted keys, no
     whitespace), built only from the persisted, already-governed task columns.
     No identity, authority, session or credential field is added.  Nested keys
-    that name a credential are dropped so a stray secret in the governed
-    payload can never cross the runtime boundary.
+    whose name matches a credential fragment are dropped as a **best-effort**
+    defence: this is name-based redaction, not content inspection, so a secret
+    placed in an ordinary-looking value is not detected.  The governed payload
+    must not carry credentials in the first place.
 
     Raises:
         RuntimePromptTooLarge: the canonical prompt exceeds the fixed bound.
@@ -547,6 +561,29 @@ def _runtime_stop_evidence_ref(
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Treat a naive DB timestamp as UTC (the columns are timezone-aware)."""
+
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+@dataclass(frozen=True)
+class _RecoverySnapshot:
+    """Detached task facts used for a network observation outside a lock.
+
+    :class:`RuntimeRecoveryChecker` only reads these attributes; a full ORM row
+    must not be held (or lazily reloaded) while an adapter call is in flight.
+    """
+
+    task_id: str
+    state: str
+    runtime_task_id: str | None
+    grant_id: str | None
+    execution_mode: str
 
 
 @dataclass(frozen=True)
@@ -666,12 +703,16 @@ class RuntimeRecoveryChecker:
       handle stays on the task for later reconciliation.
     * without a bound handle, only a persisted idempotency key can be looked
       up.  ``found`` re-observes the returned handle (or answers ``unknown``
-      when the lookup carries no usable one).  ``not_found`` answers
-      ``("not_accepted", False)`` **only** here: the adapter gave the
-      contract's definite-absence answer and this boundary never bound a
-      handle, so there is no run it could have lost.  A missing key, a raising
-      lookup, ``unknown``/``conflict``, a ``found`` run without a handle, or a
-      malformed persisted handle all answer ``("unknown", False)``.
+      when the lookup carries no usable one).  **Every other lookup answer,
+      including ``not_found``, is ``("unknown", False)``.**
+
+    ``not_accepted`` is deliberately never returned.  The Runtime Adapter
+    contract has no explicit "no side effects" guarantee, and a missing run
+    today does not prove one was never created elsewhere (or that a late
+    submission cannot still land).  The worker treats ``not_accepted`` as a
+    licence to roll the attempt back and requeue with the same Grant/key, so
+    claiming it from a mere ``not_found`` would risk a replay.  Only an
+    explicit contract guarantee (a future field) may change this.
 
     The checker is deliberately passive: it makes no writes, never submits,
     and never cancels.  It only answers for ``managed_execution`` tasks: a
@@ -729,8 +770,8 @@ class RuntimeRecoveryChecker:
                 # The run exists but cannot be observed: never adopt/replay.
                 return ("unknown", False)
             return self._observe_status(str(task_id), found)
-        if lookup.outcome is LookupOutcome.NOT_FOUND:
-            return ("not_accepted", False)
+        # ``not_found`` (and every other answer) is not proof of no side
+        # effects: never hand the worker a rollback/requeue licence.
         return ("unknown", False)
 
     def _observe_status(
@@ -756,6 +797,58 @@ class RuntimeRecoveryChecker:
             # Still live: never "not accepted", never replayed.
             return ("running", False)
         return ("unknown", False)
+
+
+class _CachedRecoveryChecker:
+    """Replay prefetched observations without any network call.
+
+    :func:`app.tasks.worker.recover_expired_leases` calls its checker while the
+    task and lease rows are locked ``FOR UPDATE``.  A network call there would
+    block an external ``request_cancel`` for the length of the adapter call and
+    stall the recovery loop.  :meth:`RuntimeDispatcher.recover_leases` therefore
+    observes the adapter **outside** the lock and passes this object under it.
+
+    The cache entry is keyed by the persisted attempt identity and carries the
+    pre-observation ``(state, runtime_task_id)`` fingerprint.  If the row
+    changed between the unlocked observation and the fenced recovery, the
+    checker answers ``("unknown", False)``: a stale runtime fact is never
+    applied, and nothing is replayed.
+    """
+
+    def __init__(
+        self,
+        observations: Mapping[
+            tuple[str, int, str | None],
+            tuple[tuple[str, str | None], str, bool],
+        ],
+    ) -> None:
+        self._observations = dict(observations)
+
+    def __call__(
+        self,
+        *,
+        task: object,
+        attempt_number: int,
+        idempotency_key: str | None,
+    ) -> tuple[str, bool]:
+        key = (
+            str(getattr(task, "task_id", "")),
+            int(attempt_number),
+            idempotency_key,
+        )
+        entry = self._observations.get(key)
+        if entry is None:
+            # Not prefetched (new/expired-now lease): fail closed.  The next
+            # loop iteration observes it before acquiring any lock.
+            return ("unknown", False)
+        fingerprint, outcome, stop_confirmed = entry
+        if fingerprint != (
+            getattr(task, "state", None),
+            getattr(task, "runtime_task_id", None),
+        ):
+            # The row moved after the observation; do not apply a stale fact.
+            return ("unknown", False)
+        return (outcome, stop_confirmed)
 
 
 class RuntimeDispatcher:
@@ -900,43 +993,55 @@ class RuntimeDispatcher:
         now: datetime | None = None,
         limit: int | None = None,
     ) -> list[worker.LeaseRecovery]:
-        """Recover expired leases in committed batches.
+        """Recover expired managed leases in committed batches.
 
-        ``worker.recover_expired_leases`` scans a fixed window per call, so a
-        single call with a small ``limit`` would starve every row behind the
-        first window.  This pass therefore drains the backlog: each batch is
-        committed before the next read, and the loop stops when a batch
-        recovers nothing (a lease skipped because another pass holds it cannot
-        make this spin) or when an explicit ``limit`` is reached.
+        The adapter is observed **outside** every task/lease row lock:
+        :func:`app.tasks.worker.recover_expired_leases` calls its checker while
+        holding ``FOR UPDATE``, so this pass prefetches the runtime facts first,
+        then lets the worker apply them under the lock through a no-network
+        :class:`_CachedRecoveryChecker`.  An external ``request_cancel`` can
+        therefore commit during a recovery observation instead of blocking on
+        the row lock.
+
+        The worker scans a fixed window per call, so a single call with a small
+        ``limit`` would starve every row behind the first window.  This pass
+        drains the backlog: each batch is committed before the next read, and
+        the loop stops when a batch recovers nothing (a lease skipped because
+        another pass holds it cannot make this spin) or when an explicit
+        ``limit`` is reached.
 
         ``limit=None`` (the default) means every expired lease.  An explicit
         ``limit`` is a hard bound: each batch asks for at most the remaining
         budget, so the pass never recovers more than ``limit`` rows and
-        ``limit=0`` performs no recovery at all.  The actor is the injected
-        service principal and the checker is the adapter-only
-        :class:`RuntimeRecoveryChecker`; no batch is rolled back by a later
-        failing dispatch pass.
+        ``limit=0`` performs no recovery at all.  Only ``managed_execution``
+        rows are recovered; the generic worker pool owns the other modes.  The
+        actor is the injected service principal.
         """
 
         recovered: list[worker.LeaseRecovery] = []
         remaining = None if limit is None else max(0, int(limit))
         if remaining == 0:
             return recovered
+        timestamp = now or _utcnow()
         try:
             self._require_service_principal()
-            checker = RuntimeRecoveryChecker(self._adapter)
             while True:
                 batch_size = (
                     _RECOVERY_BATCH_SIZE
                     if remaining is None
                     else min(_RECOVERY_BATCH_SIZE, remaining)
                 )
+                candidates, checker = self._prefetch_recovery_observations(
+                    now=timestamp, limit=batch_size
+                )
                 batch = worker.recover_expired_leases(
                     self._session,
                     actor=self._service_principal,
                     checker=checker,
-                    now=now,
+                    now=timestamp,
                     limit=batch_size,
+                    execution_mode=MANAGED_EXECUTION_MODE,
+                    candidates=candidates,
                 )
                 self._session.commit()
                 recovered.extend(batch)
@@ -950,6 +1055,84 @@ class RuntimeDispatcher:
             self._session.rollback()
             raise
         return recovered
+
+    def _prefetch_recovery_observations(
+        self, *, now: datetime, limit: int
+    ) -> tuple[list[tuple[int, str]], _CachedRecoveryChecker]:
+        """Observe the adapter for one expired-lease batch, outside any lock.
+
+        Reads the candidate identities and the persisted attempt context
+        without ``FOR UPDATE``, closes that read transaction, calls the adapter
+        with detached snapshots, and returns the exact candidate list plus a
+        cached checker.  The worker then re-locks and re-verifies every row; a
+        row that changed in between is answered ``unknown`` by the cache
+        fingerprint instead of receiving a stale runtime fact.
+        """
+
+        timestamp = now or _utcnow()
+        candidates = list(
+            self._session.execute(
+                select(TaskLease.id, TaskLease.task_id)
+                .join(Task, Task.task_id == TaskLease.task_id)
+                .where(
+                    TaskLease.released_at.is_(None),
+                    TaskLease.lease_expires_at <= timestamp,
+                    Task.execution_mode == MANAGED_EXECUTION_MODE,
+                )
+                .order_by(TaskLease.id)
+                .limit(limit)
+            )
+        )
+        snapshots: list[
+            tuple[_RecoverySnapshot, int, str | None]
+        ] = []
+        for _lease_id, task_id in candidates:
+            task = self._session.scalar(
+                select(Task).where(Task.task_id == task_id)
+            )
+            if task is None:
+                continue
+            attempt = self._load_attempt(task)
+            snapshots.append(
+                (
+                    _RecoverySnapshot(
+                        task_id=task.task_id,
+                        state=task.state,
+                        runtime_task_id=task.runtime_task_id,
+                        grant_id=task.grant_id,
+                        execution_mode=task.execution_mode,
+                    ),
+                    attempt.attempt_number if attempt is not None else 0,
+                    attempt.idempotency_key if attempt is not None else None,
+                )
+            )
+        # Close the read transaction before any adapter call: no lock and no
+        # snapshot is held while the network observation is in flight.
+        self._session.commit()
+        checker = RuntimeRecoveryChecker(self._adapter)
+        observations: dict[
+            tuple[str, int, str | None],
+            tuple[tuple[str, str | None], str, bool],
+        ] = {}
+        for snapshot, attempt_number, idempotency_key in snapshots:
+            if snapshot.state != "dispatched":
+                # The worker never consults the checker for a
+                # running/verifying/other row; do not observe the adapter for
+                # a fact that cannot be applied.
+                continue
+            outcome, stop_confirmed = checker(
+                task=snapshot,
+                attempt_number=attempt_number,
+                idempotency_key=idempotency_key,
+            )
+            observations[
+                (snapshot.task_id, attempt_number, idempotency_key)
+            ] = (
+                (snapshot.state, snapshot.runtime_task_id),
+                outcome,
+                stop_confirmed,
+            )
+        return candidates, _CachedRecoveryChecker(observations)
 
     def reconcile_cancel_requests(
         self,
@@ -979,10 +1162,14 @@ class RuntimeDispatcher:
 
         A bounded scan (``limit=None`` means all) keeps a large backlog from
         starving later rows, and every write happens under the recovery lease.
+        ``limit=0`` scans nothing (same hard-bound semantics as
+        :meth:`recover_leases`).
         """
 
         timestamp = now or _utcnow()
         results: list[DispatcherResult] = []
+        if limit is not None and int(limit) <= 0:
+            return results
         self._require_service_principal()
         try:
             query = (
@@ -994,7 +1181,7 @@ class RuntimeDispatcher:
                 .order_by(Task.id)
             )
             if limit is not None:
-                query = query.limit(max(1, int(limit)))
+                query = query.limit(int(limit))
             for task_id in list(self._session.scalars(query)):
                 result = self._reconcile_one_cancel_request(
                     task_id, now=timestamp
@@ -1028,11 +1215,14 @@ class RuntimeDispatcher:
         confirmed stop that was already persisted is left alone.
 
         ``limit=None`` scans every unknown managed row so a fixed 50-row window
-        cannot starve newer rows.
+        cannot starve newer rows.  ``limit=0`` scans nothing (same hard-bound
+        semantics as :meth:`recover_leases`).
         """
 
         timestamp = now or _utcnow()
         results: list[DispatcherResult] = []
+        if limit is not None and int(limit) <= 0:
+            return results
         self._require_service_principal()
         try:
             query = (
@@ -1044,7 +1234,7 @@ class RuntimeDispatcher:
                 .order_by(Task.id)
             )
             if limit is not None:
-                query = query.limit(max(1, int(limit)))
+                query = query.limit(int(limit))
             for task_id in list(self._session.scalars(query)):
                 result = self._cancel_one_unknown(task_id, now=timestamp)
                 if result is not None:
@@ -1111,6 +1301,7 @@ class RuntimeDispatcher:
             task,
             reason=RUNTIME_CANCEL_REQUESTED,
         )
+        self._require_current_lease(lease, now=now)
         self._persist_reconciliation(
             task,
             runtime_task_id=handle,
@@ -1243,6 +1434,7 @@ class RuntimeDispatcher:
             task.result or {}
         ).get("error_code")
         reason = str(original_reason or RUNTIME_CANCEL_RECONCILE)
+        self._require_current_lease(lease, now=now)
         self._persist_reconciliation(
             task,
             runtime_task_id=handle,
@@ -1256,6 +1448,9 @@ class RuntimeDispatcher:
             evidence_ref, runtime_outcome = stop_ref
             # Runtime stop evidence only.  The task must stay ``unknown``: the
             # business side effects are a human decision (never auto-cancel).
+            # The lease is re-checked after the status observation, which may
+            # have outlived a short recovery lease.
+            self._require_current_lease(lease, now=now)
             self._persist_reconciliation(
                 task,
                 runtime_task_id=handle,
@@ -1722,6 +1917,10 @@ class RuntimeDispatcher:
                     task,
                     reason=RUNTIME_CANCEL_REQUESTED,
                 )
+                # The cancel response is a network fact; re-verify the lease
+                # before staging the reconciliation document so a lease that
+                # expired/released during the call cannot commit a stale fact.
+                self._require_current_lease(lease, now=current)
                 self._persist_reconciliation(
                     task,
                     runtime_task_id=runtime_task_id,
@@ -1995,6 +2194,7 @@ class RuntimeDispatcher:
                 runtime_outcome=runtime_outcome,
                 now=now,
             )
+        self._require_current_lease(lease, now=now)
         self._persist_reconciliation(
             task,
             runtime_task_id=runtime_task_id,
@@ -2033,8 +2233,15 @@ class RuntimeDispatcher:
         ``cancelled``; it persists the hashed evidence and escalates
         ``needs_human`` (T35/T40/T52) so a person can reconcile and then run
         T63.
+
+        ``escalate_task`` cannot express a worker/fencing token, so the current
+        lease is re-verified under its row lock *before* any fact is written.
+        A stale pass raises ``task_fencing_token_stale`` and its transaction
+        rolls back; the current owner keeps the row and no escalation is
+        recorded from the stale observation.
         """
 
+        self._require_current_lease(lease, now=now)
         self._persist_reconciliation(
             task,
             runtime_task_id=runtime_task_id,
@@ -2281,7 +2488,7 @@ class RuntimeDispatcher:
                 reason=RUNTIME_RESULT_UNUSABLE,
                 now=now,
             )
-        self._ensure_running(
+        observed_state = self._ensure_running(
             task,
             lease,
             runtime_task_id=runtime_task_id,
@@ -2289,6 +2496,19 @@ class RuntimeDispatcher:
             expected_revision=expected_revision,
             now=now,
         )
+        if observed_state not in ("running", "cancel_requested"):
+            # Another writer moved the row (recovery/cancel/terminal) while the
+            # result was being fetched.  A second managed write from this stale
+            # observation would either fail again or overwrite an honest fact,
+            # so release what this pass still holds and fail closed.  A stale
+            # lease raises here and the pass rolls back.
+            self._release(task, lease, now=now)
+            return DispatcherResult(
+                outcome="unknown",
+                task_id=task.task_id,
+                runtime_task_id=runtime_task_id,
+                detail=RUNTIME_FACT_REFUSED,
+            )
         try:
             task_service.record_attempt_result(
                 self._session,
@@ -2561,17 +2781,16 @@ class RuntimeDispatcher:
         confirmed = self._confirmed_stop_ref(
             task, runtime_task_id, cancel, now=now
         )
-        self._persist_reconciliation(
-            task,
-            runtime_task_id=runtime_task_id,
-            idempotency_key=idempotency_key,
-            cancel=cancel,
-            reason=RUNTIME_WAITING_INPUT,
-            stop_evidence_refs=(confirmed[0],) if confirmed else (),
-            runtime_outcome=confirmed[1] if confirmed else None,
-            now=now,
-        )
         if confirmed is None:
+            self._require_current_lease(lease, now=now)
+            self._persist_reconciliation(
+                task,
+                runtime_task_id=runtime_task_id,
+                idempotency_key=idempotency_key,
+                cancel=cancel,
+                reason=RUNTIME_WAITING_INPUT,
+                now=now,
+            )
             return self._record_lost(
                 task,
                 lease,
@@ -2579,22 +2798,22 @@ class RuntimeDispatcher:
                 reason=RUNTIME_WAITING_INPUT,
                 now=now,
             )
-        stop_ref = confirmed[0]
 
-        task_service.escalate_task(
-            self._session,
-            task_id=task.task_id,
-            actor=self._service_principal,
-            reason_code=RUNTIME_WAITING_INPUT,
-            evidence_refs=(stop_ref,),
-            now=now,
-        )
-        self._release(task, lease, now=now)
-        return DispatcherResult(
-            outcome="needs_human",
-            task_id=task.task_id,
+        # A confirmed stop follows the shared escalation path (evidence +
+        # ``needs_human``), including its fenced-lease check and the
+        # TaskError -> fail-closed handling.  A refused escalation therefore
+        # never leaves a half-written reconciliation document behind.
+        stop_ref, runtime_outcome = confirmed
+        return self._escalate_with_stop(
+            task,
+            lease,
             runtime_task_id=runtime_task_id,
-            detail=RUNTIME_WAITING_INPUT,
+            idempotency_key=idempotency_key,
+            cancel=cancel,
+            reason=RUNTIME_WAITING_INPUT,
+            stop_ref=stop_ref,
+            runtime_outcome=runtime_outcome,
+            now=now,
         )
 
     def _load_attempt(self, task: Task) -> TaskAttempt | None:
@@ -2995,6 +3214,44 @@ class RuntimeDispatcher:
             now=now,
         )
         self._release(task, lease, now=now)
+
+    def _require_current_lease(
+        self, lease: TaskLease, *, now: datetime
+    ) -> None:
+        """Fail closed unless this pass still holds the current lease/fencing.
+
+        ``escalate_task`` and the reconciliation document write have no
+        worker/fencing parameter of their own, so they would otherwise be able
+        to write a managed fact from a pass whose lease was released or staled
+        by another writer.  The lease row is re-read under ``FOR UPDATE`` with
+        ``populate_existing`` (a plain reselect does not refresh a loaded ORM
+        object) and compared on id/worker/token/expiry.  A mismatch raises
+        ``task_fencing_token_stale`` before any fact is written; the caller's
+        transaction then rolls back and the current owner keeps the row.
+
+        Works for both a claim lease and a recovery lease: both are ordinary
+        :class:`~app.tasks.models.TaskLease` rows with their own worker id and
+        fencing token.
+        """
+
+        current = self._session.scalar(
+            select(TaskLease)
+            .where(TaskLease.id == lease.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if (
+            current is None
+            or current.released_at is not None
+            or current.worker_id != lease.worker_id
+            or current.fencing_token != lease.fencing_token
+            or _as_utc(current.lease_expires_at) <= now
+        ):
+            raise TaskError(
+                "task_fencing_token_stale",
+                "the current lease/fencing token is not held by this pass",
+                context={"task_id": lease.task_id},
+            )
 
     def _release(self, task: Task, lease: TaskLease, *, now: datetime) -> None:
         """Release the lease this pass actually holds.

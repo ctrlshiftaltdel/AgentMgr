@@ -1,6 +1,6 @@
 # Runtime Dispatch（Managed Execution 生产调度器）
 
-- 状态：**Draft — 待所有者审阅**；本文只定义 #96 的设计，不代表已实现或已批准实施。
+- 状态：**已实现（PR #98，Issue #96）**；实现与测试位于 `app/tasks/execution.py`、`app/tests/tasks/`，运维见 [docs/operations/runtime-dispatch.md](../operations/runtime-dispatch.md)。**#97 的真实 Hermes managed 执行与 #83 的真实客户端/E2E 仍未验证**；本文不构成真实运行时兼容性证据。
 - 关联：Issue #96、#83、#97、#81、#82；[Runtime Adapter 契约](../contracts/runtime-adapter.md)、[任务状态机](task-state-machine.md)、[受控执行边界记录](../security/managed-execution-boundary.md)。
 - 依赖：`RuntimeAdapter` v1.0.0、task/ExecutionGrant 冻结契约、`app.tasks.worker` 的 lease/fencing。
 - 日期：2026-10-24
@@ -92,8 +92,8 @@ class RuntimeDispatcher:
 
 - `run_once`：claim 一个 managed queued task；校验 Grant/能力/健康；submit；维持 lease；把受理/运行/终态/取消事实写入核心；释放或交给 recovery。
 - `run_forever`：轮询 `run_once`，健康不可用时指数退避；支持 SIGTERM/事件停止；不实现多任务并发。
-- `RuntimeRecoveryChecker`：供 `worker.recover_expired_leases` 注入，使用 adapter `find_by_idempotency_key`/`get_status`；只有 adapter 明确 `not_found` 且契约允许无副作用结论时才返回 `not_accepted`，否则 `unknown`。
-- `cancel`：只处理 `cancel_requested`；`adapter.cancel_task` 的 `requested` 不写停止事实，只有 `stop_confirmed=true` 才 `confirm_stop`。
+- `RuntimeRecoveryChecker`：供 `worker.recover_expired_leases` 注入，使用 adapter `find_by_idempotency_key`/`get_status`。契约没有显式“无副作用”保证字段，因此**从不**返回 `not_accepted`：除可观察的 found handle/live status 外一律 `unknown`（不重放、不用旧 key 重排）。适配器观测在 task/lease 行锁之外完成，再以缓存的 checker 在锁内落事实。
+- `cancel`：只处理 `cancel_requested`；`adapter.cancel_task` 的 `requested` 不写停止事实。`stop_confirmed=true` 只保存证据并 `escalate_task(needs_human)`，**不**调用 `confirm_stop`、不自动写 `cancelled`/`side_effects_reconciled`（人工对账后由 T63 决定）。
 - 所有写 `start_attempt`/`mark_running`/`record_attempt_result`/`record_dispatch_failure` 都携带当前 worker/fencing；lease 丢失后只做 best-effort cancel，不再写业务事实。
 
 ### 3.3 CLI
@@ -156,8 +156,8 @@ task_service.submit_task(..., execution_mode="managed_execution",
 | `waiting_input` | 本 Issue 不支持通用输入；先 cancel 并取得停止证据，再转 `needs_human`；停止未确认则 `unknown` |
 | `completed` + `get_result` | 只接受合法 `result_*`/`evidence:*`；`record_attempt_result(completed)` → `verifying`；**不自动 succeeded** |
 | `failed` + stop_confirmed | `record_attempt_result(failed, stop_confirmed=True, evidence_refs=...)` |
-| `stopped` + cancel_requested | `record_attempt_result(stopped, stop_confirmed=True)` |
-| `timed_out` + stop_confirmed | `record_attempt_result(timed_out, stop_confirmed=True)` |
+| `stopped` + cancel_requested | confirmed stop → 保存 hashed evidence + `escalate_task(needs_human)`（T52）；**不**调用 `confirm_stop`、不自动写 `cancelled`/`side_effects_reconciled` |
+| `timed_out` + stop_confirmed | `record_attempt_result(timed_out, stop_confirmed=True, evidence_refs=...)` |
 | `unknown` / `not_found` | `record_attempt_result(lost)`；任务 `unknown`，Grant 撤销；best-effort cancel；不恢复执行 |
 | `completed` 但 result/evidence 缺失 | fail closed：`unknown`/`needs_human`，不得构造/伪造 `result_*`/`evidence:*` |
 
@@ -177,7 +177,7 @@ task_service.submit_task(..., execution_mode="managed_execution",
 ### 4.5 崩溃、lease 过期与恢复
 
 - `run_forever` 定期调用 `worker.recover_expired_leases(checker=RuntimeRecoveryChecker(...))`。
-- dispatched：checker 只能依据 adapter lookup/status；无法证明 `not_accepted` 时必须 `unknown`。
+- dispatched：checker 只能依据 adapter lookup/status；**不返回 `not_accepted`**（契约无显式无副作用保证），一律 `unknown`，不重放、不换 key 重排。适配器观测必须在行锁之外完成，锁内只落已缓存的事实。
 - running/verifying：不重放；进入 `unknown`/证据不可用；不把 `running` 恢复为继续执行。
 - 任务已 `unknown` 但有 `runtime_task_id`：best-effort cancel/stop；confirmed stop 只保存 stop evidence 并保持 `unknown`/转人工，不自动 `cancelled`；业务对账由人工完成。
 - `cancel_requested` 的过期/崩溃对账：有 handle 则 cancel/status；confirmed stop -> 保存证据并 `needs_human`；无 handle 则按从未开始/人工路径处理；不得静默释放 lease 后留下永久 `cancel_requested`。

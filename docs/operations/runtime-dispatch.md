@@ -128,9 +128,11 @@ claim (managed queued only)
 ### 4.4 崩溃与 lease 过期
 
 - `run_forever` 每轮先执行 `recover_leases`：worker 的固定窗口会被**分批排空**（`limit=None` 表示全部），因此积压不会让后面的行永久饿死；每批独立提交。排空整个积压可能让单轮循环变长；需要限制单轮工作量时传入显式 `limit`（硬上限，`limit=0` 不恢复任何行）。
+- 恢复的 adapter 观测在 task/lease 行锁**之外**完成，锁内只落已缓存事实（每批默认 10 行），因此外部 `request_cancel` 不会被一次网络观测阻塞。
+- 升级 `needs_human` 或写对账文档前，会重新校验当前 claim/recovery lease 与 fencing token；已失效的 pass 直接回滚，不写半截 `needs_human`/证据。
 - `RuntimeRecoveryChecker` 只依据 adapter 事实回答，且只处理 managed 任务：
   - 已绑定 handle：观察 `get_status`；仍 live 的 run 报 `running`，worker 进入 `unknown`，**绝不重放**；确认 `failed`/`timed_out` 才可关闭 attempt。
-  - 无绑定 handle：只有 adapter 明确 `not_found`（契约的无副作用结论）才报 `not_accepted`；其余（缺 key、lookup 抛错、`unknown`/`conflict`、found 但无 handle）一律 `unknown`。
+  - 无绑定 handle：**即使 adapter 回答 `not_found` 也报 `unknown`**。契约没有显式的“无副作用”保证字段，缺失 run 不能证明未来不会落地，更不能作为用同一 Grant/key 重排的依据；缺 key、lookup 抛错、`unknown`/`conflict`、found 但无 handle 同样一律 `unknown`。
 - `running`/`verifying` 的过期任务不会恢复执行；进入 `unknown` 并等待对账。
 - 任何重试都必须来自新的 PDP 决策 + 新 Grant；不得复用旧 Grant 或旧 idempotency key。
 - 旧的 attempt 的停止/查找事实不会继承到新 attempt：reconciliation 事实以 `runtime_key` 归属，新 key 不继承旧 stop/lookup。

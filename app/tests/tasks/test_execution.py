@@ -48,7 +48,7 @@ from sqlalchemy.orm import Session
 
 from app.governance.errors import PrincipalResolutionError
 from app.governance.grants import revoke_grant
-from app.governance.models import ExecutionGrant
+from app.governance.models import ExecutionGrant, GovernanceDecisionRecord
 from app.governance.policies import canonical_json
 from app.governance.principal import (
     GovernancePrincipal,
@@ -270,6 +270,74 @@ class _StopOnStatusAdapter(FakeRuntimeAdapter):
         status = super().get_status(runtime_task_id, task_id=task_id)
         self._stop_event.set()
         return status
+
+
+class _ReleaseLeaseAdapter(FakeRuntimeAdapter):
+    """Fake adapter that releases the task's live lease on another connection.
+
+    Used to prove a stale pass cannot write an escalation/managed fact: the
+    second connection commits a real ``release_lease`` while the observation is
+    in flight, so the dispatcher's fenced check must reject the write.
+    """
+
+    def __init__(
+        self,
+        *,
+        engine: object,
+        task_id: str,
+        **kwargs: object,
+    ) -> None:
+        super().__init__(**kwargs)
+        self._engine = engine
+        self._task_id = task_id
+        self.release_committed = False
+
+    def get_status(
+        self, runtime_task_id: str, *, task_id: str | None = None
+    ) -> StatusResult:
+        status = super().get_status(runtime_task_id, task_id=task_id)
+        if not self.release_committed:
+            self._release_on_another_connection()
+        return status
+
+    def _release_on_another_connection(self) -> None:
+        errors: list[BaseException] = []
+
+        def _run() -> None:
+            try:
+                other = Session(self._engine)  # type: ignore[arg-type]
+                try:
+                    lease = other.scalar(
+                        select(TaskLease)
+                        .where(
+                            TaskLease.task_id == self._task_id,
+                            TaskLease.released_at.is_(None),
+                        )
+                        .order_by(TaskLease.id.desc())
+                    )
+                    assert lease is not None
+                    worker.release_lease(
+                        other,
+                        task_id=self._task_id,
+                        worker_id=lease.worker_id,
+                        fencing_token=lease.fencing_token,
+                    )
+                    other.commit()
+                finally:
+                    other.close()
+            except BaseException as exc:  # noqa: BLE001 - re-raised below
+                errors.append(exc)
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        thread.join(timeout=10)
+        if errors:
+            raise errors[0]
+        if thread.is_alive():
+            raise AssertionError(
+                "the pass held the lease row lock across an observation"
+            )
+        self.release_committed = True
 
 
 def _leases(session: Session, task: Task) -> list[TaskLease]:
@@ -749,15 +817,48 @@ def test_expired_grant_never_reaches_the_adapter(
 # -- decision binding ---------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    ("field", "detail"),
+    [
+        ("decision_id", "grant_decision_mismatch"),
+        ("decision_hash", "grant_decision_hash_mismatch"),
+        ("task_revision", "grant_task_revision_mismatch"),
+    ],
+)
 def test_grant_decision_binding_mismatch_never_submits(
-    session: Session, world: TaskWorld
+    session: Session,
+    world: TaskWorld,
+    field: str,
+    detail: str,
 ) -> None:
     task = submit_managed(session, world)
     session.commit()
     grant = _grant(session, task)
     # Keep the row structurally valid but no longer the persisted decision's
-    # hash.  The projection alone cannot see this; the dispatcher must.
-    grant.decision_hash = "sha256:" + "0" * 64
+    # value.  The projection alone cannot see this; the dispatcher must.
+    if field == "decision_id":
+        # ``execution_grants.decision_id`` has an FK, so point it at a second
+        # valid (unused) decision row rather than an invalid id.
+        original = session.scalar(
+            select(GovernanceDecisionRecord).where(
+                GovernanceDecisionRecord.decision_id == grant.decision_id
+            )
+        )
+        assert original is not None
+        copied = {
+            column.name: getattr(original, column.name)
+            for column in GovernanceDecisionRecord.__table__.columns
+            if column.name != "id"
+        }
+        copied["decision_id"] = "gdec_binding_other_0001"
+        copied["decision_revision"] = original.decision_revision + 1
+        session.add(GovernanceDecisionRecord(**copied))
+        session.flush()
+        grant.decision_id = "gdec_binding_other_0001"
+    elif field == "decision_hash":
+        grant.decision_hash = "sha256:" + "0" * 64
+    else:
+        grant.task_revision = grant.task_revision + 1
     session.commit()
     adapter = FakeRuntimeAdapter()
 
@@ -765,9 +866,7 @@ def test_grant_decision_binding_mismatch_never_submits(
 
     assert result.outcome == "unavailable"
     assert result.task_id == task.task_id
-    assert result.detail == (
-        f"{DECISION_BINDING_MISMATCH}:grant_decision_hash_mismatch"
-    )
+    assert result.detail == f"{DECISION_BINDING_MISMATCH}:{detail}"
     assert task.state == "failed"
     assert task.result["outcome"] == "unavailable"
     assert task.result["error_code"] == DECISION_BINDING_MISMATCH
@@ -1522,6 +1621,39 @@ def test_waiting_input_confirmed_by_terminal_status_escalates(
         "evidence:runtime_stop_"
     )
     _assert_lease_released(session, task)
+
+
+def test_waiting_input_escalation_refusal_fails_closed(
+    session: Session, world: TaskWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = submit_managed(session, world)
+    session.commit()
+    adapter = FakeRuntimeAdapter(
+        status=[
+            _status(RuntimeState.RUNNING),
+            _status(RuntimeState.WAITING_INPUT),
+        ],
+        cancel=CancelResult(
+            outcome=CancelOutcome.STOPPED,
+            stop_confirmed=True,
+            observed_at=utcnow(),
+        ),
+    )
+
+    def _refuse(*args: object, **kwargs: object) -> None:
+        raise TaskError("task_invalid_transition")
+
+    monkeypatch.setattr(task_service, "escalate_task", _refuse)
+
+    result = _dispatcher(session, world, adapter=adapter).run_once()
+
+    # A refused escalation follows the shared fail-closed path: the attempt is
+    # recorded lost (unknown) and no needs_human fact is left half-written.
+    assert result.outcome == "unknown"
+    assert result.detail == RUNTIME_FACT_REFUSED
+    assert task.state == "unknown"
+    assert task.needs_human_origin is None
+    assert _leases(session, task)[-1].released_at is not None
 
 
 # -- drive bounds, lease renewal and handle attribution -----------------------
@@ -2309,7 +2441,7 @@ def test_recovery_checker_ignores_non_managed_tasks() -> None:
     assert adapter.submit_calls == []
 
 
-def test_recovery_checker_not_found_only_without_a_bound_handle() -> None:
+def test_recovery_checker_never_claims_not_accepted() -> None:
     unbound = SimpleNamespace(
         task_id="task_recovery_0002",
         grant_id="grnt_recovery_0002",
@@ -2321,11 +2453,12 @@ def test_recovery_checker_not_found_only_without_a_bound_handle() -> None:
     )
     checker = RuntimeRecoveryChecker(not_found)
 
-    # No handle was ever bound and the adapter gives the contract's definite
-    # absence answer: this is the only "never accepted" answer.
+    # The adapter contract has no explicit no-side-effect guarantee, so even the
+    # definite-absence lookup answer is not a licence to roll the attempt back
+    # and requeue with the same Grant/key.
     assert checker(
         task=unbound, attempt_number=1, idempotency_key="idem_recovery_0002"
-    ) == ("not_accepted", False)
+    ) == ("unknown", False)
     assert not_found.submit_calls == []
     # Missing local state is not a proof of no side effects.
     assert checker(task=unbound, attempt_number=1, idempotency_key=None) == (
@@ -2432,6 +2565,157 @@ def test_lease_expiry_does_not_replay_running_runtime(
     assert dispatcher.recover_leases(now=expired + timedelta(seconds=1)) == []
     assert dispatcher.run_once().outcome == "idle"
     assert adapter.submit_calls == []
+
+
+def test_recovery_not_found_does_not_claim_no_side_effects(
+    session: Session, world: TaskWorld
+) -> None:
+    task = submit_managed(session, world)
+    session.commit()
+    principal = _service_principal(session, world)
+    started = utcnow()
+    claimed = worker.claim_task(
+        session,
+        worker_id=WORKER_ID,
+        actor=principal,
+        execution_mode="managed_execution",
+        lease_seconds=5,
+        now=started,
+    )
+    assert claimed is not None
+    task_service.start_attempt(
+        session,
+        task_id=task.task_id,
+        actor=principal,
+        worker_id=WORKER_ID,
+        fencing_token=claimed.lease.fencing_token,
+        runtime_ref="rtask_fake_0001",
+        idempotency_key="idem_recovery_not_found_0001",
+        now=started,
+    )
+    # Simulate a dispatched attempt whose handle never reached the task row
+    # (the persisted attempt key is all recovery has to look up).
+    task.runtime_task_id = None
+    session.commit()
+    adapter = FakeRuntimeAdapter(
+        lookup=LookupResult(outcome=LookupOutcome.NOT_FOUND)
+    )
+
+    recovered = _dispatcher(session, world, adapter=adapter).recover_leases(
+        now=started + timedelta(seconds=6)
+    )
+
+    # ``not_found`` is not a no-side-effect guarantee: the attempt is not rolled
+    # back to queued and nothing claims there were no effects.
+    assert [(item.action, item.state) for item in recovered] == [
+        ("entered_unknown", "unknown")
+    ]
+    assert task.state == "unknown"
+    assert task.attempt == 1
+    assert "no_side_effects" not in (task.result or {})
+    assert task.grant_status == "revoked"
+    assert task.runtime_task_id is None
+    assert adapter.submit_calls == []
+
+
+def test_recovery_observation_does_not_block_an_external_cancel(
+    session: Session, world: TaskWorld, engine: object
+) -> None:
+    task = submit_managed(session, world)
+    session.commit()
+    principal = _service_principal(session, world)
+    started = utcnow()
+    claimed = worker.claim_task(
+        session,
+        worker_id=WORKER_ID,
+        actor=principal,
+        execution_mode="managed_execution",
+        lease_seconds=5,
+        now=started,
+    )
+    assert claimed is not None
+    task_service.start_attempt(
+        session,
+        task_id=task.task_id,
+        actor=principal,
+        worker_id=WORKER_ID,
+        fencing_token=claimed.lease.fencing_token,
+        runtime_ref="rtask_fake_0001",
+        idempotency_key="idem_recovery_cancel_0001",
+        now=started,
+    )
+    session.commit()
+    adapter = _ExternalCancelAdapter(
+        engine=engine,
+        actor=principal,
+        task_id=task.task_id,
+        after_status_calls=1,
+        status=[
+            _status(RuntimeState.RUNNING),
+            _status(RuntimeState.STOPPED, stop_confirmed=True),
+        ],
+    )
+    dispatcher = _dispatcher(session, world, adapter=adapter)
+    expired = started + timedelta(seconds=6)
+
+    recovered = dispatcher.recover_leases(now=expired)
+
+    # The external cancel committed while the recovery observation was in
+    # flight: the adapter call happens outside the task/lease row lock.
+    assert adapter.cancel_committed is True
+    # The row moved to cancel_requested before recovery could write: the pass
+    # only releases the expired lease and never applies a stale runtime fact.
+    assert [(item.action, item.state) for item in recovered] == [
+        ("released", "cancel_requested")
+    ]
+    assert task.state == "cancel_requested"
+    assert task.runtime_task_id == "rtask_fake_0001"
+    assert adapter.submit_calls == []
+    assert _leases(session, task)[-1].released_at is not None
+    assert "no_side_effects" not in (task.result or {})
+
+    # The strand is now reachable by the cancel pass (no stale row lock).
+    results = dispatcher.reconcile_cancel_requests(now=expired)
+
+    assert [item.outcome for item in results] == ["needs_human"]
+    assert task.state == "needs_human"
+    assert task.needs_human_origin == "cancel_requested"
+    reconciliation = task.result["runtime_reconciliation"]
+    assert reconciliation["runtime_outcome"] == "stopped"
+    assert reconciliation["stop_confirmed"] is True
+    assert len(adapter.cancel_calls) == 1
+    assert adapter.submit_calls == []
+
+
+def test_stale_lease_cannot_escalate_with_runtime_evidence(
+    session: Session, world: TaskWorld, engine: object
+) -> None:
+    task = submit_managed(session, world)
+    session.commit()
+    adapter = _ReleaseLeaseAdapter(
+        engine=engine,
+        task_id=task.task_id,
+        status=_status(RuntimeState.STOPPED, stop_confirmed=True),
+    )
+    dispatcher = _dispatcher(session, world, adapter=adapter)
+
+    # The lease is released on another connection while the status is being
+    # observed.  Escalation has no worker/fencing argument, so the dispatcher
+    # must reject the write instead of recording a stale needs_human fact.
+    with pytest.raises(TaskError):
+        dispatcher.run_once()
+
+    assert adapter.release_committed is True
+    assert task.state == "dispatched"
+    assert task.needs_human_origin is None
+    assert task.stop_confirmed is False
+    assert (task.result or {}).get("runtime_reconciliation") is None
+    assert not any(
+        event.event_type == "human.escalation_required"
+        for event in _task_events(session, task)
+    )
+    assert len(adapter.submit_calls) == 1
+    assert adapter.cancel_calls == []
 
 
 def test_unknown_with_runtime_handle_best_effort_cancel(
@@ -2773,9 +3057,12 @@ def test_run_forever_runs_lease_recovery_and_cancel_reconciliation(
         checker: object = None,
         now: object = None,
         limit: int = 50,
+        execution_mode: str | None = None,
+        candidates: object = None,
     ) -> list[object]:
         seen["checker"] = checker
         seen["actor"] = actor
+        seen["execution_mode"] = execution_mode
         return []
 
     monkeypatch.setattr(worker, "recover_expired_leases", _recover)
@@ -2802,7 +3089,8 @@ def test_run_forever_runs_lease_recovery_and_cancel_reconciliation(
         session_factory=lambda: Session(engine),  # type: ignore[arg-type]
     )
 
-    assert isinstance(seen["checker"], RuntimeRecoveryChecker)
+    assert isinstance(seen["checker"], task_execution._CachedRecoveryChecker)
+    assert seen["execution_mode"] == "managed_execution"
     assert seen["actor"] is not None
     assert seen["cancel_pass"] is True
     assert seen["unknown_pass"] is True
@@ -3305,11 +3593,27 @@ def _unit_dispatcher(
     )
 
 
+def _patch_recovery_prefetch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Return a benign candidate batch without touching the stub session."""
+
+    def _prefetch(
+        self: RuntimeDispatcher, *, now: object, limit: int
+    ) -> tuple[list[tuple[int, str]], object]:
+        return [(index, f"task_{index}") for index in range(limit)], object()
+
+    monkeypatch.setattr(
+        RuntimeDispatcher, "_prefetch_recovery_observations", _prefetch
+    )
+
+
 def test_recover_leases_drains_every_batch_without_a_fixed_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pending = [object() for _ in range(5)]
     limits: list[int] = []
+    seen: dict[str, object] = {}
 
     def _recover(
         db: object,
@@ -3318,11 +3622,15 @@ def test_recover_leases_drains_every_batch_without_a_fixed_window(
         checker: object = None,
         now: object = None,
         limit: int = 50,
+        execution_mode: str | None = None,
+        candidates: object = None,
     ) -> list[object]:
         limits.append(limit)
+        seen["execution_mode"] = execution_mode
         batch, pending[:] = pending[:2], pending[2:]
         return batch
 
+    _patch_recovery_prefetch(monkeypatch)
     monkeypatch.setattr(worker, "recover_expired_leases", _recover)
     session = _StubSession()
 
@@ -3333,7 +3641,9 @@ def test_recover_leases_drains_every_batch_without_a_fixed_window(
     assert len(recovered) == 5
     assert len(limits) == 4
     assert len(set(limits)) == 1
-    assert limits[0] > 50
+    assert limits[0] == task_execution._RECOVERY_BATCH_SIZE
+    assert limits[0] > 1
+    assert seen["execution_mode"] == "managed_execution"
     assert session.commits == 4
     assert session.rollbacks == 0
 
@@ -3350,10 +3660,13 @@ def test_recover_leases_honours_an_explicit_bound(
         checker: object = None,
         now: object = None,
         limit: int = 50,
+        execution_mode: str | None = None,
+        candidates: object = None,
     ) -> list[object]:
         calls.append(limit)
         return [object() for _ in range(min(2, limit))]
 
+    _patch_recovery_prefetch(monkeypatch)
     monkeypatch.setattr(worker, "recover_expired_leases", _recover)
     dispatcher = _unit_dispatcher()
 
@@ -3367,6 +3680,46 @@ def test_recover_leases_honours_an_explicit_bound(
     # A zero budget performs no recovery at all.
     assert dispatcher.recover_leases(limit=0) == []
     assert calls == [5, 3, 1]
+
+
+def test_cached_recovery_checker_rejects_a_changed_row() -> None:
+    checker = task_execution._CachedRecoveryChecker(
+        {
+            ("task_cached", 1, "idem_cached"): (
+                ("dispatched", "rtask_fake_0001"),
+                "running",
+                False,
+            )
+        }
+    )
+    task = SimpleNamespace(
+        task_id="task_cached",
+        state="dispatched",
+        runtime_task_id="rtask_fake_0001",
+    )
+
+    assert checker(
+        task=task, attempt_number=1, idempotency_key="idem_cached"
+    ) == ("running", False)
+
+    # The row moved after the unlocked observation: no stale fact is applied.
+    task.state = "cancel_requested"
+    assert checker(
+        task=task, attempt_number=1, idempotency_key="idem_cached"
+    ) == ("unknown", False)
+
+    # A different attempt/key was never observed: fail closed.
+    task.state = "dispatched"
+    assert checker(
+        task=task, attempt_number=2, idempotency_key="idem_cached"
+    ) == ("unknown", False)
+
+
+def test_cancel_passes_treat_limit_zero_as_a_no_op() -> None:
+    dispatcher = _unit_dispatcher()
+
+    assert dispatcher.reconcile_cancel_requests(limit=0) == []
+    assert dispatcher.cancel_unknown_runs(limit=0) == []
 
 
 class _RecordingStopEvent(threading.Event):

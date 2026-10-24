@@ -15,6 +15,7 @@ reconciliation -- it is never blindly replayed.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, Protocol
@@ -392,23 +393,42 @@ def recover_expired_leases(
     checker: RecoveryChecker | None = None,
     now: datetime | None = None,
     limit: int = 50,
+    execution_mode: str | None = None,
+    candidates: Sequence[tuple[int, str]] | None = None,
 ) -> list[LeaseRecovery]:
     """Recover every expired lease, fail-closed.
 
     * ``queued``: no execution fact exists; release the lease only.
-    * ``dispatched``: with a checker proving ``not_accepted`` **and** no side
-      effects, roll the attempt back (T33) and leave the grant active.
-      Otherwise enter ``unknown`` and revoke the grant.
+    * ``dispatched``: only a checker that can prove ``not_accepted`` **and** no
+      side effects may roll the attempt back (T33) and leave the grant active.
+      ``RuntimeRecoveryChecker`` never makes that claim (the adapter contract
+      has no explicit no-side-effect guarantee), so a managed expiry normally
+      enters ``unknown`` and revokes the grant.
     * ``running``/``verifying``: never replayed; enter ``unknown``.
+
+    ``execution_mode`` narrows the candidate scan (and re-checks the loaded
+    row) to one execution mode; ``None`` keeps the unfiltered generic-worker
+    scan.  ``candidates`` lets a caller that already observed the runtime
+    outside the lock supply the exact ``(lease_id, task_id)`` batch; they are
+    still re-read and re-verified under ``FOR UPDATE``.
+
+    The checker is called **while the task and lease rows are locked**.  A
+    caller whose checker performs network I/O must therefore prefetch its facts
+    (see :meth:`app.tasks.execution.RuntimeDispatcher.recover_leases`) and pass
+    a cached, no-network checker; otherwise the adapter call blocks external
+    writers for its duration.
     """
     timestamp = now or _utcnow()
     # I1: take the same lock order as ``claim_task`` / ``acquire_recovery_lease``
     # -- task first, then lease.  The candidate list is read without a lock and
     # every row is re-checked under the task lock, so a worker claiming or a
     # recovery pass racing this one is skipped instead of deadlocking.
-    candidates = list(
-        session.execute(
+    if candidates is not None:
+        lease_candidates = list(candidates)
+    else:
+        candidate_query = (
             select(TaskLease.id, TaskLease.task_id)
+            .join(Task, Task.task_id == TaskLease.task_id)
             .where(
                 TaskLease.released_at.is_(None),
                 TaskLease.lease_expires_at <= timestamp,
@@ -416,15 +436,22 @@ def recover_expired_leases(
             .order_by(TaskLease.id)
             .limit(limit)
         )
-    )
+        if execution_mode is not None:
+            candidate_query = candidate_query.where(
+                Task.execution_mode == execution_mode
+            )
+        lease_candidates = list(session.execute(candidate_query))
     results: list[LeaseRecovery] = []
-    for lease_id, lease_task_id in candidates:
+    for lease_id, lease_task_id in lease_candidates:
         task = session.scalar(
             select(Task)
             .where(Task.task_id == lease_task_id)
             .with_for_update(skip_locked=True)
         )
         if task is None:
+            continue
+        if execution_mode is not None and task.execution_mode != execution_mode:
+            # Another mode's lease: this pass must not release or rewrite it.
             continue
         lease = session.scalar(
             select(TaskLease).where(TaskLease.id == lease_id).with_for_update()
@@ -478,7 +505,10 @@ def recover_expired_leases(
 
         if task.state == "dispatched" and outcome == "not_accepted":
             # T33: void a submission that never started.  No retry budget is
-            # consumed and the original grant remains valid.
+            # consumed and the original grant remains valid.  ``not_accepted``
+            # is an explicit checker guarantee (never inferred from a mere
+            # lookup ``not_found``); without it the task takes the ``unknown``
+            # path below and is never replayed.
             task.result = {
                 **dict(task.result or {}),
                 "no_side_effects": True,
