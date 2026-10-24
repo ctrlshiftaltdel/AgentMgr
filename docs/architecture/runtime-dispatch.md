@@ -159,17 +159,20 @@ task_service.submit_task(..., execution_mode="managed_execution",
 
 - `request_cancel` 由核心写入 `cancel_requested` 后，调度器才能调用 adapter cancel。
 - `cancel_task.outcome=requested` 不是停止；继续轮询。
-- `stopped`/`timed_out` 且 `stop_confirmed=true` 才能写 cancelled/timed_out。
+- **Runtime `stop_confirmed` 只证明运行时不再产生新动作，不证明业务副作用已对账。** 本 Issue 不自动写 `cancelled`/`side_effects_reconciled=true`：从 `cancel_requested`/`running`/`dispatched` 得到 confirmed stop 时，保存 stop evidence 并 `escalate_task` 到 `needs_human`（T52/T40）；由人工在业务对账后执行 T63。`unknown` + stop evidence 保持 `unknown`，直到人工对账。
+- `failed`/`timed_out` 从 `cancel_requested` 也进入 `needs_human` 并保留 runtime outcome/stop evidence；不得改写成自动 `cancelled`。
 - `already_terminal`：按实际结果走完成/失败映射，不丢弃已完成结果。
 - cancel 与 completed 竞态：以 runtime 终态 + 核心验证为准；已完成的成功结果不能被取消吞掉。
 - `unsupported`/`unknown` cancel：保持 `cancel_requested`/`unknown` 并对账；不得报“已停止”。
+- **事务边界：** 驱动器在每次状态观察后提交并重新读取任务；不得在 sleep/轮询期间持有 task/lease 行锁。外部 `request_cancel` 必须能在运行中提交。单独的 `cancel_requested` 对账 pass 处理崩溃后无 live lease 的取消请求；`cancel_requested` 不是 `unknown`，二者都要有明确对账去向。
 
 ### 4.5 崩溃、lease 过期与恢复
 
 - `run_forever` 定期调用 `worker.recover_expired_leases(checker=RuntimeRecoveryChecker(...))`。
 - dispatched：checker 只能依据 adapter lookup/status；无法证明 `not_accepted` 时必须 `unknown`。
 - running/verifying：不重放；进入 `unknown`/证据不可用；不把 `running` 恢复为继续执行。
-- 任务已 `unknown` 但有 `runtime_task_id`：best-effort cancel/stop；只有 stop_confirmed 才能进入对账终态；否则保持 unknown。
+- 任务已 `unknown` 但有 `runtime_task_id`：best-effort cancel/stop；confirmed stop 只保存 stop evidence 并保持 `unknown`/转人工，不自动 `cancelled`；业务对账由人工完成。
+- `cancel_requested` 的过期/崩溃对账：有 handle 则 cancel/status；confirmed stop -> 保存证据并 `needs_human`；无 handle 则按从未开始/人工路径处理；不得静默释放 lease 后留下永久 `cancel_requested`。
 - 任何重试都必须由新的 PDP 决策 + 新 Grant；不得复用旧 Grant 或旧 idempotency key。
 
 ## 5. 能力、健康与安全

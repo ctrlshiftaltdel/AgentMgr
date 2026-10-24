@@ -400,26 +400,31 @@ git commit -m "feat(tasks): map managed runtime status to task facts"
 - Modify: `app/tests/tasks/test_execution.py`
 
 **Interfaces:**
-- Produces: `RuntimeRecoveryChecker(adapter)` implementing `RecoveryChecker.__call__`.
-- `run_forever` calls `worker.recover_expired_leases(checker=...)`; cancel requests use `adapter.cancel_task` and `task_service.confirm_stop`.
+- Produces: `RuntimeRecoveryChecker(adapter)` implementing `RecoveryChecker.__call__`; managed-only, never replays/resumes.
+- `run_forever` calls `worker.recover_expired_leases(checker=...)` and a separate `cancel_requested` reconciliation pass; cancel requests use `adapter.cancel_task`.
+- **Transaction boundary:** the drive commits after each status observation and reloads the task; no sleep/poll while holding the task/lease row lock. This is what makes an external `request_cancel` able to commit.
+- **Stop policy:** a runtime `stop_confirmed` is evidence, not business reconciliation. Save stop evidence and `escalate_task(needs_human)` (T52/T40); never call `confirm_stop(side_effects_reconciled=True)` from the dispatcher. `unknown` + stop evidence stays unknown until human reconciliation.
 
 - [ ] **Step 1: Write failing tests**
 
 Add:
-- `test_cancel_requested_waits_for_requested_then_confirms_stop`
+- `test_cancel_requested_waits_for_requested_then_escalates_on_confirmed_stop` (use a **second session/connection** to request cancel while the drive runs; same-session mutation is not production proof)
 - `test_cancel_requested_only_is_not_cancelled`
 - `test_cancel_race_completed_result_wins`
-- `test_recovery_checker_found_and_unknown`
+- `test_recovery_checker_found_and_unknown` and `test_recovery_checker_ignores_non_managed_tasks`
 - `test_lease_expiry_does_not_replay_running_runtime`
 - `test_unknown_with_runtime_handle_best_effort_cancel`
+- `test_cancel_requested_crash_pass_escalates_without_live_lease`
+- `test_confirmed_stop_never_sets_side_effects_reconciled`
+- `test_drive_commits_between_observations_so_cancel_is_reachable`
 
-Assertions: `stop_confirmed=false` for `requested`; only `STOPPED`/`TIMED_OUT` with confirmation writes terminal; completed result survives a cancel; recovery never resubmits; unknown task with handle gets cancel attempt.
+Assertions: `stop_confirmed=false` for `requested`; a confirmed stop yields `needs_human` with evidence, not `cancelled`; completed result survives a cancel; recovery never resubmits; unknown/cancel_requested handle gets cancel/status; no `side_effects_reconciled=true` from runtime facts alone.
 
 - [ ] **Step 2: Run RED.**
 
-- [ ] **Step 3: Implement cancel/recovery**
+- [ ] **Step 3: Implement cancel/recovery/transaction boundary**
 
-Handle `cancel_requested` before polling; call adapter cancel; `requested` keeps state; `already_terminal` maps to result; `unsupported`/`unknown` do not become cancelled. Implement `RuntimeRecoveryChecker` with lookup/status; return `not_accepted` only on an adapter `not_found` with the contract guarantee, never on missing local state.
+Handle `cancel_requested` before polling; call adapter cancel; `requested` keeps state; `already_terminal` maps to result; confirmed stop -> save evidence + `needs_human`; unsupported/unknown do not become cancelled. Commit/reload between observations. `RuntimeRecoveryChecker` must return `unknown` for non-managed tasks and never use missing local state as `not_accepted`. Add a cancel-requested pass for stranded rows, with a recovery lease or equivalent fencing; avoid the 50-row starvation and unfenced `task.result` write.
 
 - [ ] **Step 4: Run GREEN; full task suite.**
 
