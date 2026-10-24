@@ -71,14 +71,22 @@ class DispatcherConfig:
     lease_seconds: int = 300
     poll_interval: float = 0.5
     health_backoff_seconds: float = 5.0
+    error_backoff_seconds: float = 5.0
+    max_error_backoff_seconds: float = 60.0
+    max_status_observations: int | None = None   # test-only bound
 
 class RuntimeDispatcher:
     def __init__(self, adapter: RuntimeAdapter, config: DispatcherConfig, *,
-                 service_principal: GovernancePrincipal, session: Session): ...
+                 service_principal: GovernancePrincipal, session: Session,
+                 stop_event: threading.Event | None = None,
+                 session_factory: Callable[[], Session] | None = None): ...
     def run_once(self, *, now: datetime | None = None) -> DispatcherResult: ...
     def run_forever(self, stop_event: threading.Event, *,
-                    session_factory: Callable[[], Session]) -> None: ...
+                    session_factory: Callable[[], Session] | None = None) -> None: ...
 ```
+
+`run_forever` 的 `session_factory` 可省略，回退到构造参数；`--loop` 需要其中之一。
+`error_backoff_seconds`/`max_error_backoff_seconds` 只影响可恢复 domain/lease 错误的退避。
 
 职责：
 

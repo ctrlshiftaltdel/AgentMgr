@@ -3352,14 +3352,21 @@ def test_recover_leases_honours_an_explicit_bound(
         limit: int = 50,
     ) -> list[object]:
         calls.append(limit)
-        return [object() for _ in range(limit)]
+        return [object() for _ in range(min(2, limit))]
 
     monkeypatch.setattr(worker, "recover_expired_leases", _recover)
+    dispatcher = _unit_dispatcher()
 
-    recovered = _unit_dispatcher().recover_leases(limit=3)
+    recovered = dispatcher.recover_leases(limit=5)
 
-    assert len(recovered) == 3
-    assert calls == [3]
+    # The explicit limit is a hard bound and the remaining budget (not the
+    # batch size) is handed to each call: 5 -> 3 -> 1, then stop.
+    assert len(recovered) == 5
+    assert calls == [5, 3, 1]
+
+    # A zero budget performs no recovery at all.
+    assert dispatcher.recover_leases(limit=0) == []
+    assert calls == [5, 3, 1]
 
 
 class _RecordingStopEvent(threading.Event):
@@ -3521,7 +3528,7 @@ def test_reconciliation_keeps_same_attempt_facts() -> None:
 def test_cli_without_trusted_configuration_fails_closed(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert main(["--once", "--adapter", "fake"]) != 0
+    assert main(["--once", "--adapter", "fake"]) == 2
 
     err = capsys.readouterr().err.lower()
     assert "#97 production dispatch configuration not supplied" in err
@@ -3535,7 +3542,7 @@ def test_cli_rejects_unknown_adapter(
             ["--once", "--adapter", "unknown"],
             dispatcher_factory=lambda name: None,
         )
-        != 0
+        == 2
     )
 
     err = capsys.readouterr().err.lower()
@@ -3564,7 +3571,10 @@ def test_cli_once_uses_injected_dispatcher(
         == 0
     )
     assert calls == ["run_once"]
-    assert capsys.readouterr().err == ""
+    captured = capsys.readouterr()
+    # Only the stable outcome is printed; nothing else on stdout/stderr.
+    assert captured.out == "idle\n"
+    assert captured.err == ""
 
 
 def test_cli_loop_runs_until_the_dispatcher_stops(
@@ -3601,14 +3611,14 @@ def test_cli_requires_exactly_one_mode(
         return None
 
     assert (
-        main(["--adapter", "fake"], dispatcher_factory=factory) != 0
+        main(["--adapter", "fake"], dispatcher_factory=factory) == 2
     )
     assert (
         main(
             ["--once", "--loop", "--adapter", "fake"],
             dispatcher_factory=factory,
         )
-        != 0
+        == 2
     )
     # A malformed invocation never reaches the trusted launcher.
     assert factory_calls == []
@@ -3630,7 +3640,7 @@ def test_cli_failure_reports_only_a_safe_code(
             ["--once", "--adapter", "fake"],
             dispatcher_factory=factory,  # type: ignore[arg-type]
         )
-        != 0
+        == 1
     )
 
     err = capsys.readouterr().err
@@ -3639,10 +3649,38 @@ def test_cli_failure_reports_only_a_safe_code(
     assert "/srv" not in err
 
 
+def test_cli_does_not_print_a_vendor_reason_code(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class _VendorError(Exception):
+        # An arbitrary third-party attribute that must never be treated as a
+        # stable domain code (it could contain a secret or a path).
+        reason_code = "vendor_private_marker"
+
+    class _FailingDispatcher:
+        def run_once(self, **kwargs: object) -> DispatcherResult:
+            raise _VendorError()
+
+    def factory(name: str) -> object | None:
+        return _FailingDispatcher() if name == "fake" else None
+
+    assert (
+        main(
+            ["--once", "--adapter", "fake"],
+            dispatcher_factory=factory,  # type: ignore[arg-type]
+        )
+        == 1
+    )
+
+    err = capsys.readouterr().err
+    assert "_VendorError" in err
+    assert "vendor_private_marker" not in err
+
+
 def test_cli_does_not_fall_back_to_a_fake_adapter(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     # ``hermes`` is rejected before #97 supplies a real managed adapter: the
     # CLI has no built-in registry entry for any name.
-    assert main(["--once", "--adapter", "hermes"]) != 0
+    assert main(["--once", "--adapter", "hermes"]) == 2
     assert "#97" in capsys.readouterr().err.lower()

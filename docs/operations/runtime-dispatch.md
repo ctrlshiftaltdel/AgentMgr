@@ -62,11 +62,11 @@ raise SystemExit(main(["--loop", "--adapter", "<adapter-name>"],
 
 | 退出码 | 含义 |
 | --- | --- |
-| `0` | pass/循环正常结束。`--once` 的任务结果（`verifying`/`unknown`/`needs_human` 等）以核心任务状态为准，不改变退出码。 |
+| `0` | pass/循环正常结束。`--once` 会向 stdout 打印稳定的 `DispatcherResult.outcome`（如 `idle`/`verifying`/`unknown`/`needs_human`）；任务结果仍以核心任务状态为准，不改变退出码。 |
 | `1` | 未处理异常（编程错误/数据库错误）。stderr 只打印稳定的异常类型或 domain reason code，不含 message、payload、路径或凭据。 |
 | `2` | 用法错误，或没有受信配置（`#97 production dispatch configuration not supplied`），或 adapter 名字未知。 |
 
-`--once` 的 domain 拒绝（rejected/unsupported/timeout/unknown）会作为任务事实提交，CLI 仍返回 `0`；请查核心任务状态与审计，而不是只看退出码。
+`--once` 的 domain 拒绝（rejected/unsupported/timeout/unknown）会作为任务事实提交，CLI 仍返回 `0`，并把 outcome 打到 stdout；请结合核心任务状态与审计，而不是只看退出码。
 
 ### 2.4 停止（SIGTERM/SIGINT）
 
@@ -127,7 +127,7 @@ claim (managed queued only)
 
 ### 4.4 崩溃与 lease 过期
 
-- `run_forever` 每轮先执行 `recover_leases`：worker 的固定窗口会被**分批排空**（`limit=None` 表示全部），因此积压不会让后面的行永久饿死；每批独立提交。
+- `run_forever` 每轮先执行 `recover_leases`：worker 的固定窗口会被**分批排空**（`limit=None` 表示全部），因此积压不会让后面的行永久饿死；每批独立提交。排空整个积压可能让单轮循环变长；需要限制单轮工作量时传入显式 `limit`（硬上限，`limit=0` 不恢复任何行）。
 - `RuntimeRecoveryChecker` 只依据 adapter 事实回答，且只处理 managed 任务：
   - 已绑定 handle：观察 `get_status`；仍 live 的 run 报 `running`，worker 进入 `unknown`，**绝不重放**；确认 `failed`/`timed_out` 才可关闭 attempt。
   - 无绑定 handle：只有 adapter 明确 `not_found`（契约的无副作用结论）才报 `not_accepted`；其余（缺 key、lookup 抛错、`unknown`/`conflict`、found 但无 handle）一律 `unknown`。

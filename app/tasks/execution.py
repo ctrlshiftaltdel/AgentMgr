@@ -909,20 +909,28 @@ class RuntimeDispatcher:
         recovers nothing (a lease skipped because another pass holds it cannot
         make this spin) or when an explicit ``limit`` is reached.
 
-        ``limit=None`` (the default) means every expired lease.  The actor is
-        the injected service principal and the checker is the adapter-only
+        ``limit=None`` (the default) means every expired lease.  An explicit
+        ``limit`` is a hard bound: each batch asks for at most the remaining
+        budget, so the pass never recovers more than ``limit`` rows and
+        ``limit=0`` performs no recovery at all.  The actor is the injected
+        service principal and the checker is the adapter-only
         :class:`RuntimeRecoveryChecker`; no batch is rolled back by a later
         failing dispatch pass.
         """
 
         recovered: list[worker.LeaseRecovery] = []
-        batch_size = (
-            _RECOVERY_BATCH_SIZE if limit is None else max(1, int(limit))
-        )
+        remaining = None if limit is None else max(0, int(limit))
+        if remaining == 0:
+            return recovered
         try:
             self._require_service_principal()
             checker = RuntimeRecoveryChecker(self._adapter)
             while True:
+                batch_size = (
+                    _RECOVERY_BATCH_SIZE
+                    if remaining is None
+                    else min(_RECOVERY_BATCH_SIZE, remaining)
+                )
                 batch = worker.recover_expired_leases(
                     self._session,
                     actor=self._service_principal,
@@ -934,8 +942,10 @@ class RuntimeDispatcher:
                 recovered.extend(batch)
                 if not batch:
                     break
-                if limit is not None and len(recovered) >= batch_size:
-                    break
+                if remaining is not None:
+                    remaining -= len(batch)
+                    if remaining <= 0:
+                        break
         except Exception:
             self._session.rollback()
             raise
@@ -3104,13 +3114,14 @@ def _install_stop_handlers(
 def _safe_exception_code(exc: BaseException) -> str:
     """Return a stable, non-sensitive error code for stderr/logging.
 
-    Only the domain reason code (a closed vocabulary) or the exception type is
-    rendered: never the message, context, task payload or a path.
+    Only a domain reason code (the closed ``TaskError``/``GovernanceError``
+    vocabulary) or the exception type is rendered: never the message, context,
+    task payload, path or an arbitrary vendor attribute that happens to be
+    called ``reason_code``.
     """
 
-    reason_code = getattr(exc, "reason_code", None)
-    if isinstance(reason_code, str) and reason_code:
-        return reason_code
+    if isinstance(exc, (TaskError, GovernanceError)):
+        return exc.reason_code
     return type(exc).__name__
 
 
@@ -3128,11 +3139,13 @@ def main(
     not know is rejected with :data:`UNKNOWN_ADAPTER`; nothing is imported from
     the name and nothing is submitted.
 
-    ``--once`` runs exactly one pass.  ``--loop`` runs
+    ``--once`` runs exactly one pass and prints its stable
+    :class:`DispatcherResult` outcome (for example ``idle``/``verifying``/
+    ``unknown``/``needs_human``) to stdout.  ``--loop`` runs
     :meth:`RuntimeDispatcher.run_forever` until SIGTERM/SIGINT; the loop needs
     the dispatcher to have been built with a ``session_factory``.  Both paths
-    print only a stable exception type/reason code on failure -- never a
-    credential, task payload, host path or runtime URL.
+    print only a stable outcome or exception type/reason code on failure --
+    never a credential, task payload, host path or runtime URL.
     """
 
     parser = _build_parser()
@@ -3163,13 +3176,18 @@ def main(
 
     if args.once:
         try:
-            dispatcher.run_once()
+            result = dispatcher.run_once()
         except Exception as exc:  # noqa: BLE001 - report a safe code only
             print(
                 f"dispatch pass failed: {_safe_exception_code(exc)}",
                 file=sys.stderr,
             )
             return 1
+        # The outcome is the fixed ``DispatcherResult`` vocabulary
+        # (idle/verifying/unknown/needs_human/...).  It is safe to print and
+        # lets an operator tell a no-op pass from a fail-closed one; the task
+        # detail (reason code, ids) stays in core state/audit.
+        print(result.outcome)
         return 0
 
     stop_event = threading.Event()
@@ -3189,4 +3207,3 @@ def main(
 
 if __name__ == "__main__":  # pragma: no cover - module entry point
     raise SystemExit(main())
-
