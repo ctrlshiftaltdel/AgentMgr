@@ -4,10 +4,12 @@ These tests use the real PostgreSQL task fixtures and the scripted
 :class:`FakeRuntimeAdapter`.  The fake is test-only evidence; nothing here
 claims that a real runtime supports Managed Execution.
 
-Scope of this file in Task 4: the accepted submit path binds ``rtask_*`` through
-``start_attempt``; the decision binding is verified before any adapter call; a
-post-accept binding failure cancels and enters ``unknown``.  Status/result
-mapping and the ambiguous-submit lookup matrix arrive in Tasks 5-6.
+Scope of this file in Task 5: the accepted submit path binds ``rtask_*``
+through ``start_attempt``; the decision binding is verified before any adapter
+call; a post-accept binding failure cancels and enters ``unknown``; and the
+non-accepted submit matrix reconciles through ``find_by_idempotency_key``
+without ever creating a second run.  Status/result mapping and lease recovery
+arrive in Tasks 6-7.
 """
 
 from __future__ import annotations
@@ -35,6 +37,8 @@ from app.runtime.contract import (
     Capability,
     CapabilityStatus,
     HealthStatus,
+    LookupOutcome,
+    LookupResult,
     RuntimeCapabilities,
     RuntimeCapability,
     RuntimeGrant,
@@ -723,6 +727,289 @@ def test_oversize_prompt_is_rejected_without_submitting(
     assert task.result["error_code"] == RUNTIME_PROMPT_TOO_LARGE
     assert adapter.submit_calls == []
     _assert_lease_released(session, task)
+
+
+# -- submit failure matrix ----------------------------------------------------
+
+
+def _lookup_found(
+    runtime_task_id: str = "rtask_fake_adopted_0001",
+) -> LookupResult:
+    return LookupResult(
+        outcome=LookupOutcome.FOUND,
+        runtime_task_id=runtime_task_id,
+        reported_state="running",
+        payload_hash="sha256:" + "1" * 64,
+        accepted_at=utcnow(),
+        observed_at=utcnow(),
+    )
+
+
+def test_rejected_submit_records_failed_without_retry(
+    session: Session, world: TaskWorld
+) -> None:
+    task = submit_managed(session, world)
+    session.commit()
+    adapter = FakeRuntimeAdapter(
+        submit=SubmitResult(outcome=SubmitOutcome.REJECTED)
+    )
+    dispatcher = _dispatcher(session, world, adapter=adapter)
+
+    result = dispatcher.run_once()
+
+    assert result.outcome == "rejected"
+    assert result.task_id == task.task_id
+    assert result.detail == "runtime_submit_rejected"
+    assert task.state == "failed"
+    assert task.attempt == 0
+    assert task.runtime_task_id is None
+    assert task.result["outcome"] == "rejected"
+    assert task.result["error_code"] == "runtime_submit_rejected"
+    # A definite rejection confirms no side effect and needs no reconciliation.
+    assert task.result["no_side_effects"] is True
+    assert task.grant_status == "revoked"
+    assert len(adapter.submit_calls) == 1
+    assert adapter.lookup_calls == []
+    _assert_lease_released(session, task)
+
+    # A failed task is never claimed again: no second submit, no retry.
+    assert dispatcher.run_once().outcome == "idle"
+    assert len(adapter.submit_calls) == 1
+
+
+def test_unsupported_submit_enters_needs_human(
+    session: Session, world: TaskWorld
+) -> None:
+    task = submit_managed(session, world)
+    session.commit()
+    adapter = FakeRuntimeAdapter(
+        submit=SubmitResult(outcome=SubmitOutcome.UNSUPPORTED)
+    )
+    dispatcher = _dispatcher(session, world, adapter=adapter)
+
+    result = dispatcher.run_once()
+
+    assert result.outcome == "unsupported"
+    assert result.task_id == task.task_id
+    assert result.detail == "runtime_submit_unsupported"
+    assert task.state == "needs_human"
+    assert task.needs_human_origin == "queued"
+    assert task.attempt == 0
+    assert task.result["outcome"] == "unsupported"
+    assert task.result["error_code"] == "runtime_submit_unsupported"
+    assert task.grant_status == "revoked"
+    assert len(adapter.submit_calls) == 1
+    # A capability gap is not ambiguous: no lookup and no retry.
+    assert adapter.lookup_calls == []
+    _assert_lease_released(session, task)
+
+    assert dispatcher.run_once().outcome == "idle"
+    assert len(adapter.submit_calls) == 1
+
+
+def test_timeout_lookup_found_adopts_existing_run(
+    session: Session, world: TaskWorld
+) -> None:
+    task = submit_managed(session, world)
+    session.commit()
+    grant = _grant(session, task)
+    expected_key = build_runtime_idempotency_key(task, grant, 1)
+    adopted = "rtask_fake_adopted_0001"
+    adapter = FakeRuntimeAdapter(
+        submit=SubmitResult(outcome=SubmitOutcome.TIMEOUT),
+        lookup=_lookup_found(adopted),
+    )
+
+    result = _dispatcher(session, world, adapter=adapter).run_once()
+
+    # The lost accepted reply is recovered from the lookup, then bound exactly
+    # like a direct acceptance: same attempt number, key, worker and fencing.
+    assert result.outcome == "accepted"
+    assert result.task_id == task.task_id
+    assert result.runtime_task_id == adopted
+    assert task.state == "dispatched"
+    assert task.attempt == 1
+    assert task.runtime_task_id == adopted
+    assert task.execution_ref is None
+    attempt = _attempt(session, task)
+    assert attempt.runtime_ref == adopted
+    assert attempt.idempotency_key == expected_key
+    assert attempt.execution_ref is None
+    assert _leases(session, task)[-1].released_at is None
+    # Exactly one submission and one lookup; adoption created no second run.
+    assert len(adapter.submit_calls) == 1
+    assert adapter.submit_calls[0][1] == expected_key
+    assert adapter.lookup_calls == [
+        (task.task_id, task.grant_id, expected_key, None)
+    ]
+    assert adapter.created_runtime_task_ids == []
+    reconciliation = task.result["runtime_reconciliation"]
+    assert reconciliation["lookup_outcome"] == "found"
+    assert reconciliation["submit_outcome"] == "timeout"
+    assert reconciliation["runtime_task_id"] == adopted
+    assert reconciliation["runtime_key"] == expected_key
+
+
+def test_timeout_lookup_not_found_enters_unknown_without_second_submit(
+    session: Session, world: TaskWorld
+) -> None:
+    task = submit_managed(session, world)
+    session.commit()
+    adapter = FakeRuntimeAdapter(
+        submit=SubmitResult(outcome=SubmitOutcome.TIMEOUT),
+        lookup=LookupResult(outcome=LookupOutcome.NOT_FOUND),
+    )
+    dispatcher = _dispatcher(session, world, adapter=adapter)
+
+    result = dispatcher.run_once()
+
+    # not_found is a definite query answer, but the contract has no
+    # "no side effect" guarantee field: record unknown/timeout and never retry.
+    assert result.outcome == "timeout"
+    assert result.task_id == task.task_id
+    assert result.detail == "runtime_submit_timeout"
+    assert task.state == "unknown"
+    assert task.attempt == 0
+    assert task.runtime_task_id is None
+    assert task.result["outcome"] == "timeout"
+    assert task.result["error_code"] == "runtime_submit_timeout"
+    assert task.result["no_side_effects"] is False
+    assert task.grant_status == "revoked"
+    assert _grant(session, task).status == "revoked"
+    assert len(adapter.submit_calls) == 1
+    assert len(adapter.lookup_calls) == 1
+    reconciliation = task.result["runtime_reconciliation"]
+    assert reconciliation["lookup_outcome"] == "not_found"
+    assert reconciliation["submit_outcome"] == "timeout"
+    assert reconciliation["runtime_task_id"] is None
+    _assert_lease_released(session, task)
+
+    assert dispatcher.run_once().outcome == "idle"
+    assert len(adapter.submit_calls) == 1
+
+
+def test_timeout_lookup_unknown_enters_unknown(
+    session: Session, world: TaskWorld
+) -> None:
+    task = submit_managed(session, world)
+    session.commit()
+    adapter = FakeRuntimeAdapter(
+        submit=SubmitResult(outcome=SubmitOutcome.TIMEOUT),
+        lookup=LookupResult(outcome=LookupOutcome.UNKNOWN),
+    )
+
+    result = _dispatcher(session, world, adapter=adapter).run_once()
+
+    assert result.outcome == "timeout"
+    assert result.detail == "runtime_submit_timeout"
+    assert task.state == "unknown"
+    assert task.attempt == 0
+    assert task.runtime_task_id is None
+    assert task.result["outcome"] == "timeout"
+    assert task.result["error_code"] == "runtime_submit_timeout"
+    assert task.grant_status == "revoked"
+    assert len(adapter.submit_calls) == 1
+    assert len(adapter.lookup_calls) == 1
+    reconciliation = task.result["runtime_reconciliation"]
+    assert reconciliation["lookup_outcome"] == "unknown"
+    assert reconciliation["submit_outcome"] == "timeout"
+    _assert_lease_released(session, task)
+
+
+def test_lookup_error_is_treated_as_unknown_without_second_submit(
+    session: Session, world: TaskWorld
+) -> None:
+    task = submit_managed(session, world)
+    session.commit()
+    adapter = FakeRuntimeAdapter(
+        submit=SubmitResult(outcome=SubmitOutcome.UNKNOWN),
+        lookup_error=RuntimeError("lookup exploded"),
+    )
+
+    result = _dispatcher(session, world, adapter=adapter).run_once()
+
+    # An adapter that cannot answer proves nothing: enter unknown instead of
+    # rolling the claim back and resubmitting on the next pass.
+    assert result.outcome == "unknown"
+    assert result.detail == "runtime_submit_unknown"
+    assert task.state == "unknown"
+    assert task.attempt == 0
+    assert task.grant_status == "revoked"
+    assert len(adapter.submit_calls) == 1
+    assert len(adapter.lookup_calls) == 1
+    reconciliation = task.result["runtime_reconciliation"]
+    assert reconciliation["lookup_outcome"] == "unknown"
+    assert reconciliation["submit_outcome"] == "unknown"
+    _assert_lease_released(session, task)
+
+
+def test_timeout_lookup_found_with_unusable_handle_stays_unknown(
+    session: Session, world: TaskWorld
+) -> None:
+    task = submit_managed(session, world)
+    session.commit()
+    unusable = "rtask_bad handle!"
+    adapter = FakeRuntimeAdapter(
+        submit=SubmitResult(outcome=SubmitOutcome.TIMEOUT),
+        lookup=_lookup_found(unusable),
+    )
+
+    result = _dispatcher(session, world, adapter=adapter).run_once()
+
+    # A found run whose handle cannot be stored is still not bindable: the
+    # dispatcher records an honest unknown and never submits a second time.
+    assert result.outcome == "unknown"
+    assert result.detail == RUNTIME_SUBMIT_HANDLE_INVALID
+    assert task.state == "unknown"
+    assert task.attempt == 0
+    assert task.runtime_task_id is None
+    assert task.result["error_code"] == RUNTIME_SUBMIT_HANDLE_INVALID
+    assert task.grant_status == "revoked"
+    assert len(adapter.submit_calls) == 1
+    assert len(adapter.lookup_calls) == 1
+    assert len(adapter.cancel_calls) == 1
+    reconciliation = task.result["runtime_reconciliation"]
+    assert reconciliation["lookup_outcome"] == "found"
+    assert reconciliation["runtime_task_id"] == unusable
+    _assert_lease_released(session, task)
+
+
+def test_conflict_never_creates_second_run(
+    session: Session, world: TaskWorld
+) -> None:
+    task = submit_managed(session, world)
+    session.commit()
+    found = "rtask_fake_adopted_0001"
+    adapter = FakeRuntimeAdapter(
+        submit=SubmitResult(outcome=SubmitOutcome.CONFLICT),
+        lookup=_lookup_found(found),
+    )
+    dispatcher = _dispatcher(session, world, adapter=adapter)
+
+    result = dispatcher.run_once()
+
+    # The runtime says this key is bound to a different payload.  Binding the
+    # found run would attest to effects of the wrong input, so the task enters
+    # unknown with the handle kept for human reconciliation.
+    assert result.outcome == "unknown"
+    assert result.detail == "runtime_submit_conflict"
+    assert task.state == "unknown"
+    assert task.attempt == 0
+    assert task.runtime_task_id is None
+    assert task.result["outcome"] == "unknown"
+    assert task.result["error_code"] == "runtime_submit_conflict"
+    assert task.grant_status == "revoked"
+    assert len(adapter.submit_calls) == 1
+    assert len(adapter.lookup_calls) == 1
+    assert adapter.created_runtime_task_ids == []
+    reconciliation = task.result["runtime_reconciliation"]
+    assert reconciliation["lookup_outcome"] == "found"
+    assert reconciliation["submit_outcome"] == "conflict"
+    assert reconciliation["runtime_task_id"] == found
+    _assert_lease_released(session, task)
+
+    assert dispatcher.run_once().outcome == "idle"
+    assert len(adapter.submit_calls) == 1
 
 
 # -- service principal --------------------------------------------------------

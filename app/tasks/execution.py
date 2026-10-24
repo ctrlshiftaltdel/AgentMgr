@@ -29,19 +29,29 @@ lease:
     status/result work.  If binding is rejected after acceptance, best-effort
     cancel the runtime task, persist the accepted handle/key for reconciliation
     and record an honest ``unknown`` outcome (never a fake "rejected" and never
-    a second submit).
+    a second submit);
+11. on ``timeout``/``unknown``/``conflict``, call
+    ``adapter.find_by_idempotency_key`` **before** deciding anything else: a
+    ``found`` run is adopted through the same ``start_attempt`` bind (same key,
+    worker and fencing token) instead of being submitted again.  Only a
+    ``timeout``/``unknown`` run may be adopted this way; a ``conflict`` proves
+    the key is bound to a different payload, so it enters ``unknown``.  When no
+    adoptable run can be proven the submission is recorded as
+    ``timeout``/``unknown``, the Grant is revoked and nothing is resubmitted.
 
-Status polling, the full submit failure/lookup matrix (timeout/unknown/conflict
-adoption), result mapping and lease recovery are added by later tasks.  This
-module never calls ``task_service.complete_task``: a runtime self-report can
-never become ``succeeded``.
+Status polling, result mapping and lease recovery are added by later tasks.
+This module never calls ``task_service.complete_task``: a runtime self-report
+can never become ``succeeded``.
 
 Transaction boundary
 --------------------
 ``run_once`` uses the **injected** session.  It commits successful and
 domain-rejected work and rolls back unexpected exceptions; the caller still owns
-``close``.  :meth:`RuntimeDispatcher.run_forever` creates a fresh session from
-the supplied factory for every iteration.
+``close``.  One exception is deliberately swallowed: after an ambiguous
+submission, a lookup that raises is treated exactly like ``unknown`` (the
+dispatcher cannot prove no run exists, so it must enter ``unknown`` instead of
+losing the claim and trying again).  :meth:`RuntimeDispatcher.run_forever`
+creates a fresh session from the supplied factory for every iteration.
 """
 
 from __future__ import annotations
@@ -65,6 +75,8 @@ from app.governance.principal import GovernancePrincipal
 from app.runtime.contract import (
     CapabilityStatus,
     HealthStatus,
+    LookupOutcome,
+    LookupResult,
     RuntimeAdapter,
     RuntimeCapability,
     SubmitOutcome,
@@ -307,11 +319,13 @@ class DispatcherConfig:
 class DispatcherResult:
     """Stable, non-sensitive outcome of one dispatch pass.
 
-    Outcomes produced so far: ``idle``, ``accepted`` (submitted and bound),
+    Outcomes produced so far: ``idle``, ``accepted`` (submitted and bound, or
+    a run found by lookup and adopted after an ambiguous submit),
     ``unavailable`` (invalid/revoked/expired Grant or decision-binding
     mismatch), ``unsupported`` (capability gap or adapter unsupported),
     ``adapter_unavailable`` (health/degraded), ``rejected`` (definite local or
-    adapter rejection) and ``unknown`` (ambiguous submission or post-accept
+    adapter rejection), ``timeout`` (submit timed out and no run could be
+    adopted) and ``unknown`` (ambiguous submission, conflict, or post-accept
     binding failure).
 
     ``detail`` is a short machine-readable code, never a payload, credential or
@@ -538,11 +552,15 @@ class RuntimeDispatcher:
                 now=timestamp,
             )
 
-        # The full lookup/adoption matrix for timeout/unknown/conflict arrives
-        # with the reconciliation task.  Until then ambiguous outcomes fail
-        # closed as ``unknown`` and are never resubmitted.
-        return self._record_submit_refusal(
-            task, lease, submission, now=timestamp
+        # A definite refusal is recorded locally; an ambiguous or conflicting
+        # answer is reconciled through the idempotency key before anything else.
+        # Nothing on this path resubmits.
+        return self._reconcile_submit_outcome(
+            task,
+            lease,
+            submission,
+            idempotency_key=idempotency_key,
+            now=timestamp,
         )
 
     # -- helpers -------------------------------------------------------------
@@ -621,6 +639,11 @@ class RuntimeDispatcher:
         now: datetime,
     ) -> DispatcherResult:
         """Bind an accepted runtime handle to the task, or fail closed.
+
+        The same bind is also the adoption path for a run found by idempotency
+        lookup after a timeout/unknown submit: the caller passes a synthetic
+        accepted result carrying the found ``rtask_*`` handle and the original
+        key.
 
         The lease stays held after a successful bind so the later status/result
         work can keep writing execution facts under the same fencing token.
@@ -754,13 +777,15 @@ class RuntimeDispatcher:
         cancel: Mapping[str, object] | None,
         reason: str,
         now: datetime,
+        lookup: LookupResult | None = None,
+        submit_outcome: str | None = None,
     ) -> None:
         """Persist the accepted-but-unbound handle before entering unknown.
 
         ``record_dispatch_failure`` merges the existing result document, so
         these keys survive the transition.  Only the opaque handle, the stable
-        key, cancellation facts and a reason are stored -- never a prompt,
-        token or credential.
+        key, cancellation facts, the lookup answer and a reason are stored --
+        never a prompt, token or credential.
         """
 
         document: dict[str, object] = {
@@ -775,43 +800,163 @@ class RuntimeDispatcher:
             "stop_confirmed": bool((cancel or {}).get("stop_confirmed", False)),
             "reason": reason,
         }
+        if lookup is not None:
+            document["lookup_outcome"] = lookup.outcome.value
+        if submit_outcome is not None:
+            document["submit_outcome"] = submit_outcome
+        previous = (task.result or {}).get("runtime_reconciliation")
+        if isinstance(previous, Mapping):
+            # A follow-up fact in the same pass (e.g. a found handle that could
+            # not be bound) keeps the lookup/adoption evidence already gathered.
+            for key in ("lookup_outcome", "submit_outcome"):
+                if key in previous and key not in document:
+                    document[key] = previous[key]
         task.result = {
             **dict(task.result or {}),
             "runtime_reconciliation": document,
         }
 
-    def _record_submit_refusal(
+    def _reconcile_submit_outcome(
         self,
         task: Task,
         lease: TaskLease,
         submission: SubmitResult,
         *,
+        idempotency_key: str,
         now: datetime,
     ) -> DispatcherResult:
-        """Record a non-accepted submit outcome without ever resubmitting."""
+        """Map a non-accepted submit outcome without ever resubmitting.
 
+        ``rejected``/``unsupported`` are definite answers: they are recorded
+        and no lookup is made.  ``timeout``/``unknown``/``conflict`` mean the
+        runtime may already own a run for this key, so the adapter is asked
+        first.  A ``found`` run after ``timeout``/``unknown`` is adopted
+        through the same bind the ``accepted`` path uses.  A ``conflict`` can
+        never be adopted: the runtime has just told us the key is bound to a
+        *different* payload, so binding it would attest to effects of the
+        wrong input.
+        """
+
+        if submission.outcome is SubmitOutcome.REJECTED:
+            # Definite refusal with no side effect: no lookup and no retry.
+            return self._refuse_submit(
+                task, lease, submission, outcome="rejected", now=now
+            )
         if submission.outcome is SubmitOutcome.UNSUPPORTED:
-            outcome = "unsupported"
-        elif submission.outcome is SubmitOutcome.REJECTED:
-            outcome = "rejected"
-        else:
-            # timeout / unknown / conflict: the runtime may have accepted the
-            # work.  The reconciliation task adds the lookup/adoption path; for
-            # now the only safe action is an honest unknown with no retry.
-            outcome = "unknown"
+            # Definite capability gap: needs_human, no lookup and no retry.
+            return self._refuse_submit(
+                task, lease, submission, outcome="unsupported", now=now
+            )
+
         reason = f"runtime_submit_{submission.outcome.value}"
-        self._record_failure(
+        lookup = self._lookup_submission(task, idempotency_key)
+        if (
+            submission.outcome is not SubmitOutcome.CONFLICT
+            and lookup.outcome is LookupOutcome.FOUND
+        ):
+            # The runtime already created the run whose reply we lost.
+            # Adopting its handle is the only correct move; a resubmit would
+            # create a second run.  The reconciliation block records it.
+            self._persist_reconciliation(
+                task,
+                runtime_task_id=self._handle_or_none(lookup.runtime_task_id),
+                idempotency_key=idempotency_key,
+                cancel=None,
+                reason=reason,
+                now=now,
+                lookup=lookup,
+                submit_outcome=submission.outcome.value,
+            )
+            return self._bind_accepted(
+                task,
+                lease,
+                SubmitResult(
+                    outcome=SubmitOutcome.ACCEPTED,
+                    runtime_task_id=lookup.runtime_task_id,
+                    accepted_at=lookup.accepted_at,
+                    reported_state=lookup.reported_state,
+                ),
+                idempotency_key=idempotency_key,
+                now=now,
+            )
+
+        # No adoptable run could be proven (lookup not_found/unknown/conflict,
+        # or a submit conflict with a different payload).  ``not_found`` is a
+        # definite query answer, but the adapter contract has no "no side
+        # effects" guarantee field, so it is *not* a retry licence here: the
+        # task enters unknown, keeps the handle/key for reconciliation and is
+        # never resubmitted with this Grant.
+        self._persist_reconciliation(
             task,
-            lease,
-            outcome=outcome,
+            runtime_task_id=self._handle_or_none(lookup.runtime_task_id),
+            idempotency_key=idempotency_key,
+            cancel=None,
             reason=reason,
             now=now,
+            lookup=lookup,
+            submit_outcome=submission.outcome.value,
+        )
+        outcome = (
+            "timeout"
+            if submission.outcome is SubmitOutcome.TIMEOUT
+            else "unknown"
+        )
+        self._record_failure(
+            task, lease, outcome=outcome, reason=reason, now=now
         )
         return DispatcherResult(
             outcome=outcome,
             task_id=task.task_id,
             detail=reason,
         )
+
+    def _refuse_submit(
+        self,
+        task: Task,
+        lease: TaskLease,
+        submission: SubmitResult,
+        *,
+        outcome: str,
+        now: datetime,
+    ) -> DispatcherResult:
+        """Record a definite (side-effect-free) submit refusal."""
+
+        reason = f"runtime_submit_{submission.outcome.value}"
+        self._record_failure(
+            task, lease, outcome=outcome, reason=reason, now=now
+        )
+        return DispatcherResult(
+            outcome=outcome,
+            task_id=task.task_id,
+            detail=reason,
+        )
+
+    def _lookup_submission(
+        self, task: Task, idempotency_key: str
+    ) -> LookupResult:
+        """Ask the adapter which run (if any) this key already created.
+
+        No ``payload_hash`` is passed: the dispatcher does not own the
+        adapter's canonical request body (an adapter may wrap the prompt), so
+        only the adapter can compare hashes.  A lookup that raises is treated
+        exactly like ``unknown`` -- the dispatcher cannot prove there is no
+        run, so it must not resubmit and must not lose the claim to a rollback.
+        """
+
+        try:
+            return self._adapter.find_by_idempotency_key(
+                task.task_id,
+                task.grant_id,
+                idempotency_key,
+            )
+        except Exception:  # noqa: BLE001 - cannot prove absence
+            return LookupResult(outcome=LookupOutcome.UNKNOWN)
+
+    @staticmethod
+    def _handle_or_none(value: object) -> str | None:
+        """Keep only a string handle in the reconciliation document."""
+
+        return value if isinstance(value, str) else None
 
     def _unverified_capabilities(self) -> tuple[str, ...]:
         snapshot = self._adapter.capabilities()

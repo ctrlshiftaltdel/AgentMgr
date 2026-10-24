@@ -72,6 +72,10 @@ class FakeRuntimeAdapter:
     Parameters script one response per protocol method.  ``status`` also
     accepts a sequence: each ``get_status`` call consumes the next item and the
     final item repeats, so a test can script a short state progression.
+    ``lookup`` accepts a sequence in the same way, which lets a test script
+    ``unknown`` followed by ``found`` (or any other reconciliation
+    progression).  ``lookup_error`` raises from ``find_by_idempotency_key``
+    instead of returning a result.
 
     Unscripted defaults are deliberately conservative:
 
@@ -97,7 +101,8 @@ class FakeRuntimeAdapter:
         submit: SubmitResult | None = None,
         status: StatusResult | Sequence[StatusResult] | None = None,
         result: RuntimeResult | None = None,
-        lookup: LookupResult | None = None,
+        lookup: LookupResult | Sequence[LookupResult] | None = None,
+        lookup_error: BaseException | None = None,
         cancel: CancelResult | None = None,
         events: EventBatch | None = None,
         provide_input: InputResult | None = None,
@@ -116,6 +121,8 @@ class FakeRuntimeAdapter:
         self._status_index = 0
         self._result = result
         self._lookup = lookup
+        self._lookup_index = 0
+        self.lookup_error = lookup_error
         self._cancel = cancel
         self._events = events
         self._provide_input = provide_input
@@ -239,9 +246,19 @@ class FakeRuntimeAdapter:
         self.lookup_calls.append(
             (task_id, grant_id, idempotency_key, payload_hash)
         )
-        if self._lookup is not None:
-            return self._lookup
-        return LookupResult(outcome=LookupOutcome.UNKNOWN)
+        if self.lookup_error is not None:
+            raise self.lookup_error
+        scripted = self._lookup
+        if scripted is None:
+            return LookupResult(outcome=LookupOutcome.UNKNOWN)
+        if isinstance(scripted, LookupResult):
+            return scripted
+        items = list(scripted)
+        if not items:
+            raise AssertionError("FakeRuntimeAdapter lookup sequence is empty")
+        index = min(self._lookup_index, len(items) - 1)
+        self._lookup_index += 1
+        return items[index]
 
     # -- status / events / result -------------------------------------------
 
