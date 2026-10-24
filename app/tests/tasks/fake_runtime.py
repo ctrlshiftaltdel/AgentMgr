@@ -88,7 +88,10 @@ class FakeRuntimeAdapter:
       remembered per ``(task_id, idempotency_key)``; a repeat returns the same
       handle with ``replayed=True`` and creates no second runtime task);
     * ``status`` is ``accepted`` (never a terminal state the test did not ask
-      for, and a stable answer that proves the poll loop always terminates);
+      for).  A drive test must script a terminal status or set a bounded
+      ``DispatcherConfig``: the dispatcher drives until the run ends, so an
+      unscripted status produces an ``accepted`` run that is only stopped by the
+      test-only observation cap or the task's runtime deadline.
     * ``lookup`` is ``unknown`` and ``get_result`` is ``unknown`` (never a
       definite "not found"/"succeeded" answer the test did not ask for);
     * ``cancel`` is ``requested`` with ``stop_confirmed=False``;

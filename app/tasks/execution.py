@@ -1,4 +1,4 @@
-"""Managed Execution dispatcher: claim, preflight, submit and bind.
+"""Managed Execution dispatcher: claim, preflight, submit, bind and drive.
 
 This module is the production caller that connects the task/ExecutionGrant core
 to the frozen :class:`app.runtime.contract.RuntimeAdapter` protocol.  It only
@@ -7,8 +7,8 @@ tasks stay client/PEP driven.
 
 Scope of the current implementation
 -----------------------------------
-The whole **submission** half of the loop is implemented here, inside one
-lease:
+One dispatch pass owns one task from ``queued`` to a terminal/``verifying``
+fact, inside one lease:
 
 1. validate the injected service principal;
 2. claim one managed task with the existing lease/fencing machinery;
@@ -44,25 +44,41 @@ lease:
     evidence ref, a ``completed`` run is only accepted when it carries a
     core-compatible ``result_*`` plus at least one ``evidence:*`` reference and
     ends in ``verifying``, a confirmed ``failed``/``timed_out`` run is recorded
-    as such, and ``unknown``/``not_found``/``waiting_input`` fail closed to
-    ``unknown`` with the Grant revoked.  The poll loop is bounded, so a run that
-    stays ``accepted``/``running`` never spins.
+    as such, ``unknown``/``not_found`` fail closed to ``unknown`` with the Grant
+    revoked, and ``waiting_input`` is cancelled best-effort: a confirmed stop
+    escalates to ``needs_human``, an unconfirmed one fails closed to ``unknown``.
+
+The drive is **time/lease bounded**, not observation bounded: it waits
+``poll_interval`` between observations, renews the lease at roughly half its
+life, and stops at the run's remaining ``max_runtime_seconds`` deadline.  A run
+that hits the deadline (or a lost lease) is never stranded: the deadline path
+cancels best-effort, keeps the handle/stop facts for reconciliation and records
+``lost`` before releasing the lease; a lost lease rolls the pass back so the
+stable idempotency key lets the next pass (or lease recovery) adopt the same run.
 
 This module never calls ``task_service.complete_task``: a runtime self-report
 can never become ``succeeded``.  The verification boundary is
 :mod:`app.tasks.verification`, which independently rejects runtime/agent
-self-report evidence.  Lease recovery and core-driven cancellation belong to
-the later tasks.
+self-report evidence.  Core-driven cancellation, lease recovery and replay
+belong to the later tasks.
 
 Transaction boundary
 --------------------
 ``run_once`` uses the **injected** session.  It commits successful and
 domain-rejected work and rolls back unexpected exceptions; the caller still owns
-``close``.  One exception is deliberately swallowed: after an ambiguous
-submission, a lookup that raises is treated exactly like ``unknown`` (the
-dispatcher cannot prove no run exists, so it must enter ``unknown`` instead of
-losing the claim and trying again).  :meth:`RuntimeDispatcher.run_forever`
-creates a fresh session from the supplied factory for every iteration.
+``close``.  Two adapter failures are deliberately swallowed because they prove
+nothing and a rollback would make an accepted run look unsubmitted:
+
+* after an ambiguous submission, a lookup that raises is treated exactly like
+  ``unknown``;
+* a status/result call that raises is treated as an unreadable fact and the
+  attempt fails closed to ``unknown``.
+
+A **lease renewal failure is not swallowed**: no fact may be written under a
+stale fencing token, so the whole pass rolls back and the next pass adopts the
+same run through the stable idempotency key.
+:meth:`RuntimeDispatcher.run_forever` creates a fresh session from the supplied
+factory for every iteration.
 """
 
 from __future__ import annotations
@@ -70,9 +86,10 @@ from __future__ import annotations
 import hashlib
 import re
 import threading
-from collections.abc import Callable, Mapping
+import time
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import select
@@ -110,14 +127,16 @@ __all__ = [
     "DECISION_BINDING_MISMATCH",
     "GRANT_DOCUMENT_INVALID",
     "MAX_RUNTIME_PROMPT_BYTES",
-    "MAX_STATUS_POLLS_PER_PASS",
     "REQUIRED_CAPABILITIES",
     "RUNTIME_BIND_FAILED",
     "RUNTIME_CAPABILITY_UNVERIFIED",
+    "RUNTIME_DRIVE_DEADLINE",
+    "RUNTIME_DRIVE_OBSERVATION_CAP",
     "RUNTIME_EXECUTION_FAILED",
     "RUNTIME_EXECUTION_LOST",
     "RUNTIME_EXECUTION_TIMED_OUT",
     "RUNTIME_FACT_REFUSED",
+    "RUNTIME_HANDLE_MISMATCH",
     "RUNTIME_PROMPT_INVALID",
     "RUNTIME_PROMPT_TOO_LARGE",
     "RUNTIME_RESULT_UNREADABLE",
@@ -177,13 +196,6 @@ RUNTIME_PROMPT_TOO_LARGE = "runtime_prompt_too_large"
 #: room for a normal task document.
 MAX_RUNTIME_PROMPT_BYTES = 16 * 1024
 
-#: How many status observations one dispatch pass may consume.  The bound keeps
-#: a scripted/repeating runtime status (a fake that repeats its last answer, or
-#: a runtime that stays ``accepted``) from spinning forever inside one pass; a
-#: run still in progress is re-observed by the recovery task under a fresh
-#: lease.  Nothing is written when the bound is reached.
-MAX_STATUS_POLLS_PER_PASS = 8
-
 #: Stable reason recorded when a completed run carries no core-compatible
 #: ``result_*``/``evidence:*`` pair.  Refs are never synthesized.
 RUNTIME_RESULT_UNUSABLE = "runtime_result_unusable"
@@ -214,6 +226,19 @@ RUNTIME_WAITING_INPUT = "runtime_waiting_input_unsupported"
 
 #: Stable reason recorded when the run's execution evidence is lost/unknown.
 RUNTIME_EXECUTION_LOST = "runtime_execution_lost"
+
+#: Stable reason recorded when the drive loop reaches the run's runtime deadline
+#: and the run is still in progress.  The dispatcher cancels best-effort and
+#: records ``lost``; it never leaves a live lease on an in-progress task.
+RUNTIME_DRIVE_DEADLINE = "runtime_drive_deadline"
+
+#: Stable reason recorded when a test-only observation cap stops the drive while
+#: the run is still in progress.  Production never sets that cap.
+RUNTIME_DRIVE_OBSERVATION_CAP = "runtime_drive_observation_cap"
+
+#: Stable reason recorded when the adapter reports a status for another handle.
+#: Nothing from that observation is attributed to this task.
+RUNTIME_HANDLE_MISMATCH = "runtime_status_handle_mismatch"
 
 #: Stable error codes persisted for a confirmed failed/timed-out run.
 RUNTIME_EXECUTION_FAILED = "runtime_execution_failed"
@@ -382,6 +407,25 @@ def _runtime_start_evidence_ref(
     return "evidence:runtime_start_" + digest[:24]
 
 
+def _runtime_stop_evidence_ref(
+    runtime_task_id: str, observed_at: datetime, source: str
+) -> str:
+    """Return the hashed ``evidence:runtime_stop_*`` ref for a confirmed stop.
+
+    Same contract as :func:`_runtime_start_evidence_ref`: the reference is a
+    digest of the opaque handle, the adapter observation time and the fact that
+    confirmed it (cancel response or status).  It never carries a vendor reason
+    string, path or credential.
+    """
+
+    material = (
+        "agentmgr.runtime.stop.v1\n"
+        f"{runtime_task_id}\n{source}\n{_rfc3339(observed_at)}"
+    )
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
+    return "evidence:runtime_stop_" + digest[:24]
+
+
 def _utcnow() -> datetime:
     return datetime.now(UTC)
 
@@ -392,30 +436,46 @@ class DispatcherConfig:
 
     ``worker_id`` is the lease owner.  One dispatcher handles one task at a
     time; parallel workers are only safe on *different* tasks.
+
+    ``poll_interval`` is the wait between two status observations of the same
+    run (and the delay between idle passes); tests set it to ``0``.
+    ``lease_seconds`` is renewed at roughly half its life while a run is being
+    driven, so the fencing token stays current until the run's own runtime
+    deadline.
+
+    ``max_status_observations`` is a hard safety bound for the drive loop and
+    exists for tests: production leaves it ``None`` and relies on the run's
+    own runtime budget and the live lease.  A test sets a small value so an
+    unexpected non-terminal script fails closed quickly instead of sleeping out
+    a 300 s runtime budget.
     """
 
     worker_id: str
     lease_seconds: int = 300
     poll_interval: float = 0.5
     health_backoff_seconds: float = 5.0
+    max_status_observations: int | None = None
 
 
 @dataclass(frozen=True)
 class DispatcherResult:
     """Stable, non-sensitive outcome of one dispatch pass.
 
-    Outcomes: ``idle``; ``accepted`` (submitted and bound, or a run found by
-    lookup and adopted after an ambiguous submit, with the run still
-    ``accepted``); ``running`` (the run reported ``running``; the task is
-    ``running`` and the lease stays held); ``verifying`` (a completed run
-    carried a core-compatible result/evidence pair and the task now waits for
-    independent verification); ``failed``/``timed_out`` (a confirmed terminal
-    stop); ``unavailable`` (invalid/revoked/expired Grant or decision-binding
+    Outcomes returned by :meth:`RuntimeDispatcher.run_once`: ``idle``;
+    ``running``/``verifying`` (the run reported a live/terminal state and the
+    task now waits for the next observation or for independent verification);
+    ``failed``/``timed_out`` (a confirmed terminal stop);
+    ``needs_human`` (an input-waiting run was stopped and escalated);
+    ``unavailable`` (invalid/revoked/expired Grant or decision-binding
     mismatch); ``unsupported`` (capability gap or adapter unsupported);
     ``adapter_unavailable`` (health/degraded); ``rejected`` (definite local or
     adapter rejection); ``timeout`` (submit timed out and no run could be
     adopted) and ``unknown`` (ambiguous submission, conflict, post-accept
     binding failure, or an execution fact the core cannot map honestly).
+
+    ``accepted`` is internal to the bind step: a pass that binds a run always
+    continues into one of the drive outcomes above, so a bound run is never
+    returned as merely "accepted".
 
     No outcome is ever ``succeeded``: only :mod:`app.tasks.verification` can
     move a task out of ``verifying``.
@@ -474,9 +534,11 @@ class RuntimeDispatcher:
         """Poll :meth:`run_once` until ``stop_event`` is set.
 
         Minimal loop for now: one fresh session per iteration, a health backoff
-        when the adapter is unavailable, and no parallel task execution.
-        Lease recovery, error backoff and signal handling are completed with the
-        cancellation/recovery task.
+        when the adapter is unavailable, and no parallel task execution.  A
+        pass that binds a run drives it to a terminal/``verifying`` fact (up to
+        the run's own runtime budget) before the loop moves on, so this is the
+        single-worker serial boundary.  Lease recovery, error backoff and
+        signal handling are completed with the cancellation/recovery task.
         """
         while not stop_event.is_set():
             with session_factory() as session:
@@ -865,21 +927,33 @@ class RuntimeDispatcher:
         idempotency_key: str,
         now: datetime,
     ) -> DispatcherResult:
-        """Map runtime status/result facts onto the task state machine.
+        """Drive the accepted run to a terminal/verifying fact, or fail closed.
+
+        The loop is bounded by the run's own runtime budget
+        (``task.max_runtime_seconds``) and, indirectly, by the live lease: the
+        lease is renewed at roughly half its life, and a renewal failure stops
+        the drive before another fact is written.  Between observations the
+        dispatcher waits ``poll_interval`` and refreshes its clock, so a run
+        that is not terminal immediately is still driven to an end instead of
+        being stranded in ``dispatched``/``running`` with a live lease.
 
         Only contract enums and the existing task service are used; the
         dispatcher never writes a state directly, never calls
-        ``complete_task`` and never invents result/evidence references.  The
-        loop consumes at most :data:`MAX_STATUS_POLLS_PER_PASS` observations, so
-        a run that stays ``accepted``/``running`` (or a fake that repeats its
-        last scripted answer) returns instead of spinning.
-
-        A run still in progress keeps the lease, so the same fencing token owns
-        the later observations/recovery.
+        ``complete_task`` and never invents result/evidence references.  When
+        the deadline (or the test-only observation cap) is reached while the
+        run is still in progress, the run is cancelled best-effort, the handle
+        is kept for reconciliation and the attempt is recorded as ``lost``
+        (``unknown``) before the lease is released: no in-progress run is ever
+        left behind by this pass.
         """
 
-        outcome = "accepted"
-        for _ in range(MAX_STATUS_POLLS_PER_PASS):
+        deadline = self._runtime_deadline(task, now=now)
+        current = now
+        observations = 0
+        while True:
+            # Renewing before a write keeps the fencing token valid for every
+            # fact below; a lost lease raises and the whole pass rolls back.
+            self._renew_lease_if_due(task, lease, now=current)
             try:
                 status = self._adapter.get_status(
                     runtime_task_id, task_id=task.task_id
@@ -894,73 +968,259 @@ class RuntimeDispatcher:
                     lease,
                     runtime_task_id=runtime_task_id,
                     reason=RUNTIME_STATUS_UNREADABLE,
-                    now=now,
+                    now=current,
+                )
+            observations += 1
+            if status.runtime_task_id != runtime_task_id:
+                # A status about another handle is not evidence about this
+                # task; nothing from it may be attributed here.
+                return self._record_lost(
+                    task,
+                    lease,
+                    runtime_task_id=runtime_task_id,
+                    reason=RUNTIME_HANDLE_MISMATCH,
+                    now=current,
                 )
 
             state = status.state
-            if state is RuntimeState.ACCEPTED:
-                # The runtime has not started; keep polling within the bound.
-                continue
             if state is RuntimeState.RUNNING:
                 self._ensure_running(
                     task,
                     lease,
                     runtime_task_id=runtime_task_id,
                     observed_at=status.observed_at,
-                    now=now,
+                    now=current,
                 )
-                outcome = "running"
-                continue
-            if state is RuntimeState.COMPLETED:
+            elif state is RuntimeState.COMPLETED:
                 return self._observe_completed(
                     task,
                     lease,
                     runtime_task_id=runtime_task_id,
                     observed_at=status.observed_at,
-                    now=now,
+                    now=current,
                 )
-            if state in (RuntimeState.FAILED, RuntimeState.TIMED_OUT):
+            elif state in (RuntimeState.FAILED, RuntimeState.TIMED_OUT):
                 return self._observe_failure(
                     task,
                     lease,
                     runtime_task_id=runtime_task_id,
                     state=state,
                     stop_confirmed=bool(status.stop_confirmed),
-                    now=now,
+                    now=current,
                 )
-            if state is RuntimeState.WAITING_INPUT:
+            elif state is RuntimeState.WAITING_INPUT:
                 return self._observe_waiting_input(
                     task,
                     lease,
                     runtime_task_id=runtime_task_id,
                     idempotency_key=idempotency_key,
-                    now=now,
+                    now=current,
                 )
-            if state is RuntimeState.STOPPED:
+            elif state is RuntimeState.STOPPED:
                 # A stop may only become a terminal fact after a core cancel
-                # request; this boundary never requested one, so the state is
-                # reported as unknown rather than as "stopped by us".
+                # request; this boundary never requested one.  The confirmed
+                # stop is kept as a reconciliation fact instead of being
+                # discarded or written as "stopped by us".
+                stop_ref = (
+                    _runtime_stop_evidence_ref(
+                        runtime_task_id, status.observed_at, "status"
+                    )
+                    if status.stop_confirmed
+                    else None
+                )
+                self._persist_reconciliation(
+                    task,
+                    runtime_task_id=runtime_task_id,
+                    idempotency_key=idempotency_key,
+                    cancel={
+                        "attempted": False,
+                        "outcome": state.value,
+                        "stop_confirmed": bool(status.stop_confirmed),
+                    },
+                    reason=RUNTIME_STOP_UNREQUESTED,
+                    stop_evidence_refs=(stop_ref,) if stop_ref else (),
+                    now=current,
+                )
                 return self._record_lost(
                     task,
                     lease,
                     runtime_task_id=runtime_task_id,
                     reason=RUNTIME_STOP_UNREQUESTED,
-                    now=now,
+                    now=current,
                 )
-            # ``unknown`` / ``not_found`` (and any future state this task does
-            # not map) prove nothing about the run's effects: no resume/replay.
-            return self._record_lost(
-                task,
-                lease,
-                runtime_task_id=runtime_task_id,
-                reason=RUNTIME_EXECUTION_LOST,
-                now=now,
-            )
+            elif state is not RuntimeState.ACCEPTED:
+                # ``unknown`` / ``not_found`` (and any future state this task
+                # does not map) prove nothing about the run's effects: no
+                # resume/replay.
+                return self._record_lost(
+                    task,
+                    lease,
+                    runtime_task_id=runtime_task_id,
+                    reason=RUNTIME_EXECUTION_LOST,
+                    now=current,
+                )
 
-        return DispatcherResult(
-            outcome=outcome,
+            # The run is still in progress.  Never leave it behind: the runtime
+            # deadline (or the test-only observation cap) ends the pass with a
+            # cancelled, reconciled and released attempt.
+            if current >= deadline:
+                return self._abandon_in_progress(
+                    task,
+                    lease,
+                    runtime_task_id=runtime_task_id,
+                    idempotency_key=idempotency_key,
+                    reason=RUNTIME_DRIVE_DEADLINE,
+                    now=current,
+                )
+            cap = self._config.max_status_observations
+            if cap is not None and observations >= max(1, int(cap)):
+                return self._abandon_in_progress(
+                    task,
+                    lease,
+                    runtime_task_id=runtime_task_id,
+                    idempotency_key=idempotency_key,
+                    reason=RUNTIME_DRIVE_OBSERVATION_CAP,
+                    now=current,
+                )
+            current = self._wait_for_next_observation(current)
+
+    def _wait_for_next_observation(self, current: datetime) -> datetime:
+        """Sleep ``poll_interval`` and return a strictly later clock value."""
+
+        interval = max(0.0, float(self._config.poll_interval))
+        if interval > 0:
+            time.sleep(interval)
+        observed = _utcnow()
+        if observed > current:
+            return observed
+        # An injected clock that is ahead of the wall clock must still advance,
+        # otherwise the deadline could never be reached.
+        return current + timedelta(seconds=max(interval, 0.001))
+
+    def _runtime_deadline(self, task: Task, *, now: datetime) -> datetime:
+        """Return the time this pass must stop driving an in-progress run.
+
+        The task runtime cap is cumulative across attempts, so the remaining
+        budget is what ``start_attempt``/``record_attempt_result`` already
+        enforce (:func:`app.tasks.service._attempt_runtime_elapsed`), not the
+        raw column.  A run that outlives it must not be left running with a
+        lease.
+        """
+
+        remaining = int(task.max_runtime_seconds or 0)
+        elapsed = task_service._attempt_runtime_elapsed(  # noqa: SLF001 - same domain
+            self._session, task, now=now
+        )
+        if elapsed is not None:
+            remaining -= int(elapsed.total_seconds())
+        return now + timedelta(seconds=max(1, remaining))
+
+    def _renew_lease_if_due(
+        self, task: Task, lease: TaskLease, *, now: datetime
+    ) -> None:
+        """Renew the lease at roughly half its life.
+
+        Renewal is a precondition for every write below.  A failure (stale
+        fencing token, released or expired lease) raises before another fact is
+        written; ``run_once`` rolls the whole pass back, so the task returns to
+        ``queued`` and the stable idempotency key lets the next pass (or lease
+        recovery) adopt the same run instead of creating a second one.  The run
+        is deliberately not cancelled here: another worker may already own it.
+        """
+
+        expires = lease.lease_expires_at
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=UTC)
+        lifetime = timedelta(seconds=max(1, int(self._config.lease_seconds)))
+        if expires - now > lifetime / 2:
+            return
+        worker.renew_lease(
+            self._session,
             task_id=task.task_id,
+            worker_id=self._config.worker_id,
+            fencing_token=lease.fencing_token,
+            lease_seconds=self._config.lease_seconds,
+            now=now,
+        )
+
+    def _abandon_in_progress(
+        self,
+        task: Task,
+        lease: TaskLease,
+        *,
+        runtime_task_id: str,
+        idempotency_key: str,
+        reason: str,
+        now: datetime,
+    ) -> DispatcherResult:
+        """Cancel best-effort, keep the facts, then fail closed to ``unknown``.
+
+        Used when the drive deadline (or the test-only observation cap) is hit
+        while the run is still in progress.  A requested cancel is not a stop,
+        so the attempt is recorded as ``lost``; a confirmed stop is retained as
+        a reconciliation fact and never fabricated into a core stop transition.
+        """
+
+        cancel = self._cancel_after_accept(
+            runtime_task_id, idempotency_key, task, reason=reason
+        )
+        stop_ref = self._confirmed_stop_ref(
+            task, runtime_task_id, cancel, now=now
+        )
+        self._persist_reconciliation(
+            task,
             runtime_task_id=runtime_task_id,
+            idempotency_key=idempotency_key,
+            cancel=cancel,
+            reason=reason,
+            stop_evidence_refs=(stop_ref,) if stop_ref else (),
+            now=now,
+        )
+        return self._record_lost(
+            task,
+            lease,
+            runtime_task_id=runtime_task_id,
+            reason=reason,
+            now=now,
+        )
+
+    def _confirmed_stop_ref(
+        self,
+        task: Task,
+        runtime_task_id: str,
+        cancel: Mapping[str, object],
+        *,
+        now: datetime,
+    ) -> str | None:
+        """Return a safe stop-evidence ref when the runtime confirmed a stop.
+
+        ``stop_confirmed`` is trusted from the cancel response, or from one
+        follow-up status when the cancel only reported ``requested``.  The
+        reference is a hash of the observation, never a vendor string; when no
+        stop is confirmed nothing is returned and no stop is claimed.
+        """
+
+        if bool(cancel.get("stop_confirmed")):
+            return _runtime_stop_evidence_ref(runtime_task_id, now, "cancel")
+        try:
+            status = self._adapter.get_status(
+                runtime_task_id, task_id=task.task_id
+            )
+        except Exception:  # noqa: BLE001 - no stop can be proven
+            return None
+        if (
+            status.runtime_task_id != runtime_task_id
+            or not status.stop_confirmed
+            or status.state
+            not in (
+                RuntimeState.STOPPED,
+                RuntimeState.FAILED,
+                RuntimeState.TIMED_OUT,
+            )
+        ):
+            return None
+        return _runtime_stop_evidence_ref(
+            runtime_task_id, status.observed_at, "status"
         )
 
     def _ensure_running(
@@ -1154,12 +1414,20 @@ class RuntimeDispatcher:
         idempotency_key: str,
         now: datetime,
     ) -> DispatcherResult:
-        """Stop an input-waiting run best-effort and fail closed.
+        """Stop an input-waiting run best-effort and hand it to a human.
 
         #96 has no generic input channel, so the run must not be left waiting
-        indefinitely.  A ``requested`` cancel is not a stop, so the task cannot
-        be claimed as stopped: the attempt is recorded as lost (``unknown``)
-        with the cancel facts kept for reconciliation.
+        indefinitely.  When the runtime confirms the stop, the task is escalated
+        to ``needs_human`` (T40, or T35 from ``dispatched``) with the stop
+        observation as evidence: the run is over and the remaining decision
+        belongs to a person.  A ``requested`` cancel is not a stop, so an
+        unconfirmed stop still fails closed to ``unknown``.
+
+        The confirmed stop is recorded as an observation reference; the core
+        ``stop_confirmed`` flag is **not** written here, because ``cancelled``
+        requires a core stop transition with reconciled side effects (Task 7).
+        The attempt therefore stays open exactly as the service defines for
+        ``needs_human``.
         """
 
         cancel = self._cancel_after_accept(
@@ -1168,20 +1436,41 @@ class RuntimeDispatcher:
             task,
             reason=RUNTIME_WAITING_INPUT,
         )
+        stop_ref = self._confirmed_stop_ref(
+            task, runtime_task_id, cancel, now=now
+        )
         self._persist_reconciliation(
             task,
             runtime_task_id=runtime_task_id,
             idempotency_key=idempotency_key,
             cancel=cancel,
             reason=RUNTIME_WAITING_INPUT,
+            stop_evidence_refs=(stop_ref,) if stop_ref else (),
             now=now,
         )
-        return self._record_lost(
-            task,
-            lease,
-            runtime_task_id=runtime_task_id,
-            reason=RUNTIME_WAITING_INPUT,
+        if stop_ref is None:
+            return self._record_lost(
+                task,
+                lease,
+                runtime_task_id=runtime_task_id,
+                reason=RUNTIME_WAITING_INPUT,
+                now=now,
+            )
+
+        task_service.escalate_task(
+            self._session,
+            task_id=task.task_id,
+            actor=self._service_principal,
+            reason_code=RUNTIME_WAITING_INPUT,
+            evidence_refs=(stop_ref,),
             now=now,
+        )
+        self._release(task, lease, now=now)
+        return DispatcherResult(
+            outcome="needs_human",
+            task_id=task.task_id,
+            runtime_task_id=runtime_task_id,
+            detail=RUNTIME_WAITING_INPUT,
         )
 
     def _record_lost(
@@ -1282,13 +1571,14 @@ class RuntimeDispatcher:
         now: datetime,
         lookup: LookupResult | None = None,
         submit_outcome: str | None = None,
+        stop_evidence_refs: Sequence[str] = (),
     ) -> None:
         """Persist the accepted-but-unbound handle before entering unknown.
 
         ``record_dispatch_failure`` merges the existing result document, so
         these keys survive the transition.  Only the opaque handle, the stable
-        key, cancellation facts, the lookup answer and a reason are stored --
-        never a prompt, token or credential.
+        key, cancellation/stop facts, the lookup answer and a reason are stored
+        -- never a prompt, token or credential.
         """
 
         document: dict[str, object] = {
@@ -1303,6 +1593,11 @@ class RuntimeDispatcher:
             "stop_confirmed": bool((cancel or {}).get("stop_confirmed", False)),
             "reason": reason,
         }
+        if stop_evidence_refs:
+            # An observation-hash reference for a runtime-confirmed stop.  It is
+            # kept here (not written as a core stop fact) so a confirmed stop is
+            # never silently discarded by the fail-closed path.
+            document["stop_evidence_refs"] = list(stop_evidence_refs)
         if lookup is not None:
             document["lookup_outcome"] = lookup.outcome.value
         if submit_outcome is not None:
