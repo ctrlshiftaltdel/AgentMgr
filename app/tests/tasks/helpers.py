@@ -128,6 +128,41 @@ def submit_gated(
     return submit_task(session, **params)
 
 
+def submit_managed(
+    session: Session,
+    world: TaskWorld,
+    *,
+    key: str = "idem_task_managed_0001",
+    **overrides: Any,
+) -> Task:
+    """Submit a task the runtime dispatcher owns instead of a client.
+
+    The default goal summary is deliberately distinct from ``submit_read``: the
+    duplicate classifier fingerprints the normalised goal, so two otherwise
+    identical submissions would be rejected as ``task_duplicate`` before any
+    claim filter could run.  Only the summary differs -- goal shape, scope and
+    capability stay the same as ``submit_read``.
+
+    ``runtime_capabilities_verified`` only records that the capability evidence
+    was checked by the test; every transition, grant and lease guard still
+    applies exactly as in production.
+    """
+    params: dict[str, Any] = {
+        "requester": world.actors.requester,
+        "owner": world.actors.owner,
+        "executor": world.actors.executor,
+        "idempotency_key": key,
+        "goal": goal(summary="Read one synthetic managed expense"),
+        "resource_scope": scope(),
+        "requested_capabilities": [READ_CAPABILITY],
+        "policy_set_id": world.policy.policy_set_id,
+        "execution_mode": "managed_execution",
+        "runtime_capabilities_verified": True,
+    }
+    params.update(overrides)
+    return submit_task(session, **params)
+
+
 def pending_confirmation(session: Session, task: Task) -> TaskConfirmation:
     row = session.scalar(
         select(TaskConfirmation)

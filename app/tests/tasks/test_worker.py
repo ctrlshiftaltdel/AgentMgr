@@ -13,7 +13,12 @@ from app.tasks.errors import TaskError
 from app.tasks.models import TaskAttempt, TaskEvent
 from app.tasks.service import record_dispatch_failure, start_attempt
 from app.tests.tasks.conftest import TaskWorld
-from app.tests.tasks.helpers import goal, submit_read, utcnow
+from app.tests.tasks.helpers import (
+    goal,
+    submit_managed,
+    submit_read,
+    utcnow,
+)
 
 
 def test_claim_orders_by_bounded_priority(session: Session, world: TaskWorld) -> None:
@@ -58,6 +63,36 @@ def test_claim_skips_a_task_that_already_holds_a_lease(
     assert one is not None and two is not None
     assert one.task.task_id != two.task.task_id
     assert one.task.task_id == first.task_id
+
+
+def test_claim_filter_only_returns_managed_tasks(
+    session: Session, world: TaskWorld
+) -> None:
+    submit_read(session, world, key="idem_advisory_filter_0001")
+    managed = submit_managed(session, world, key="idem_managed_filter_0001")
+    session.commit()
+
+    claimed = worker.claim_task(
+        session,
+        worker_id="worker-managed",
+        actor=world.actors.executor,
+        execution_mode="managed_execution",
+    )
+    assert claimed is not None
+    assert claimed.task.task_id == managed.task_id
+
+
+def test_claim_filter_none_keeps_existing_behavior(
+    session: Session, world: TaskWorld
+) -> None:
+    advisory = submit_read(session, world, key="idem_advisory_none_0001")
+    session.commit()
+
+    claimed = worker.claim_task(
+        session, worker_id="worker-any", actor=world.actors.executor
+    )
+    assert claimed is not None
+    assert claimed.task.task_id == advisory.task_id
 
 
 def test_lease_is_renewed_and_released_only_by_its_holder(
