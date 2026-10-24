@@ -4,8 +4,8 @@ These tests use the real PostgreSQL task fixtures and the scripted
 :class:`FakeRuntimeAdapter`.  The fake is test-only evidence; nothing here
 claims that a real runtime supports Managed Execution.
 
-Scope of this file in Task 6: the accepted submit path binds ``rtask_*``
-through ``start_attempt`` and the same pass drives the bound run through
+Scope of this file: the accepted submit path binds ``rtask_*`` through
+``start_attempt`` and the same pass drives the bound run through
 ``get_status``/``get_result`` under the held lease/fencing token.  The drive is
 bounded by the run's own runtime budget (``poll_interval`` between observations,
 lease renewal at half life) and never returns while a dispatched/running task
@@ -14,8 +14,13 @@ ref, a completed run with a core-compatible ``result_*``/``evidence:*`` pair
 reaches ``verifying`` only, confirmed failures/stops are recorded, a confirmed
 stop while waiting for input escalates to ``needs_human``, and everything the
 core cannot map honestly fails closed to ``unknown`` with the Grant revoked.  The
-dispatcher never calls ``complete_task``.  Lease recovery and core-driven
-cancellation arrive in Task 7.
+dispatcher never calls ``complete_task``.
+
+Task 7 adds the two loops that surrounded the pass: a core ``cancel_requested``
+is driven to a confirmed stop (``requested`` is never a stop, a raced
+completion still verifies), ``RuntimeRecoveryChecker`` feeds
+``worker.recover_expired_leases`` and never replays a live runtime, and
+``unknown`` tasks that still carry a runtime handle get a best-effort stop.
 """
 
 from __future__ import annotations
@@ -68,6 +73,8 @@ from app.tasks.execution import (
     GRANT_DOCUMENT_INVALID,
     MAX_RUNTIME_PROMPT_BYTES,
     RUNTIME_BIND_FAILED,
+    RUNTIME_CANCEL_RECONCILE,
+    RUNTIME_CANCEL_REQUESTED,
     RUNTIME_DRIVE_DEADLINE,
     RUNTIME_DRIVE_OBSERVATION_CAP,
     RUNTIME_EXECUTION_FAILED,
@@ -88,6 +95,7 @@ from app.tasks.execution import (
     DispatcherResult,
     RuntimeDispatcher,
     RuntimePromptTooLarge,
+    RuntimeRecoveryChecker,
     build_runtime_idempotency_key,
     build_runtime_prompt,
 )
@@ -142,6 +150,65 @@ def _dispatcher(
         ),
         session=session,
     )
+
+
+class _CancelRequestingAdapter(FakeRuntimeAdapter):
+    """Fake adapter that also registers a real core cancel request mid-drive.
+
+    ``task_service.request_cancel`` is the production service a participant
+    calls.  It is issued in the dispatcher's own session, which is exactly how
+    a task becomes ``cancel_requested`` while the pass that owns it is
+    observing the runtime.  The adapter itself only reports facts.
+    """
+
+    def __init__(
+        self,
+        *,
+        session: Session,
+        world: TaskWorld,
+        task_id: str,
+        after_status_calls: int = 1,
+        **kwargs: object,
+    ) -> None:
+        super().__init__(**kwargs)
+        self._session = session
+        self._world = world
+        self._task_id = task_id
+        self._after_status_calls = after_status_calls
+        self.cancel_requests = 0
+
+    def get_status(
+        self, runtime_task_id: str, *, task_id: str | None = None
+    ) -> StatusResult:
+        status = super().get_status(runtime_task_id, task_id=task_id)
+        if (
+            self.cancel_requests == 0
+            and len(self.status_calls) >= self._after_status_calls
+        ):
+            task_service.request_cancel(
+                self._session,
+                task_id=self._task_id,
+                actor=self._world.actors.requester,
+            )
+            self.cancel_requests += 1
+        return status
+
+
+class _StopOnStatusAdapter(FakeRuntimeAdapter):
+    """Fake adapter that signals the dispatcher's stop event mid-drive."""
+
+    def __init__(
+        self, stop_event: threading.Event, **kwargs: object
+    ) -> None:
+        super().__init__(**kwargs)
+        self._stop_event = stop_event
+
+    def get_status(
+        self, runtime_task_id: str, *, task_id: str | None = None
+    ) -> StatusResult:
+        status = super().get_status(runtime_task_id, task_id=task_id)
+        self._stop_event.set()
+        return status
 
 
 def _leases(session: Session, task: Task) -> list[TaskLease]:
@@ -1358,9 +1425,9 @@ def test_waiting_input_with_confirmed_stop_escalates(
         if event.event_type == "human.escalation_required"
     )
     assert escalation.payload["evidence_refs"] == stop_refs
-    # The core stop flag is never fabricated here: `cancelled` needs a core stop
-    # transition with reconciled side effects (Task 7), and needs_human keeps
-    # the attempt open exactly as the service defines.
+    # The core stop flag is never fabricated here: the core never requested
+    # this stop, so needs_human keeps the attempt open exactly as the service
+    # defines (a core `cancel_requested` is the Task 7 path).
     assert task.stop_confirmed is False
     attempt = _attempt(session, task)
     assert attempt.state == "running"
@@ -1643,6 +1710,655 @@ def test_confirmed_stop_without_result_evidence_fails_closed(
     assert task.stop_confirmed is False
     assert task.result["outcome"] == "lost"
     _assert_lease_released(session, task)
+
+
+# -- core cancel and stop -----------------------------------------------------
+
+
+def test_cancel_requested_waits_for_requested_then_confirms_stop(
+    session: Session, world: TaskWorld
+) -> None:
+    task = submit_managed(session, world)
+    session.commit()
+    adapter = _CancelRequestingAdapter(
+        session=session,
+        world=world,
+        task_id=task.task_id,
+        after_status_calls=2,
+        status=[
+            _status(RuntimeState.RUNNING),
+            _status(RuntimeState.RUNNING),
+            _status(RuntimeState.STOPPED, stop_confirmed=True),
+        ],
+    )
+    dispatcher = _dispatcher(session, world, adapter=adapter)
+
+    result = dispatcher.run_once()
+
+    # The cancel was only "requested"; the terminal fact comes from the
+    # confirmed stop observation, not from the cancel response.
+    assert result.outcome == "cancelled"
+    assert result.task_id == task.task_id
+    assert result.runtime_task_id == "rtask_fake_0001"
+    assert task.state == "cancelled"
+    assert task.stop_confirmed is True
+    assert task.result["outcome"] == "cancelled"
+    stop_refs = task.result["stop_evidence_refs"]
+    assert len(stop_refs) == 1
+    assert stop_refs[0].startswith("evidence:runtime_stop_")
+    assert "rtask_fake_0001" not in stop_refs[0]
+    attempt = _attempt(session, task)
+    assert attempt.state == "cancelled"
+    assert attempt.stop_confirmed is True
+    # Exactly one core cancel request reached the runtime; the stop was a
+    # status fact, not a second cancel.
+    assert len(adapter.cancel_calls) == 1
+    assert adapter.cancel_calls[0]["reason"] == RUNTIME_CANCEL_REQUESTED
+    assert adapter.cancel_calls[0]["runtime_task_id"] == "rtask_fake_0001"
+    assert adapter.cancel_calls[0]["task_id"] == task.task_id
+    reconciliation = task.result["runtime_reconciliation"]
+    # `requested` stayed honest: the cancel itself never claimed a stop.
+    assert reconciliation["cancel_outcome"] == "requested"
+    assert reconciliation["stop_confirmed"] is False
+    assert reconciliation["runtime_task_id"] == "rtask_fake_0001"
+    assert reconciliation["runtime_key"] == adapter.submit_calls[0][1]
+    events = _event_types(session, task)
+    assert "task.cancel_requested" in events
+    assert "execution.stopped" in events
+    assert task.grant_status == "revoked"
+    _assert_lease_released(session, task)
+    # No second submission and no replay.
+    assert len(adapter.submit_calls) == 1
+    assert dispatcher.run_once().outcome == "idle"
+
+
+def test_cancel_requested_only_is_not_cancelled(
+    session: Session, world: TaskWorld
+) -> None:
+    task = submit_managed(session, world)
+    session.commit()
+    adapter = _CancelRequestingAdapter(
+        session=session,
+        world=world,
+        task_id=task.task_id,
+        after_status_calls=1,
+        status=_status(RuntimeState.RUNNING),
+        cancel=CancelResult(
+            outcome=CancelOutcome.REQUESTED,
+            stop_confirmed=False,
+            observed_at=utcnow(),
+        ),
+    )
+    dispatcher = _dispatcher(
+        session,
+        world,
+        adapter=adapter,
+        config=DispatcherConfig(
+            worker_id=WORKER_ID,
+            poll_interval=0.0,
+            max_status_observations=3,
+        ),
+    )
+
+    result = dispatcher.run_once()
+
+    # A requested cancel is not a stop.  The run never confirmed the stop, so
+    # the pass fails closed instead of claiming "cancelled".
+    assert result.outcome == "unknown"
+    assert result.detail == RUNTIME_DRIVE_OBSERVATION_CAP
+    assert task.state == "unknown"
+    assert task.state != "cancelled"
+    assert task.stop_confirmed is False
+    assert task.result["outcome"] == "lost"
+    assert len(adapter.cancel_calls) == 1
+    assert adapter.cancel_calls[0]["reason"] == RUNTIME_CANCEL_REQUESTED
+    reconciliation = task.result["runtime_reconciliation"]
+    assert reconciliation["cancel_outcome"] == "requested"
+    assert reconciliation["stop_confirmed"] is False
+    assert task.grant_status == "revoked"
+    _assert_lease_released(session, task)
+    assert len(adapter.submit_calls) == 1
+
+
+@pytest.mark.parametrize(
+    "cancel_outcome",
+    [CancelOutcome.UNSUPPORTED, CancelOutcome.UNKNOWN],
+    ids=["unsupported", "unknown"],
+)
+def test_cancel_outcome_that_is_not_a_stop_never_reports_cancelled(
+    session: Session, world: TaskWorld, cancel_outcome: CancelOutcome
+) -> None:
+    task = submit_managed(session, world)
+    session.commit()
+    adapter = _CancelRequestingAdapter(
+        session=session,
+        world=world,
+        task_id=task.task_id,
+        after_status_calls=1,
+        status=_status(RuntimeState.RUNNING),
+        cancel=CancelResult(
+            outcome=cancel_outcome,
+            stop_confirmed=False,
+            observed_at=utcnow(),
+        ),
+    )
+    dispatcher = _dispatcher(
+        session,
+        world,
+        adapter=adapter,
+        config=DispatcherConfig(
+            worker_id=WORKER_ID,
+            poll_interval=0.0,
+            max_status_observations=3,
+        ),
+    )
+
+    result = dispatcher.run_once()
+
+    # Unsupported/unknown cancels are reconciled honestly and never become a
+    # fabricated stop.
+    assert result.outcome == "unknown"
+    assert task.state == "unknown"
+    assert task.stop_confirmed is False
+    assert len(adapter.cancel_calls) == 1
+    reconciliation = task.result["runtime_reconciliation"]
+    assert reconciliation["cancel_outcome"] == cancel_outcome.value
+    assert reconciliation["stop_confirmed"] is False
+    assert task.grant_status == "revoked"
+    _assert_lease_released(session, task)
+
+
+def test_cancel_race_completed_result_wins(
+    session: Session, world: TaskWorld
+) -> None:
+    task = submit_managed(session, world)
+    session.commit()
+    adapter = _CancelRequestingAdapter(
+        session=session,
+        world=world,
+        task_id=task.task_id,
+        after_status_calls=1,
+        status=[
+            _status(RuntimeState.RUNNING),
+            _status(RuntimeState.RUNNING),
+            _status(RuntimeState.COMPLETED),
+        ],
+        result=_result(),
+    )
+
+    result = _dispatcher(session, world, adapter=adapter).run_once()
+
+    # The run completed before the unconfirmed cancel took effect: the
+    # completed result must survive and reach verification.
+    assert result.outcome == "verifying"
+    assert task.state == "verifying"
+    assert task.result["outcome"] == "completed"
+    assert task.result["result_ref"] == FAKE_RESULT_REF
+    assert task.result["evidence_refs"] == [FAKE_EVIDENCE_REF]
+    assert task.stop_confirmed is False
+    assert "execution.stopped" not in _event_types(session, task)
+    assert len(adapter.cancel_calls) == 1
+    assert len(adapter.result_calls) == 1
+    assert len(adapter.submit_calls) == 1
+    _assert_lease_released(session, task)
+
+
+def test_cancel_already_terminal_keeps_the_completed_result(
+    session: Session, world: TaskWorld
+) -> None:
+    task = submit_managed(session, world)
+    session.commit()
+    adapter = _CancelRequestingAdapter(
+        session=session,
+        world=world,
+        task_id=task.task_id,
+        after_status_calls=1,
+        status=[
+            _status(RuntimeState.RUNNING),
+            _status(RuntimeState.COMPLETED),
+        ],
+        cancel=CancelResult(
+            outcome=CancelOutcome.ALREADY_TERMINAL,
+            stop_confirmed=False,
+            observed_at=utcnow(),
+        ),
+        result=_result(),
+    )
+
+    result = _dispatcher(session, world, adapter=adapter).run_once()
+
+    # `already_terminal` follows the real result path instead of being treated
+    # as a stop.
+    assert result.outcome == "verifying"
+    assert task.state == "verifying"
+    assert task.result["outcome"] == "completed"
+    assert task.result["result_ref"] == FAKE_RESULT_REF
+    reconciliation = task.result["runtime_reconciliation"]
+    assert reconciliation["cancel_outcome"] == "already_terminal"
+    assert task.stop_confirmed is False
+    _assert_lease_released(session, task)
+
+
+def test_first_observation_timed_out_is_recorded_after_running(
+    session: Session, world: TaskWorld
+) -> None:
+    task = submit_managed(session, world)
+    session.commit()
+    adapter = FakeRuntimeAdapter(
+        status=_status(RuntimeState.TIMED_OUT, stop_confirmed=True),
+        result=_result(
+            outcome=ResultOutcome.TIMED_OUT,
+            result_ref=None,
+            evidence_refs=("evidence:fake_stop_0001",),
+            stop_confirmed=True,
+        ),
+    )
+
+    result = _dispatcher(session, world, adapter=adapter).run_once()
+
+    # A runtime may time out before it ever reports `running`; the terminal
+    # fact is written through the legal dispatched -> running -> timed_out
+    # path instead of raising an invalid transition.
+    assert result.outcome == "timed_out"
+    assert task.state == "timed_out"
+    assert task.stop_confirmed is True
+    events = _event_types(session, task)
+    assert "execution.started" in events
+    assert "execution.timed_out" in events
+    assert events.index("execution.started") < events.index(
+        "execution.timed_out"
+    )
+    assert _attempt(session, task).state == "timed_out"
+    _assert_lease_released(session, task)
+
+
+# -- lease recovery and unknown-run cancellation ------------------------------
+
+
+def test_recovery_checker_reports_a_bound_run_and_never_replays() -> None:
+    task = SimpleNamespace(
+        task_id="task_recovery_0001",
+        grant_id="grnt_recovery_0001",
+        runtime_task_id=None,
+    )
+    adapter = FakeRuntimeAdapter(
+        lookup=LookupResult(
+            outcome=LookupOutcome.FOUND,
+            runtime_task_id="rtask_recovery_0001",
+        ),
+        status=_status(
+            RuntimeState.RUNNING, runtime_task_id="rtask_recovery_0001"
+        ),
+    )
+    checker = RuntimeRecoveryChecker(adapter)
+
+    # A key lookup found the run; its status is live, so the boundary reports
+    # "running" and the worker never re-dispatches it.
+    assert checker(
+        task=task, attempt_number=1, idempotency_key="idem_recovery_0001"
+    ) == ("running", False)
+    assert adapter.submit_calls == []
+    assert adapter.lookup_calls == [
+        (
+            "task_recovery_0001",
+            "grnt_recovery_0001",
+            "idem_recovery_0001",
+            None,
+        )
+    ]
+
+    # A bound handle is authoritative; no lookup is needed.
+    task.runtime_task_id = "rtask_recovery_0001"
+    bound = FakeRuntimeAdapter(
+        status=_status(
+            RuntimeState.RUNNING, runtime_task_id="rtask_recovery_0001"
+        )
+    )
+    assert RuntimeRecoveryChecker(bound)(
+        task=task, attempt_number=1, idempotency_key=None
+    ) == ("running", False)
+    assert bound.lookup_calls == []
+    assert bound.submit_calls == []
+
+    # Unreadable / unknown facts are honest "unknown", never "not accepted".
+    unreadable = FakeRuntimeAdapter(
+        status_error=RuntimeError("status exploded")
+    )
+    assert RuntimeRecoveryChecker(unreadable)(
+        task=task, attempt_number=1, idempotency_key="idem_recovery_0001"
+    ) == ("unknown", False)
+    unknown_lookup = FakeRuntimeAdapter(
+        lookup=LookupResult(outcome=LookupOutcome.UNKNOWN)
+    )
+    unbound = SimpleNamespace(
+        task_id="task_recovery_0001",
+        grant_id="grnt_recovery_0001",
+        runtime_task_id=None,
+    )
+    assert RuntimeRecoveryChecker(unknown_lookup)(
+        task=unbound, attempt_number=1, idempotency_key="idem_recovery_0001"
+    ) == ("unknown", False)
+    assert unknown_lookup.submit_calls == []
+
+
+def test_recovery_checker_not_found_only_without_a_bound_handle() -> None:
+    unbound = SimpleNamespace(
+        task_id="task_recovery_0002",
+        grant_id="grnt_recovery_0002",
+        runtime_task_id=None,
+    )
+    not_found = FakeRuntimeAdapter(
+        lookup=LookupResult(outcome=LookupOutcome.NOT_FOUND)
+    )
+    checker = RuntimeRecoveryChecker(not_found)
+
+    # No handle was ever bound and the adapter gives the contract's definite
+    # absence answer: this is the only "never accepted" answer.
+    assert checker(
+        task=unbound, attempt_number=1, idempotency_key="idem_recovery_0002"
+    ) == ("not_accepted", False)
+    assert not_found.submit_calls == []
+    # Missing local state is not a proof of no side effects.
+    assert checker(task=unbound, attempt_number=1, idempotency_key=None) == (
+        "unknown",
+        False,
+    )
+    # A raising lookup cannot prove absence.
+    raising = FakeRuntimeAdapter(lookup_error=RuntimeError("lookup exploded"))
+    assert RuntimeRecoveryChecker(raising)(
+        task=unbound, attempt_number=1, idempotency_key="idem_recovery_0002"
+    ) == ("unknown", False)
+    # A found run without a usable handle cannot be observed or replayed.
+    no_handle = FakeRuntimeAdapter(
+        lookup=LookupResult(outcome=LookupOutcome.FOUND)
+    )
+    assert RuntimeRecoveryChecker(no_handle)(
+        task=unbound, attempt_number=1, idempotency_key="idem_recovery_0002"
+    ) == ("unknown", False)
+
+    # A bound run that the runtime no longer knows is still never replayed.
+    bound = SimpleNamespace(
+        task_id="task_recovery_0002",
+        grant_id="grnt_recovery_0002",
+        runtime_task_id="rtask_recovery_0002",
+    )
+    missing_run = FakeRuntimeAdapter(
+        lookup=LookupResult(outcome=LookupOutcome.NOT_FOUND),
+        status=_status(
+            RuntimeState.NOT_FOUND, runtime_task_id="rtask_recovery_0002"
+        ),
+    )
+    assert RuntimeRecoveryChecker(missing_run)(
+        task=bound, attempt_number=1, idempotency_key="idem_recovery_0002"
+    ) == ("unknown", False)
+    assert missing_run.submit_calls == []
+
+    # A malformed persisted handle cannot be observed, so absence is never
+    # inferred from it either.
+    malformed = SimpleNamespace(
+        task_id="task_recovery_0002",
+        grant_id="grnt_recovery_0002",
+        runtime_task_id="not-a-runtime-handle",
+    )
+    checker_adapter = FakeRuntimeAdapter(
+        lookup=LookupResult(outcome=LookupOutcome.NOT_FOUND)
+    )
+    assert RuntimeRecoveryChecker(checker_adapter)(
+        task=malformed, attempt_number=1, idempotency_key="idem_recovery_0002"
+    ) == ("unknown", False)
+    assert checker_adapter.lookup_calls == []
+    assert checker_adapter.submit_calls == []
+
+
+def test_lease_expiry_does_not_replay_running_runtime(
+    session: Session, world: TaskWorld
+) -> None:
+    task = submit_managed(session, world)
+    session.commit()
+    principal = _service_principal(session, world)
+    started = utcnow()
+    claimed = worker.claim_task(
+        session,
+        worker_id=WORKER_ID,
+        actor=principal,
+        execution_mode="managed_execution",
+        lease_seconds=5,
+        now=started,
+    )
+    assert claimed is not None
+    assert claimed.task.task_id == task.task_id
+    task_service.start_attempt(
+        session,
+        task_id=task.task_id,
+        actor=principal,
+        worker_id=WORKER_ID,
+        fencing_token=claimed.lease.fencing_token,
+        runtime_ref="rtask_fake_0001",
+        idempotency_key="idem_lease_expired_0001",
+        now=started,
+    )
+    session.commit()
+    adapter = FakeRuntimeAdapter(status=_status(RuntimeState.RUNNING))
+    dispatcher = _dispatcher(session, world, adapter=adapter)
+    expired = started + timedelta(seconds=6)
+
+    recovered = dispatcher.recover_leases(now=expired)
+
+    # A live runtime is never rolled back or replayed: the attempt enters
+    # unknown and the handle stays for reconciliation.
+    assert [(item.action, item.state) for item in recovered] == [
+        ("entered_unknown", "unknown")
+    ]
+    assert task.state == "unknown"
+    assert task.runtime_task_id == "rtask_fake_0001"
+    assert task.result["outcome"] == "lost"
+    assert task.grant_status == "revoked"
+    assert adapter.submit_calls == []
+    assert adapter.status_calls == [("rtask_fake_0001", task.task_id)]
+    assert adapter.cancel_calls == []
+    assert _leases(session, task)[-1].released_at is not None
+    # No second recovery and no dispatch pass can pick the row up again.
+    assert dispatcher.recover_leases(now=expired + timedelta(seconds=1)) == []
+    assert dispatcher.run_once().outcome == "idle"
+    assert adapter.submit_calls == []
+
+
+def test_unknown_with_runtime_handle_best_effort_cancel(
+    session: Session, world: TaskWorld
+) -> None:
+    task = submit_managed(session, world)
+    session.commit()
+    adapter = FakeRuntimeAdapter(
+        status=[
+            _status(RuntimeState.RUNNING),
+            _status(RuntimeState.UNKNOWN),
+        ]
+    )
+    dispatcher = _dispatcher(session, world, adapter=adapter)
+
+    assert dispatcher.run_once().outcome == "unknown"
+    assert task.state == "unknown"
+    assert task.runtime_task_id == "rtask_fake_0001"
+    submit_key = adapter.submit_calls[0][1]
+
+    results = dispatcher.cancel_unknown_runs()
+
+    # The persisted handle is a real run: stop it best-effort, but an
+    # unconfirmed stop never closes the task.
+    assert [item.outcome for item in results] == ["unknown"]
+    assert results[0].detail == RUNTIME_CANCEL_RECONCILE
+    assert len(adapter.cancel_calls) == 1
+    assert adapter.cancel_calls[0]["runtime_task_id"] == "rtask_fake_0001"
+    assert adapter.cancel_calls[0]["reason"] == RUNTIME_CANCEL_RECONCILE
+    assert adapter.cancel_calls[0]["idempotency_key"] == submit_key
+    assert adapter.cancel_calls[0]["task_id"] == task.task_id
+    assert task.state == "unknown"
+    assert task.stop_confirmed is False
+    reconciliation = task.result["runtime_reconciliation"]
+    assert reconciliation["cancel_outcome"] == "requested"
+    assert reconciliation["stop_confirmed"] is False
+    assert reconciliation["runtime_task_id"] == "rtask_fake_0001"
+    assert reconciliation["runtime_key"] == submit_key
+    # The original unknown reason is preserved, not overwritten.
+    assert reconciliation["reason"] == RUNTIME_EXECUTION_LOST
+    assert len(adapter.submit_calls) == 1
+    # No prompt or credential is persisted by the cancel pass.
+    prompt = adapter.submit_calls[0][3]
+    serialised = canonical_json(task.result)
+    assert prompt not in serialised
+    assert "completion_criteria" not in serialised
+
+
+def test_unknown_with_persisted_confirmed_stop_reconciles_to_cancelled(
+    session: Session, world: TaskWorld
+) -> None:
+    task = submit_managed(session, world)
+    session.commit()
+    adapter = FakeRuntimeAdapter(
+        status=_status(RuntimeState.RUNNING),
+        cancel=CancelResult(
+            outcome=CancelOutcome.STOPPED,
+            stop_confirmed=True,
+            observed_at=utcnow(),
+        ),
+    )
+    dispatcher = _dispatcher(
+        session,
+        world,
+        adapter=adapter,
+        config=DispatcherConfig(
+            worker_id=WORKER_ID,
+            poll_interval=0.0,
+            max_status_observations=2,
+        ),
+    )
+
+    assert dispatcher.run_once().outcome == "unknown"
+    assert task.state == "unknown"
+    reconciliation = task.result["runtime_reconciliation"]
+    assert reconciliation["stop_confirmed"] is True
+    assert reconciliation["stop_evidence_refs"][0].startswith(
+        "evidence:runtime_stop_"
+    )
+    assert len(adapter.cancel_calls) == 1
+
+    results = dispatcher.cancel_unknown_runs()
+
+    # The confirmed stop is a real fact: reconcile it without asking the
+    # runtime again.
+    assert [item.outcome for item in results] == ["cancelled"]
+    assert task.state == "cancelled"
+    assert task.stop_confirmed is True
+    assert len(adapter.cancel_calls) == 1
+    assert "reconcile.stopped" in _event_types(session, task)
+    attempt = _attempt(session, task)
+    assert attempt.state == "cancelled"
+    assert attempt.stop_confirmed is True
+    assert _leases(session, task)[-1].released_at is not None
+    assert len(adapter.submit_calls) == 1
+
+
+def test_only_unknown_tasks_are_best_effort_cancelled(
+    session: Session, world: TaskWorld
+) -> None:
+    task = submit_managed(session, world)
+    session.commit()
+    adapter = FakeRuntimeAdapter(
+        status=[
+            _status(RuntimeState.RUNNING),
+            _status(RuntimeState.COMPLETED),
+        ],
+        result=_result(),
+    )
+    dispatcher = _dispatcher(session, world, adapter=adapter)
+    assert dispatcher.run_once().outcome == "verifying"
+    # A reconciliation block alone is not a reason to cancel a verifying task.
+    task.result = {
+        **dict(task.result or {}),
+        "runtime_reconciliation": {
+            "runtime_task_id": "rtask_fake_0001",
+            "runtime_key": adapter.submit_calls[0][1],
+            "stop_confirmed": False,
+        },
+    }
+    session.flush()
+
+    assert dispatcher.cancel_unknown_runs() == []
+
+    assert task.state == "verifying"
+    assert adapter.cancel_calls == []
+
+
+def test_run_forever_runs_lease_recovery_with_the_runtime_checker(
+    session: Session,
+    world: TaskWorld,
+    engine: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop_event = threading.Event()
+    seen: dict[str, object] = {}
+
+    def _recover(
+        db: Session,
+        *,
+        actor: object = None,
+        checker: object = None,
+        now: object = None,
+        limit: int = 50,
+    ) -> list[object]:
+        seen["checker"] = checker
+        seen["actor"] = actor
+        stop_event.set()
+        return []
+
+    monkeypatch.setattr(worker, "recover_expired_leases", _recover)
+    cancelled: list[bool] = []
+    monkeypatch.setattr(
+        RuntimeDispatcher,
+        "cancel_unknown_runs",
+        lambda self, **kwargs: cancelled.append(True) or [],
+    )
+
+    _dispatcher(session, world).run_forever(
+        stop_event,
+        session_factory=lambda: Session(engine),  # type: ignore[arg-type]
+    )
+
+    assert isinstance(seen["checker"], RuntimeRecoveryChecker)
+    assert seen["actor"] is not None
+    assert cancelled == [True]
+
+
+def test_run_forever_stops_driving_when_the_stop_event_is_set(
+    session: Session, world: TaskWorld, engine: object
+) -> None:
+    task = submit_managed(session, world)
+    session.commit()
+    stop_event = threading.Event()
+    adapter = _StopOnStatusAdapter(
+        stop_event, status=_status(RuntimeState.RUNNING)
+    )
+
+    _dispatcher(session, world, adapter=adapter).run_forever(
+        stop_event,
+        session_factory=lambda: Session(engine),  # type: ignore[arg-type]
+    )
+
+    # The shutdown signal is honoured between observations: the pass rolls
+    # back (no facts under a half-driven run, no live lease) and the loop
+    # returns without cancelling the runtime.
+    fresh = Session(engine)  # type: ignore[arg-type]
+    try:
+        reloaded = fresh.scalar(
+            select(Task).where(Task.task_id == task.task_id)
+        )
+        assert reloaded is not None
+        assert reloaded.state == "queued"
+        assert fresh.scalars(select(TaskLease)).all() == []
+    finally:
+        fresh.close()
+    assert len(adapter.submit_calls) == 1
+    assert adapter.cancel_calls == []
 
 
 # -- submit failure matrix ----------------------------------------------------
