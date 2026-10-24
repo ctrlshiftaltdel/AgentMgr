@@ -1,11 +1,13 @@
-"""Managed dispatcher preflight: claim fence, lease release and fail-closed.
+"""Managed dispatcher: preflight, submit and runtime-handle binding.
 
 These tests use the real PostgreSQL task fixtures and the scripted
 :class:`FakeRuntimeAdapter`.  The fake is test-only evidence; nothing here
 claims that a real runtime supports Managed Execution.
 
-Scope of this file in Task 3: ``run_once`` stops at a successful preflight and
-never submits.  Submit/status/cancel behaviour arrives in Tasks 4-7.
+Scope of this file in Task 4: the accepted submit path binds ``rtask_*`` through
+``start_attempt``; the decision binding is verified before any adapter call; a
+post-accept binding failure cancels and enters ``unknown``.  Status/result
+mapping and the ambiguous-submit lookup matrix arrive in Tasks 5-6.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ from __future__ import annotations
 import threading
 from dataclasses import replace
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
@@ -20,6 +23,8 @@ from sqlalchemy.orm import Session
 
 from app.governance.errors import PrincipalResolutionError
 from app.governance.grants import revoke_grant
+from app.governance.models import ExecutionGrant
+from app.governance.policies import canonical_json
 from app.governance.principal import (
     GovernancePrincipal,
     resolve_service_principal,
@@ -32,16 +37,27 @@ from app.runtime.contract import (
     HealthStatus,
     RuntimeCapabilities,
     RuntimeCapability,
+    RuntimeGrant,
     RuntimeType,
+    SubmitOutcome,
+    SubmitResult,
     VersionSource,
 )
+from app.tasks import service as task_service
 from app.tasks.errors import TaskError
 from app.tasks.execution import (
+    DECISION_BINDING_MISMATCH,
+    MAX_RUNTIME_PROMPT_BYTES,
+    RUNTIME_BIND_FAILED,
+    RUNTIME_PROMPT_TOO_LARGE,
     DispatcherConfig,
     DispatcherResult,
     RuntimeDispatcher,
+    RuntimePromptTooLarge,
+    build_runtime_idempotency_key,
+    build_runtime_prompt,
 )
-from app.tasks.models import Task, TaskLease
+from app.tasks.models import Task, TaskAttempt, TaskLease
 from app.tests.governance.helpers import make_service_identity
 from app.tests.tasks.conftest import TaskWorld
 from app.tests.tasks.fake_runtime import FakeRuntimeAdapter
@@ -89,6 +105,36 @@ def _assert_lease_released(session: Session, task: Task) -> None:
     leases = _leases(session, task)
     assert leases, "the dispatcher must claim before it can release"
     assert all(lease.released_at is not None for lease in leases)
+
+
+def _grant(session: Session, task: Task) -> ExecutionGrant:
+    grant = session.scalar(
+        select(ExecutionGrant).where(
+            ExecutionGrant.grant_id == task.grant_id
+        )
+    )
+    assert grant is not None
+    return grant
+
+
+def _attempt(session: Session, task: Task) -> TaskAttempt:
+    attempt = session.scalar(
+        select(TaskAttempt).where(TaskAttempt.task_id == task.task_id)
+    )
+    assert attempt is not None
+    return attempt
+
+
+def _runtime_grant() -> RuntimeGrant:
+    return RuntimeGrant(
+        grant_id="grnt_fake_0001",
+        task_id="task_fake_0001",
+        task_revision=1,
+        execution_mode="managed_execution",
+        capabilities=("expense.read@1.0.0",),
+        resource_scope={"scope_type": "expense_claim"},
+        expires_at=utcnow() + timedelta(hours=1),
+    )
 
 
 def _capabilities(
@@ -140,26 +186,152 @@ def test_run_once_returns_idle_without_a_managed_task(
     assert session.scalars(select(TaskLease)).all() == []
 
 
-def test_run_once_reaches_preflight_ok_without_submitting(
+def test_accepted_submit_binds_runtime_handle(
     session: Session, world: TaskWorld
 ) -> None:
     task = submit_managed(session, world)
     session.commit()
-    adapter = FakeRuntimeAdapter()
+    grant = _grant(session, task)
+    expected_key = build_runtime_idempotency_key(task, grant, 1)
+    expected_prompt = build_runtime_prompt(task)
+    adapter = FakeRuntimeAdapter(
+        submit=SubmitResult(
+            outcome=SubmitOutcome.ACCEPTED,
+            runtime_task_id="rtask_fake_0001",
+        )
+    )
 
     result = _dispatcher(session, world, adapter=adapter).run_once()
 
-    assert result.outcome == "preflight_ok"
+    assert result.outcome == "accepted"
     assert result.task_id == task.task_id
-    assert result.runtime_task_id is None
-    # The managed task is claimable again and no execution fact was written.
-    assert task.state == "queued"
-    assert task.attempt == 0
-    assert task.runtime_task_id is None
-    assert adapter.capability_probes == [False]
-    assert adapter.health_calls == 1
-    assert adapter.submit_calls == []
-    _assert_lease_released(session, task)
+    assert result.runtime_task_id == "rtask_fake_0001"
+    assert task.state == "dispatched"
+    assert task.runtime_task_id == "rtask_fake_0001"
+    # Managed execution never carries an ``exec_*`` handle.
+    assert task.execution_ref is None
+    assert task.attempt == 1
+    assert len(adapter.submit_calls) == 1
+    submitted_task_id, submitted_key, submitted_grant_id, submitted_prompt = (
+        adapter.submit_calls[0]
+    )
+    assert submitted_task_id == task.task_id
+    assert submitted_grant_id == task.grant_id
+    assert submitted_key == expected_key
+    assert submitted_prompt == expected_prompt
+    attempt = _attempt(session, task)
+    assert attempt.attempt_number == 1
+    assert attempt.runtime_ref == "rtask_fake_0001"
+    assert attempt.execution_ref is None
+    assert attempt.idempotency_key == expected_key
+    # The lease stays held so the status/result work can keep writing under
+    # the same fencing token.
+    assert _leases(session, task)[-1].released_at is None
+
+
+# -- key and prompt -----------------------------------------------------------
+
+
+def test_runtime_key_is_stable_per_attempt_and_changes_with_grant() -> None:
+    task = SimpleNamespace(task_id="task_key_fixture_0001")
+    grant = SimpleNamespace(grant_id="grnt_key_fixture_0001")
+
+    first = build_runtime_idempotency_key(task, grant, 1)
+    assert first == build_runtime_idempotency_key(task, grant, 1)
+    assert first.startswith("idem_")
+    assert len(first) <= 64
+    # A retry of the same attempt reuses the key; a new attempt does not.
+    assert first != build_runtime_idempotency_key(task, grant, 2)
+    # A fresh Grant changes the key even for the same attempt number.
+    assert first != build_runtime_idempotency_key(
+        task, SimpleNamespace(grant_id="grnt_key_fixture_0002"), 1
+    )
+    # A different task never shares a runtime key.
+    assert first != build_runtime_idempotency_key(
+        SimpleNamespace(task_id="task_key_fixture_0002"), grant, 1
+    )
+
+
+def test_same_runtime_key_reuses_a_single_runtime_task() -> None:
+    adapter = FakeRuntimeAdapter()
+    grant = _runtime_grant()
+    key = build_runtime_idempotency_key(
+        SimpleNamespace(task_id="task_fake_0001"),
+        SimpleNamespace(grant_id="grnt_fake_0001"),
+        1,
+    )
+
+    first = adapter.submit_task("task_fake_0001", "{}", key, grant)
+    second = adapter.submit_task("task_fake_0001", "{}", key, grant)
+
+    assert first.outcome is SubmitOutcome.ACCEPTED
+    assert second.outcome is SubmitOutcome.ACCEPTED
+    assert second.runtime_task_id == first.runtime_task_id
+    assert second.replayed is True
+    assert adapter.created_runtime_task_ids == [first.runtime_task_id]
+    assert [call[1] for call in adapter.submit_calls] == [key, key]
+
+
+def test_runtime_prompt_is_canonical_and_bounded() -> None:
+    task = SimpleNamespace(
+        goal={
+            "summary": "Read one synthetic managed expense",
+            "completion_criteria": [
+                {"criterion_id": "crit_fixture_0001", "expected": "submitted"}
+            ],
+        },
+        payload={"expense_id": "exp_fixture_0001", "amount": "12.00"},
+        principal_id="prin_should_never_leak",
+        grant_id="grnt_should_never_leak",
+    )
+
+    prompt = build_runtime_prompt(task)
+
+    assert prompt == canonical_json(
+        {"goal": task.goal, "payload": task.payload}
+    )
+    assert build_runtime_prompt(task) == prompt
+    assert len(prompt.encode("utf-8")) <= MAX_RUNTIME_PROMPT_BYTES
+    # Identity/authority columns are not part of the prompt.
+    assert "prin_should_never_leak" not in prompt
+    assert "grnt_should_never_leak" not in prompt
+
+
+def test_runtime_prompt_never_includes_credentials() -> None:
+    task = SimpleNamespace(
+        goal={"summary": "Read one synthetic managed expense"},
+        payload={
+            "expense_id": "exp_fixture_0001",
+            "api_key": "sk-live-do-not-leak",
+            "nested": {"client_secret": "nested-secret", "amount": "12.00"},
+            "items": [{"access_token": "token-secret", "sku": "SKU-1"}],
+        },
+    )
+
+    prompt = build_runtime_prompt(task)
+
+    for leaked in (
+        "sk-live-do-not-leak",
+        "nested-secret",
+        "token-secret",
+        "api_key",
+        "client_secret",
+        "access_token",
+    ):
+        assert leaked not in prompt
+    # Non-credential governed fields survive the redaction.
+    assert "exp_fixture_0001" in prompt
+    assert "SKU-1" in prompt
+
+
+def test_runtime_prompt_refuses_oversize_governed_input() -> None:
+    task = SimpleNamespace(
+        goal={"summary": "oversize fixture"},
+        payload={"blob": "x" * MAX_RUNTIME_PROMPT_BYTES},
+    )
+
+    with pytest.raises(RuntimePromptTooLarge):
+        build_runtime_prompt(task)
 
 
 # -- capabilities -------------------------------------------------------------
@@ -300,6 +472,110 @@ def test_expired_grant_never_reaches_the_adapter(
     _assert_lease_released(session, task)
 
 
+# -- decision binding ---------------------------------------------------------
+
+
+def test_grant_decision_binding_mismatch_never_submits(
+    session: Session, world: TaskWorld
+) -> None:
+    task = submit_managed(session, world)
+    session.commit()
+    grant = _grant(session, task)
+    # Keep the row structurally valid but no longer the persisted decision's
+    # hash.  The projection alone cannot see this; the dispatcher must.
+    grant.decision_hash = "sha256:" + "0" * 64
+    session.commit()
+    adapter = FakeRuntimeAdapter()
+
+    result = _dispatcher(session, world, adapter=adapter).run_once()
+
+    assert result.outcome == "unavailable"
+    assert result.task_id == task.task_id
+    assert result.detail == (
+        f"{DECISION_BINDING_MISMATCH}:grant_decision_hash_mismatch"
+    )
+    assert task.state == "failed"
+    assert task.result["outcome"] == "unavailable"
+    assert task.result["error_code"] == DECISION_BINDING_MISMATCH
+    # The binding is proven before capability, health, key/prompt or submit.
+    assert adapter.capability_probes == []
+    assert adapter.health_calls == 0
+    assert adapter.submit_calls == []
+    _assert_lease_released(session, task)
+
+
+# -- post-accept binding failure ---------------------------------------------
+
+
+def test_binding_failure_cancels_and_enters_unknown(
+    session: Session, world: TaskWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = submit_managed(session, world)
+    session.commit()
+    adapter = FakeRuntimeAdapter(
+        submit=SubmitResult(
+            outcome=SubmitOutcome.ACCEPTED,
+            runtime_task_id="rtask_fake_0001",
+        )
+    )
+
+    def _reject_binding(*args: object, **kwargs: object) -> Task:
+        raise TaskError(
+            "task_fencing_token_stale", "the attempt binding was rejected"
+        )
+
+    monkeypatch.setattr(
+        task_service, "start_attempt", _reject_binding
+    )
+
+    result = _dispatcher(session, world, adapter=adapter).run_once()
+
+    assert result.outcome == "unknown"
+    assert result.task_id == task.task_id
+    assert result.runtime_task_id == "rtask_fake_0001"
+    assert result.detail == RUNTIME_BIND_FAILED
+    assert task.state == "unknown"
+    assert task.attempt == 0
+    assert task.runtime_task_id is None
+    assert task.result["outcome"] == "unknown"
+    assert task.result["error_code"] == RUNTIME_BIND_FAILED
+    assert task.grant_status == "revoked"
+    # Exactly one submission; the accepted handle is cancelled best-effort.
+    assert len(adapter.submit_calls) == 1
+    submitted_key = adapter.submit_calls[0][1]
+    assert adapter.cancel_calls == [
+        {
+            "runtime_task_id": "rtask_fake_0001",
+            "reason": RUNTIME_BIND_FAILED,
+            "idempotency_key": submitted_key,
+            "task_id": task.task_id,
+        }
+    ]
+    _assert_lease_released(session, task)
+
+
+def test_oversize_prompt_is_rejected_without_submitting(
+    session: Session, world: TaskWorld
+) -> None:
+    task = submit_managed(
+        session,
+        world,
+        key="idem_task_managed_oversize_0001",
+        payload={"blob": "x" * MAX_RUNTIME_PROMPT_BYTES},
+    )
+    session.commit()
+    adapter = FakeRuntimeAdapter()
+
+    result = _dispatcher(session, world, adapter=adapter).run_once()
+
+    assert result.outcome == "rejected"
+    assert result.detail == RUNTIME_PROMPT_TOO_LARGE
+    assert task.state == "failed"
+    assert task.result["error_code"] == RUNTIME_PROMPT_TOO_LARGE
+    assert adapter.submit_calls == []
+    _assert_lease_released(session, task)
+
+
 # -- service principal --------------------------------------------------------
 
 
@@ -361,9 +637,9 @@ def test_dispatcher_accepts_an_active_runtime_principal(
         session, world, principal=runtime_principal
     ).run_once()
 
-    assert result.outcome == "preflight_ok"
+    assert result.outcome == "accepted"
     assert result.task_id == task.task_id
-    _assert_lease_released(session, task)
+    assert _leases(session, task)[-1].released_at is None
 
 
 # -- transaction boundary and loop -------------------------------------------

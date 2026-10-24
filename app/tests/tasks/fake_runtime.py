@@ -77,7 +77,9 @@ class FakeRuntimeAdapter:
 
     * ``capabilities`` is ``verified`` (set ``capabilities_verified=False`` to
       script an unsupported runtime);
-    * ``submit`` is ``accepted``;
+    * ``submit`` is ``accepted`` (an ACCEPTED result with a handle is
+      remembered per ``(task_id, idempotency_key)``; a repeat returns the same
+      handle with ``replayed=True`` and creates no second runtime task);
     * ``lookup`` is ``unknown`` and ``get_result`` is ``unknown`` (never a
       definite "not found"/"succeeded" answer the test did not ask for);
     * ``cancel`` is ``requested`` with ``stop_confirmed=False``;
@@ -117,9 +119,14 @@ class FakeRuntimeAdapter:
         self._cancel = cancel
         self._events = events
         self._provide_input = provide_input
+        self._runtime_task_by_key: dict[tuple[str, str], str] = {}
 
         #: ``(task_id, idempotency_key, grant_id, prompt)`` per submission.
         self.submit_calls: list[tuple[str, str, str, str]] = []
+        #: Handles actually created by the fake, in creation order.  A replay
+        #: with the same ``(task_id, idempotency_key)`` returns the existing
+        #: handle and does **not** append here.
+        self.created_runtime_task_ids: list[str] = []
         self.lookup_calls: list[tuple[str, str, str, str | None]] = []
         self.status_calls: list[tuple[str, str | None]] = []
         self.cancel_calls: list[dict[str, object]] = []
@@ -188,14 +195,36 @@ class FakeRuntimeAdapter:
         self.submit_calls.append(
             (task_id, idempotency_key, grant.grant_id, prompt)
         )
+        # The runtime idempotency contract: the same task/key reuses one
+        # handle and reports the replay; it never creates a second run.
+        existing = self._runtime_task_by_key.get((task_id, idempotency_key))
+        if existing is not None:
+            return SubmitResult(
+                outcome=SubmitOutcome.ACCEPTED,
+                runtime_task_id=existing,
+                accepted_at=self.now,
+                reported_state=RuntimeState.ACCEPTED.value,
+                replayed=True,
+            )
         if self._submit is not None:
-            return self._submit
-        return SubmitResult(
-            outcome=SubmitOutcome.ACCEPTED,
-            runtime_task_id=self.runtime_task_id,
-            accepted_at=self.now,
-            reported_state=RuntimeState.ACCEPTED.value,
-        )
+            result = self._submit
+        else:
+            result = SubmitResult(
+                outcome=SubmitOutcome.ACCEPTED,
+                runtime_task_id=self.runtime_task_id,
+                accepted_at=self.now,
+                reported_state=RuntimeState.ACCEPTED.value,
+            )
+        if (
+            result.outcome is SubmitOutcome.ACCEPTED
+            and isinstance(result.runtime_task_id, str)
+            and result.runtime_task_id
+        ):
+            self._runtime_task_by_key[(task_id, idempotency_key)] = (
+                result.runtime_task_id
+            )
+            self.created_runtime_task_ids.append(result.runtime_task_id)
+        return result
 
     def find_by_idempotency_key(
         self,

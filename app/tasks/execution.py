@@ -1,4 +1,4 @@
-"""Managed Execution dispatcher: claim, preflight and fail-closed mapping.
+"""Managed Execution dispatcher: claim, preflight, submit and bind.
 
 This module is the production caller that connects the task/ExecutionGrant core
 to the frozen :class:`app.runtime.contract.RuntimeAdapter` protocol.  It only
@@ -7,21 +7,29 @@ tasks stay client/PEP driven.
 
 Scope of the current implementation
 -----------------------------------
-Only the **preflight** half of the loop is implemented here:
+The whole **submission** half of the loop is implemented here, inside one
+lease:
 
 1. validate the injected service principal;
 2. claim one managed task with the existing lease/fencing machinery;
 3. load the task-bound :class:`~app.governance.models.ExecutionGrant` and
    project it with :func:`app.runtime.projection.project_runtime_grant`;
-4. require ``task.submit`` **and** ``task.status`` to be ``verified``;
-5. probe ``adapter.health()``;
-6. record a domain rejection through the existing
-   :func:`app.tasks.service.record_dispatch_failure` path, or stop at a clean
-   ``preflight_ok`` result.
+4. verify the persisted :class:`~app.governance.models.GovernanceDecisionRecord`
+   binding **before any adapter call** (task, decision id/hash, task revision);
+5. require ``task.submit`` **and** ``task.status`` to be ``verified``;
+6. probe ``adapter.health()``;
+7. build the stable runtime idempotency key and the canonical, bounded,
+   credential-free prompt;
+8. call ``adapter.submit_task`` exactly once for this pass;
+9. on ``accepted``, bind the returned ``rtask_*`` handle through
+   :func:`app.tasks.service.start_attempt` and keep the lease for the later
+   status/result work.  If binding is rejected after acceptance, best-effort
+   cancel the runtime task and record an honest ``unknown`` outcome (never a
+   fake "rejected" and never a second submit).
 
-Submission, status/result mapping, cancellation and lease recovery are added by
-later tasks.  ``run_once`` therefore never calls ``adapter.submit_task`` today,
-and it never calls ``task_service.complete_task``: a runtime self-report can
+Status polling, the full submit failure/lookup matrix (timeout/unknown/conflict
+adoption), result mapping and lease recovery are added by later tasks.  This
+module never calls ``task_service.complete_task``: a runtime self-report can
 never become ``succeeded``.
 
 Transaction boundary
@@ -34,21 +42,26 @@ the supplied factory for every iteration.
 
 from __future__ import annotations
 
+import hashlib
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.governance.models import ExecutionGrant
+from app.governance.models import ExecutionGrant, GovernanceDecisionRecord
+from app.governance.policies import canonical_json
 from app.governance.principal import GovernancePrincipal
 from app.runtime.contract import (
     CapabilityStatus,
     HealthStatus,
     RuntimeAdapter,
     RuntimeCapability,
+    SubmitOutcome,
+    SubmitResult,
 )
 from app.runtime.projection import (
     MANAGED_EXECUTION_MODE,
@@ -61,11 +74,19 @@ from app.tasks.errors import TaskError
 from app.tasks.models import Task, TaskLease
 
 __all__ = [
+    "DECISION_BINDING_MISMATCH",
+    "MAX_RUNTIME_PROMPT_BYTES",
     "REQUIRED_CAPABILITIES",
+    "RUNTIME_BIND_FAILED",
     "RUNTIME_CAPABILITY_UNVERIFIED",
+    "RUNTIME_PROMPT_TOO_LARGE",
+    "RUNTIME_SUBMIT_HANDLE_INVALID",
     "DispatcherConfig",
     "DispatcherResult",
     "RuntimeDispatcher",
+    "RuntimePromptTooLarge",
+    "build_runtime_idempotency_key",
+    "build_runtime_prompt",
 ]
 
 #: Capabilities the adapter must report as ``verified`` before a managed task
@@ -80,8 +101,147 @@ REQUIRED_CAPABILITIES: tuple[RuntimeCapability, ...] = (
 #: names the missing capabilities for the caller's logs.
 RUNTIME_CAPABILITY_UNVERIFIED = "runtime_capability_unverified"
 
+#: Stable reason recorded when the persisted Grant does not match the persisted
+#: decision it claims to derive from.  The adapter is never called.
+DECISION_BINDING_MISMATCH = "decision_binding_mismatch"
+
+#: Stable reason recorded when the runtime accepted a submission but the
+#: binding raised.  The task enters ``unknown``; it is never retried in place.
+RUNTIME_BIND_FAILED = "runtime_bind_failed"
+
+#: Stable reason recorded when an accepted result carried no usable handle.
+RUNTIME_SUBMIT_HANDLE_INVALID = "runtime_submit_handle_invalid"
+
+#: Stable reason recorded when the governed goal/payload cannot fit the prompt
+#: limit.  The task is rejected locally instead of sending an unbounded prompt.
+RUNTIME_PROMPT_TOO_LARGE = "runtime_prompt_too_large"
+
+#: Hard upper bound for the canonical UTF-8 runtime prompt.  A governed task
+#: whose goal/payload exceeds this is not submitted; 16 KiB keeps the request
+#: well inside the runtime boundary's per-request budget while leaving ample
+#: room for a normal task document.
+MAX_RUNTIME_PROMPT_BYTES = 16 * 1024
+
 #: Principal types allowed to write Managed Execution facts.
 _SERVICE_PRINCIPAL_TYPES = frozenset({"service", "runtime"})
+
+#: Key-name fragments (normalised to lower-case alphanumerics) that mark a
+#: value as a credential.  Such keys are dropped from the prompt rather than
+#: forwarded to the runtime; the governed payload is not a secret channel.
+_SENSITIVE_KEY_FRAGMENTS: tuple[str, ...] = (
+    "accesstoken",
+    "accesskey",
+    "apikey",
+    "authorization",
+    "bearer",
+    "credential",
+    "password",
+    "passwd",
+    "privatekey",
+    "secret",
+    "sessionkey",
+    "token",
+)
+
+
+class RuntimePromptTooLarge(ValueError):
+    """The canonical governed prompt exceeds :data:`MAX_RUNTIME_PROMPT_BYTES`.
+
+    The caller must not send it; it records a local rejection instead.  The
+    message only contains sizes, never prompt content.
+    """
+
+    def __init__(self, size: int, limit: int) -> None:
+        self.size = size
+        self.limit = limit
+        super().__init__(
+            f"runtime prompt is {size} bytes; the limit is {limit}"
+        )
+
+
+def build_runtime_idempotency_key(
+    task: object, grant: object, attempt_number: int
+) -> str:
+    """Return the stable runtime submission key for one attempt of one Grant.
+
+    The key is derived only from server-owned identifiers (task id, grant id)
+    and the attempt number, so the same attempt retried after a crash reuses
+    the same key (:class:`~app.runtime.contract.RuntimeAdapter` idempotency),
+    while a new Grant or a new attempt gets a different key.  A client never
+    supplies any part of it.
+    """
+
+    if (
+        isinstance(attempt_number, bool)
+        or not isinstance(attempt_number, int)
+        or attempt_number < 1
+    ):
+        raise ValueError("attempt_number must be a positive integer")
+    task_id = getattr(task, "task_id", None)
+    grant_id = getattr(grant, "grant_id", None)
+    if not isinstance(task_id, str) or not task_id:
+        raise ValueError("task must have a non-empty task_id")
+    if not isinstance(grant_id, str) or not grant_id:
+        raise ValueError("grant must have a non-empty grant_id")
+
+    material = (
+        "agentmgr.runtime.submit.v1\n"
+        f"{task_id}\n{grant_id}\n{attempt_number}"
+    )
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
+    # ``idem_`` + 40 hex characters stays inside the repository's 64-char
+    # idempotency-key bounds and is collision-safe for this namespace.
+    return "idem_" + digest[:40]
+
+
+def build_runtime_prompt(task: object) -> str:
+    """Render the governed ``goal``/``payload`` as a canonical runtime prompt.
+
+    The output is RFC 8785 JCS canonical JSON (UTF-8, sorted keys, no
+    whitespace), built only from the persisted, already-governed task columns.
+    No identity, authority, session or credential field is added.  Nested keys
+    that name a credential are dropped so a stray secret in the governed
+    payload can never cross the runtime boundary.
+
+    Raises:
+        RuntimePromptTooLarge: the canonical prompt exceeds the fixed bound.
+        TypeError: the persisted columns are not JSON-shaped (fail closed).
+    """
+
+    goal = getattr(task, "goal", None) or {}
+    payload = getattr(task, "payload", None) or {}
+    if not isinstance(goal, Mapping) or not isinstance(payload, Mapping):
+        raise TypeError("task goal and payload must be JSON objects")
+
+    prompt = canonical_json(
+        {
+            "goal": _redact_credentials(goal),
+            "payload": _redact_credentials(payload),
+        }
+    )
+    size = len(prompt.encode("utf-8"))
+    if size > MAX_RUNTIME_PROMPT_BYTES:
+        raise RuntimePromptTooLarge(size, MAX_RUNTIME_PROMPT_BYTES)
+    return prompt
+
+
+def _redact_credentials(value: Any) -> Any:
+    """Return a JSON-shaped copy with credential-named object keys removed."""
+
+    if isinstance(value, Mapping):
+        return {
+            key: _redact_credentials(item)
+            for key, item in value.items()
+            if not (isinstance(key, str) and _is_sensitive_key(key))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_credentials(item) for item in value]
+    return value
+
+
+def _is_sensitive_key(key: str) -> bool:
+    normalised = "".join(char for char in key.lower() if char.isalnum())
+    return any(fragment in normalised for fragment in _SENSITIVE_KEY_FRAGMENTS)
 
 
 def _utcnow() -> datetime:
@@ -106,10 +266,12 @@ class DispatcherConfig:
 class DispatcherResult:
     """Stable, non-sensitive outcome of one dispatch pass.
 
-    Outcomes produced so far: ``idle``, ``preflight_ok``, ``unavailable``
-    (invalid/revoked/expired Grant), ``unsupported`` (capability gap) and
-    ``adapter_unavailable`` (health/degraded).  Later tasks add the
-    submission/execution outcomes.
+    Outcomes produced so far: ``idle``, ``accepted`` (submitted and bound),
+    ``unavailable`` (invalid/revoked/expired Grant or decision-binding
+    mismatch), ``unsupported`` (capability gap or adapter unsupported),
+    ``adapter_unavailable`` (health/degraded), ``rejected`` (definite local or
+    adapter rejection) and ``unknown`` (ambiguous submission or post-accept
+    binding failure).
 
     ``detail`` is a short machine-readable code, never a payload, credential or
     runtime URL.
@@ -200,7 +362,7 @@ class RuntimeDispatcher:
         # payload never supplies or widens it.
         grant = self._load_grant(task)
         try:
-            project_runtime_grant(task, grant, now=timestamp)
+            runtime_grant = project_runtime_grant(task, grant, now=timestamp)
         except GrantProjectionError as exc:
             # No runtime call is made: the Grant does not prove a usable
             # managed authority for this task.
@@ -215,6 +377,26 @@ class RuntimeDispatcher:
                 outcome="unavailable",
                 task_id=task.task_id,
                 detail=exc.reason_code,
+            )
+
+        # The Grant is only as trustworthy as the decision it derives from.
+        # Verify that binding from persisted rows *before* any adapter call,
+        # so a mutated/forged Grant can never turn into a runtime submission.
+        binding_mismatch = self._decision_binding_mismatch(
+            task, grant, self._load_decision(task)
+        )
+        if binding_mismatch is not None:
+            self._record_failure(
+                task,
+                lease,
+                outcome="unavailable",
+                reason=DECISION_BINDING_MISMATCH,
+                now=timestamp,
+            )
+            return DispatcherResult(
+                outcome="unavailable",
+                task_id=task.task_id,
+                detail=f"{DECISION_BINDING_MISMATCH}:{binding_mismatch}",
             )
 
         missing = self._unverified_capabilities()
@@ -243,11 +425,46 @@ class RuntimeDispatcher:
                 detail=health.status.value,
             )
 
-        # Submission and binding arrive with the next task.  Releasing the
-        # lease here keeps the task claimable instead of stranding it until the
-        # lease expires.
-        self._release(task, lease, now=timestamp)
-        return DispatcherResult(outcome="preflight_ok", task_id=task.task_id)
+        attempt_number = task.attempt + 1
+        idempotency_key = build_runtime_idempotency_key(
+            task, grant, attempt_number
+        )
+        try:
+            prompt = build_runtime_prompt(task)
+        except RuntimePromptTooLarge:
+            # Never send an unbounded prompt.  No runtime call was made, so the
+            # never-dispatched rejection path applies.
+            self._record_failure(
+                task,
+                lease,
+                outcome="rejected",
+                reason=RUNTIME_PROMPT_TOO_LARGE,
+                now=timestamp,
+            )
+            return DispatcherResult(
+                outcome="rejected",
+                task_id=task.task_id,
+                detail=RUNTIME_PROMPT_TOO_LARGE,
+            )
+
+        submission = self._adapter.submit_task(
+            task.task_id, prompt, idempotency_key, runtime_grant
+        )
+        if submission.outcome is SubmitOutcome.ACCEPTED:
+            return self._bind_accepted(
+                task,
+                lease,
+                submission,
+                idempotency_key=idempotency_key,
+                now=timestamp,
+            )
+
+        # The full lookup/adoption matrix for timeout/unknown/conflict arrives
+        # with the reconciliation task.  Until then ambiguous outcomes fail
+        # closed as ``unknown`` and are never resubmitted.
+        return self._record_submit_refusal(
+            task, lease, submission, now=timestamp
+        )
 
     # -- helpers -------------------------------------------------------------
 
@@ -279,6 +496,175 @@ class RuntimeDispatcher:
             )
         )
 
+    def _load_decision(self, task: Task) -> GovernanceDecisionRecord | None:
+        if not task.decision_id:
+            return None
+        return self._session.scalar(
+            select(GovernanceDecisionRecord).where(
+                GovernanceDecisionRecord.decision_id == task.decision_id
+            )
+        )
+
+    def _decision_binding_mismatch(
+        self,
+        task: Task,
+        grant: ExecutionGrant | None,
+        record: GovernanceDecisionRecord | None,
+    ) -> str | None:
+        """Return the safe field label when the Grant/decision binding fails.
+
+        This is a persisted-state check only.  It runs before capability/health
+        probes and before the key/prompt are built, so a mismatch can never
+        reach the adapter.
+        """
+
+        if record is None:
+            return "decision_missing"
+        if record.task_id != task.task_id:
+            return "decision_task_mismatch"
+        if grant is None:
+            return "grant_missing"
+        if grant.decision_id != record.decision_id:
+            return "grant_decision_mismatch"
+        if grant.decision_hash != record.decision_hash:
+            return "grant_decision_hash_mismatch"
+        if grant.task_revision != record.task_revision:
+            return "grant_task_revision_mismatch"
+        return None
+
+    def _bind_accepted(
+        self,
+        task: Task,
+        lease: TaskLease,
+        submission: SubmitResult,
+        *,
+        idempotency_key: str,
+        now: datetime,
+    ) -> DispatcherResult:
+        """Bind an accepted runtime handle to the task, or fail closed.
+
+        The lease stays held after a successful bind so the later status/result
+        work can keep writing execution facts under the same fencing token.
+        """
+
+        runtime_task_id = submission.runtime_task_id
+        if (
+            not isinstance(runtime_task_id, str)
+            or not runtime_task_id.startswith("rtask_")
+        ):
+            # The runtime says it accepted but returned no usable handle: there
+            # is nothing to bind and nothing to cancel by id.  The submission is
+            # ambiguous, so the task must reconcile instead of retrying.
+            self._record_failure(
+                task,
+                lease,
+                outcome="unknown",
+                reason=RUNTIME_SUBMIT_HANDLE_INVALID,
+                now=now,
+            )
+            return DispatcherResult(
+                outcome="unknown",
+                task_id=task.task_id,
+                detail=RUNTIME_SUBMIT_HANDLE_INVALID,
+            )
+
+        try:
+            task_service.start_attempt(
+                self._session,
+                task_id=task.task_id,
+                actor=self._service_principal,
+                worker_id=self._config.worker_id,
+                fencing_token=lease.fencing_token,
+                runtime_ref=runtime_task_id,
+                idempotency_key=idempotency_key,
+                now=now,
+            )
+        except TaskError:
+            # The runtime already accepted the work.  A lease/fencing/state
+            # rejection must not be recorded as "rejected" (that would claim no
+            # side effect) and must never trigger a second submit.  Best-effort
+            # cancel, then enter the honest unknown/reconciliation state.
+            self._cancel_after_accept(
+                runtime_task_id, idempotency_key, task
+            )
+            self._record_failure(
+                task,
+                lease,
+                outcome="unknown",
+                reason=RUNTIME_BIND_FAILED,
+                now=now,
+            )
+            return DispatcherResult(
+                outcome="unknown",
+                task_id=task.task_id,
+                runtime_task_id=runtime_task_id,
+                detail=RUNTIME_BIND_FAILED,
+            )
+
+        return DispatcherResult(
+            outcome="accepted",
+            task_id=task.task_id,
+            runtime_task_id=runtime_task_id,
+        )
+
+    def _cancel_after_accept(
+        self,
+        runtime_task_id: str,
+        idempotency_key: str,
+        task: Task,
+    ) -> None:
+        """Ask the runtime to stop a submission we could not bind.
+
+        Cancellation is best effort by contract: a ``requested`` result is not
+        a stop, and a failed cancel call must not hide the unknown outcome.
+        """
+
+        try:
+            self._adapter.cancel_task(
+                runtime_task_id,
+                reason=RUNTIME_BIND_FAILED,
+                idempotency_key=idempotency_key,
+                task_id=task.task_id,
+            )
+        except Exception:  # noqa: BLE001 - best-effort stop; unknown is recorded
+            # The runtime may already be unreachable.  The task still records
+            # ``unknown`` and its grant is invalidated, so no retry can reuse
+            # the accepted handle.
+            return
+
+    def _record_submit_refusal(
+        self,
+        task: Task,
+        lease: TaskLease,
+        submission: SubmitResult,
+        *,
+        now: datetime,
+    ) -> DispatcherResult:
+        """Record a non-accepted submit outcome without ever resubmitting."""
+
+        if submission.outcome is SubmitOutcome.UNSUPPORTED:
+            outcome = "unsupported"
+        elif submission.outcome is SubmitOutcome.REJECTED:
+            outcome = "rejected"
+        else:
+            # timeout / unknown / conflict: the runtime may have accepted the
+            # work.  The reconciliation task adds the lookup/adoption path; for
+            # now the only safe action is an honest unknown with no retry.
+            outcome = "unknown"
+        reason = f"runtime_submit_{submission.outcome.value}"
+        self._record_failure(
+            task,
+            lease,
+            outcome=outcome,
+            reason=reason,
+            now=now,
+        )
+        return DispatcherResult(
+            outcome=outcome,
+            task_id=task.task_id,
+            detail=reason,
+        )
+
     def _unverified_capabilities(self) -> tuple[str, ...]:
         snapshot = self._adapter.capabilities()
         missing: list[str] = []
@@ -300,7 +686,7 @@ class RuntimeDispatcher:
         reason: str,
         now: datetime,
     ) -> None:
-        """Record a pre-submission rejection and release the claim."""
+        """Record one dispatch outcome and release the claim."""
         task_service.record_dispatch_failure(
             self._session,
             task_id=task.task_id,
