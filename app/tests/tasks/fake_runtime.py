@@ -72,10 +72,13 @@ class FakeRuntimeAdapter:
     Parameters script one response per protocol method.  ``status`` also
     accepts a sequence: each ``get_status`` call consumes the next item and the
     final item repeats, so a test can script a short state progression.
-    ``lookup`` accepts a sequence in the same way, which lets a test script
-    ``unknown`` followed by ``found`` (or any other reconciliation
-    progression).  ``lookup_error`` raises from ``find_by_idempotency_key``
-    instead of returning a result.
+    ``result`` accepts a sequence in the same way.  ``lookup`` accepts a
+    sequence in the same way, which lets a test script ``unknown`` followed by
+    ``found`` (or any other reconciliation progression).  ``lookup_error``
+    raises from ``find_by_idempotency_key`` instead of returning a result;
+    ``status_error``/``result_error`` do the same for the status/result calls
+    so a test can prove the dispatcher fails closed when those facts cannot be
+    read.
 
     Unscripted defaults are deliberately conservative:
 
@@ -84,6 +87,8 @@ class FakeRuntimeAdapter:
     * ``submit`` is ``accepted`` (an ACCEPTED result with a handle is
       remembered per ``(task_id, idempotency_key)``; a repeat returns the same
       handle with ``replayed=True`` and creates no second runtime task);
+    * ``status`` is ``accepted`` (never a terminal state the test did not ask
+      for, and a stable answer that proves the poll loop always terminates);
     * ``lookup`` is ``unknown`` and ``get_result`` is ``unknown`` (never a
       definite "not found"/"succeeded" answer the test did not ask for);
     * ``cancel`` is ``requested`` with ``stop_confirmed=False``;
@@ -100,7 +105,9 @@ class FakeRuntimeAdapter:
         health: HealthStatus | BaseException = HealthStatus.HEALTHY,
         submit: SubmitResult | None = None,
         status: StatusResult | Sequence[StatusResult] | None = None,
-        result: RuntimeResult | None = None,
+        status_error: BaseException | None = None,
+        result: RuntimeResult | Sequence[RuntimeResult] | None = None,
+        result_error: BaseException | None = None,
         lookup: LookupResult | Sequence[LookupResult] | None = None,
         lookup_error: BaseException | None = None,
         cancel: CancelResult | None = None,
@@ -119,7 +126,10 @@ class FakeRuntimeAdapter:
         self._submit = submit
         self._status = status
         self._status_index = 0
+        self.status_error = status_error
         self._result = result
+        self._result_index = 0
+        self.result_error = result_error
         self._lookup = lookup
         self._lookup_index = 0
         self.lookup_error = lookup_error
@@ -269,6 +279,8 @@ class FakeRuntimeAdapter:
         task_id: str | None = None,
     ) -> StatusResult:
         self.status_calls.append((runtime_task_id, task_id))
+        if self.status_error is not None:
+            raise self.status_error
         return self._next_status(runtime_task_id)
 
     def poll_events(
@@ -292,19 +304,29 @@ class FakeRuntimeAdapter:
         task_id: str | None = None,
     ) -> RuntimeResult:
         self.result_calls.append((runtime_task_id, task_id))
-        if self._result is not None:
-            return self._result
-        return RuntimeResult(
-            outcome=ResultOutcome.UNKNOWN,
-            result_ref=None,
-            summary=None,
-            structured_payload=None,
-            artifacts=(),
-            evidence_refs=(),
-            verification_hints=(),
-            stop_confirmed=False,
-            completed_at=None,
-        )
+        if self.result_error is not None:
+            raise self.result_error
+        scripted = self._result
+        if scripted is None:
+            return RuntimeResult(
+                outcome=ResultOutcome.UNKNOWN,
+                result_ref=None,
+                summary=None,
+                structured_payload=None,
+                artifacts=(),
+                evidence_refs=(),
+                verification_hints=(),
+                stop_confirmed=False,
+                completed_at=None,
+            )
+        if isinstance(scripted, RuntimeResult):
+            return scripted
+        items = list(scripted)
+        if not items:
+            raise AssertionError("FakeRuntimeAdapter result sequence is empty")
+        index = min(self._result_index, len(items) - 1)
+        self._result_index += 1
+        return items[index]
 
     # -- control -------------------------------------------------------------
 
