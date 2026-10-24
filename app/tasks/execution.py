@@ -173,7 +173,7 @@ from app.runtime.projection import (
 from app.tasks import service as task_service
 from app.tasks import verification
 from app.tasks import worker
-from app.tasks.errors import TaskError
+from app.tasks.errors import TaskError, TaskStateConflict
 from app.tasks.models import Task, TaskAttempt, TaskLease
 
 __all__ = [
@@ -1624,6 +1624,10 @@ class RuntimeDispatcher:
 
             # The task may have moved while the adapter call was in flight.
             self._session.refresh(task)
+            # Captured before any adapter result/status work below: a cancel
+            # that commits during those calls must make the running write
+            # conflict instead of being absorbed by T49.
+            expected_revision = task.state_revision
             state = status.state
             if task.state == "cancel_requested":
                 # The cancel may have landed before *or* during this
@@ -1641,19 +1645,35 @@ class RuntimeDispatcher:
                 if decided is not None:
                     return decided
             elif state is RuntimeState.RUNNING:
-                self._ensure_running(
+                observed_state = self._ensure_running(
                     task,
                     lease,
                     runtime_task_id=runtime_task_id,
                     observed_at=status.observed_at,
+                    expected_revision=expected_revision,
                     now=current,
                 )
+                if observed_state == "cancel_requested":
+                    # The cancel committed while this observation was being
+                    # processed; never absorb it as "running".
+                    decided = self._observe_cancelling(
+                        task,
+                        lease,
+                        runtime_task_id=runtime_task_id,
+                        idempotency_key=idempotency_key,
+                        status=status,
+                        cancel=cancel_facts,
+                        now=current,
+                    )
+                    if decided is not None:
+                        return decided
             elif state is RuntimeState.COMPLETED:
                 return self._observe_completed(
                     task,
                     lease,
                     runtime_task_id=runtime_task_id,
                     observed_at=status.observed_at,
+                    expected_revision=expected_revision,
                     now=current,
                 )
             elif state in (RuntimeState.FAILED, RuntimeState.TIMED_OUT):
@@ -1663,6 +1683,7 @@ class RuntimeDispatcher:
                     runtime_task_id=runtime_task_id,
                     idempotency_key=idempotency_key,
                     status=status,
+                    expected_revision=expected_revision,
                     now=current,
                 )
             elif state is RuntimeState.WAITING_INPUT:
@@ -2001,8 +2022,9 @@ class RuntimeDispatcher:
         *,
         runtime_task_id: str,
         observed_at: datetime,
+        expected_revision: int | None,
         now: datetime,
-    ) -> None:
+    ) -> str:
         """Record ``dispatched -> running`` on fresh runtime evidence.
 
         A runtime may jump from ``accepted`` straight to a terminal state
@@ -2010,21 +2032,65 @@ class RuntimeDispatcher:
         proof that execution started, so the running fact is written first: it
         keeps the completion/failure edge legal and never claims more than the
         runtime proved.
+
+        The write is guarded against a cancel that committed **while the
+        adapter fact was being read**.  The in-memory task may still say
+        ``dispatched`` although the authoritative row is already
+        ``cancel_requested``; ``mark_running`` would then accept T49
+        (``cancel_requested -> running``) and silently absorb the cancel.  The
+        task row is therefore re-read under ``FOR UPDATE`` with
+        ``populate_existing`` before the write, and ``expected_revision`` (from
+        the post-observation refresh) turns any intervening state change into a
+        :class:`TaskStateConflict`.  In that case nothing is written and the
+        authoritative state is returned so the caller can route to the cancel
+        branch.
+
+        Returns the authoritative task state after the attempt: ``running`` on
+        success, otherwise the state that prevented the write.
         """
 
-        if task.state != "dispatched":
-            return
-        task_service.mark_running(
-            self._session,
-            task_id=task.task_id,
-            actor=self._service_principal,
-            worker_id=lease.worker_id,
-            fencing_token=lease.fencing_token,
-            evidence_ref=_runtime_start_evidence_ref(
-                runtime_task_id, observed_at
-            ),
-            now=now,
+        # Persist any staged reconciliation fact, then take the row lock and
+        # replace the possibly stale identity-map attributes with the
+        # authoritative row.  A plain reselect does not refresh a loaded ORM
+        # object, so ``populate_existing`` is required here.
+        self._session.flush()
+        self._session.scalar(
+            select(Task)
+            .where(Task.task_id == task.task_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
+        if task.state != "dispatched":
+            return task.state
+        try:
+            task_service.mark_running(
+                self._session,
+                task_id=task.task_id,
+                actor=self._service_principal,
+                worker_id=lease.worker_id,
+                fencing_token=lease.fencing_token,
+                evidence_ref=_runtime_start_evidence_ref(
+                    runtime_task_id, observed_at
+                ),
+                expected_revision=(
+                    expected_revision
+                    if expected_revision is not None
+                    else task.state_revision
+                ),
+                now=now,
+            )
+        except TaskStateConflict:
+            # Another writer changed the row between the observation and this
+            # write.  Re-read (still under the lock) and let the caller decide;
+            # never fall through to a terminal failure from a stale state.
+            self._session.scalar(
+                select(Task)
+                .where(Task.task_id == task.task_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            return task.state
+        return "running"
 
     def _observe_completed(
         self,
@@ -2034,6 +2100,7 @@ class RuntimeDispatcher:
         runtime_task_id: str,
         observed_at: datetime,
         now: datetime,
+        expected_revision: int | None = None,
     ) -> DispatcherResult:
         """Persist a completed run as ``verifying``, or fail closed.
 
@@ -2070,6 +2137,7 @@ class RuntimeDispatcher:
             lease,
             runtime_task_id=runtime_task_id,
             observed_at=observed_at,
+            expected_revision=expected_revision,
             now=now,
         )
         try:
@@ -2112,6 +2180,7 @@ class RuntimeDispatcher:
         idempotency_key: str,
         status: StatusResult,
         now: datetime,
+        expected_revision: int | None = None,
     ) -> DispatcherResult:
         """Persist a confirmed ``failed``/``timed_out`` run, or fail closed.
 
@@ -2171,6 +2240,7 @@ class RuntimeDispatcher:
             lease,
             runtime_task_id=runtime_task_id,
             observed_at=status.observed_at,
+            expected_revision=expected_revision,
             now=now,
         )
         if task.state == "cancel_requested":

@@ -165,7 +165,9 @@ class _ExternalCancelAdapter(FakeRuntimeAdapter):
     ``Session``/connection.  It can only commit if the drive is **not** holding
     the task row lock while it observes the runtime, which is exactly the
     production property under test (a same-session mutation would prove
-    nothing).  The adapter itself only reports facts.
+    nothing).  The trigger can be a status call or a result call, so the
+    "cancel commits while the drive is reading the result" race is testable.
+    The adapter itself only reports facts.
     """
 
     def __init__(
@@ -174,7 +176,8 @@ class _ExternalCancelAdapter(FakeRuntimeAdapter):
         engine: object,
         actor: GovernancePrincipal,
         task_id: str,
-        after_status_calls: int = 1,
+        after_status_calls: int | None = None,
+        after_result_calls: int | None = None,
         **kwargs: object,
     ) -> None:
         super().__init__(**kwargs)
@@ -182,6 +185,7 @@ class _ExternalCancelAdapter(FakeRuntimeAdapter):
         self._actor = actor
         self._task_id = task_id
         self._after_status_calls = after_status_calls
+        self._after_result_calls = after_result_calls
         self.cancel_requests = 0
         self.cancel_committed = False
 
@@ -190,12 +194,28 @@ class _ExternalCancelAdapter(FakeRuntimeAdapter):
     ) -> StatusResult:
         status = super().get_status(runtime_task_id, task_id=task_id)
         if (
-            self.cancel_requests == 0
+            self._after_status_calls is not None
             and len(self.status_calls) >= self._after_status_calls
         ):
-            self.cancel_requests += 1
-            self._request_cancel_on_another_connection()
+            self._maybe_request_cancel()
         return status
+
+    def get_result(
+        self, runtime_task_id: str, *, task_id: str | None = None
+    ) -> RuntimeResult:
+        result = super().get_result(runtime_task_id, task_id=task_id)
+        if (
+            self._after_result_calls is not None
+            and len(self.result_calls) >= self._after_result_calls
+        ):
+            self._maybe_request_cancel()
+        return result
+
+    def _maybe_request_cancel(self) -> None:
+        if self.cancel_requests:
+            return
+        self.cancel_requests += 1
+        self._request_cancel_on_another_connection()
 
     def _request_cancel_on_another_connection(self) -> None:
         errors: list[BaseException] = []
@@ -2125,6 +2145,60 @@ def test_first_observation_timed_out_is_recorded_after_running(
         "execution.timed_out"
     )
     assert _attempt(session, task).state == "timed_out"
+    _assert_lease_released(session, task)
+
+
+def test_cancel_during_result_fetch_is_not_absorbed_as_terminal_failure(
+    session: Session, world: TaskWorld, engine: object
+) -> None:
+    task = submit_managed(session, world)
+    session.commit()
+    # The first observation is already a confirmed timeout.  The external
+    # cancel commits *while get_result is running*: the post-status refresh saw
+    # `dispatched`, but the authoritative row becomes `cancel_requested` before
+    # the running/failure write.
+    adapter = _ExternalCancelAdapter(
+        engine=engine,
+        actor=world.actors.requester,
+        task_id=task.task_id,
+        after_result_calls=1,
+        status=_status(RuntimeState.TIMED_OUT, stop_confirmed=True),
+        result=_result(
+            outcome=ResultOutcome.TIMED_OUT,
+            result_ref=None,
+            evidence_refs=("evidence:fake_stop_0001",),
+            stop_confirmed=True,
+        ),
+    )
+    dispatcher = _dispatcher(session, world, adapter=adapter)
+
+    result = dispatcher.run_once()
+
+    assert adapter.cancel_committed is True
+    # The cancel must not be silently absorbed by `mark_running` (T49) and the
+    # timeout must not be written as a plain terminal fact.
+    assert result.outcome == "needs_human"
+    assert result.detail == RUNTIME_STOP_CONFIRMED
+    assert task.state == "needs_human"
+    assert task.state not in {"timed_out", "failed", "cancelled"}
+    assert task.needs_human_origin == "cancel_requested"
+    assert task.stop_confirmed is False
+    assert task.result.get("side_effects_reconciled") is not True
+    reconciliation = task.result["runtime_reconciliation"]
+    assert reconciliation["stop_confirmed"] is True
+    assert reconciliation["runtime_outcome"] == "timed_out"
+    assert reconciliation["stop_evidence_refs"][0].startswith(
+        "evidence:runtime_stop_"
+    )
+    events = _event_types(session, task)
+    assert "task.cancel_requested" in events
+    # The revision guard prevented `dispatched -> running` (which would have
+    # swallowed the cancel) and no terminal failure was recorded.
+    assert "execution.started" not in events
+    assert "execution.timed_out" not in events
+    assert "execution.failed" not in events
+    assert "human.escalation_required" in events
+    assert len(adapter.submit_calls) == 1
     _assert_lease_released(session, task)
 
 
