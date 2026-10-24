@@ -243,6 +243,7 @@ git commit -m "feat(tasks): add managed dispatcher preflight"
 - Produces: `build_runtime_idempotency_key(task, grant, attempt_number) -> str` (`idem_...`, stable per attempt/grant).
 - Produces: `build_runtime_prompt(task) -> str` (canonical UTF-8 JSON from goal/payload; bounded; no credentials).
 - `run_once` after accepted calls `task_service.start_attempt(... runtime_ref=rtask, idempotency_key=key, worker/fencing)`.
+- Pre-submit decision binding: load the persisted `GovernanceDecisionRecord` by `task.decision_id`; require `record.task_id == task.task_id`, `grant.decision_id == record.decision_id`, `grant.decision_hash == record.decision_hash`, and `grant.task_revision == record.task_revision`. A mismatch must not call the adapter and must record a safe queued dispatch failure.
 
 - [ ] **Step 1: Write failing tests**
 
@@ -262,6 +263,11 @@ def test_runtime_key_is_stable_per_attempt_and_changes_with_grant():
     assert build_runtime_idempotency_key(task, grant, 1) == build_runtime_idempotency_key(task, grant, 1)
     assert build_runtime_idempotency_key(task, grant, 1) != build_runtime_idempotency_key(task, grant, 2)
 
+def test_grant_decision_binding_mismatch_never_submits(session, world):
+    # mutate/inject a grant whose decision_id/hash/revision is not the task's
+    # persisted decision; assert adapter.submit_calls == [] and safe failure.
+    ...
+
 def test_binding_failure_cancels_and_enters_unknown(session, world):
     # accepted, but force start_attempt failure (e.g. stale fencing)
     ...
@@ -276,7 +282,7 @@ Also test prompt is canonical, bounded, and does not contain an injected credent
 
 - [ ] **Step 3: Implement submit path**
 
-Build the key and prompt. Call `adapter.submit_task`. On accepted, call `start_attempt` with the current lease/fencing and `runtime_ref`; never pass `execution_ref` for managed. On binding failure, best-effort `adapter.cancel_task`, then `record_dispatch_failure(outcome="unknown")`; no retry.
+Before building the key/prompt, load and verify the persisted `GovernanceDecisionRecord` binding described in the Interfaces block; on mismatch, record a safe queued failure and return without touching the adapter. Then build the key and prompt. Call `adapter.submit_task`. On accepted, call `start_attempt` with the current lease/fencing and `runtime_ref`; never pass `execution_ref` for managed. On binding failure, best-effort `adapter.cancel_task`, then `record_dispatch_failure(outcome="unknown")`; no retry.
 
 - [ ] **Step 4: Run GREEN; run focused tests and `app/tests/tasks`.**
 
