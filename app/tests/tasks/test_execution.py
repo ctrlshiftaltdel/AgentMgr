@@ -3379,11 +3379,19 @@ class _RecordingStopEvent(threading.Event):
 
 def test_run_forever_backs_off_on_a_recoverable_error(
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
     def _boom(self: RuntimeDispatcher, **kwargs: object) -> list[object]:
         raise TaskError("task_not_found")
 
+    # Spy on the module logger directly.  ``caplog`` depends on root/propagate
+    # handler state that the test host does not guarantee for this logger; the
+    # assertion is about what the loop logs, not about logging configuration.
+    warnings: list[tuple[str, tuple[object, ...]]] = []
+
+    def _record(message: str, *args: object) -> None:
+        warnings.append((message, args))
+
+    monkeypatch.setattr(task_execution.logger, "warning", _record)
     monkeypatch.setattr(RuntimeDispatcher, "recover_leases", _boom)
     stop_event = _RecordingStopEvent(after=3)
     config = DispatcherConfig(
@@ -3393,18 +3401,23 @@ def test_run_forever_backs_off_on_a_recoverable_error(
         max_error_backoff_seconds=10.0,
     )
 
-    with caplog.at_level("WARNING", logger="app.tasks.execution"):
-        _unit_dispatcher(config=config).run_forever(
-            stop_event,
-            session_factory=lambda: _StubSession(),  # type: ignore[return-value]
-        )
+    _unit_dispatcher(config=config).run_forever(
+        stop_event,
+        session_factory=lambda: _StubSession(),  # type: ignore[return-value]
+    )
 
     # A domain/lease error is retried, not fatal: the delay doubles per
     # consecutive failing pass (no busy loop) and only a safe code is logged.
     assert stop_event.waits == [0.25, 0.5, 1.0]
-    assert "runtime_dispatch_pass_error" in caplog.text
-    assert "task_not_found" in caplog.text
-    assert "svc_dispatcher_unit" not in caplog.text
+    assert len(warnings) == 3
+    assert all(
+        "runtime_dispatch_pass_error" in message for message, _ in warnings
+    )
+    # The stable reason code and the backoff are the only facts logged; the
+    # service principal id (and any other context) must not appear.
+    assert [args[0] for _, args in warnings] == ["task_not_found"] * 3
+    assert [args[2] for _, args in warnings] == [0.25, 0.5, 1.0]
+    assert all("svc_dispatcher_unit" not in repr(args) for _, args in warnings)
 
 
 def test_run_forever_propagates_a_programming_error(
