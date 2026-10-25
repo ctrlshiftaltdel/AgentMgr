@@ -374,10 +374,21 @@ def _write_task_files(
 
 @contextmanager
 def _alarm(seconds: int):
-    """Fail instead of hanging when a marker read blocks the helper."""
+    """Fail instead of hanging when a marker/task-file read blocks the helper.
+
+    The handler raises ``AssertionError`` — deliberately not ``OSError`` /
+    ``TimeoutError`` — so the helper's fail-closed error mapping cannot swallow
+    it and turn a blocked read into a passing test.
+    """
+
+    fired = False
 
     def _raise(signum: int, frame: object) -> None:
-        raise TimeoutError(f"blocked for more than {seconds}s")
+        nonlocal fired
+        fired = True
+        raise AssertionError(
+            f"blocked for more than {seconds}s: the read is not O_NONBLOCK"
+        )
 
     previous = signal.signal(signal.SIGALRM, _raise)
     signal.alarm(seconds)
@@ -386,6 +397,10 @@ def _alarm(seconds: int):
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, previous)
+        if fired:
+            raise AssertionError(
+                f"blocked for more than {seconds}s: the read is not O_NONBLOCK"
+            )
 
 
 def _write_started(sandbox: SimpleNamespace, *, unit: str = UNIT) -> None:
@@ -1117,6 +1132,11 @@ def test_adapter_ids_require_membership_of_the_sandbox_group(sandbox, monkeypatc
     assert helper._adapter_ids(config) == (sandbox.uid, 1111)
 
 
+def test_private_tmp_guard_default_is_closed():
+    assert helper.ALLOW_PRIVATE_TMP_SOURCES is False
+    assert helper.PRIVATE_TMP_PREFIXES == (Path("/tmp"), Path("/var/tmp"))
+
+
 def test_install_config_rejects_private_tmp_bind_sources(sandbox, monkeypatch):
     monkeypatch.setattr(helper, "ALLOW_PRIVATE_TMP_SOURCES", False)
 
@@ -1318,6 +1338,7 @@ def test_launch_waits_through_activating(sandbox):
         (lambda sandbox: (sandbox.task_dir / "profile.template.yaml").write_bytes(b"other"), "profile_hash_mismatch"),
         (lambda sandbox: (sandbox.task_dir / "egress.token").chmod(0o644), "token_mode_invalid"),
         (lambda sandbox: (sandbox.task_dir / "egress.token").chmod(0o660), "token_mode_invalid"),
+        (lambda sandbox: (sandbox.task_dir / "egress.token").chmod(0o440), "token_mode_invalid"),
         (lambda sandbox: (sandbox.task_dir / "prompt.txt").chmod(0o604), "prompt_mode_invalid"),
         (lambda sandbox: (sandbox.task_dir / "prompt.txt").chmod(0o660), "prompt_mode_invalid"),
         (lambda sandbox: (sandbox.task_dir / "prompt.txt").chmod(0o600), "prompt_mode_invalid"),
@@ -1739,6 +1760,96 @@ def test_launch_rejects_a_fifo_started_marker_without_blocking(sandbox):
         helper.launch(valid_request(), sandbox.config, runner=runner)
     assert excinfo.value.code == "started_marker_invalid"
     assert any("--signal=SIGTERM" in call for call in runner.calls)
+
+
+def test_launch_rejects_fifo_task_files_without_blocking(sandbox):
+    _prepare(sandbox)
+    _write_task_files(sandbox)
+    _write_started(sandbox)
+    for name, code in (
+        ("prompt.txt", "prompt_invalid"),
+        ("profile.template.yaml", "profile_invalid"),
+    ):
+        path = sandbox.task_dir / name
+        original = path.read_bytes()
+        try:
+            path.unlink()
+            os.mkfifo(path)
+            runner = ScriptedRunner([SHOW_NOT_FOUND])
+            with _alarm(5), pytest.raises(helper.HelperError) as excinfo:
+                helper.launch(valid_request(), sandbox.config, runner=runner)
+            assert excinfo.value.code == code
+            assert runner.launch_calls() == []
+        finally:
+            path.unlink(missing_ok=True)
+            path.write_bytes(original)
+            path.chmod(0o640)
+            os.chown(path, sandbox.uid, sandbox.gid)
+
+
+@pytest.mark.parametrize(
+    ("name", "label", "expected", "expected_size", "max_size"),
+    [
+        ("prompt.txt", "prompt", _sha256(PROMPT), len(PROMPT), helper.MAX_PROMPT_BYTES),
+        (
+            "profile.template.yaml",
+            "profile",
+            _sha256(PROFILE_TEMPLATE),
+            None,
+            helper.MAX_PROFILE_TEMPLATE_BYTES,
+        ),
+    ],
+)
+def test_verify_task_file_rejects_a_fifo_raced_after_lstat(
+    sandbox, monkeypatch, name, label, expected, expected_size, max_size
+):
+    """Prove the post-open guard, not just the pre-open lstat check."""
+
+    _prepare(sandbox)
+    _write_task_files(sandbox)
+    path = sandbox.task_dir / name
+    regular_info = os.lstat(path)
+    path.unlink()
+    os.mkfifo(path)
+
+    original_lstat = helper._lstat
+    state = {"first": True}
+
+    def _raced_lstat(target):
+        if target == path and state["first"]:
+            state["first"] = False
+            return regular_info
+        return original_lstat(target)
+
+    monkeypatch.setattr(helper, "_lstat", _raced_lstat)
+
+    with _alarm(5), pytest.raises(helper.HelperError) as excinfo:
+        helper._verify_task_file(
+            path,
+            label=label,
+            expected_sha256=expected,
+            expected_size=expected_size,
+            max_size=max_size,
+            uid=sandbox.uid,
+            gid=sandbox.gid,
+        )
+    assert excinfo.value.code == f"{label}_invalid"
+
+
+def test_attest_rejects_a_fifo_task_file_without_blocking(sandbox):
+    _prepare(sandbox)
+    _write_task_files(sandbox)
+    _write_started(sandbox)
+    path = sandbox.task_dir / "prompt.txt"
+    path.unlink()
+    os.mkfifo(path)
+    with _alarm(5), pytest.raises(helper.HelperError) as excinfo:
+        helper.attest(
+            valid_request(operation="attest"),
+            sandbox.config,
+            runner=ScriptedRunner([SHOW_ACTIVE]),
+        )
+    assert excinfo.value.code == "prompt_invalid"
 
 
 def test_stop_escalates_to_sigkill_and_confirms_only_when_gone(sandbox, monkeypatch):

@@ -47,8 +47,9 @@ Deployment invariants
   owned by the trusted adapter user and the fixed sandbox group
   ``agentmgr-hermes``.  Existing paths are never repaired: a symlink, wrong
   owner/group or wrong mode fails closed.
-  ``prompt.txt``/``profile.template.yaml`` are accepted at most at ``0640`` and
-  ``egress.token`` exactly at ``0640``.
+  ``prompt.txt``/``profile.template.yaml`` are accepted exactly at ``0440`` or
+  ``0640`` (group-read is required by the unit) and ``egress.token`` exactly at
+  ``0640``.
 * ``systemd-run`` receives a fixed transient unit: private ``/run`` and
   ``/tmp``, isolated loopback only, read-only host minus the task directory, an
   empty capability set, ``@system-service`` and no caller supplied property.
@@ -1109,16 +1110,29 @@ def _verify_task_file(
     if expected_size is not None and info.st_size != expected_size:
         raise HelperError(f"{label}_size_mismatch")
 
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    flags = _FILE_FLAGS
     try:
         descriptor = os.open(path, flags)
+    except BlockingIOError:
+        raise HelperError(f"{label}_invalid") from None
     except OSError:
         raise HelperError(f"{label}_invalid") from None
     digest = hashlib.sha256()
     total = 0
     try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            # A unit can race a FIFO/socket/device into prompt/profile after the
+            # lstat; ``O_NONBLOCK`` prevents the root helper from blocking and
+            # the regular-file check rejects the substitution.
+            raise HelperError(f"{label}_invalid")
         while True:
-            chunk = os.read(descriptor, _SHA256_CHUNK_BYTES)
+            try:
+                chunk = os.read(descriptor, _SHA256_CHUNK_BYTES)
+            except BlockingIOError:
+                raise HelperError(f"{label}_invalid") from None
+            except OSError:
+                raise HelperError(f"{label}_invalid") from None
             if not chunk:
                 break
             total += len(chunk)
