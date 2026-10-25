@@ -503,8 +503,8 @@ Expected: FAIL with missing adapter/supervisor.
 
 Implement `HelperSandboxSupervisor` with a fixed helper path, mapping `SandboxSpec` to the helper's exact-key JSON request (hashes/sizes only, no prompt/token content, no caller paths), stdin JSON, `subprocess.run(..., shell=False, timeout=...)`, no argv secrets, strict JSON parsing, and error mapping. Implement `HermesManagedAdapter`:
 - `capabilities` calls `verify_runtime_attestation` first and passes only the returned `VerifiedRuntimeAttestation` to `managed_capabilities`; default unverified. A structurally valid forged 64-hex HMAC must not yield `VERIFIED`.
-- `submit_task` validates the managed grant shape, calls `verify_task_attestation(..., expected_runtime_root_hash=config.runtime_root_hash)`, uses `build_sandbox_spec` with the dispatcher's idempotency key, creates the task dir via supervisor, writes `prompt.txt`, `profile.template.yaml` (with `__PORT__`), and `egress.token` with the helper's required modes/group (prompt/profile group `agentmgr-hermes`, token exactly `0640`, `out/` `0770`), then calls helper `launch`. The helper returns only after the unit is active and the `started` marker exists; a launch response without that evidence is treated as `unknown` + stop/cleanup. Duplicate same key/payload -> same handle/`replayed=True`; different payload -> conflict.
-- `get_status` verifies task binding and maps `SandboxStatus`; `stop_confirmed` only from `process_gone`.
+- `submit_task` validates the managed grant shape, calls `verify_task_attestation(..., expected_runtime_root_hash=config.runtime_root_hash)`, rejects `runtime_max_sec < 9` and model names outside the workload pattern before any launch, uses `build_sandbox_spec` with the dispatcher's idempotency key, creates the task dir via supervisor, writes `prompt.txt`, `profile.template.yaml` (with `__PORT__`), and `egress.token` with the helper's required modes/group (prompt/profile group `agentmgr-hermes`, token exactly `0640`, `out/` `0770`), then calls helper `launch`. The helper returns only after the unit is active and the `started` marker exists; a launch response without that evidence is treated as `unknown` + stop/cleanup. Duplicate same key/payload -> same handle/`replayed=True`; different payload -> conflict.
+- `get_status` verifies task binding and maps `SandboxStatus`; `stop_confirmed` only from `process_gone`; `started + non-zero + no exit marker` is unknown/failed, never success.
 - `get_result` calls `read_artifact(spec.task_dir, max_bytes=...)` (fixed `out/result.txt`, dir_fd/O_NOFOLLOW/O_NONBLOCK); returns result/evidence or unknown/needs_human.
 - `cancel_task` maps helper stop; `requested` vs `stopped`/`already_terminal`.
 - `poll_events` empty/unsupported; `provide_input` unsupported; `health` helper/broker/runtime root/attestation.
@@ -720,7 +720,7 @@ git commit -m "test(runtime): add hermes managed live e2e"
 - Modify: `docs/integrations/runtimes/hermes.md`
 
 **Interfaces:**
-- Produces: `load_config(path: Path) -> HermesManagedConfig` (no secrets; validates roots/attestation/evidence/model name/local proxy template/worker settings; the real provider upstream/key belongs to the broker config, not this file).
+- Produces: `load_config(path: Path) -> HermesManagedConfig` (no secrets; validates roots/attestation/evidence/model name pattern/local proxy template/worker settings; enforces `runtime_max_sec >= 9`; the real provider upstream/key belongs to the broker config, not this file).
 - Produces: `main(argv=None, *, dispatcher_factory=None) -> int`; `--once`/`--loop`, no default adapter, nonzero with a stable message when trusted config/attestation/service principal is absent. `main` constructs `HermesManagedAdapter`, #96 `DispatcherConfig`/`RuntimeDispatcher`, and owns the session lifecycle.
 - Consumes: Task 5 adapter, #96 `RuntimeDispatcher`, `SessionLocal`.
 
