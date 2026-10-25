@@ -1,0 +1,6 @@
+#!/bin/sh
+# Thin production wrapper, installed as /usr/local/libexec/agentmgr-hermes-exec
+# (root:root 0755).  The trusted adapter user reaches it only through sudo; the
+# helper accepts no arguments and reads its one JSON request from stdin.  This
+# file is intentionally fixed: no caller arguments and no shell indirection.
+exec /usr/bin/python3 /usr/local/libexec/agentmgr_hermes_exec.py

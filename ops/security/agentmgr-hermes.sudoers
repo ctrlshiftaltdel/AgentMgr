@@ -1,0 +1,14 @@
+# Hermes managed sandbox privileged helper template (Issue #97).
+#
+# Install as /etc/sudoers.d/agentmgr-hermes with mode 0440 and check it with
+# `visudo -c` before use.  Remove the file to revoke the permission.
+#
+# `agentmgr` is a placeholder for <adapter-user>, the dedicated trusted adapter
+# service account.  It is not a repository account, and this template does not
+# create any persistent user.
+#
+# The trailing "" pins an empty command line: the adapter may run exactly this
+# wrapper and no other command, with no arguments.  The wrapper in turn execs
+# one fixed helper path, and the helper validates the unit binding and the
+# exact request field set, so this policy grants no wildcard command rule.
+agentmgr ALL=(root) NOPASSWD: /usr/local/libexec/agentmgr-hermes-exec ""
