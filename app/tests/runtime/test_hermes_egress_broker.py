@@ -18,7 +18,10 @@ They pin:
 
 from __future__ import annotations
 
+import base64
 import contextlib
+import hashlib
+import hmac
 import http.client
 import http.server
 import json
@@ -26,6 +29,7 @@ import logging
 import socket
 import stat
 import threading
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -36,16 +40,21 @@ import pytest
 from app.runtime.hermes_egress import (
     EXIT_CONFIG,
     EXIT_UNAVAILABLE,
+    REVOCATION_MARKER_KINDS,
     BrokerConfig,
     BrokerConfigError,
     BrokerError,
     BrokerResponse,
     EgressBroker,
     EgressClaims,
+    EgressTokenError,
     egress_token_hash,
     load_broker_config,
     mint_egress_token,
+    revocation_markers,
     run_broker,
+    verify_egress_token,
+    write_revocation_markers,
 )
 
 NOW = datetime(2026, 10, 25, 12, 0, 0, tzinfo=UTC)
@@ -393,26 +402,53 @@ def test_expired_and_not_yet_valid_tokens_are_rejected(tmp_path: Path) -> None:
     assert state.requests == []
 
 
-def test_revoked_token_and_revoked_unit_are_rejected_but_siblings_pass(
-    harness: Harness,
-) -> None:
-    assert call(harness.broker, token_for()).status == 200
+def test_revocation_marker_contract_is_written_and_enforced(harness: Harness) -> None:
+    token = token_for()
+    assert call(harness.broker, token).status == 200
 
-    token_hash = egress_token_hash(token_for())
-    (harness.revocation_dir / f"token.{token_hash}").write_text("", encoding="utf-8")
-    revoked_response = call(harness.broker, token_for())
+    token_hash = egress_token_hash(token)
+    names = revocation_markers(claims(), token_hash)
+    assert names == (
+        f"token.{token_hash}",
+        f"unit.{UNIT}",
+        "task.task_1",
+        "grant.grnt_1",
+    )
+    assert REVOCATION_MARKER_KINDS == ("token", "unit", "task", "grant")
+    assert not any((harness.revocation_dir / name).exists() for name in names)
+
+    written = write_revocation_markers(harness.revocation_dir, claims(), token_hash)
+    assert written == names
+    assert all((harness.revocation_dir / name).is_file() for name in names)
+
+    revoked_response = call(harness.broker, token)
     assert revoked_response.status == 401
     assert error_code(revoked_response) == "token_revoked"
 
-    (harness.revocation_dir / f"unit.{UNIT}").write_text("", encoding="utf-8")
-    assert call(harness.broker, token_for()).status == 401
 
-    # A revocation marker for one unit must not block another task's token.
-    other_token = token_for(unit=OTHER_UNIT, task_id="task_2", grant_id="grnt_2")
+def test_revocation_markers_do_not_leak_across_tasks(harness: Harness) -> None:
+    other_claims = claims(unit=OTHER_UNIT, task_id="task_2", grant_id="grnt_2")
+    other_token = mint_egress_token(other_claims, key=KEY, now=NOW)
     write_task(
-        harness.task_root, other_token, unit=OTHER_UNIT, task_id="task_2", grant_id="grnt_2"
+        harness.task_root,
+        other_token,
+        unit=OTHER_UNIT,
+        task_id="task_2",
+        grant_id="grnt_2",
     )
+
+    write_revocation_markers(
+        harness.revocation_dir, claims(), egress_token_hash(token_for())
+    )
+    assert call(harness.broker, token_for()).status == 401
     assert call(harness.broker, other_token).status == 200
+
+
+def test_revocation_markers_reject_malformed_input(harness: Harness) -> None:
+    with pytest.raises(ValueError):
+        revocation_markers(claims(), "not-a-hash")
+    with pytest.raises(ValueError):
+        write_revocation_markers(harness.revocation_dir, claims(), "not-a-hash")
 
 
 def test_missing_revocation_store_fails_closed(harness: Harness) -> None:
@@ -470,12 +506,50 @@ def test_wrong_provider_or_path_claims_are_rejected(harness: Harness) -> None:
     assert harness.state.requests == []
 
 
-def test_token_for_another_model_is_accepted_for_the_path(harness: Harness) -> None:
-    # The broker never parses the body; model selection is a profile fact.  This
-    # pins that a prompt-bearing body is forwarded opaquely and never logged.
-    other_body = b'{"model":"another-model","messages":[{"role":"user","content":"PROMPT-CANARY"}]}'
-    assert call(harness.broker, token_for(), body=other_body).status == 200
-    assert harness.state.requests[0]["body"] == other_body
+_PROMPT_MESSAGES = b', "messages":[{"role":"user","content":"PROMPT-CANARY"}]}'
+
+
+def test_body_model_must_match_the_token_claim(harness: Harness) -> None:
+    mismatched = b'{"model":"another-model"' + _PROMPT_MESSAGES
+
+    response = call(harness.broker, token_for(), body=mismatched)
+
+    assert response.status == 403
+    assert error_code(response) == "model_not_allowed"
+    assert harness.state.requests == []
+
+
+@pytest.mark.parametrize(
+    ("body", "status", "code"),
+    [
+        (b'{"messages":[]}', 403, "model_not_allowed"),
+        (b'{"model":7,"messages":[]}', 403, "model_not_allowed"),
+        (b'{"model":""}', 403, "model_not_allowed"),
+        (b"not json", 400, "request_invalid"),
+        (b"[]", 400, "request_invalid"),
+        (b"", 400, "request_invalid"),
+    ],
+    ids=["missing", "non-string", "empty", "malformed", "not-object", "empty-body"],
+)
+def test_model_claim_rejects_missing_or_invalid_body(
+    harness: Harness, body: bytes, status: int, code: str
+) -> None:
+    response = call(harness.broker, token_for(), body=body)
+
+    assert response.status == status
+    assert error_code(response) == code
+    assert harness.state.requests == []
+
+
+def test_matching_model_body_is_forwarded_opaquely(harness: Harness) -> None:
+    response = call(harness.broker, token_for(model="another-model"), body=BODY)
+
+    # The token's model claim is ``another-model`` here, so BODY (model-x) is a
+    # mismatch; the matching case is the plain fixture body.
+    assert response.status == 403
+    assert error_code(response) == "model_not_allowed"
+    assert call(harness.broker, token_for(), body=BODY).status == 200
+    assert harness.state.requests[0]["body"] == BODY
 
 
 # ---------------------------------------------------------------------------
@@ -576,6 +650,7 @@ def test_upstream_failures_map_to_stable_codes_without_echo(
 
     assert response.status == status
     assert json.loads(body)["error"] == code
+    assert dict(response.headers)["Content-Type"] == "application/json"
     assert REAL_KEY not in body
     assert b"upstream leaks" not in body
     if upstream_status == 429:
@@ -822,9 +897,21 @@ def test_config_loader_rejects_a_group_readable_secret(tmp_path: Path) -> None:
         load_broker_config(config_path)
 
 
-def test_run_broker_fails_closed_without_a_task_binding(tmp_path: Path) -> None:
+def test_run_broker_requires_the_task_root_directory(tmp_path: Path) -> None:
     with upstream() as state:
-        config = build_config(tmp_path, state, task_root=None)
+        config = build_config(tmp_path, state)
+        config.task_root.rmdir()
+
+        exit_code = run_broker(config)
+
+    assert exit_code == EXIT_UNAVAILABLE
+    assert not config.socket_path.exists()
+
+
+def test_run_broker_refuses_a_volatile_socket_path(tmp_path: Path) -> None:
+    with upstream() as state:
+        # The test socket lives under the pytest tmp root, which is under /tmp.
+        config = build_config(tmp_path, state)
 
         exit_code = run_broker(config)
 
@@ -841,3 +928,362 @@ def test_run_broker_refuses_a_missing_revocation_store(tmp_path: Path) -> None:
 
     assert exit_code == EXIT_UNAVAILABLE
     assert not config.socket_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# review fixes: socket location, concurrency, deadline, framing, model contract
+# ---------------------------------------------------------------------------
+
+UNIT_FILE = (
+    Path(__file__).resolve().parents[3]
+    / "ops"
+    / "security"
+    / "agentmgr-hermes-egress.service"
+)
+CONTROL_SOCKET = Path("/var/lib/agentmgr-hermes-control/egress.sock")
+VOLATILE_ROOTS = (Path("/run"), Path("/tmp"), Path("/var/tmp"))
+
+
+def test_service_unit_uses_a_non_volatile_state_directory() -> None:
+    text = UNIT_FILE.read_text(encoding="utf-8")
+
+    assert "StateDirectory=agentmgr-hermes-control" in text
+    assert "StateDirectoryMode=0750" in text
+    assert "RuntimeDirectory=" not in text
+    assert str(CONTROL_SOCKET) in text
+    assert not any(
+        root == CONTROL_SOCKET or root in CONTROL_SOCKET.parents
+        for root in VOLATILE_ROOTS
+    )
+    for directive in (
+        "TasksMax=64",
+        "LimitNOFILE=256",
+        "MemoryMax=512M",
+        "LimitCORE=0",
+        "TimeoutStopSec=30",
+        "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+    ):
+        assert directive in text
+    assert "\nPrivateNetwork=yes" not in text
+
+
+def _iso_utc(value: datetime) -> str:
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _b64(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _signed_token(document: dict[str, object]) -> str:
+    raw = json.dumps(
+        document, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    signature = hmac.new(KEY, raw, hashlib.sha256).digest()
+    return f"egt.{_b64(raw)}.{_b64(signature)}"
+
+
+def _raw_payload(**overrides: object) -> dict[str, object]:
+    document: dict[str, object] = {
+        "v": 1,
+        "task_id": "task_1",
+        "grant_id": "grnt_1",
+        "unit": UNIT,
+        "model": "model-x",
+        "provider_host": PROVIDER_HOST,
+        "path_prefix": "/v1",
+        "issued_at": _iso_utc(NOW),
+        "expires_at": _iso_utc(NOW + timedelta(seconds=60)),
+        "nonce": "n" * 32,
+    }
+    document.update(overrides)
+    return document
+
+
+@pytest.mark.parametrize("prefix", ["/", "///"])
+def test_path_prefix_root_is_rejected_at_mint_and_verify(prefix: str) -> None:
+    with pytest.raises(EgressTokenError):
+        mint_egress_token(claims(path_prefix=prefix), key=KEY, now=NOW)
+
+    signed = _signed_token(_raw_payload(path_prefix=prefix))
+    with pytest.raises(EgressTokenError):
+        verify_egress_token(signed, key=KEY, now=NOW)
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [" Bearer", "Bearer  ", "Bearer Key", "\tBearer", "Bearer\t"],
+    ids=["leading", "double-space", "embedded", "tab-leading", "tab-trailing"],
+)
+def test_provider_key_prefix_whitespace_is_rejected(
+    tmp_path: Path, prefix: str
+) -> None:
+    with upstream() as state:
+        with pytest.raises(BrokerConfigError):
+            build_config(tmp_path, state, provider_key_prefix=prefix)
+
+
+def test_empty_prefix_requires_a_non_authorization_header(tmp_path: Path) -> None:
+    with upstream() as state:
+        with pytest.raises(BrokerConfigError):
+            build_config(tmp_path, state, provider_key_prefix="")
+
+        config = build_config(
+            tmp_path, state, provider_key_header="x-api-key", provider_key_prefix=""
+        )
+
+    assert config.provider_key_header == "x-api-key"
+    assert config.provider_key_prefix == ""
+
+
+def test_bare_api_key_header_injection(tmp_path: Path) -> None:
+    with upstream() as state:
+        config = build_config(
+            tmp_path, state, provider_key_header="x-api-key", provider_key_prefix=""
+        )
+        write_task(config.task_root, token_for())
+
+        response = call(EgressBroker(config), token_for())
+
+    assert response.status == 200
+    forwarded = state.requests[0]["headers"]
+    assert isinstance(forwarded, dict)
+    assert forwarded["x-api-key"] == REAL_KEY.decode()
+    assert "Authorization" not in forwarded
+
+
+def _request_bytes(
+    token: str,
+    *,
+    extra_headers: bytes = b"",
+    body: bytes = BODY,
+    path: str = "/v1/chat/completions",
+) -> bytes:
+    return (
+        b"POST " + path.encode("ascii") + b" HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Content-Type: application/json\r\n"
+        + f"Content-Length: {len(body)}\r\n".encode("ascii")
+        + f"{TOKEN_HEADER}: {token}\r\n".encode("ascii")
+        + extra_headers
+        + b"Connection: close\r\n\r\n"
+        + body
+    )
+
+
+def _raw_exchange(path: Path, request: bytes, *, timeout: float = 5.0) -> bytes:
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    connection.settimeout(timeout)
+    try:
+        connection.connect(str(path))
+        connection.sendall(request)
+        chunks: list[bytes] = []
+        while True:
+            chunk = connection.recv(65_536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        connection.close()
+    return b"".join(chunks)
+
+
+def _header_lines(raw: bytes) -> list[bytes]:
+    head, _, _body = raw.partition(b"\r\n\r\n")
+    return head.split(b"\r\n")
+
+
+def _start_broker(config: BrokerConfig) -> EgressBroker:
+    broker = EgressBroker(config)
+    broker.start()
+    return broker
+
+
+def test_socket_response_has_exactly_one_content_length(tmp_path: Path) -> None:
+    with upstream() as state:
+        config = build_config(tmp_path, state)
+        write_task(config.task_root, token_for())
+        broker = _start_broker(config)
+        try:
+            raw = _raw_exchange(config.socket_path, _request_bytes(token_for()))
+        finally:
+            broker.stop()
+
+    lines = _header_lines(raw)
+    assert lines[0] == b"HTTP/1.1 200 OK"
+    content_lengths = [
+        line for line in lines[1:] if line.lower().startswith(b"content-length:")
+    ]
+    assert len(content_lengths) == 1
+    head, _, body = raw.partition(b"\r\n\r\n")
+    assert body == b'{"ok":true}'
+    assert int(content_lengths[0].split(b":", 1)[1]) == len(body)
+
+
+def test_duplicate_request_content_length_is_rejected(tmp_path: Path) -> None:
+    with upstream() as state:
+        config = build_config(tmp_path, state)
+        write_task(config.task_root, token_for())
+        broker = _start_broker(config)
+        try:
+            duplicate = (
+                f"Content-Length: {len(BODY)}\r\n".encode("ascii")
+            )
+            raw = _raw_exchange(
+                config.socket_path,
+                _request_bytes(token_for(), extra_headers=duplicate),
+            )
+        finally:
+            broker.stop()
+
+    assert b"HTTP/1.1 400" in _header_lines(raw)[0]
+    assert b'"error":"request_invalid"' in raw
+    assert state.requests == []
+
+
+def test_bounded_concurrency_rejects_the_extra_connection(tmp_path: Path) -> None:
+    with upstream() as state:
+        config = build_config(
+            tmp_path,
+            state,
+            max_connections=1,
+            # A generous handler timeout keeps the single admitted worker busy
+            # while the test probes the second connection; ``first.close()``
+            # releases it immediately and ``block_on_close=False`` keeps stop
+            # from waiting on the stalled handler.
+            upstream_timeout_sec=5.0,
+            request_timeout_sec=5.0,
+        )
+        write_task(config.task_root, token_for())
+        broker = _start_broker(config)
+        first = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        first.settimeout(5.0)
+        try:
+            first.connect(str(config.socket_path))
+            # Keep the one admitted handler busy without finishing a request.
+            first.sendall(b"POST /v1/chat/completions HTTP/1.1\r\n")
+            deadline = time.monotonic() + 2.0
+            while broker.active_connections < 1 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert broker.active_connections == 1
+
+            raw = _raw_exchange(config.socket_path, _request_bytes(token_for()))
+
+            assert b"HTTP/1.1 503" in _header_lines(raw)[0]
+            assert b'"error":"broker_busy"' in raw
+            assert broker.active_connections == 1
+            assert state.requests == []
+        finally:
+            first.close()
+            broker.stop()
+
+
+def test_stale_owned_socket_is_replaced(tmp_path: Path) -> None:
+    with upstream() as state:
+        config = build_config(tmp_path, state)
+        write_task(config.task_root, token_for())
+        stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stale.bind(str(config.socket_path))
+        stale.close()
+        assert config.socket_path.exists()
+
+        broker = _start_broker(config)
+        try:
+            assert stat.S_IMODE(config.socket_path.stat().st_mode) == 0o660
+            raw = _raw_exchange(config.socket_path, _request_bytes(token_for()))
+            assert b"HTTP/1.1 200" in _header_lines(raw)[0]
+        finally:
+            broker.stop()
+
+
+def test_live_socket_is_never_replaced(tmp_path: Path) -> None:
+    with upstream() as state:
+        config = build_config(tmp_path, state)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(config.socket_path))
+        listener.listen(1)
+        try:
+            with pytest.raises(BrokerError) as excinfo:
+                EgressBroker(config).start()
+            assert excinfo.value.code == "socket_in_use"
+            assert config.socket_path.exists()
+        finally:
+            listener.close()
+
+
+def test_serve_forever_serves_until_stop(tmp_path: Path) -> None:
+    with upstream() as state:
+        config = build_config(tmp_path, state)
+        write_task(config.task_root, token_for())
+        broker = EgressBroker(config)
+        thread = threading.Thread(target=broker.serve_forever, daemon=True)
+        thread.start()
+        try:
+            deadline = time.monotonic() + 5.0
+            # ``serving`` flips only after bind + listen, so this is race-free
+            # (the socket file exists briefly before the listener is active).
+            while not broker.serving and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert broker.serving
+            assert config.socket_path.exists()
+
+            connection = _UnixConnection(str(config.socket_path))
+            try:
+                connection.request(
+                    "POST",
+                    "/v1/chat/completions",
+                    body=BODY,
+                    headers={
+                        TOKEN_HEADER: token_for(),
+                        "Content-Type": "application/json",
+                    },
+                )
+                response = connection.getresponse()
+                assert response.status == 200
+                assert response.read() == b'{"ok":true}'
+            finally:
+                connection.close()
+        finally:
+            broker.stop()
+            thread.join(5.0)
+
+        assert not config.socket_path.exists()
+
+    assert len(state.requests) == 1
+
+
+def test_overall_request_deadline_stops_a_slow_stream(tmp_path: Path) -> None:
+    with upstream(
+        stream=True,
+        stream_chunks=(b"data: one\n\n", b"data: two\n\n"),
+        wait_seconds=5.0,
+    ) as state:
+        config = build_config(
+            tmp_path,
+            state,
+            upstream_timeout_sec=5.0,
+            request_timeout_sec=0.3,
+        )
+        write_task(config.task_root, token_for())
+        started = time.monotonic()
+        response = call(EgressBroker(config), token_for())
+        body = response.read_body()
+        elapsed = time.monotonic() - started
+        state.release.set()
+
+    assert b"data: one" in body
+    assert b"data: two" not in body
+    assert elapsed < 2.0, "the overall deadline must bound the whole request"
+
+
+def test_config_loader_allows_empty_prefix_for_api_key_header(tmp_path: Path) -> None:
+    config_path, _, _ = _write_config(
+        tmp_path, provider_key_header="x-api-key", provider_key_prefix=""
+    )
+
+    config = load_broker_config(config_path)
+
+    assert config.provider_key_header == "x-api-key"
+    assert config.provider_key_prefix == ""
+    assert config.max_connections == 32
+    assert config.request_timeout_sec == 300.0

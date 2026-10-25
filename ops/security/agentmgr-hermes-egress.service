@@ -16,14 +16,26 @@
 #   /etc/agentmgr/hermes/egress-broker.json   0440 root:agentmgr-hermes
 #       Secret-free JSON: socket_path, upstream_base_url, provider_host,
 #       token_key_path, provider_key_path, revocation_dir, task_root and the
-#       optional limits.  The credential paths point at the LoadCredential
-#       copies under /run/credentials/agentmgr-hermes-egress.service/.
+#       optional limits (max_request_bytes, max_response_bytes,
+#       upstream_timeout_sec, request_timeout_sec, max_connections).  The
+#       credential paths point at the LoadCredential copies under
+#       /run/credentials/agentmgr-hermes-egress.service/.
+#       socket_path MUST be /var/lib/agentmgr-hermes-control/egress.sock; the
+#       broker refuses /run, /tmp and /var/tmp at startup.
 #   /etc/agentmgr/hermes/egress-token-key     0400 root:root
 #   /etc/agentmgr/hermes/provider-key         0400 root:root
 #   <revocation-dir>                          owned by the trusted adapter user,
-#       group agentmgr-hermes, 0770; this unit only reads it.
+#       0750, never writable by the sandbox group agentmgr-hermes; this unit
+#       only reads the markers the adapter writes on stop/result-read.
 #   <task-root>                               group agentmgr-hermes; this unit
 #       only reads <task-root>/<unit>/manifest.json.
+#
+# The socket lives under StateDirectory=/var/lib/agentmgr-hermes-control, not
+# /run: a task unit masks /run and its own private /run cannot be a bind source,
+# so the control socket must be on a stable host path outside /run, /tmp and
+# /var/tmp.  On startup the broker replaces a leftover socket only when it is
+# owned by this service and no process is listening; a live socket, a regular
+# file or another user's path fails closed.
 #
 # There is deliberately no PrivateNetwork=yes and no IPAddressDeny: reaching the
 # configured provider over TLS is this unit's only purpose.  The listener itself
@@ -43,12 +55,13 @@ Type=simple
 User=<broker-user>
 Group=agentmgr-hermes
 WorkingDirectory=<install-root>
-# The socket must stay on a host-visible path so a task unit can bind-mount it
-# to /task/egress.sock.  It is never placed in a task unit's private /run or
-# /tmp.  The process sets the socket to 0660 and chgrps it to agentmgr-hermes.
-RuntimeDirectory=agentmgr-hermes-egress
-RuntimeDirectoryMode=0750
+# The socket lives in the host-visible state directory so a task unit can
+# bind-mount it to /task/egress.sock.  The process sets the socket to 0660 and
+# chgrps it to agentmgr-hermes.
+StateDirectory=agentmgr-hermes-control
+StateDirectoryMode=0750
 UMask=0077
+TimeoutStopSec=30
 ExecStart=<venv>/python -m app.runtime.hermes_egress --config /etc/agentmgr/hermes/egress-broker.json
 
 # systemd reads both sources as root and exposes 0400 copies to this service
@@ -64,11 +77,20 @@ RestartSec=2
 # opens only AF_UNIX (listener) and AF_INET/AF_INET6 (TLS upstream) sockets.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
-# Filesystem: read-only host, no home, private /tmp, no devices.
+# Filesystem: read-only host, no home, private /tmp, no devices.  Only the
+# StateDirectory (the control socket) is writable.
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
+
+# Resource bounds: concurrency is bounded in code (default 32 requests, config
+# max_connections), with TasksMax as the second (thread/process) bound.  No core
+# dumps can capture prompts or keys.
+TasksMax=64
+LimitNOFILE=256
+MemoryMax=512M
+LimitCORE=0
 
 # Privileges and syscalls.
 NoNewPrivileges=yes

@@ -21,15 +21,26 @@ Guarantees enforced here:
 This module holds two layers:
 
 * the pure token helpers above (:func:`mint_egress_token`,
-  :func:`verify_egress_token`, :func:`egress_token_hash`), and
+  :func:`verify_egress_token`, :func:`egress_token_hash`) plus the revocation
+  marker contract (:func:`revocation_markers`,
+  :func:`write_revocation_markers`), and
 * the host egress broker (Task 4, design §9.3): a Unix-socket HTTP bridge that
-  validates a task token, checks revocation and the task/manifest binding,
-  injects the real provider key and streams the allowlisted OpenAI-compatible
-  call upstream.  The sandbox never sees the provider key.
+  validates a task token, checks revocation and the required task/manifest
+  binding, enforces the token's ``model`` claim for POST model routes, injects
+  the real provider key and streams the allowlisted OpenAI-compatible call
+  upstream.  The sandbox never sees the provider key.
 
 The broker speaks HTTP over ``AF_UNIX`` only.  It never listens on an IP port,
 never follows upstream redirects, never parses a prompt, never caches a body and
-never writes a token, key, prompt or upstream body to a log line.
+never writes a token, key, prompt or upstream body to a log line.  Concurrent
+connections are bounded (``max_connections``, 503 on overflow) and every request
+has an overall wall-clock deadline in addition to the per-I/O timeout.
+
+Revocation contract for the managed adapter (Task 5): after a task is stopped,
+cleaned up, or its result has been read, call
+:func:`write_revocation_markers` with the task's claims and token digest.  The
+broker re-reads the directory on every request, so a token cannot outlive the
+task even if an earlier copy leaked into the sandbox.
 """
 
 from __future__ import annotations
@@ -47,10 +58,12 @@ import logging
 import os
 import re
 import signal
+import socket
 import socketserver
 import ssl
 import stat
 import threading
+import time
 import types
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
@@ -59,13 +72,17 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 __all__ = [
+    "BROKER_MAX_CONNECTIONS",
+    "BROKER_REQUEST_TIMEOUT_SECONDS",
     "BROKER_SOCKET_GROUP",
     "BROKER_SOCKET_MODE",
     "DEFAULT_ALLOWED_ROUTES",
     "EGRESS_TOKEN_HEADER",
     "MAX_EGRESS_TOKEN_LENGTH",
     "MAX_EGRESS_TTL_SECONDS",
+    "REVOCATION_MARKER_KINDS",
     "TOKEN_PREFIX",
+    "VOLATILE_SOCKET_ROOTS",
     "BrokerConfig",
     "BrokerConfigError",
     "BrokerError",
@@ -77,8 +94,10 @@ __all__ = [
     "load_broker_config",
     "main",
     "mint_egress_token",
+    "revocation_markers",
     "run_broker",
     "verify_egress_token",
+    "write_revocation_markers",
 ]
 
 #: Fixed token prefix; also the first dot-separated segment of every token.
@@ -396,10 +415,13 @@ def _require_path_prefix(value: object) -> None:
     if (
         not isinstance(value, str)
         or not value.startswith("/")
+        or value.rstrip("/") == ""
         or ".." in value
         or "?" in value
         or "#" in value
     ):
+        # "/" (or "///") would authorise every allowlisted route; the token must
+        # pin a concrete prefix such as "/v1".
         raise EgressTokenError(reason)
 
 
@@ -439,8 +461,12 @@ _TOKEN_HEADER_LOWER = EGRESS_TOKEN_HEADER.lower()
 BROKER_SOCKET_GROUP = "agentmgr-hermes"
 BROKER_SOCKET_MODE = 0o660
 
-#: The only upstream routes a task token may reach.  This matches the sandbox
-#: proxy's own allowlist; both sides must agree or traffic is dropped.
+#: The only upstream routes a task token may reach.  This is exactly the
+#: sandbox proxy's ``ALLOWED_REQUESTS`` (``ops/security/agentmgr_hermes_workload.py``);
+#: both sides must agree or traffic is dropped before it reaches the broker.
+#: ``/v1/responses`` is deliberately absent: the pinned Hermes client only calls
+#: ``/v1/chat/completions`` and widening the allowlist here would not be reachable
+#: through the proxy anyway.
 DEFAULT_ALLOWED_ROUTES: Mapping[str, frozenset[str]] = types.MappingProxyType(
     {
         "POST": frozenset(
@@ -448,11 +474,23 @@ DEFAULT_ALLOWED_ROUTES: Mapping[str, frozenset[str]] = types.MappingProxyType(
                 "/v1/chat/completions",
                 "/v1/completions",
                 "/v1/embeddings",
-                "/v1/responses",
             }
         ),
         "GET": frozenset({"/v1/models"}),
     }
+)
+
+#: Revocation marker file-name prefixes (``<kind>.<value>``) understood by
+#: :func:`revocation_markers` and checked by :meth:`EgressBroker._is_revoked`.
+REVOCATION_MARKER_KINDS: tuple[str, ...] = ("token", "unit", "task", "grant")
+
+#: The control-plane socket may not live in a volatile/masked filesystem: the
+#: task unit binds it read-only and Task 2 masks the control directory.  The
+#: production path is ``/var/lib/agentmgr-hermes-control/egress.sock``.
+VOLATILE_SOCKET_ROOTS: tuple[Path, ...] = (
+    Path("/run"),
+    Path("/tmp"),
+    Path("/var/tmp"),
 )
 
 #: Client headers copied upstream.  Everything else -- in particular
@@ -472,7 +510,6 @@ _FORWARDED_RESPONSE_HEADERS: tuple[str, ...] = (
     "X-Request-Id",
 )
 
-#: Stable upstream error mapping (design §9.3: never echo an upstream body).
 #: Parser-level failures reported by ``BaseHTTPRequestHandler.send_error``.
 _PROTOCOL_ERROR_CODES: Mapping[int, str] = {
     400: "request_invalid",
@@ -483,6 +520,7 @@ _PROTOCOL_ERROR_CODES: Mapping[int, str] = {
     505: "request_invalid",
 }
 
+#: Stable upstream error mapping (design §9.3: never echo an upstream body).
 _UPSTREAM_ERRORS: Mapping[int, tuple[int, str]] = {
     401: (502, "upstream_auth_failed"),
     403: (502, "upstream_auth_failed"),
@@ -498,7 +536,12 @@ _UPSTREAM_ERRORS: Mapping[int, tuple[int, str]] = {
 BROKER_MAX_REQUEST_BYTES = 8 * 1024 * 1024
 BROKER_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 BROKER_UPSTREAM_TIMEOUT_SECONDS = 120.0
+#: Overall wall-clock budget for one request, including every I/O operation.
+BROKER_REQUEST_TIMEOUT_SECONDS = 300.0
+#: Concurrent Unix connections served before new ones get a stable 503.
+BROKER_MAX_CONNECTIONS = 32
 
+_MAX_CONNECTIONS_LIMIT = 512
 _MAX_REQUEST_BYTES_LIMIT = 64 * 1024 * 1024
 _MAX_RESPONSE_BYTES_LIMIT = 128 * 1024 * 1024
 _MAX_TIMEOUT_SECONDS = 3600.0
@@ -508,6 +551,8 @@ _MAX_SECRET_BYTES = 4_096
 _MAX_CONFIG_BYTES = 65_536
 _MAX_MANIFEST_BYTES = 65_536
 _STREAM_CHUNK_BYTES = 65_536
+_BUSY_RESPONSE_TIMEOUT_SECONDS = 1.0
+_BUSY_DRAIN_SECONDS = 0.2
 
 EXIT_OK = 0
 EXIT_CONFIG = 2
@@ -522,6 +567,7 @@ _ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _GROUP_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,31}$")
 _HOSTNAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$")
 _OCTAL_RE = re.compile(r"^0[0-7]+$")
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 logger = logging.getLogger("agentmgr.hermes.egress")
 
@@ -625,23 +671,42 @@ def _require_limit(value: object, *, maximum: int, code: str) -> int:
     return value
 
 
-def _require_timeout(value: object) -> float:
+def _require_timeout(value: object, code: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise BrokerConfigError("config_timeout_invalid")
+        raise BrokerConfigError(code)
     timeout = float(value)
     if not 0.05 <= timeout <= _MAX_TIMEOUT_SECONDS:
-        raise BrokerConfigError("config_timeout_invalid")
+        raise BrokerConfigError(code)
     return timeout
 
 
-def _require_header_value(value: object) -> str:
-    if not isinstance(value, str) or not value or len(value) > 4_096:
-        raise BrokerConfigError("config_provider_header_invalid")
+def _require_auth_prefix(value: object) -> str:
+    """Validate an injected credential prefix.
+
+    Accepted: ``""`` (only for a non-``Authorization`` header such as
+    ``x-api-key``), ``"Bearer"`` or ``"Bearer "`` (exactly one separator
+    space).  Leading whitespace, double spaces and embedded whitespace are
+    rejected so the header cannot be smuggled or malformed.
+    """
+
+    code = "config_provider_header_invalid"
+    if not isinstance(value, str) or len(value) > 256:
+        raise BrokerConfigError(code)
     if any(
         character in "\r\n\x00" or ord(character) < 0x20 or ord(character) == 0x7F
         for character in value
     ):
-        raise BrokerConfigError("config_provider_header_invalid")
+        raise BrokerConfigError(code)
+    if value == "":
+        return value
+    core = value.rstrip(" ")
+    if (
+        core == ""
+        or value != value.lstrip()
+        or any(character.isspace() for character in core)
+        or value not in {core, core + " "}
+    ):
+        raise BrokerConfigError(code)
     return value
 
 
@@ -679,9 +744,9 @@ class BrokerConfig:
 
     ``token_key`` and ``provider_key`` are the only secrets.  ``provider_host``
     is the canonical value a token must claim (it may differ from the physical
-    upstream host only for the loopback test upstream), and ``task_root`` binds
-    a token to the prepared task manifest so a cleaned-up or cross-task token
-    fails closed.
+    upstream host only for the loopback test upstream), and ``task_root`` is
+    mandatory: every request must bind to the prepared task manifest, so a
+    cleaned-up or cross-task token fails closed.
     """
 
     socket_path: Path
@@ -689,11 +754,13 @@ class BrokerConfig:
     token_key: bytes
     provider_key: bytes
     revocation_dir: Path
+    task_root: Path
     provider_host: str
-    task_root: Path | None = None
     max_request_bytes: int = BROKER_MAX_REQUEST_BYTES
     max_response_bytes: int = BROKER_MAX_RESPONSE_BYTES
     upstream_timeout_sec: float = BROKER_UPSTREAM_TIMEOUT_SECONDS
+    request_timeout_sec: float = BROKER_REQUEST_TIMEOUT_SECONDS
+    max_connections: int = BROKER_MAX_CONNECTIONS
     allowed_routes: Mapping[str, frozenset[str]] = field(
         default_factory=lambda: DEFAULT_ALLOWED_ROUTES
     )
@@ -707,8 +774,7 @@ class BrokerConfig:
     def __post_init__(self) -> None:
         _require_absolute_path(self.socket_path, "config_socket_path_invalid")
         _require_absolute_path(self.revocation_dir, "config_revocation_dir_invalid")
-        if self.task_root is not None:
-            _require_absolute_path(self.task_root, "config_task_root_invalid")
+        _require_absolute_path(self.task_root, "config_task_root_invalid")
         if type(self.allow_insecure_upstream) is not bool:
             raise BrokerConfigError("config_upstream_invalid")
         # Parsing validates the scheme, TLS requirement and the base path.
@@ -733,7 +799,13 @@ class BrokerConfig:
             maximum=_MAX_RESPONSE_BYTES_LIMIT,
             code="config_response_limit_invalid",
         )
-        _require_timeout(self.upstream_timeout_sec)
+        _require_timeout(self.upstream_timeout_sec, "config_timeout_invalid")
+        _require_timeout(self.request_timeout_sec, "config_request_timeout_invalid")
+        _require_limit(
+            self.max_connections,
+            maximum=_MAX_CONNECTIONS_LIMIT,
+            code="config_connections_invalid",
+        )
         object.__setattr__(self, "allowed_routes", _freeze_routes(self.allowed_routes))
         if self.socket_group is not None and (
             not isinstance(self.socket_group, str)
@@ -754,7 +826,10 @@ class BrokerConfig:
             or self.provider_key_header.lower() == _TOKEN_HEADER_LOWER
         ):
             raise BrokerConfigError("config_provider_header_invalid")
-        _require_header_value(self.provider_key_prefix)
+        prefix = _require_auth_prefix(self.provider_key_prefix)
+        if self.provider_key_header.lower() == "authorization" and not prefix:
+            # ``Authorization: <bare key>`` is never a valid provider credential.
+            raise BrokerConfigError("config_provider_header_invalid")
         if not callable(self.clock):
             raise BrokerConfigError("config_clock_invalid")
 
@@ -764,7 +839,8 @@ class BrokerConfig:
             "provider_host={!r}, revocation_dir={!r}, task_root={!r}, "
             "token_key=<redacted>, provider_key=<redacted>, "
             "max_request_bytes={!r}, max_response_bytes={!r}, "
-            "upstream_timeout_sec={!r}, socket_group={!r}, socket_mode={!r})"
+            "upstream_timeout_sec={!r}, request_timeout_sec={!r}, "
+            "max_connections={!r}, socket_group={!r}, socket_mode={!r})"
         ).format(
             self.socket_path,
             self.upstream_base_url,
@@ -774,6 +850,8 @@ class BrokerConfig:
             self.max_request_bytes,
             self.max_response_bytes,
             self.upstream_timeout_sec,
+            self.request_timeout_sec,
+            self.max_connections,
             self.socket_group,
             self.socket_mode,
         )
@@ -785,7 +863,8 @@ class BrokerResponse:
 
     ``body`` is ``bytes`` for a bounded response (including every error) and an
     iterator of chunks for a streamed upstream body (SSE/chunked).  A stream is
-    single-use; call :meth:`close` if it will not be consumed.
+    single-use; call :meth:`close` if it will not be consumed.  A buffered body
+    never carries ``Content-Length`` here: the socket handler adds exactly one.
     """
 
     status: int
@@ -824,7 +903,13 @@ class BrokerResponse:
         if not isinstance(code, str) or not _ERROR_CODE_RE.fullmatch(code):
             raise ValueError("broker error code is invalid")
         body = json.dumps({"error": code}, separators=(",", ":")).encode("ascii")
-        return cls(status=status, headers=headers, body=body)
+        # Every stable error is JSON; callers may add Retry-After but not a
+        # second/conflicting content type.
+        return cls(
+            status=status,
+            headers=(("Content-Type", "application/json"),) + headers,
+            body=body,
+        )
 
     def iter_body(self) -> Iterator[bytes]:
         if isinstance(self.body, bytes):
@@ -902,12 +987,71 @@ def _marker_path(directory: str, name: str) -> str:
     return os.path.join(directory, name)
 
 
+def revocation_markers(claims: EgressClaims, token_hash: str) -> tuple[str, ...]:
+    """Return the revocation marker names for one task token.
+
+    Contract for the managed adapter (Task 5): on stop, cleanup or a completed
+    result read, write every returned name as a zero-byte file into the broker's
+    ``revocation_dir`` (see :func:`write_revocation_markers`).  The broker treats
+    any existing entry — token digest, unit, task or grant — as revoked.
+    """
+
+    if (
+        not isinstance(claims, EgressClaims)
+        or not isinstance(token_hash, str)
+        or not _SHA256_HEX_RE.fullmatch(token_hash)
+        or not _SAFE_IDENTIFIER_RE.fullmatch(claims.unit)
+        or not _SAFE_IDENTIFIER_RE.fullmatch(claims.task_id)
+        or not _SAFE_IDENTIFIER_RE.fullmatch(claims.grant_id)
+    ):
+        raise ValueError("revocation marker input is invalid")
+    values = {
+        "token": token_hash,
+        "unit": claims.unit,
+        "task": claims.task_id,
+        "grant": claims.grant_id,
+    }
+    return tuple(f"{kind}.{values[kind]}" for kind in REVOCATION_MARKER_KINDS)
+
+
+def write_revocation_markers(
+    directory: Path, claims: EgressClaims, token_hash: str
+) -> tuple[str, ...]:
+    """Write every revocation marker for one token (adapter side, Task 5).
+
+    The broker only reads revocation state; the adapter calls this on stop,
+    cleanup and after reading a task result so a short-lived token cannot outlive
+    the task even if an earlier copy leaked into the sandbox.
+    """
+
+    names = revocation_markers(claims, token_hash)
+    if not isinstance(directory, Path):
+        raise ValueError("revocation directory is invalid")
+    info = os.lstat(directory)
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise NotADirectoryError("revocation directory is invalid")
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    for name in names:
+        descriptor = os.open(_marker_path(str(directory), name), flags, 0o600)
+        os.close(descriptor)
+    return names
+
+
 class EgressBroker:
     """Validate one task token, then forward one allowlisted call upstream.
 
     :meth:`handle` is pure apart from the revocation/manifest reads and the
     upstream call, so every decision is testable without a socket.  The socket
     handler (:class:`_BrokerRequestHandler`) only frames HTTP around it.
+
+    The production entry point (:func:`run_broker`) additionally requires the
+    socket to sit outside ``/run``, ``/tmp`` and ``/var/tmp``; an embedder that
+    constructs this class directly owns that placement decision.
     """
 
     def __init__(self, config: BrokerConfig) -> None:
@@ -942,6 +1086,7 @@ class EgressBroker:
         """
 
         config = self._config
+        deadline = time.monotonic() + config.request_timeout_sec
         if not isinstance(method, str) or not isinstance(path, str):
             return self._deny(400, "request_invalid")
         if not isinstance(body, (bytes, bytearray)):
@@ -1009,13 +1154,29 @@ class EgressBroker:
         if prefix and not (route == prefix or route.startswith(prefix + "/")):
             return self._deny(403, "path_not_allowed")
 
-        if config.task_root is not None and not self._binding_matches(claims, token):
+        if method_name == "POST":
+            # Every allowlisted POST route is an OpenAI-compatible model route.
+            # Model choice is a trusted profile fact: the token names the model
+            # and the body may not silently select another one.  Only the
+            # top-level ``model`` field is read; messages/prompt are never parsed
+            # or logged.
+            try:
+                document = json.loads(payload.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return self._deny(400, "request_invalid")
+            if not isinstance(document, dict):
+                return self._deny(400, "request_invalid")
+            model = document.get("model")
+            if not isinstance(model, str) or model != claims.model:
+                return self._deny(403, "model_not_allowed")
+
+        if not self._binding_matches(claims, token):
             # Filesystem work (manifest read) runs last, after every cheap
             # claim/route check has already passed.
             return self._deny(403, "token_binding_mismatch")
 
         logger.debug("egress allowed unit=%s route=%s", claims.unit, route)
-        return self._forward(method_name, route, query, normalized, payload)
+        return self._forward(method_name, route, query, normalized, payload, deadline)
 
     def _deny(self, status: int, code: str) -> BrokerResponse:
         logger.debug("egress denied code=%s", code)
@@ -1027,9 +1188,9 @@ class EgressBroker:
     def _is_revoked(self, claims: EgressClaims, token_hash: str) -> bool:
         """Check the revocation directory once per request.
 
-        Marker names cover the token digest, its unit, task and grant, so the
-        adapter can revoke at the finest or coarsest granularity it has.  A
-        missing or non-directory store fails closed.
+        Marker names come from :func:`revocation_markers` (token digest, unit,
+        task and grant), so the adapter can revoke at the finest or coarsest
+        granularity it has.  A missing or non-directory store fails closed.
         """
 
         directory = self._config.revocation_dir
@@ -1037,13 +1198,7 @@ class EgressBroker:
             info = os.lstat(directory)
             if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
                 raise BrokerError("revocation_unavailable")
-            names = (
-                f"token.{token_hash}",
-                f"unit.{claims.unit}",
-                f"task.{claims.task_id}",
-                f"grant.{claims.grant_id}",
-            )
-            for name in names:
+            for name in revocation_markers(claims, token_hash):
                 try:
                     os.lstat(_marker_path(str(directory), name))
                 except FileNotFoundError:
@@ -1067,10 +1222,7 @@ class EgressBroker:
         rewritten cannot pass.  Any read or parse failure is a mismatch.
         """
 
-        task_root = self._config.task_root
-        if task_root is None:
-            return True
-        manifest = self._read_manifest(task_root, claims.unit)
+        manifest = self._read_manifest(self._config.task_root, claims.unit)
         if manifest is None:
             return False
         expected = {
@@ -1129,8 +1281,11 @@ class EgressBroker:
             target = f"{target}?{query}"
         return target
 
-    def _connect(self) -> http.client.HTTPConnection:
-        timeout = self._config.upstream_timeout_sec
+    def _connect(self, deadline: float) -> http.client.HTTPConnection:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise BrokerError("upstream_timeout")
+        timeout = min(self._config.upstream_timeout_sec, remaining)
         try:
             if self._target.scheme == "https":
                 return http.client.HTTPSConnection(
@@ -1145,6 +1300,26 @@ class EgressBroker:
         except (OSError, ValueError) as exc:
             raise BrokerError("upstream_unavailable") from exc
 
+    def _arm(self, sock: socket.socket | None, deadline: float) -> bool:
+        """Apply the remaining overall deadline to the upstream socket.
+
+        Returns ``False`` when the request budget is exhausted; the caller then
+        fails with the stable timeout code instead of continuing I/O.  ``sock``
+        may be ``None`` for an exotic response object; the per-I/O timeout set
+        at connect time still applies and the streaming loop checks the deadline
+        on every iteration.
+        """
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        if sock is not None:
+            try:
+                sock.settimeout(min(self._config.upstream_timeout_sec, remaining))
+            except OSError:
+                return False
+        return True
+
     def _forward(
         self,
         method: str,
@@ -1152,12 +1327,18 @@ class EgressBroker:
         query: str,
         headers: Mapping[str, tuple[str, ...]],
         body: bytes,
+        deadline: float,
     ) -> BrokerResponse:
         try:
-            connection = self._connect()
-        except BrokerError:
+            connection = self._connect(deadline)
+        except BrokerError as exc:
+            if exc.code == "upstream_timeout":
+                return self._upstream_failure(504, "upstream_timeout")
             return self._upstream_failure(502, "upstream_unavailable")
         try:
+            # Connect explicitly so the overall deadline bounds the TCP/TLS
+            # handshake as well as every later read and write.
+            connection.connect()
             connection.putrequest(
                 method,
                 self._target_path(route, query),
@@ -1177,7 +1358,13 @@ class EgressBroker:
             connection.putheader("Content-Length", str(len(body)))
             connection.endheaders()
             if body:
+                if not self._arm(connection.sock, deadline):
+                    connection.close()
+                    return self._upstream_failure(504, "upstream_timeout")
                 connection.send(body)
+            if not self._arm(connection.sock, deadline):
+                connection.close()
+                return self._upstream_failure(504, "upstream_timeout")
             response = connection.getresponse()
         except TimeoutError:
             connection.close()
@@ -1186,7 +1373,7 @@ class EgressBroker:
             connection.close()
             return self._upstream_failure(502, "upstream_unavailable")
         try:
-            return self._translate(response, connection)
+            return self._translate(response, connection, deadline)
         except TimeoutError:
             response.close()
             connection.close()
@@ -1204,6 +1391,7 @@ class EgressBroker:
         self,
         response: http.client.HTTPResponse,
         connection: http.client.HTTPConnection,
+        deadline: float,
     ) -> BrokerResponse:
         status = response.status
         if 300 <= status < 400:
@@ -1246,6 +1434,10 @@ class EgressBroker:
                 return self._upstream_failure(502, "response_too_large")
 
         if length is not None:
+            if not self._arm(_response_socket(response), deadline):
+                response.close()
+                connection.close()
+                return self._upstream_failure(504, "upstream_timeout")
             data = response.read(length)
             if len(data) != length:
                 response.close()
@@ -1253,7 +1445,7 @@ class EgressBroker:
                 return self._upstream_failure(502, "upstream_error")
             response.close()
             connection.close()
-            out_headers.append(("Content-Length", str(len(data))))
+            # The handler sets exactly one Content-Length for a buffered body.
             return BrokerResponse(
                 status=status, headers=tuple(out_headers), body=data
             )
@@ -1261,13 +1453,14 @@ class EgressBroker:
         return BrokerResponse(
             status=status,
             headers=tuple(out_headers),
-            body=self._stream(response, connection),
+            body=self._stream(response, connection, deadline),
         )
 
     def _stream(
         self,
         response: http.client.HTTPResponse,
         connection: http.client.HTTPConnection,
+        deadline: float,
     ) -> Iterator[bytes]:
         """Copy an SSE/chunked body chunk by chunk under the response cap.
 
@@ -1279,6 +1472,8 @@ class EgressBroker:
         remaining = self._config.max_response_bytes
         try:
             while remaining > 0:
+                if not self._arm(_response_socket(response), deadline):
+                    return
                 try:
                     chunk = response.read1(min(_STREAM_CHUNK_BYTES, remaining))
                 except (OSError, http.client.HTTPException):
@@ -1357,17 +1552,42 @@ class EgressBroker:
             thread.join(timeout=5.0)
         _safe_unlink(self._config.socket_path)
 
+    @property
+    def serving(self) -> bool:
+        """True once the Unix listener is bound, activated and accepting."""
+
+        return self._server is not None
+
+    @property
+    def active_connections(self) -> int:
+        """Connections currently being served (bounded by ``max_connections``)."""
+
+        server = self._server
+        return server.active_connections if server is not None else 0
+
     def _bind(self) -> "_BrokerServer":
         path = self._config.socket_path
         try:
-            os.lstat(path)
+            info = os.lstat(path)
         except FileNotFoundError:
-            pass
+            info = None
         except OSError as exc:
             raise BrokerError("socket_unavailable") from exc
-        else:
-            # Never clobber a socket, file or symlink another process may own.
-            raise BrokerError("socket_path_exists")
+        if info is not None:
+            # A leftover socket from a previous instance is ours to replace, but
+            # only after proving nothing is listening: never clobber a live
+            # socket, a regular file or another user's path.
+            if (
+                not stat.S_ISSOCK(info.st_mode)
+                or info.st_uid != getattr(os, "geteuid", lambda: -1)()
+            ):
+                raise BrokerError("socket_path_exists")
+            if _socket_is_live(path):
+                raise BrokerError("socket_in_use")
+            try:
+                os.unlink(path)
+            except OSError as exc:
+                raise BrokerError("socket_unavailable") from exc
         try:
             server = _BrokerServer(str(path), self)
         except OSError as exc:
@@ -1390,6 +1610,21 @@ class EgressBroker:
         return server
 
 
+def _response_socket(
+    response: http.client.HTTPResponse,
+) -> socket.socket | None:
+    """Return the socket behind a response for deadline re-arming.
+
+    ``HTTPConnection.getresponse`` closes the connection object for a
+    ``Connection: close`` response, but the response's buffered socket stays
+    usable until the response is closed.
+    """
+
+    raw = getattr(getattr(response, "fp", None), "raw", None)
+    sock = getattr(raw, "_sock", None)
+    return sock if isinstance(sock, socket.socket) else None
+
+
 def _read_bounded(descriptor: int, limit: int) -> bytes | None:
     chunks: list[bytes] = []
     total = 0
@@ -1402,6 +1637,24 @@ def _read_bounded(descriptor: int, limit: int) -> bytes | None:
             return None
         chunks.append(chunk)
     return b"".join(chunks)
+
+
+def _socket_is_live(path: Path) -> bool:
+    """True when a process accepts connections on ``path`` (or the check fails)."""
+
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.settimeout(_BUSY_RESPONSE_TIMEOUT_SECONDS)
+    try:
+        probe.connect(str(path))
+    except (ConnectionRefusedError, FileNotFoundError):
+        return False
+    except OSError:
+        # Unknown state: fail closed and leave the path untouched.
+        return True
+    else:
+        return True
+    finally:
+        probe.close()
 
 
 def _safe_unlink(path: Path) -> None:
@@ -1442,8 +1695,10 @@ class _BrokerRequestHandler(http.server.BaseHTTPRequestHandler):
 
     def setup(self) -> None:
         # ``StreamRequestHandler.setup`` applies ``self.timeout`` to the socket;
-        # a stalled client must never pin a worker thread past the upstream bound.
-        self.timeout = self._broker.config.upstream_timeout_sec
+        # a stalled client must never pin a worker thread past the tighter of the
+        # per-I/O and overall request bounds.
+        config = self._broker.config
+        self.timeout = min(config.upstream_timeout_sec, config.request_timeout_sec)
         super().setup()
 
     def send_error(
@@ -1488,6 +1743,10 @@ class _BrokerRequestHandler(http.server.BaseHTTPRequestHandler):
             self._send(BrokerResponse.failure(414, "path_too_long"))
             return
         if self.headers.get("Transfer-Encoding") is not None:
+            self._send(BrokerResponse.failure(400, "request_invalid"))
+            return
+        if len(self.headers.get_all("Content-Length") or ()) > 1:
+            # HTTP request smuggling guard: one authoritative body length only.
             self._send(BrokerResponse.failure(400, "request_invalid"))
             return
         length_header = self.headers.get("Content-Length")
@@ -1554,15 +1813,89 @@ class _BrokerRequestHandler(http.server.BaseHTTPRequestHandler):
 
 
 class _BrokerServer(socketserver.ThreadingUnixStreamServer):
-    """Threaded ``AF_UNIX`` server; it has no IP listener by construction."""
+    """Threaded ``AF_UNIX`` server; it has no IP listener by construction.
+
+    Concurrency is bounded by ``BrokerConfig.max_connections``: an accepted
+    connection beyond the cap receives a stable ``503 broker_busy`` and is closed
+    instead of spawning another handler thread.  The service unit's ``TasksMax``
+    is the second bound.
+    """
 
     daemon_threads = True
+    # Do not join handler threads in ``server_close``: a stalled upstream call
+    # must not delay SIGTERM past the unit's TimeoutStopSec.  In-flight daemon
+    # threads are aborted when the process exits.
+    block_on_close = False
     allow_reuse_address = False
     request_queue_size = 64
 
     def __init__(self, socket_path: str, broker: EgressBroker) -> None:
         self.broker = broker
+        self._active = 0
+        self._active_lock = threading.Lock()
         super().__init__(socket_path, _BrokerRequestHandler)
+
+    @property
+    def active_connections(self) -> int:
+        with self._active_lock:
+            return self._active
+
+    def process_request(self, request: socket.socket, client_address: object) -> None:
+        with self._active_lock:
+            if self._active >= self.broker.config.max_connections:
+                overflow = True
+            else:
+                self._active += 1
+                overflow = False
+        if overflow:
+            self._reject_busy(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._release()
+            raise
+
+    def process_request_thread(
+        self, request: socket.socket, client_address: object
+    ) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._release()
+
+    def _release(self) -> None:
+        with self._active_lock:
+            if self._active > 0:
+                self._active -= 1
+
+    def _reject_busy(self, request: socket.socket) -> None:
+        # Consume the already-queued request first (bounded): closing a Unix
+        # socket with unread data would reset the connection and the caller would
+        # never see the stable 503.
+        try:
+            request.settimeout(_BUSY_DRAIN_SECONDS)
+            request.recv(_STREAM_CHUNK_BYTES)
+            request.setblocking(False)
+            while request.recv(_STREAM_CHUNK_BYTES):
+                pass
+        except OSError:
+            pass
+        body = b'{"error":"broker_busy"}'
+        payload = (
+            b"HTTP/1.1 503 Service Unavailable\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n"
+            b"Connection: close\r\n\r\n" + body
+        )
+        try:
+            request.settimeout(_BUSY_RESPONSE_TIMEOUT_SECONDS)
+            request.sendall(payload)
+            request.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        finally:
+            self.shutdown_request(request)
 
     def handle_error(self, request: object, client_address: object) -> None:
         # The default handler prints a traceback, which could disclose request
@@ -1592,6 +1925,8 @@ _CONFIG_OPTIONAL = frozenset(
         "max_request_bytes",
         "max_response_bytes",
         "upstream_timeout_sec",
+        "request_timeout_sec",
+        "max_connections",
         "allow_insecure_upstream",
         "provider_key_header",
         "provider_key_prefix",
@@ -1652,6 +1987,14 @@ def _config_bool(value: object, code: str) -> bool:
 def _config_int(value: object, code: str) -> int:
     if type(value) is not int:
         raise BrokerConfigError(code)
+    return value
+
+
+def _config_prefix(value: object) -> str:
+    # An empty prefix is meaningful for a non-Authorization header (x-api-key);
+    # BrokerConfig rejects it for Authorization and all whitespace abuse.
+    if not isinstance(value, str):
+        raise BrokerConfigError("config_provider_header_invalid")
     return value
 
 
@@ -1760,6 +2103,13 @@ def load_broker_config(path: Path) -> BrokerConfig:
         upstream_timeout_sec=document.get(
             "upstream_timeout_sec", BROKER_UPSTREAM_TIMEOUT_SECONDS
         ),
+        request_timeout_sec=document.get(
+            "request_timeout_sec", BROKER_REQUEST_TIMEOUT_SECONDS
+        ),
+        max_connections=_config_int(
+            document.get("max_connections", BROKER_MAX_CONNECTIONS),
+            "config_connections_invalid",
+        ),
         allow_insecure_upstream=allow_insecure,
         socket_group=socket_group,
         socket_mode=_config_mode(document.get("socket_mode", BROKER_SOCKET_MODE)),
@@ -1767,9 +2117,8 @@ def load_broker_config(path: Path) -> BrokerConfig:
             document.get("provider_key_header", "Authorization"),
             "config_provider_header_invalid",
         ),
-        provider_key_prefix=_config_string(
-            document.get("provider_key_prefix", "Bearer "),
-            "config_provider_header_invalid",
+        provider_key_prefix=_config_prefix(
+            document.get("provider_key_prefix", "Bearer ")
         ),
     )
 
@@ -1806,21 +2155,32 @@ def _restore_stop_handlers(previous: Mapping[int, object]) -> None:
             pass
 
 
+def _require_control_socket_path(path: Path) -> None:
+    """Reject a socket in a volatile/masked filesystem (design §9.1).
+
+    ``/run`` is replaced/masked inside task units and ``/tmp``/``/var/tmp`` are
+    private or temporary, so a socket there cannot be a stable host-side bind
+    source.  The service unit uses ``StateDirectory=agentmgr-hermes-control``.
+    """
+
+    for root in VOLATILE_SOCKET_ROOTS:
+        if path == root or root in path.parents:
+            raise BrokerError("socket_path_volatile")
+
+
 def run_broker(config: BrokerConfig) -> int:
     """Validate the deployment, serve until SIGTERM/SIGINT and return an exit code."""
 
     if not isinstance(config, BrokerConfig):
         logger.error("egress broker rejected: config_invalid")
         return EXIT_CONFIG
-    if config.task_root is None:
-        logger.error("egress broker rejected: config_task_root_required")
-        return EXIT_CONFIG
     try:
         _require_directory(config.revocation_dir, "revocation_unavailable")
         _require_directory(config.task_root, "task_root_unavailable")
+        _require_control_socket_path(config.socket_path)
     except BrokerError as exc:
         logger.error("egress broker unavailable: %s", exc.code)
-        return EXIT_UNAVAILABLE
+        return EXIT_CONFIG if exc.code == "socket_path_volatile" else EXIT_UNAVAILABLE
 
     broker = EgressBroker(config)
     stop_event = threading.Event()
