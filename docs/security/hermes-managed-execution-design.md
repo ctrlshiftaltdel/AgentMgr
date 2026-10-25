@@ -182,7 +182,7 @@ unit = "agentmgr-hermes-" + sha256(("agentmgr-hermes:v1:" + task_id + "\n" + att
 
 ### 7.3 Attestation
 
-attestation 分两层，均由 helper 用 HMAC-SHA256 签名（密钥只在 helper/adapter 可读的 root-only 文件）：
+attestation 分两层，均由 helper 用 HMAC-SHA256 签名。密钥为 root 所有、group 为受信 adapter 的私有组、mode 0440/0400；**不得对 `agentmgr-hermes` 沙箱组可读**，路径必须在 `/etc/agentmgr` 等 unit 不可见目录。helper 用该密钥签名，adapter 用同一密钥验证；沙箱 unit 只拿到签名结果，拿不到密钥。
 
 - **runtime attestation**（schema `agentmgr.hermes.runtime.v1`）：不绑定单个任务；包含 helper 版本、runtime name/version、runtime root manifest 哈希、sandbox profile 常量、broker socket 健康、测试 evidence_ref、签发/过期时间。`capabilities()` 只有在有效 runtime attestation + evidence_ref 存在时才把 Managed 能力标为 `verified`。
 - **task attestation**（schema `agentmgr.hermes.sandbox.v1`）：在 launch 时绑定 task/grant/unit/UID/profile/prompt 哈希与 sandbox 事实；`submit_task` 必须校验它。
@@ -484,7 +484,7 @@ class HermesManagedAdapter:
 2. 安装 root-owned helper/wrapper/workload/broker unit；sudoers 只允许固定 helper 路径、无参数。
 3. 准备只读运行时根（根所有；Hermes 安装 + Python tools；不含 Profile/auth/.env/session）；计算并记录 runtime root manifest 哈希。
 4. 创建任务根/状态根，group `agentmgr-hermes`，mode 0770；unit 以 `InaccessiblePaths=-<task-root>` 隐藏兄弟目录；broker socket 放在不落入 unit 私有 `/run`/`/tmp`/`/var/tmp` 的固定控制目录。
-5. 写入 root-only provider key/credential 和 attestation HMAC key；key 只对 broker/helper+adapter 可读；attestation key 必须在 `/etc/agentmgr` 等 unit 不可见路径，且不得对 `agentmgr-hermes` 组可读。
+5. 写入 root-only provider key/credential 和 attestation HMAC key；provider key 只对 broker 可读；attestation key 为 root:adapter-private-group 0440（或 root-only 0400），helper/adapter 可读，`agentmgr-hermes` 沙箱组不可读；路径在 `/etc/agentmgr` 等 unit 不可见位置。
 6. 启动 broker；配置只允许 provider host/path；验证 broker 健康。
 7. 运行 `ops/security/verify_hermes_isolation.sh`；校验 helper 版本、unit 属性、运行时根哈希、个人 profile 未挂载、broker key 不可被 unit 读取。
 8. 创建/验证专用 service identity；记录 ID；不创建公开 Managed API。
