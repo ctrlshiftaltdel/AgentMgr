@@ -20,6 +20,7 @@ Properties pinned here:
 from __future__ import annotations
 
 import http.client
+import hashlib
 import importlib.util
 import json
 import os
@@ -27,7 +28,6 @@ import re
 import signal
 import socketserver
 import stat
-import subprocess
 import sys
 import textwrap
 import threading
@@ -84,6 +84,10 @@ workload = _load_workload()
 # ---------------------------------------------------------------------------
 
 
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
 def _manifest(**overrides: object) -> dict[str, object]:
     document: dict[str, object] = {
         "schema": "agentmgr.hermes.manifest.v1",
@@ -92,6 +96,9 @@ def _manifest(**overrides: object) -> dict[str, object]:
         "runtime_handle": HANDLE,
         "runtime_max_sec": 60,
         "model": MODEL,
+        "prompt_sha256": _sha256(PROMPT_CANARY.encode("utf-8")),
+        "profile_template_sha256": _sha256(PROFILE_TEMPLATE.encode("utf-8")),
+        "egress_token_sha256": _sha256(TOKEN_CANARY.encode("ascii")),
     }
     document.update(overrides)
     return document
@@ -109,14 +116,20 @@ def _make_task(
     prompt: bytes = PROMPT_CANARY.encode("utf-8"),
     template: bytes = PROFILE_TEMPLATE.encode("utf-8"),
     token: bytes = TOKEN_CANARY.encode("ascii"),
-    manifest: dict[str, object] | None = None,
+    manifest_overrides: dict[str, object] | None = None,
     result: bytes | None = None,
 ) -> Path:
     task = root / "task"
     task.mkdir()
     (task / "out").mkdir()
     (task / "profile").mkdir()
-    _write(task / "manifest.json", json.dumps(_manifest() if manifest is None else manifest).encode())
+    manifest = _manifest(
+        prompt_sha256=_sha256(prompt),
+        profile_template_sha256=_sha256(template),
+        egress_token_sha256=_sha256(token),
+        **(manifest_overrides or {}),
+    )
+    _write(task / "manifest.json", json.dumps(manifest))
     _write(task / "prompt.txt", prompt)
     _write(task / "profile.template.yaml", template)
     _write(task / "egress.token", token)
@@ -171,6 +184,8 @@ class _UpstreamHandler(BaseHTTPRequestHandler):
             return
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
+        for name, value in server.response_headers.items():
+            self.send_header(name, value)
         self.send_header("Content-Length", str(len(server.response_body)))
         self.end_headers()
         self.wfile.write(server.response_body)
@@ -188,10 +203,12 @@ class _Upstream(socketserver.ThreadingUnixStreamServer):
         *,
         stream: bool = False,
         response_body: bytes = b'{"ok":true}',
+        response_headers: dict[str, str] | None = None,
     ) -> None:
         self.records: list[dict[str, object]] = []
         self.stream = stream
         self.response_body = response_body
+        self.response_headers = dict(response_headers or {})
         self.release = threading.Event()
         super().__init__(str(path), _UpstreamHandler)
 
@@ -278,9 +295,22 @@ def test_hermes_argv_uses_query_file_and_never_prompt_or_key():
 @pytest.mark.parametrize(
     ("kwargs", "code"),
     [
-        ({"model": "", "base_url": BASE_URL, "run_budget_sec": 60}, "model_invalid"),
-        ({"model": "--yolo", "base_url": BASE_URL, "run_budget_sec": 60}, "model_invalid"),
-        ({"model": "a b", "base_url": BASE_URL, "run_budget_sec": 60}, "model_invalid"),
+        (
+            {"model": "", "base_url": BASE_URL, "run_budget_sec": 60},
+            "model_invalid",
+        ),
+        (
+            {"model": "--yolo", "base_url": BASE_URL, "run_budget_sec": 60},
+            "model_invalid",
+        ),
+        (
+            {"model": "a\nb", "base_url": BASE_URL, "run_budget_sec": 60},
+            "model_invalid",
+        ),
+        (
+            {"model": "a\tb", "base_url": BASE_URL, "run_budget_sec": 60},
+            "model_invalid",
+        ),
         (
             {"model": MODEL, "base_url": "http://example.com/v1", "run_budget_sec": 60},
             "base_url_invalid",
@@ -297,14 +327,45 @@ def test_hermes_argv_uses_query_file_and_never_prompt_or_key():
             },
             "base_url_invalid",
         ),
-        ({"model": MODEL, "base_url": BASE_URL, "run_budget_sec": 0}, "budget_invalid"),
-        ({"model": MODEL, "base_url": BASE_URL, "run_budget_sec": 1.5}, "budget_invalid"),
+        (
+            {"model": MODEL, "base_url": BASE_URL, "run_budget_sec": 0},
+            "budget_invalid",
+        ),
+        (
+            {"model": MODEL, "base_url": BASE_URL, "run_budget_sec": 1.5},
+            "budget_invalid",
+        ),
     ],
 )
 def test_hermes_argv_rejects_unsafe_input(kwargs, code):
     with pytest.raises(workload.WorkloadError) as excinfo:
         workload.build_hermes_argv(RUNTIME_ROOT, **kwargs)
     assert excinfo.value.code == code
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "a" * workload.MAX_MODEL_BYTES,
+        "provider/model-x",
+        "model v1",
+        "a.b:c+d_e@f",
+    ],
+)
+def test_model_validation_accepts_task2_compatible_names(model):
+    argv = workload.build_hermes_argv(
+        RUNTIME_ROOT, model=model, base_url=BASE_URL, run_budget_sec=10
+    )
+    assert argv[argv.index("--model") + 1] == model
+
+
+def test_model_validation_rejects_an_overlong_name():
+    model = "a" * (workload.MAX_MODEL_BYTES + 1)
+    with pytest.raises(workload.WorkloadError) as excinfo:
+        workload.build_hermes_argv(
+            RUNTIME_ROOT, model=model, base_url=BASE_URL, run_budget_sec=10
+        )
+    assert excinfo.value.code == "model_invalid"
 
 
 def test_hermes_argv_rejects_relative_runtime_root():
@@ -571,6 +632,69 @@ def test_proxy_handler_never_logs_the_token(tmp_path, capsys):
     assert TOKEN_CANARY not in captured.out + captured.err
     assert CLIENT_CANARY not in captured.out + captured.err
     assert upstream.records
+
+
+def test_proxy_forwards_content_encoding_and_never_requests_compression(tmp_path):
+    with _upstream(
+        tmp_path / "e.sock", response_headers={"Content-Encoding": "gzip"}
+    ) as upstream:
+        handle = _start_proxy(tmp_path)
+        try:
+            status, headers, _body = _http(
+                handle.port,
+                "POST",
+                "/v1/chat/completions",
+                body=b'{"model":"m"}',
+                headers={
+                    "Content-Type": "application/json",
+                    "Content-Encoding": "identity",
+                },
+            )
+        finally:
+            handle.close()
+    assert status == 200
+    assert headers.get("Content-Encoding") == "gzip"
+    record = upstream.records[0]
+    assert record["headers"]["content-encoding"] == "identity"
+    # Identity responses are guaranteed: the proxy never asks for compression.
+    assert "accept-encoding" not in record["headers"]
+
+
+def test_proxy_rejects_a_declared_response_body_over_the_cap(tmp_path):
+    with _upstream(tmp_path / "e.sock", response_body=b"x" * 100):
+        handle = _start_proxy(tmp_path, max_response_bytes=32)
+        try:
+            status, _headers, body = _http(
+                handle.port, "POST", "/v1/chat/completions", body=b"{}"
+            )
+        finally:
+            handle.close()
+    assert status == 502
+    assert json.loads(body)["error"] == "response_too_large"
+
+
+def test_proxy_returns_a_stable_error_for_a_malformed_request_target(
+    tmp_path, monkeypatch
+):
+    # ``http.server`` normalises a leading ``//`` before the handler sees it, so
+    # the defensive ``urlsplit`` branch is exercised directly with a malformed
+    # target: it must answer a stable 400 instead of raising in the thread.
+    def broken_urlsplit(_value):
+        raise ValueError("malformed request target")
+
+    with _upstream(tmp_path / "e.sock") as upstream:
+        handle = _start_proxy(tmp_path)
+        try:
+            monkeypatch.setattr(workload, "urlsplit", broken_urlsplit)
+            status, _headers, body = _http(
+                handle.port, "POST", "/v1/chat/completions", body=b"{}"
+            )
+        finally:
+            handle.close()
+            monkeypatch.undo()
+    assert status == 400
+    assert json.loads(body)["error"] == "request_invalid"
+    assert upstream.records == []
 
 
 # ---------------------------------------------------------------------------
@@ -910,6 +1034,27 @@ def test_run_workload_bounds_stdout_and_stderr(tmp_path):
             ),
             "manifest_model_mismatch",
         ),
+        (
+            lambda task: _write(
+                task / "manifest.json",
+                json.dumps(_manifest(prompt_sha256="0" * 64)),
+            ),
+            "prompt_hash_mismatch",
+        ),
+        (
+            lambda task: _write(
+                task / "manifest.json",
+                json.dumps(_manifest(profile_template_sha256="0" * 64)),
+            ),
+            "profile_template_hash_mismatch",
+        ),
+        (
+            lambda task: _write(
+                task / "manifest.json",
+                json.dumps(_manifest(egress_token_sha256="0" * 64)),
+            ),
+            "egress_token_hash_mismatch",
+        ),
     ],
 )
 def test_run_workload_validates_task_files_before_starting(tmp_path, mutate, code):
@@ -950,6 +1095,142 @@ def test_run_workload_reports_a_missing_runtime_binary(tmp_path):
     assert not (task / "status" / "heartbeat.json").exists()
 
 
+def test_run_workload_kills_the_child_when_a_status_write_fails(
+    tmp_path, monkeypatch
+):
+    """A failing heartbeat must not leave Hermes running until RuntimeMaxSec."""
+
+    runtime = _fake_runtime(tmp_path, TIMEOUT_SCRIPT)
+    task = _make_task(tmp_path)
+    socket_path = tmp_path / "e.sock"
+    real_write = workload.write_status_atomic
+
+    def flaky_write(path, payload):
+        # The first heartbeat happens immediately after the spawn; fail a later
+        # one so the fake child has recorded its process group first.
+        if path.name == "heartbeat.json" and (task / "pids.json").exists():
+            raise workload.WorkloadError("status_write_failed")
+        real_write(path, payload)
+
+    monkeypatch.setattr(workload, "write_status_atomic", flaky_write)
+    with _upstream(socket_path):
+        with pytest.raises(workload.WorkloadError) as excinfo:
+            workload.run_workload(
+                task_dir=task,
+                runtime_root=runtime,
+                model=MODEL,
+                run_budget_sec=30,
+                proxy_socket=socket_path,
+                heartbeat_interval_sec=0.2,
+                poll_interval_sec=0.05,
+                terminate_grace_sec=0.3,
+            )
+    assert excinfo.value.code == "status_write_failed"
+    pids = _json(task / "pids.json")
+    assert _wait_gone(pids["pid"])
+    assert _wait_gone(pids["child"])
+    exit_document = _json(task / "status" / "exit.json")
+    assert exit_document["error"] == "status_write_failed"
+    assert exit_document["timed_out"] is False
+    assert exit_document["cancelled"] is False
+
+
+def test_run_workload_redacts_prompt_and_token_from_captured_output(tmp_path):
+    leak = f"{PROMPT_CANARY} {TOKEN_CANARY}"
+    script = (
+        "import sys\n"
+        f"leak = {leak!r}\n"
+        "sys.stdout.write(leak + chr(10))\n"
+        "sys.stderr.write(leak + chr(10))\n"
+        "sys.stdout.flush()\n"
+        "sys.stderr.flush()\n"
+    )
+    runtime = _fake_runtime(tmp_path, script)
+    task = _make_task(tmp_path)
+    socket_path = tmp_path / "e.sock"
+    with _upstream(socket_path):
+        code = workload.run_workload(
+            task_dir=task,
+            runtime_root=runtime,
+            model=MODEL,
+            run_budget_sec=30,
+            proxy_socket=socket_path,
+            heartbeat_interval_sec=30.0,
+        )
+    assert code == 0
+    stdout = (task / "stdout.txt").read_text(encoding="utf-8")
+    stderr = (task / "stderr.txt").read_text(encoding="utf-8")
+    for text in (stdout, stderr):
+        assert PROMPT_CANARY not in text
+        assert TOKEN_CANARY not in text
+        assert "[redacted]" in text
+
+
+@pytest.mark.parametrize("runtime_max_sec", [10, 60, 600])
+def test_unit_run_parameters_keep_deadline_and_grace_below_runtime_max(
+    runtime_max_sec,
+):
+    budget, deadline = workload.unit_run_parameters(runtime_max_sec)
+    assert 1 <= budget <= deadline
+    assert deadline <= runtime_max_sec - 1
+    assert (
+        deadline
+        + workload.TERMINATE_GRACE_SECONDS
+        + workload.EXIT_WRITE_RESERVE_SECONDS
+        <= runtime_max_sec - 1
+    )
+
+
+@pytest.mark.parametrize("runtime_max_sec", [1, 8])
+def test_unit_run_parameters_fails_closed_below_the_minimum_contract(
+    runtime_max_sec,
+):
+    with pytest.raises(workload.WorkloadError) as excinfo:
+        workload.unit_run_parameters(runtime_max_sec)
+    assert excinfo.value.code == "runtime_too_short"
+
+
+def test_run_workload_clamps_the_deadline_to_runtime_max(tmp_path, monkeypatch):
+    runtime = _fake_runtime(tmp_path, "import sys\nsys.exit(0)\n")
+    task = _make_task(tmp_path)
+    captured: dict[str, object] = {}
+
+    def fake_run_child(argv, **kwargs):
+        captured.update(kwargs)
+        captured["argv"] = argv
+        return 0
+
+    monkeypatch.setattr(workload, "_run_child", fake_run_child)
+    code = workload.run_workload(
+        task_dir=task,
+        runtime_root=runtime,
+        model=MODEL,
+        run_budget_sec=60,
+        proxy_socket=tmp_path / "e.sock",
+        runtime_max_sec=10,
+    )
+    assert code == 0
+    deadline = captured["deadline_sec"]
+    assert deadline <= 10 - 1
+    assert (
+        deadline
+        + captured["terminate_grace_sec"]
+        + workload.EXIT_WRITE_RESERVE_SECONDS
+        <= 10 - 1
+    )
+
+    with pytest.raises(workload.WorkloadError) as excinfo:
+        workload.run_workload(
+            task_dir=task,
+            runtime_root=runtime,
+            model=MODEL,
+            run_budget_sec=1,
+            proxy_socket=tmp_path / "e.sock",
+            runtime_max_sec=1,
+        )
+    assert excinfo.value.code == "runtime_too_short"
+
+
 # ---------------------------------------------------------------------------
 # entry point / import boundary
 # ---------------------------------------------------------------------------
@@ -957,7 +1238,43 @@ def test_run_workload_reports_a_missing_runtime_binary(tmp_path):
 
 def test_main_rejects_arguments():
     assert workload.main(["--task-dir", "/task"]) == workload.EXIT_USAGE
-    assert workload.main([]) != 0
+
+
+def test_main_fails_closed_without_a_task_directory(tmp_path, monkeypatch):
+    monkeypatch.setattr(workload, "UNIT_TASK_DIR", tmp_path / "missing")
+    assert workload.main([]) == workload.EXIT_TASK_INVALID
+
+
+def test_main_derives_the_budget_and_deadline_from_the_manifest(
+    tmp_path, monkeypatch
+):
+    task = _make_task(tmp_path)
+    monkeypatch.setattr(workload, "UNIT_TASK_DIR", task)
+    captured: dict[str, object] = {}
+
+    def fake_run_workload(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(workload, "run_workload", fake_run_workload)
+    assert workload.main([]) == 0
+    budget, _deadline = workload.unit_run_parameters(60)
+    assert captured["task_dir"] == task
+    assert captured["model"] == MODEL
+    assert captured["run_budget_sec"] == budget
+    assert captured["runtime_max_sec"] == 60
+    assert captured["proxy_socket"] == workload.UNIT_EGRESS_SOCKET_PATH
+
+
+def test_main_fails_closed_for_a_too_short_runtime_max(tmp_path, monkeypatch):
+    task = _make_task(tmp_path, manifest_overrides={"runtime_max_sec": 5})
+    monkeypatch.setattr(workload, "UNIT_TASK_DIR", task)
+
+    def forbidden_run_workload(**kwargs):  # pragma: no cover - must not run
+        raise AssertionError("run_workload must not start")
+
+    monkeypatch.setattr(workload, "run_workload", forbidden_run_workload)
+    assert workload.main([]) == workload.EXIT_TASK_INVALID
 
 
 def test_workload_is_stdlib_only_and_never_imports_app():

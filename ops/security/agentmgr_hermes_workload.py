@@ -22,9 +22,10 @@ Behaviour
 ---------
 
 1. Validate the task directory and its files (regular files, no symlinks,
-   bounded sizes, expected modes) and read the model/binding facts from
-   ``manifest.json``.  The prompt is *never* read into argv and never logged;
-   :func:`run_workload` only validates it.
+   bounded sizes, expected modes), verify the manifest's prompt, profile
+   template and egress-token SHA-256 digests against the files, and read the
+   model/binding facts from ``manifest.json``.  The prompt is never read into
+   argv and never logged.
 2. Start a loopback HTTP proxy on ``127.0.0.1:0``.  It accepts the allowlisted
    OpenAI-compatible method/path pairs, removes every client credential
    (``Authorization``, ``X-Api-Key`` and any client-supplied egress token),
@@ -43,10 +44,12 @@ Behaviour
    DSN, path or profile variable).  The task egress token is exposed only as
    ``CUSTOM_API_KEY``/``OPENAI_API_KEY``; it is never a command-line argument.
 5. Write ``status/started.json`` and ``status/heartbeat.json`` atomically,
-   bound stdout/stderr, enforce the run budget/deadline, and on timeout or a
-   stop signal send SIGTERM to the whole process group, then SIGKILL after the
-   grace period.  ``status/exit.json`` records exit code, signal, duration and
-   the timeout/cancel flags.
+   capture stdout/stderr with the prompt and token redacted, enforce the run
+   budget/deadline, and on timeout, stop signal or any post-spawn failure send
+   SIGTERM to the whole process group, then SIGKILL after the grace period.
+   ``status/exit.json`` records exit code, signal, duration and the
+   timeout/cancel flags plus a stable error code when the workload itself
+   failed.
 6. Never create, modify or read ``out/result.txt``: the host adapter reads and
    hashes it after the unit stopped.
 
@@ -57,6 +60,7 @@ installed outside the project environment and runs inside the sandbox.
 from __future__ import annotations
 
 import http.client
+import hashlib
 import json
 import os
 import re
@@ -77,6 +81,8 @@ from typing import BinaryIO
 from urllib.parse import urlsplit
 
 __all__ = [
+    "ALLOWED_PATHS",
+    "ALLOWED_REQUESTS",
     "CHILD_PATH",
     "DEADLINE_MARGIN_SECONDS",
     "EGRESS_TOKEN_HEADER",
@@ -85,10 +91,12 @@ __all__ = [
     "EXIT_TASK_INVALID",
     "EXIT_UNAVAILABLE",
     "EXIT_USAGE",
+    "EXIT_WRITE_RESERVE_SECONDS",
     "EgressProxy",
     "HEARTBEAT_INTERVAL_SECONDS",
     "MAX_EGRESS_TOKEN_BYTES",
     "MAX_MANIFEST_BYTES",
+    "MAX_MODEL_BYTES",
     "MAX_PROFILE_TEMPLATE_BYTES",
     "MAX_PROMPT_BYTES",
     "MAX_REQUEST_BYTES",
@@ -116,6 +124,7 @@ __all__ = [
     "render_profile",
     "run_workload",
     "start_egress_proxy",
+    "unit_run_parameters",
     "write_status_atomic",
 ]
 
@@ -166,12 +175,14 @@ MAX_REQUEST_BYTES = 8 * 1024 * 1024
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_STDOUT_BYTES = 1_048_576
 MAX_STDERR_BYTES = 262_144
+#: Replacement written where a prompt or token occurrence was redacted.
+REDACTED = b"[redacted]"
 
 MIN_RUN_BUDGET_SECONDS = 1
 MAX_RUN_BUDGET_SECONDS = 86_400
-#: Budget kept between the Hermes ``--run-budget`` and systemd ``RuntimeMaxSec``
-#: so the workload can write status/exit before the unit cgroup is killed.
-UNIT_BUDGET_RESERVE_SECONDS = 10
+#: Seconds kept between the workload's internal deadline (plus the SIGTERM
+#: grace and the exit-marker write) and systemd ``RuntimeMaxSec``.
+EXIT_WRITE_RESERVE_SECONDS = 2
 
 HEARTBEAT_INTERVAL_SECONDS = 5.0
 POLL_INTERVAL_SECONDS = 0.2
@@ -201,12 +212,19 @@ ALLOWED_REQUESTS: Mapping[str, frozenset[str]] = {
 }
 ALLOWED_PATHS: frozenset[str] = frozenset().union(*ALLOWED_REQUESTS.values())
 #: Client request headers copied upstream.  Everything else, in particular
-#: ``Authorization``, cookies and API keys, is dropped.
-FORWARDED_REQUEST_HEADERS: tuple[str, ...] = ("Content-Type", "Accept")
+#: ``Authorization``, cookies and API keys, is dropped.  ``Accept-Encoding`` is
+#: never sent, so the broker/upstream answers identity-encoded (a client may
+#: still send a ``Content-Encoding`` for its own request body).
+FORWARDED_REQUEST_HEADERS: tuple[str, ...] = (
+    "Content-Type",
+    "Content-Encoding",
+    "Accept",
+)
 #: Upstream response headers copied to Hermes.  Cookies and authentication
 #: challenges are never replayed into the sandbox.
 FORWARDED_RESPONSE_HEADERS: tuple[str, ...] = (
     "Content-Type",
+    "Content-Encoding",
     "Cache-Control",
     "Retry-After",
     "X-Request-Id",
@@ -222,8 +240,14 @@ EXIT_INTERNAL = 5
 
 UNIT_PATTERN = re.compile(r"^agentmgr-hermes-[0-9a-f]{16}$")
 HANDLE_PATTERN = re.compile(r"^rtask_hermes_[A-Za-z0-9_-]{4,63}$")
-MODEL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,199}$")
+#: Task 2 treats ``model_name`` as trusted text of at most 256 characters with
+#: no control characters.  The workload keeps that length limit, rejects a
+#: leading ``-`` (option injection) and other characters that cannot be part of
+#: a provider model identifier.
+MODEL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._:+/@-]{0,255}$")
+MAX_MODEL_BYTES = 256
 TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9._~+/=-]{8,4096}$")
+SHA256_HEX_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 BASE_URL_PATTERN = re.compile(r"^http://127\.0\.0\.1:(\d{1,5})/v1$")
 CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
 
@@ -279,6 +303,9 @@ class TaskManifest:
     runtime_handle: str
     model: str
     runtime_max_sec: int
+    prompt_sha256: str
+    profile_template_sha256: str
+    egress_token_sha256: str
 
 
 class ProxyHandle:
@@ -555,12 +582,25 @@ def read_manifest(task_dir: Path) -> TaskManifest:
         or not MIN_RUN_BUDGET_SECONDS <= runtime_max_sec <= MAX_RUN_BUDGET_SECONDS
     ):
         raise WorkloadError("manifest_invalid")
+    hashes: dict[str, str] = {}
+    for field in (
+        "prompt_sha256",
+        "profile_template_sha256",
+        "egress_token_sha256",
+    ):
+        value = document.get(field)
+        if not isinstance(value, str) or SHA256_HEX_PATTERN.fullmatch(value) is None:
+            raise WorkloadError("manifest_invalid")
+        hashes[field] = value
     return TaskManifest(
         unit=unit,
         task_id=task_id,
         runtime_handle=handle,
         model=model,
         runtime_max_sec=runtime_max_sec,
+        prompt_sha256=hashes["prompt_sha256"],
+        profile_template_sha256=hashes["profile_template_sha256"],
+        egress_token_sha256=hashes["egress_token_sha256"],
     )
 
 
@@ -621,7 +661,11 @@ def _validate_port(value: object) -> int:
 
 
 def _validate_model(value: object) -> str:
-    if not isinstance(value, str) or MODEL_PATTERN.fullmatch(value) is None:
+    if (
+        not isinstance(value, str)
+        or len(value) > MAX_MODEL_BYTES
+        or MODEL_PATTERN.fullmatch(value) is None
+    ):
         raise WorkloadError("model_invalid")
     return value
 
@@ -844,6 +888,11 @@ class _ProxyServer(ThreadingHTTPServer):
         self.proxy = proxy
         super().__init__(address, _ProxyHandler)
 
+    def handle_error(self, request: object, client_address: object) -> None:
+        """Never print a handler traceback into the unit's stderr."""
+
+        return
+
 
 class _ProxyHandler(BaseHTTPRequestHandler):
     """Forward allowlisted OpenAI-compatible calls to the host broker."""
@@ -894,7 +943,13 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         self._send_json(405, "method_not_allowed")
 
     def _dispatch(self, method: str) -> None:
-        parsed = urlsplit(self.path)
+        try:
+            parsed = urlsplit(self.path)
+        except ValueError:
+            # A malformed request target (for example a broken IPv6 literal)
+            # must fail closed instead of raising inside the handler thread.
+            self._send_json(400, "request_invalid")
+            return
         if parsed.scheme or parsed.netloc or not parsed.path.startswith("/"):
             self._send_json(404, "path_not_allowed")
             return
@@ -922,7 +977,11 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         if length < 0 or length > proxy.max_request_bytes:
             self._send_json(413, "request_too_large")
             return
-        body = self.rfile.read(length) if length else b""
+        try:
+            body = self.rfile.read(length) if length else b""
+        except OSError:
+            self._send_json(400, "request_invalid")
+            return
         if len(body) != length:
             self._send_json(400, "request_invalid")
             return
@@ -970,12 +1029,24 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             return
 
         try:
+            length_value = response.getheader("Content-Length")
+            if length_value:
+                try:
+                    declared_size = int(length_value)
+                except ValueError:
+                    declared_size = None
+                if declared_size is not None and (
+                    declared_size < 0 or declared_size > proxy.max_response_bytes
+                ):
+                    # Refuse before any header is sent, so the client sees a
+                    # stable 502 instead of a silently truncated body.
+                    self._send_json(502, "response_too_large")
+                    return
             self.send_response_only(response.status, response.reason)
             for name in FORWARDED_RESPONSE_HEADERS:
                 value = response.getheader(name)
                 if value:
                     self.send_header(name, value)
-            length_value = response.getheader("Content-Length")
             if length_value:
                 self.send_header("Content-Length", length_value)
             # ``HTTP/1.0`` plus an explicit close frames a streamed body that
@@ -1145,8 +1216,66 @@ def _open_output(path: Path) -> BinaryIO:
     return os.fdopen(descriptor, "wb")
 
 
-def _drain(stream: BinaryIO, handle: BinaryIO, limit: int) -> None:
-    """Copy at most ``limit`` bytes to ``handle`` and keep draining the pipe."""
+class _Redactor:
+    """Streaming byte redactor for the task prompt and egress token.
+
+    Complete occurrences are replaced; the last ``longest_needle - 1`` bytes are
+    held back so an occurrence split across two pipe reads is still caught.  It
+    never guesses: a held tail is flushed verbatim (after replacement) at EOF.
+    """
+
+    __slots__ = ("_needles", "_hold", "_pending")
+
+    def __init__(self, needles: tuple[bytes, ...]) -> None:
+        self._needles = tuple(
+            dict.fromkeys(item for item in needles if isinstance(item, bytes) and item)
+        )
+        self._hold = max((len(item) for item in self._needles), default=1) - 1
+        self._pending = b""
+
+    def feed(self, chunk: bytes) -> bytes:
+        data = self._pending + chunk
+        for needle in self._needles:
+            data = data.replace(needle, REDACTED)
+        if self._hold and len(data) > self._hold:
+            self._pending = data[-self._hold :]
+            return data[: -self._hold]
+        if self._hold:
+            self._pending = data
+            return b""
+        self._pending = b""
+        return data
+
+    def flush(self) -> bytes:
+        data = self._pending
+        self._pending = b""
+        return data
+
+
+def _write_bounded(
+    handle: BinaryIO, data: bytes, total: int, limit: int
+) -> tuple[int, bool]:
+    """Write at most ``limit`` bytes; return ``(total_written, truncated)``."""
+
+    if not data:
+        return total, False
+    if total < limit:
+        room = limit - total
+        piece = data[:room]
+        handle.write(piece)
+        total += len(piece)
+        if len(piece) < len(data):
+            handle.write(TRUNCATION_MARKER)
+            return total, True
+        return total, False
+    handle.write(TRUNCATION_MARKER)
+    return total, True
+
+
+def _drain(
+    stream: BinaryIO, handle: BinaryIO, limit: int, redactor: _Redactor
+) -> None:
+    """Copy at most ``limit`` redacted bytes, then keep draining the pipe."""
 
     total = 0
     truncated = False
@@ -1155,17 +1284,15 @@ def _drain(stream: BinaryIO, handle: BinaryIO, limit: int) -> None:
             chunk = stream.read(65_536)
             if not chunk:
                 break
-            if total < limit:
-                room = limit - total
-                piece = chunk[:room]
-                handle.write(piece)
-                total += len(piece)
-                if len(piece) < len(chunk):
-                    handle.write(TRUNCATION_MARKER)
-                    truncated = True
-            elif not truncated:
-                handle.write(TRUNCATION_MARKER)
-                truncated = True
+            if truncated:
+                # Keep reading so the child never blocks on a full pipe, but
+                # never write past the cap.
+                continue
+            total, truncated = _write_bounded(
+                handle, redactor.feed(chunk), total, limit
+            )
+        if not truncated:
+            _write_bounded(handle, redactor.flush(), total, limit)
     except (OSError, ValueError):
         pass
     finally:
@@ -1182,10 +1309,48 @@ def _drain(stream: BinaryIO, handle: BinaryIO, limit: int) -> None:
 def _signal_group(process: subprocess.Popen[bytes], signum: int) -> None:
     if process.poll() is not None:
         return
+    _kill_group(process.pid, signum)
+
+
+def _kill_group(pgid: int, signum: int) -> None:
     try:
-        os.killpg(process.pid, signum)
+        os.killpg(pgid, signum)
     except (ProcessLookupError, PermissionError, OSError):
         return
+
+
+def _group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True
+    return True
+
+
+def _terminate_process_group(
+    process: subprocess.Popen[bytes], grace_sec: float
+) -> None:
+    """SIGTERM the child process group, then SIGKILL after the grace period.
+
+    The whole group is considered, not just the direct child: a grandchild that
+    ignores SIGTERM keeps the group alive and must be SIGKILLed as well.
+    """
+
+    if process.poll() is not None and not _group_alive(process.pid):
+        return
+    _kill_group(process.pid, signal.SIGTERM)
+    deadline = time.monotonic() + max(0.0, grace_sec)
+    while time.monotonic() < deadline:
+        if process.poll() is not None and not _group_alive(process.pid):
+            return
+        time.sleep(0.05)
+    _kill_group(process.pid, signal.SIGKILL)
+    try:
+        process.wait(timeout=5.0)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def _signal_name(returncode: int | None) -> str | None:
@@ -1229,25 +1394,56 @@ def _run_child(
     task_dir: Path,
     env: Mapping[str, str],
     manifest: TaskManifest,
-    run_budget_sec: int,
+    deadline_sec: float,
     heartbeat_interval_sec: float,
     poll_interval_sec: float,
-    deadline_margin_sec: float,
     terminate_grace_sec: float,
     stdout_limit: int,
     stderr_limit: int,
+    redact_needles: tuple[bytes, ...] = (),
 ) -> int:
-    """Spawn Hermes, drive the status markers and enforce the deadline."""
+    """Spawn Hermes, drive the status markers and enforce the deadline.
+
+    Every post-spawn step (started rewrite, heartbeat, wait loop, exit write)
+    runs under ``except BaseException``: if a status write or anything else
+    fails, the child process group is SIGTERMed, SIGKILLed after the grace and
+    a best-effort ``exit.json`` is written before the error is re-raised.  A
+    sandbox must never leave an orphan Hermes running until ``RuntimeMaxSec``.
+    """
 
     global _stop_signal
 
     status_dir = _ensure_directory(task_dir, "status")
     stdout_handle = _open_output(task_dir / "stdout.txt")
     stderr_handle = _open_output(task_dir / "stderr.txt")
+    stdout_redactor = _Redactor(redact_needles)
+    stderr_redactor = _Redactor(redact_needles)
     readers: list[threading.Thread] = []
     previous: dict[int, object] = {}
+    process: subprocess.Popen[bytes] | None = None
+    forced: str | None = None
     _stop_signal = None
     started_monotonic = time.monotonic()
+
+    def _write_exit_safely(error_code: str | None = None) -> None:
+        returncode = None if process is None else process.returncode
+        payload: dict[str, object] = {
+            "exit_code": returncode,
+            "signal": _signal_name(returncode),
+            "duration_sec": round(time.monotonic() - started_monotonic, 3),
+            "timed_out": forced == "timed_out",
+            "cancelled": forced == "cancelled",
+            "finished_at": _utcnow(),
+        }
+        if process is not None:
+            payload["child_pid"] = process.pid
+        if error_code is not None:
+            payload["error"] = error_code
+        try:
+            write_status_atomic(status_dir / "exit.json", payload)
+        except Exception:
+            pass
+
     try:
         previous = _install_signal_handlers()
         # Design 8.1: the started marker is written before Hermes is spawned so
@@ -1264,36 +1460,31 @@ def _run_child(
         }
         write_status_atomic(status_dir / "started.json", started_payload)
 
-        try:
-            process = _spawn(argv, task_dir=task_dir, env=env)
-        except WorkloadError as error:
-            # The unit started, but no child exists: leave an honest exit marker
-            # so a supervisor never reads "started without an exit" as success.
-            write_status_atomic(
-                status_dir / "exit.json",
-                {
-                    "exit_code": None,
-                    "signal": None,
-                    "duration_sec": round(time.monotonic() - started_monotonic, 3),
-                    "timed_out": False,
-                    "cancelled": False,
-                    "error": error.code,
-                    "finished_at": _utcnow(),
-                },
-            )
-            raise
+        process = _spawn(argv, task_dir=task_dir, env=env)
         write_status_atomic(
             status_dir / "started.json",
             {**started_payload, "child_pid": process.pid},
         )
         assert process.stdout is not None and process.stderr is not None
-        for stream, handle, limit, name in (
-            (process.stdout, stdout_handle, stdout_limit, "workload-stdout"),
-            (process.stderr, stderr_handle, stderr_limit, "workload-stderr"),
+        for stream, handle, limit, redactor, name in (
+            (
+                process.stdout,
+                stdout_handle,
+                stdout_limit,
+                stdout_redactor,
+                "workload-stdout",
+            ),
+            (
+                process.stderr,
+                stderr_handle,
+                stderr_limit,
+                stderr_redactor,
+                "workload-stderr",
+            ),
         ):
             reader = threading.Thread(
                 target=_drain,
-                args=(stream, handle, limit),
+                args=(stream, handle, limit, redactor),
                 name=name,
                 daemon=True,
             )
@@ -1305,9 +1496,8 @@ def _run_child(
             {"heartbeat_at": _utcnow(), "child_pid": process.pid},
         )
 
-        deadline = started_monotonic + run_budget_sec + deadline_margin_sec
+        deadline = started_monotonic + deadline_sec
         next_heartbeat = started_monotonic + heartbeat_interval_sec
-        forced: str | None = None
         terminate_deadline = 0.0
         sigkill_sent = False
         while process.poll() is None:
@@ -1324,13 +1514,12 @@ def _run_child(
                 _signal_group(process, signal.SIGKILL)
                 sigkill_sent = True
             if now >= next_heartbeat:
-                try:
-                    write_status_atomic(
-                        status_dir / "heartbeat.json",
-                        {"heartbeat_at": _utcnow(), "child_pid": process.pid},
-                    )
-                except WorkloadError:
-                    pass
+                # A failing status write is fatal: the supervisor can no longer
+                # observe the task, so fail closed and take the child down.
+                write_status_atomic(
+                    status_dir / "heartbeat.json",
+                    {"heartbeat_at": _utcnow(), "child_pid": process.pid},
+                )
                 next_heartbeat = now + heartbeat_interval_sec
             time.sleep(poll_interval_sec)
 
@@ -1338,24 +1527,24 @@ def _run_child(
         for reader in readers:
             reader.join(5.0)
         returncode = process.returncode
-        duration = time.monotonic() - started_monotonic
-        write_status_atomic(
-            status_dir / "exit.json",
-            {
-                "exit_code": returncode,
-                "signal": _signal_name(returncode),
-                "duration_sec": round(duration, 3),
-                "timed_out": forced == "timed_out",
-                "cancelled": forced == "cancelled",
-                "child_pid": process.pid,
-                "finished_at": _utcnow(),
-            },
-        )
+        _write_exit_safely()
         if type(returncode) is not int:
             return EXIT_INTERNAL
         if returncode < 0:
             return 128 + (-returncode)
         return returncode
+    except BaseException as error:
+        if process is not None:
+            try:
+                _terminate_process_group(process, terminate_grace_sec)
+            except Exception:
+                pass
+            for reader in readers:
+                if reader.is_alive():
+                    reader.join(2.0)
+        code = error.code if isinstance(error, WorkloadError) else "workload_failed"
+        _write_exit_safely(code)
+        raise
     finally:
         _restore_signal_handlers(previous)
         for reader in readers:
@@ -1381,6 +1570,7 @@ def run_workload(
     model: str,
     run_budget_sec: int,
     proxy_socket: Path,
+    runtime_max_sec: int | None = None,
     heartbeat_interval_sec: float = HEARTBEAT_INTERVAL_SECONDS,
     poll_interval_sec: float = POLL_INTERVAL_SECONDS,
     deadline_margin_sec: float = DEADLINE_MARGIN_SECONDS,
@@ -1388,7 +1578,13 @@ def run_workload(
     stdout_limit: int = MAX_STDOUT_BYTES,
     stderr_limit: int = MAX_STDERR_BYTES,
 ) -> int:
-    """Run one Hermes task inside the sandbox and return its exit code."""
+    """Run one Hermes task inside the sandbox and return its exit code.
+
+    ``runtime_max_sec`` (when given) is the unit's systemd ``RuntimeMaxSec``;
+    the internal deadline is clamped so that deadline + SIGTERM grace + the
+    exit-marker reserve always stays below it.  A limit too small to honour
+    that contract fails closed with ``runtime_too_short``.
+    """
 
     task = _require_task_directory(task_dir)
     root = _require_absolute_path(runtime_root, "runtime_root")
@@ -1404,23 +1600,41 @@ def run_workload(
     if type(stderr_limit) is not int or stderr_limit <= 0:
         raise WorkloadError("stderr_limit_invalid")
 
+    deadline_sec = budget + deadline_margin
+    if runtime_max_sec is not None:
+        if (
+            type(runtime_max_sec) is not int
+            or not MIN_RUN_BUDGET_SECONDS <= runtime_max_sec <= MAX_RUN_BUDGET_SECONDS
+        ):
+            raise WorkloadError("runtime_max_invalid")
+        maximum = _maximum_deadline(runtime_max_sec, grace)
+        deadline_sec = min(deadline_sec, maximum)
+
     manifest = read_manifest(task)
     if manifest.model and manifest.model != name:
         raise WorkloadError("manifest_model_mismatch")
 
-    # The prompt is validated but never retained, copied into argv or logged.
-    _read_task_file(
+    # Design 8.1 step 1: the manifest promises the digests of the exact files
+    # the helper launched; verify them again before reading any of them.
+    prompt_bytes = _read_task_file(
         task / "prompt.txt",
         label="prompt",
         limit=MAX_PROMPT_BYTES,
         allowed_modes=PROTECTED_FILE_MODES,
     )
+    if hashlib.sha256(prompt_bytes).hexdigest() != manifest.prompt_sha256:
+        raise WorkloadError("prompt_hash_mismatch")
     template_bytes = _read_task_file(
         task / "profile.template.yaml",
         label="profile_template",
         limit=MAX_PROFILE_TEMPLATE_BYTES,
         allowed_modes=PROTECTED_FILE_MODES,
     )
+    if (
+        hashlib.sha256(template_bytes).hexdigest()
+        != manifest.profile_template_sha256
+    ):
+        raise WorkloadError("profile_template_hash_mismatch")
     try:
         template = template_bytes.decode("utf-8")
     except UnicodeDecodeError:
@@ -1431,6 +1645,8 @@ def run_workload(
         limit=MAX_EGRESS_TOKEN_BYTES,
         exact_mode=TOKEN_FILE_MODE,
     )
+    if hashlib.sha256(token_bytes).hexdigest() != manifest.egress_token_sha256:
+        raise WorkloadError("egress_token_hash_mismatch")
     try:
         token = _validate_egress_token(token_bytes.decode("ascii").strip())
     except UnicodeDecodeError:
@@ -1455,25 +1671,45 @@ def run_workload(
             task_dir=task,
             env=env,
             manifest=manifest,
-            run_budget_sec=budget,
+            deadline_sec=deadline_sec,
             heartbeat_interval_sec=heartbeat_interval,
             poll_interval_sec=poll_interval,
-            deadline_margin_sec=deadline_margin,
             terminate_grace_sec=grace,
             stdout_limit=stdout_limit,
             stderr_limit=stderr_limit,
+            redact_needles=(prompt_bytes, token.encode("ascii")),
         )
     finally:
         handle.close()
 
 
-def _unit_budget(runtime_max_sec: int) -> int:
-    """Keep the Hermes budget and the workload deadline below RuntimeMaxSec."""
+def _maximum_deadline(runtime_max_sec: int, grace_sec: float) -> float:
+    """Return the largest deadline that leaves grace and exit-write room."""
 
-    budget = runtime_max_sec - UNIT_BUDGET_RESERVE_SECONDS
-    if budget < MIN_RUN_BUDGET_SECONDS:
-        budget = max(MIN_RUN_BUDGET_SECONDS, runtime_max_sec - 1)
-    return budget
+    maximum = runtime_max_sec - grace_sec - EXIT_WRITE_RESERVE_SECONDS - 1
+    if maximum < 1:
+        raise WorkloadError("runtime_too_short")
+    return float(maximum)
+
+
+def unit_run_parameters(runtime_max_sec: int) -> tuple[int, float]:
+    """Return ``(hermes --run-budget, workload deadline)`` for a unit limit.
+
+    The deadline plus the default SIGTERM grace plus the exit-marker reserve is
+    strictly below ``runtime_max_sec``; the Hermes budget stops first so it can
+    exit cleanly.  A limit below the minimum contract fails closed.
+    """
+
+    if (
+        type(runtime_max_sec) is not int
+        or not MIN_RUN_BUDGET_SECONDS <= runtime_max_sec <= MAX_RUN_BUDGET_SECONDS
+    ):
+        raise WorkloadError("runtime_max_invalid")
+    maximum = _maximum_deadline(runtime_max_sec, TERMINATE_GRACE_SECONDS)
+    budget = max(MIN_RUN_BUDGET_SECONDS, int(maximum - DEADLINE_MARGIN_SECONDS))
+    budget = min(budget, int(maximum))
+    deadline = min(budget + DEADLINE_MARGIN_SECONDS, maximum)
+    return budget, float(deadline)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1489,12 +1725,17 @@ def main(argv: list[str] | None = None) -> int:
     if not manifest.model:
         return EXIT_TASK_INVALID
     try:
+        budget, _deadline = unit_run_parameters(manifest.runtime_max_sec)
+    except WorkloadError:
+        return EXIT_TASK_INVALID
+    try:
         return run_workload(
             task_dir=UNIT_TASK_DIR,
             runtime_root=UNIT_RUNTIME_ROOT,
             model=manifest.model,
-            run_budget_sec=_unit_budget(manifest.runtime_max_sec),
+            run_budget_sec=budget,
             proxy_socket=UNIT_EGRESS_SOCKET_PATH,
+            runtime_max_sec=manifest.runtime_max_sec,
         )
     except WorkloadError as error:
         if error.code.endswith("_unavailable"):
