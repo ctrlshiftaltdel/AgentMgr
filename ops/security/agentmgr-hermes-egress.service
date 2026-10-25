@@ -1,0 +1,95 @@
+# Hermes host model egress broker (Issue #97, design §9).
+#
+# This is the only component that holds the real model provider key.  A sandbox
+# presents a short-lived, task-bound egress token over a Unix socket; the broker
+# validates the token, the revocation store and the prepared task manifest,
+# strips every client credential header, injects the real key and forwards one
+# allowlisted OpenAI-compatible call over HTTPS.  It never listens on an IP
+# port, never follows a redirect and never logs a token, key, prompt or body.
+#
+# Install placeholders: replace <broker-user>, <install-root> and <venv>.
+# The broker user is a dedicated, non-login account whose primary group is
+# agentmgr-hermes, because the sandbox group must be able to connect to the
+# 0660 socket.
+#
+# Required host state (not created here):
+#   /etc/agentmgr/hermes/egress-broker.json   0440 root:agentmgr-hermes
+#       Secret-free JSON: socket_path, upstream_base_url, provider_host,
+#       token_key_path, provider_key_path, revocation_dir, task_root and the
+#       optional limits.  The credential paths point at the LoadCredential
+#       copies under /run/credentials/agentmgr-hermes-egress.service/.
+#   /etc/agentmgr/hermes/egress-token-key     0400 root:root
+#   /etc/agentmgr/hermes/provider-key         0400 root:root
+#   <revocation-dir>                          owned by the trusted adapter user,
+#       group agentmgr-hermes, 0770; this unit only reads it.
+#   <task-root>                               group agentmgr-hermes; this unit
+#       only reads <task-root>/<unit>/manifest.json.
+#
+# There is deliberately no PrivateNetwork=yes and no IPAddressDeny: reaching the
+# configured provider over TLS is this unit's only purpose.  The listener itself
+# is AF_UNIX only, and RestrictAddressFamilies keeps the process to Unix and IP
+# sockets.
+
+[Unit]
+Description=AgentMgr Hermes host model egress broker
+Documentation=file:///usr/local/share/doc/agentmgr/security/README.md
+After=network-online.target
+Wants=network-online.target
+# Fail closed until the operator installs the root-only configuration.
+ConditionPathExists=/etc/agentmgr/hermes/egress-broker.json
+
+[Service]
+Type=simple
+User=<broker-user>
+Group=agentmgr-hermes
+WorkingDirectory=<install-root>
+# The socket must stay on a host-visible path so a task unit can bind-mount it
+# to /task/egress.sock.  It is never placed in a task unit's private /run or
+# /tmp.  The process sets the socket to 0660 and chgrps it to agentmgr-hermes.
+RuntimeDirectory=agentmgr-hermes-egress
+RuntimeDirectoryMode=0750
+UMask=0077
+ExecStart=<venv>/python -m app.runtime.hermes_egress --config /etc/agentmgr/hermes/egress-broker.json
+
+# systemd reads both sources as root and exposes 0400 copies to this service
+# only; the JSON config references them by path, never by value.
+LoadCredential=egress-token-key:/etc/agentmgr/hermes/egress-token-key
+LoadCredential=provider-key:/etc/agentmgr/hermes/provider-key
+
+# An incomplete or unsafe configuration exits non-zero; do not restart-loop it.
+Restart=no
+RestartSec=2
+
+# Network: egress is required, so no PrivateNetwork/IPAddressDeny.  The broker
+# opens only AF_UNIX (listener) and AF_INET/AF_INET6 (TLS upstream) sockets.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# Filesystem: read-only host, no home, private /tmp, no devices.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+
+# Privileges and syscalls.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+
+[Install]
+WantedBy=multi-user.target
