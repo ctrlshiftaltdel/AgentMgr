@@ -142,10 +142,11 @@ unit = "agentmgr-hermes-" + sha256(("agentmgr-hermes:v1:" + task_id + "\n" + att
 
 ```text
 <task-root>/<unit>/
-  manifest.json        # 服务器写入的绑定信息/哈希；无秘密
-  prompt.txt           # 已治理 prompt；有界
-  profile/config.yaml  # 最小生成 profile；无真实 key
-  egress.token         # 短时任务令牌；仅任务/宿主 adapter 可读
+  manifest.json          # 服务器写入的绑定信息/哈希；无秘密
+  prompt.txt             # 已治理 prompt；有界
+  profile.template.yaml  # adapter 写入的最小模板（含 __PORT__）；无真实 key
+  profile/config.yaml    # workload 渲染后的 profile；无真实 key
+  egress.token           # 短时任务令牌；仅任务/宿主 adapter 可读
   status/started.json
   status/heartbeat.json
   status/exit.json
@@ -222,9 +223,9 @@ task attestation 示例：
 
 ### 8.1 启动顺序
 
-1. 读取 `/task/manifest.json`、`prompt.txt`、`profile/`、`egress.token`；校验文件大小/哈希/无 symlink。
+1. 读取 `/task/manifest.json`、`prompt.txt`、`profile.template.yaml`、`egress.token`；校验文件大小/哈希/无 symlink。
 2. 设置最小环境：`HOME=/task/home`、`HERMES_HOME=/task/profile`、`XDG_STATE_HOME=/task/state`、`HERMES_GATEWAY_LOCK_DIR=/task/locks`、`TMPDIR=/task/tmp`、`PATH` 固定最小集合；清除所有宿主凭据环境变量。
-3. 启动 localhost 模型代理（127.0.0.1，随机端口），只转发到 `/task/egress.sock`（宿主 broker socket 的只读 bind mount）；等待监听成功。
+3. 启动 localhost 模型代理（127.0.0.1，随机端口），只转发到 `/task/egress.sock`（宿主 broker socket 的只读 bind mount）；等待监听成功；把 `profile.template.yaml` 的 `__PORT__` 替换为实际端口并原子写入 `profile/config.yaml`。
 4. 写 `status/started.json`（unit、task、handle、时间、child pid/无 secret）。
 5. 启动 Hermes one-shot CLI；周期写 `heartbeat.json`；捕获有界 stdout/stderr。
 6. 子进程退出后写 `status/exit.json`（exit code、signal、duration、timed_out/cancelled 标志）。
