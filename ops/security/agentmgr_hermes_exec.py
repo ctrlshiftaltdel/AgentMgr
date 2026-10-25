@@ -66,8 +66,10 @@ Deployment invariants
   the workload's ``status/started.json`` marker, and binds the unit's real UID
   read from ``/proc/<MainPID>/status``.
 * ``status`` reads the task directory and its ``status/`` child through
-  ``O_DIRECTORY|O_NOFOLLOW`` directory fds, so a symlinked parent is rejected
-  rather than followed; a ``not-found`` unit reports ``result``/``exit_status``
+  ``O_DIRECTORY|O_NOFOLLOW`` directory fds, and markers with
+  ``O_RDONLY|O_NOFOLLOW|O_NONBLOCK`` plus a regular-file ``fstat`` before any
+  read, so a symlinked parent or a unit-created FIFO/socket/device cannot block
+  or redirect the helper; a ``not-found`` unit reports ``result``/``exit_status``
   as ``None`` instead of systemd's default ``success``/``0``.
 * ``attest`` inspects the unit first: a stopped/never-started/cleaned-up task
   yields a runtime attestation with ``task_attestation=None``; strict task-file
@@ -1097,9 +1099,10 @@ def _verify_task_file(
     if exact_mode is not None:
         if mode != exact_mode:
             raise HelperError(f"{label}_mode_invalid")
-    elif mode & 0o037 or not mode & 0o400:
-        # At most 0640: no group write/execute and no "other" access; the unit
-        # reads through its ``agentmgr-hermes`` primary group.
+    elif mode not in {0o440, 0o640}:
+        # The dynamic unit reads these through its static ``agentmgr-hermes``
+        # primary group, so group-read is mandatory.  Owner-only 0400/0600,
+        # group write/execute and every "other" bit are rejected.
         raise HelperError(f"{label}_mode_invalid")
     if info.st_size <= 0 or info.st_size > max_size:
         raise HelperError(f"{label}_size_mismatch")
@@ -1135,7 +1138,10 @@ _DIRECTORY_FLAGS = (
     | getattr(os, "O_CLOEXEC", 0)
 )
 _FILE_FLAGS = (
-    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    os.O_RDONLY
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_NONBLOCK", 0)
+    | getattr(os, "O_CLOEXEC", 0)
 )
 
 
@@ -1154,7 +1160,14 @@ def _read_fd(descriptor: int, limit: int, label: str) -> bytes:
     chunks: list[bytes] = []
     total = 0
     while True:
-        chunk = os.read(descriptor, _SHA256_CHUNK_BYTES)
+        try:
+            chunk = os.read(descriptor, _SHA256_CHUNK_BYTES)
+        except BlockingIOError:
+            # ``O_NONBLOCK`` never blocks the root helper on a unit-writable
+            # FIFO/socket; an unexpected EAGAIN is a malformed marker.
+            raise HelperError(f"{label}_invalid") from None
+        except OSError:
+            raise HelperError(f"{label}_invalid") from None
         if not chunk:
             break
         total += len(chunk)
@@ -1165,7 +1178,14 @@ def _read_fd(descriptor: int, limit: int, label: str) -> bytes:
 
 
 def _read_json_at(dir_fd: int, name: str, label: str) -> dict[str, object] | None:
-    """Read one bounded JSON object relative to a verified directory fd."""
+    """Read one bounded JSON object relative to a verified directory fd.
+
+    ``_FILE_FLAGS`` includes ``O_NONBLOCK`` and ``O_NOFOLLOW``: a sandbox unit
+    can create a FIFO/socket/device named like a marker, and the root helper
+    must never block on it.  ``fstat`` runs before any read, so only a regular,
+    non-empty, size-bounded file is accepted; EAGAIN, an empty file or invalid
+    JSON is a stable ``<label>_invalid``.
+    """
 
     try:
         descriptor = os.open(name, _FILE_FLAGS, dir_fd=dir_fd)
@@ -1477,6 +1497,12 @@ def build_systemd_run_argv(
     for path in (task_dir, runtime_root, broker_socket, workload):
         if _is_masked_source(path):
             raise HelperError("masked_source")
+        if not ALLOW_PRIVATE_TMP_SOURCES and _is_under_any(
+            path, PRIVATE_TMP_PREFIXES
+        ):
+            # ``PrivateTmp=yes`` replaces /tmp and /var/tmp inside the unit, so
+            # a bind source there cannot be resolved by systemd.
+            raise HelperError("private_tmp_source")
 
     properties = [
         "--property=DynamicUser=yes",

@@ -25,11 +25,13 @@ import os
 import pwd
 import re
 import shutil
+import signal
 import socket
 import stat
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -357,16 +359,33 @@ def _write_task_files(
     token: str = TOKEN,
     token_mode: int = 0o640,
     prompt_mode: int = 0o640,
+    profile_mode: int = 0o640,
 ) -> None:
     task_dir = sandbox.task_dir
     (task_dir / "prompt.txt").write_bytes(prompt)
     (task_dir / "prompt.txt").chmod(prompt_mode)
     (task_dir / "profile.template.yaml").write_bytes(profile)
-    (task_dir / "profile.template.yaml").chmod(0o640)
+    (task_dir / "profile.template.yaml").chmod(profile_mode)
     (task_dir / "egress.token").write_text(token, encoding="utf-8")
     (task_dir / "egress.token").chmod(token_mode)
     for name in ("prompt.txt", "profile.template.yaml", "egress.token"):
         os.chown(task_dir / name, sandbox.uid, sandbox.gid)
+
+
+@contextmanager
+def _alarm(seconds: int):
+    """Fail instead of hanging when a marker read blocks the helper."""
+
+    def _raise(signum: int, frame: object) -> None:
+        raise TimeoutError(f"blocked for more than {seconds}s")
+
+    previous = signal.signal(signal.SIGALRM, _raise)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
 
 
 def _write_started(sandbox: SimpleNamespace, *, unit: str = UNIT) -> None:
@@ -734,6 +753,27 @@ def test_systemd_argv_rejects_unsafe_or_unfixed_paths():
             broker_socket=BROKER_SOCKET,
             workload=WORKLOAD,
         )
+
+
+def test_systemd_argv_rejects_private_tmp_sources(sandbox, monkeypatch):
+    monkeypatch.setattr(helper, "ALLOW_PRIVATE_TMP_SOURCES", False)
+    arguments = {
+        "task_dir": TASK_DIR,
+        "runtime_root": RUNTIME_ROOT,
+        "broker_socket": BROKER_SOCKET,
+        "workload": WORKLOAD,
+    }
+    for override in (
+        {"task_dir": Path("/tmp") / UNIT},
+        {"runtime_root": Path("/var/tmp/runtime")},
+        {"broker_socket": Path("/tmp/egress.sock")},
+        {"workload": Path("/tmp/workload.py")},
+    ):
+        with pytest.raises(helper.HelperError) as excinfo:
+            helper.build_systemd_run_argv(
+                valid_request(), **{**arguments, **override}
+            )
+        assert excinfo.value.code == "private_tmp_source"
 
 
 def test_systemd_argv_revalidates_hand_built_request_limits():
@@ -1280,7 +1320,11 @@ def test_launch_waits_through_activating(sandbox):
         (lambda sandbox: (sandbox.task_dir / "egress.token").chmod(0o660), "token_mode_invalid"),
         (lambda sandbox: (sandbox.task_dir / "prompt.txt").chmod(0o604), "prompt_mode_invalid"),
         (lambda sandbox: (sandbox.task_dir / "prompt.txt").chmod(0o660), "prompt_mode_invalid"),
+        (lambda sandbox: (sandbox.task_dir / "prompt.txt").chmod(0o600), "prompt_mode_invalid"),
+        (lambda sandbox: (sandbox.task_dir / "prompt.txt").chmod(0o400), "prompt_mode_invalid"),
         (lambda sandbox: (sandbox.task_dir / "profile.template.yaml").chmod(0o666), "profile_mode_invalid"),
+        (lambda sandbox: (sandbox.task_dir / "profile.template.yaml").chmod(0o600), "profile_mode_invalid"),
+        (lambda sandbox: (sandbox.task_dir / "profile.template.yaml").chmod(0o400), "profile_mode_invalid"),
     ],
 )
 def test_launch_rejects_modified_task_files_before_starting(sandbox, mutate, code):
@@ -1293,6 +1337,19 @@ def test_launch_rejects_modified_task_files_before_starting(sandbox, mutate, cod
     assert excinfo.value.code == code
     assert runner.launch_calls() == []
     assert TOKEN not in str(excinfo.value)
+
+
+@pytest.mark.parametrize("mode", [0o440, 0o640])
+def test_launch_accepts_unit_readable_prompt_and_profile(sandbox, mode):
+    _prepare(sandbox)
+    _write_task_files(sandbox, prompt_mode=mode, profile_mode=mode)
+    _write_started(sandbox)
+    response = helper.launch(
+        valid_request(),
+        sandbox.config,
+        runner=ScriptedRunner([SHOW_NOT_FOUND, SHOW_ACTIVE]),
+    )
+    assert response["started"] is True
 
 
 def test_launch_rejects_symlinked_prompt_and_missing_files(sandbox):
@@ -1643,6 +1700,45 @@ def test_status_rejects_a_symlinked_task_root(sandbox):
             runner=ScriptedRunner([SHOW_ACTIVE]),
         )
     assert excinfo.value.code == "task_root_invalid"
+
+
+@pytest.mark.parametrize(
+    ("name", "code"),
+    [
+        ("started.json", "started_marker_invalid"),
+        ("heartbeat.json", "heartbeat_invalid"),
+        ("exit.json", "exit_invalid"),
+    ],
+)
+def test_status_rejects_fifo_markers_without_blocking(sandbox, name, code):
+    _prepare(sandbox)
+    if name != "started.json":
+        _write_started(sandbox)
+    status_dir = sandbox.task_dir / "status"
+    status_dir.mkdir(exist_ok=True)
+    os.mkfifo(status_dir / name)
+
+    with _alarm(5), pytest.raises(helper.HelperError) as excinfo:
+        helper.status(
+            valid_request(operation="status"),
+            sandbox.config,
+            runner=ScriptedRunner([SHOW_ACTIVE]),
+        )
+    assert excinfo.value.code == code
+
+
+def test_launch_rejects_a_fifo_started_marker_without_blocking(sandbox):
+    _prepare(sandbox)
+    _write_task_files(sandbox)
+    status_dir = sandbox.task_dir / "status"
+    status_dir.mkdir()
+    os.mkfifo(status_dir / "started.json")
+
+    runner = ScriptedRunner([SHOW_NOT_FOUND, SHOW_ACTIVE])
+    with _alarm(5), pytest.raises(helper.HelperError) as excinfo:
+        helper.launch(valid_request(), sandbox.config, runner=runner)
+    assert excinfo.value.code == "started_marker_invalid"
+    assert any("--signal=SIGTERM" in call for call in runner.calls)
 
 
 def test_stop_escalates_to_sigkill_and_confirms_only_when_gone(sandbox, monkeypatch):
