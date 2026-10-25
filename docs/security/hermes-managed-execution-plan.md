@@ -34,7 +34,7 @@
 1. **Prompt/token exposure** — a task prompt or egress token must not appear in host `ps`, process argv, error text, logs, audit, or the result document. Tests must scan the actual argv/env and serialized errors.
 2. **Cross-task access** — a task must not read another task's directory, token, unit status, or result; a handle must not bind to a different task. Tests must create two tasks/two units and assert denial.
 3. **Ambiguous launch and replay** — accepted only after `started`; missing marker/launch timeout is `unknown` with no second unit; duplicate same key/payload reuses the same unit; different payload is conflict. Tests must assert launch/unit counts.
-4. **Artifact trust** — missing, empty, oversized, symlinked, or replaced artifact must fail closed; the host must hash the file itself. Tests must not let a model-produced string satisfy evidence.
+4. **Artifact trust** — missing, empty, oversized, FIFO, symlinked-final, symlinked-parent, or replaced artifact must fail closed without blocking; the host must hash the file itself. Tests must not let a model-produced string satisfy evidence.
 5. **Stop/cancel truth** — `requested` is not stopped; only cgroup-gone is `stop_confirmed`; a completed artifact wins a cancel race; confirmed stop becomes `needs_human`, never auto-`cancelled`.
 
 ---
@@ -81,16 +81,17 @@
 - Produces: `verify_egress_token(token, *, key: bytes, now: datetime | None = None) -> EgressClaims`
 - Produces: `egress_token_hash(token: str) -> str`
 - Produces: `MAX_EGRESS_TTL_SECONDS = 300`
-- Produces: `HermesManagedConfig` (frozen dataclass: helper path, runtime root, task root, broker socket, attestation key path, egress token key path, runtime attestation path, evidence ref, runtime name/version, model name, local proxy base URL template, egress provider host/path prefix, runtime/stop/prompt/result limits, worker_id, lease_seconds, poll_interval, health_backoff_seconds)
+- Produces: `HermesManagedConfig` (frozen dataclass: helper path, runtime root, **trusted `runtime_root_hash: str`**, task root, broker socket, attestation key path, egress token key path, runtime attestation path, evidence ref, runtime name/version, model name, local proxy base URL template, egress provider host/path prefix, runtime/stop/prompt/result limits, worker_id, lease_seconds, poll_interval, health_backoff_seconds)
 - Produces: `SandboxSpec` (frozen dataclass: `task_id`, `grant_id`, `unit`, `runtime_handle`, `task_dir: Path`, `prompt_size: int`, `prompt_sha256: str`, `profile_template_sha256: str`, `egress_token_sha256: str`, `ttl_seconds: int`, `runtime_max_sec: int`, `memory_max_mb: int`, `cpu_quota_percent: int`, `tasks_max: int`; **no raw prompt/token content**)
 - Produces: `build_sandbox_spec(config, *, task_id, grant_id, idempotency_key, prompt, profile_template, egress_token) -> SandboxSpec`
 - Produces: `TaskAttestation` (`schema`, `unit`, `task_id`, `grant_id`, `runtime_handle`, `uid`, `runtime_root_hash`, `profile_template_sha256`, `prompt_sha256`, `sandbox_facts`, `issued_at`, `expires_at`, `nonce`, `hmac`) and `RuntimeAttestation` (`schema`, `helper_version`, `runtime_name`, `runtime_version`, `runtime_root_hash`, `sandbox_facts`, `broker_socket_ok`, `evidence_ref`, `issued_at`, `expires_at`, `nonce`, `hmac`), with `to_document`/`from_document`.
 - Produces: `unit_name_for(task_id: str, idempotency_key: str) -> str`
 - Produces: `runtime_handle_for(unit: str) -> str`
-- Produces: `verify_task_attestation(attestation, *, key: bytes, spec: SandboxSpec, now: datetime) -> None`
-- Produces: `verify_runtime_attestation(attestation, *, key: bytes, config: HermesManagedConfig, now: datetime) -> None`
-- Produces: `ArtifactResult` (`sha256: str`, `size: int`, `relative_path: str`) and `read_artifact(path: Path, *, max_bytes: int) -> ArtifactResult`
-- Produces: `managed_capabilities(config, runtime_attestation) -> RuntimeCapabilities`
+- Produces: `VerifiedRuntimeAttestation` (opaque proof-carrying marker returned only by successful HMAC verification)
+- Produces: `verify_task_attestation(attestation, *, key: bytes, spec: SandboxSpec, expected_runtime_root_hash: str, now: datetime) -> None`
+- Produces: `verify_runtime_attestation(attestation, *, key: bytes, config: HermesManagedConfig, now: datetime) -> VerifiedRuntimeAttestation`
+- Produces: `ArtifactResult` (`sha256: str`, `size: int`, `relative_path: str == "out/result.txt"`) and `read_artifact(task_dir: Path, *, max_bytes: int) -> ArtifactResult` — opens `out` then `result.txt` with `dir_fd`, `O_NOFOLLOW|O_DIRECTORY`, `O_NONBLOCK`; rejects FIFO/symlink-parent/non-regular/oversize.
+- Produces: `managed_capabilities(config, verified_runtime_attestation: VerifiedRuntimeAttestation | None) -> RuntimeCapabilities` (a raw/unverified attestation is a type error or unverified, never `VERIFIED`).
 - Produces: `build_managed_prompt(prompt: str) -> str`
 - Produces: `SandboxStatus` (`unit`, `task_id`, `runtime_handle`, `active_state`, `sub_state`, `main_pid`, `result`, `exit_status`, `started`, `heartbeat_at`, `exit_code`, `timed_out`, `cancelled`, `process_gone`, `observed_at`) and `SandboxStop` (`unit`, `active_state`, `result`, `exit_status`, `main_pid`, `process_gone`, `stop_confirmed`, `observed_at`) frozen dataclasses used by Task 5.
 - Consumes: `app.runtime.contract` enums/types; stdlib only.
@@ -152,23 +153,54 @@ def test_sandbox_spec_is_deterministic_and_bounded():
     assert "PROMPT-CANARY" not in repr(spec)
     assert "egt.canary" not in repr(spec)
 
-def test_artifact_reader_rejects_symlink_and_oversize(tmp_path):
-    ...
+def test_artifact_reader_rejects_fifo_symlink_parent_and_oversize(tmp_path):
+    task = tmp_path / "task"
+    out = task / "out"
+    out.mkdir(parents=True)
+    os.mkfifo(out / "result.txt")
+    with _alarm(5), pytest.raises(ArtifactError):
+        read_artifact(task, max_bytes=1024)  # must not block on a FIFO
+    (out / "result.txt").unlink()
+    out.rmdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "result.txt").write_text("x")
+    out.symlink_to(outside, target_is_directory=True)
     with pytest.raises(ArtifactError):
-        read_artifact(symlink, max_bytes=1024)
+        read_artifact(task, max_bytes=1024)
+    out.unlink()
+    out.mkdir()
+    (out / "result.txt").write_text("x" * 100)
     with pytest.raises(ArtifactError):
-        read_artifact(big_file, max_bytes=10)
+        read_artifact(task, max_bytes=10)
 
-def test_capabilities_are_unverified_without_runtime_attestation():
-    caps = managed_capabilities(config, runtime_attestation=None)
+def test_unit_name_rejects_control_characters():
+    with pytest.raises(ValueError):
+        unit_name_for("task_a\nidem_b", "c")
+    with pytest.raises(ValueError):
+        unit_name_for("task_a", "idem_b\nc")
+
+def test_capabilities_are_unverified_without_verified_runtime_attestation():
+    caps = managed_capabilities(config, None)
     for name in ("task.submit", "runtime.isolation", "runtime.managed_execution"):
         assert caps.capability(name).status is CapabilityStatus.UNVERIFIED
+    with pytest.raises((TypeError, ValueError)):
+        managed_capabilities(config, forged_structural_attestation())
 
-def test_capabilities_with_attestation_and_evidence_are_verified():
-    ...
+def test_capabilities_with_verified_attestation_and_evidence_are_verified():
+    verified = verify_runtime_attestation(valid_runtime_attestation(), key=KEY, config=config, now=NOW)
+    caps = managed_capabilities(config, verified)
     assert caps.capability("task.submit").status is CapabilityStatus.VERIFIED
     assert caps.capability("runtime.isolation").limitations
     assert caps.capability("task.events.poll").status is CapabilityStatus.UNVERIFIED
+
+def test_runtime_root_hash_mismatch_is_rejected():
+    attestation = valid_runtime_attestation(runtime_root_hash="sha256:" + "0" * 64)
+    with pytest.raises(AttestationError):
+        verify_runtime_attestation(attestation, key=KEY, config=config, now=NOW)
+    with pytest.raises(AttestationError):
+        verify_task_attestation(valid_task_attestation(), key=KEY, spec=spec,
+            expected_runtime_root_hash=config.runtime_root_hash, now=NOW)
 ```
 
 Add task/runtime attestation HMAC/tamper/expiry/task-binding tests; prompt wrapper includes the fixed “write out/result.txt” instruction and enforces the size bound.
@@ -207,7 +239,7 @@ git commit -m "feat(runtime): add hermes managed contracts and egress tokens"
 
 **Interfaces:**
 - Produces: `SandboxRequest` (frozen dataclass: operation, task_id, grant_id, unit, runtime_handle, idempotency_key, prompt_sha256, prompt_bytes, profile_template_sha256, egress_token_sha256, ttl_seconds, runtime_max_sec, memory_max_mb, cpu_quota_percent, tasks_max)
-- Produces: `InstallConfig` (fixed task root, runtime root, broker socket, workload path, adapter user, group)
+- Produces: `InstallConfig` (fixed task root, runtime root, trusted runtime root hash, broker socket, workload path, adapter user, group)
 - Produces: `load_install_config(path: Path) -> InstallConfig`
 - Produces: `validate_request(raw: Mapping[str, object]) -> SandboxRequest`
 - Produces: `build_systemd_run_argv(request: SandboxRequest, *, task_dir: Path, runtime_root: Path, broker_socket: Path, workload: Path) -> list[str]`
@@ -244,7 +276,7 @@ def test_systemd_argv_has_fixed_sandbox_properties():
     assert argv[-len(WORKLOAD_ARGV):] == WORKLOAD_ARGV
 ```
 
-Also test unit-name parity with `unit_name_for`, task/grant/unit binding, path traversal/symlink/wrong-owner rejection, numeric limits, response file hash validation, `parse_systemctl_show` mapping, HMAC tamper, stable error codes, no secrets in error strings.
+Also test unit-name parity with `unit_name_for` (including control-character rejection), task/grant/unit binding, path traversal/symlink/wrong-owner rejection, numeric limits, response file hash validation, `parse_systemctl_show` mapping, HMAC tamper, runtime-root-hash parity, stable error codes, no secrets in error strings.
 
 - [ ] **Step 2: Run to verify RED**
 
@@ -467,10 +499,10 @@ Expected: FAIL with missing adapter/supervisor.
 - [ ] **Step 3: Implement the supervisor client and adapter**
 
 Implement `HelperSandboxSupervisor` with a fixed helper path, mapping `SandboxSpec` to the helper's exact-key JSON request (hashes/sizes only, no prompt/token content, no caller paths), stdin JSON, `subprocess.run(..., shell=False, timeout=...)`, no argv secrets, strict JSON parsing, and error mapping. Implement `HermesManagedAdapter`:
-- `capabilities` loads/validates the runtime attestation; default unverified.
-- `submit_task` validates the managed grant shape, attestation, uses `build_sandbox_spec` with the dispatcher's idempotency key, creates the task dir via supervisor, writes `prompt.txt`, `profile.template.yaml` (with `__PORT__`), and `egress.token`, then calls helper `launch`. The helper returns only after the unit is active and the `started` marker exists; a launch response without that evidence is treated as `unknown` + stop/cleanup. Duplicate same key/payload -> same handle/`replayed=True`; different payload -> conflict.
+- `capabilities` calls `verify_runtime_attestation` first and passes only the returned `VerifiedRuntimeAttestation` to `managed_capabilities`; default unverified. A structurally valid forged 64-hex HMAC must not yield `VERIFIED`.
+- `submit_task` validates the managed grant shape, calls `verify_task_attestation(..., expected_runtime_root_hash=config.runtime_root_hash)`, uses `build_sandbox_spec` with the dispatcher's idempotency key, creates the task dir via supervisor, writes `prompt.txt`, `profile.template.yaml` (with `__PORT__`), and `egress.token`, then calls helper `launch`. The helper returns only after the unit is active and the `started` marker exists; a launch response without that evidence is treated as `unknown` + stop/cleanup. Duplicate same key/payload -> same handle/`replayed=True`; different payload -> conflict.
 - `get_status` verifies task binding and maps `SandboxStatus`; `stop_confirmed` only from `process_gone`.
-- `get_result` reads `out/result.txt` via `read_artifact`; returns result/evidence or unknown/needs_human.
+- `get_result` calls `read_artifact(spec.task_dir, max_bytes=...)` (fixed `out/result.txt`, dir_fd/O_NOFOLLOW/O_NONBLOCK); returns result/evidence or unknown/needs_human.
 - `cancel_task` maps helper stop; `requested` vs `stopped`/`already_terminal`.
 - `poll_events` empty/unsupported; `provide_input` unsupported; `health` helper/broker/runtime root/attestation.
 - No DB writes; no `complete_task`.
@@ -709,7 +741,7 @@ Implement the trusted config loader (root-only path passed by the launcher; no s
 
 - [ ] **Step 4: Implement provisioning/verification scripts**
 
-`provision_hermes_runtime.sh` must be idempotent and fail closed: create group/user/dirs, verify runtime root excludes personal profile/auth, install helper/wrapper/workload/broker unit/sudoers (root-owned), write no secrets, print the required root-only inputs. `verify_hermes_isolation.sh`/`.py` must check helper/wrapper modes, sudoers exactness, unit property builder, runtime root manifest hash, personal profile not mounted, broker socket/key permissions, and fail on any mismatch. Tests may inspect script text for forbidden `eval`/`sh -c` and fixed paths.
+`provision_hermes_runtime.sh` must be idempotent and fail closed: create group/user/dirs, compute and record the trusted runtime root manifest hash, verify runtime root excludes personal profile/auth, install helper/wrapper/workload/broker unit/sudoers (root-owned), write no secrets, print the required root-only inputs. `verify_hermes_isolation.sh`/`.py` must check helper/wrapper modes, sudoers exactness, unit property builder, runtime root manifest hash equality against the configured `runtime_root_hash`, personal profile not mounted, broker socket/key permissions, and fail on any mismatch. Tests may inspect script text for forbidden `eval`/`sh -c` and fixed paths.
 
 - [ ] **Step 5: Write docs**
 
