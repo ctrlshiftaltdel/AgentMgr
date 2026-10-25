@@ -293,11 +293,22 @@ def sandbox(monkeypatch: pytest.MonkeyPatch):
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         listener.bind(str(broker_socket))
         key_path = key_root / "attestation.key"
-        key_path.write_bytes(KEY)
-        key_path.chmod(0o600)
 
         uid = os.geteuid()
         gid = os.getegid()
+        private_candidates = [item for item in os.getgroups() if item != gid]
+        if not private_candidates:
+            pytest.skip("needs a supplementary group for the adapter private group")
+        adapter_gid = private_candidates[0]
+        other_gids = [item for item in private_candidates if item != adapter_gid]
+
+        key_path.write_bytes(KEY)
+        os.chown(key_path, uid, adapter_gid)
+        key_path.chmod(0o600)
+        # A unit test cannot create a root-owned key; production default (0) is
+        # asserted separately.
+        monkeypatch.setattr(helper, "ATTESTATION_KEY_OWNER_UID", uid)
+
         config = helper.InstallConfig(
             task_root=task_root,
             runtime_root=runtime_root,
@@ -305,13 +316,14 @@ def sandbox(monkeypatch: pytest.MonkeyPatch):
             broker_socket=broker_socket,
             workload=workload,
             adapter_user=pwd.getpwuid(uid).pw_name,
-            adapter_group=helper.GROUP_NAME,
+            adapter_group="agentmgr",
             attestation_key_path=key_path,
             evidence_ref=EVIDENCE_REF,
             runtime_name="hermes-agent",
             runtime_version="0.22.1",
             adapter_uid=uid,
-            adapter_gid=gid,
+            adapter_gid=adapter_gid,
+            sandbox_gid=gid,
         )
         yield SimpleNamespace(
             root=root,
@@ -324,6 +336,8 @@ def sandbox(monkeypatch: pytest.MonkeyPatch):
             config=config,
             uid=uid,
             gid=gid,
+            adapter_gid=adapter_gid,
+            other_gids=other_gids,
             task_dir=task_root / UNIT,
         )
         listener.close()
@@ -936,13 +950,13 @@ def _install_config_document(sandbox: SimpleNamespace, **overrides: object) -> d
         "broker_socket": str(sandbox.broker_socket),
         "workload": str(sandbox.workload),
         "adapter_user": pwd.getpwuid(sandbox.uid).pw_name,
-        "adapter_group": helper.GROUP_NAME,
+        "adapter_group": "agentmgr",
         "attestation_key_path": str(sandbox.key_path),
         "evidence_ref": EVIDENCE_REF,
         "runtime_name": "hermes-agent",
         "runtime_version": "0.22.1",
         "adapter_uid": sandbox.uid,
-        "adapter_gid": sandbox.gid,
+        "adapter_gid": sandbox.adapter_gid,
     }
     document.update(overrides)
     return document
@@ -956,7 +970,8 @@ def test_load_install_config_roundtrip(sandbox):
     config = helper.load_install_config(path)
     assert config.task_root == sandbox.task_root
     assert config.runtime_root_hash == RUNTIME_ROOT_HASH
-    assert config.adapter_group == helper.GROUP_NAME
+    assert config.adapter_group == "agentmgr"
+    assert config.adapter_group != helper.GROUP_NAME
     assert config.helper_version == helper.HELPER_VERSION
     assert config.stop_timeout_sec >= 1
     assert config.start_timeout_sec >= 1
@@ -966,7 +981,9 @@ def test_load_install_config_roundtrip(sandbox):
     "overrides",
     [
         {"unknown": "x"},
-        {"adapter_group": "sudo"},
+        {"adapter_group": ""},
+        {"adapter_group": helper.GROUP_NAME},
+        {"adapter_group": "bad group"},
         {"runtime_root_hash": "sha256:" + "A" * 64},
         {"runtime_root_hash": "not-a-digest"},
         {"task_root": "relative/tasks"},
@@ -975,6 +992,7 @@ def test_load_install_config_roundtrip(sandbox):
         {"workload": "/var/lib/agentmgr/workload.py"},
         {"task_root": "/var/lib/agentmgr/tasks"},
         {"adapter_uid": 0},
+        {"sandbox_gid": 1234},
         {"stop_timeout_sec": 0},
     ],
 )
@@ -1027,12 +1045,36 @@ def test_load_install_config_accepts_read_only_group_variant(sandbox):
     path.write_text(json.dumps(_install_config_document(sandbox)), encoding="utf-8")
     path.chmod(0o640)
     config = helper.load_install_config(path)
-    assert config.adapter_group == helper.GROUP_NAME
+    assert config.adapter_group == "agentmgr"
 
 
 def test_attestation_key_root_defaults_to_the_unit_invisible_directory():
     assert helper.ATTESTATION_KEY_ROOT == Path("/etc/agentmgr")
     assert "-/etc/agentmgr" in helper.INACCESSIBLE_PATHS
+    assert helper.ATTESTATION_KEY_OWNER_UID == 0
+
+
+def test_adapter_ids_require_membership_of_the_sandbox_group(sandbox, monkeypatch):
+    monkeypatch.setattr(
+        helper.pwd, "getpwnam", lambda name: SimpleNamespace(pw_uid=sandbox.uid)
+    )
+
+    def _fake_group(name: str) -> SimpleNamespace:
+        return SimpleNamespace(gr_gid=2222 if name == helper.GROUP_NAME else 1111)
+
+    monkeypatch.setattr(helper.grp, "getgrnam", _fake_group)
+    monkeypatch.setattr(helper.os, "getgrouplist", lambda user, gid: [1111])
+
+    config = dataclasses.replace(
+        sandbox.config, adapter_uid=None, adapter_gid=None, sandbox_gid=None
+    )
+    assert helper._sandbox_gid(config) == 2222
+    with pytest.raises(helper.HelperError) as excinfo:
+        helper._adapter_ids(config)
+    assert excinfo.value.code == "adapter_sandbox_group_missing"
+
+    monkeypatch.setattr(helper.os, "getgrouplist", lambda user, gid: [1111, 2222])
+    assert helper._adapter_ids(config) == (sandbox.uid, 1111)
 
 
 def test_install_config_rejects_private_tmp_bind_sources(sandbox, monkeypatch):
@@ -1070,12 +1112,15 @@ def test_prepare_creates_task_and_out_dirs_with_fixed_owner_group_and_mode(sandb
     out_dir = task_dir / "out"
     assert task_dir.is_dir() and not task_dir.is_symlink()
     assert out_dir.is_dir() and not out_dir.is_symlink()
+    # The adapter's private group and the sandbox group are distinct.
+    assert sandbox.adapter_gid != sandbox.gid
     for path in (task_dir, out_dir):
         info = os.lstat(path)
         assert stat.S_ISDIR(info.st_mode)
         assert stat.S_IMODE(info.st_mode) == 0o770
         assert info.st_uid == sandbox.uid
         assert info.st_gid == sandbox.gid
+        assert info.st_gid != sandbox.adapter_gid
 
     manifest = task_dir / "manifest.json"
     info = os.lstat(manifest)
@@ -1145,7 +1190,8 @@ def test_prepare_rejects_wrong_owner_and_wrong_mode(sandbox):
         runtime_name=sandbox.config.runtime_name,
         runtime_version=sandbox.config.runtime_version,
         adapter_uid=sandbox.uid + 1,
-        adapter_gid=sandbox.gid,
+        adapter_gid=sandbox.adapter_gid,
+        sandbox_gid=sandbox.gid,
     )
     with pytest.raises(helper.HelperError) as excinfo:
         helper.prepare(valid_request(operation="prepare"), wrong_owner)
@@ -1158,7 +1204,7 @@ def test_prepare_rejects_wrong_owner_and_wrong_mode(sandbox):
 
 
 def test_prepare_rejects_wrong_group(sandbox):
-    config = dataclasses.replace(sandbox.config, adapter_gid=sandbox.gid + 1)
+    config = dataclasses.replace(sandbox.config, sandbox_gid=sandbox.gid + 1)
     with pytest.raises(helper.HelperError) as excinfo:
         helper.prepare(valid_request(operation="prepare"), config)
     assert excinfo.value.code in {"task_root_group_invalid", "task_dir_group_invalid"}
@@ -1181,7 +1227,8 @@ def test_prepare_rejects_missing_roots(sandbox):
                 runtime_name=sandbox.config.runtime_name,
                 runtime_version=sandbox.config.runtime_version,
                 adapter_uid=sandbox.uid,
-                adapter_gid=sandbox.gid,
+                adapter_gid=sandbox.adapter_gid,
+                sandbox_gid=sandbox.gid,
             ),
         )
 
@@ -1360,26 +1407,101 @@ def test_launch_rejects_runtime_root_and_workload_unreadable_by_the_unit(sandbox
     assert runner.launch_calls() == []
 
 
-def test_launch_rejects_an_unsafe_attestation_key(sandbox):
+def _set_key(sandbox: SimpleNamespace, mode: int, gid: int | None = None) -> None:
+    owner_gid = sandbox.adapter_gid if gid is None else gid
+    os.chown(sandbox.key_path, sandbox.uid, owner_gid)
+    sandbox.key_path.chmod(mode)
+
+
+@pytest.mark.parametrize("mode", [0o600, 0o400, 0o440])
+def test_launch_accepts_safe_attestation_key_modes(sandbox, mode):
+    _set_key(sandbox, mode, sandbox.adapter_gid)
+    response = _launch_ready(sandbox, ScriptedRunner([SHOW_NOT_FOUND, SHOW_ACTIVE]))
+    assert response["started"] is True
+
+
+def test_launch_rejects_attestation_key_readable_by_the_sandbox_group(sandbox):
+    _set_key(sandbox, 0o440, sandbox.gid)
     _prepare(sandbox)
     _write_task_files(sandbox)
     _write_started(sandbox)
     runner = ScriptedRunner([SHOW_NOT_FOUND, SHOW_ACTIVE])
-
-    # Group can read (and it is the sandbox group): never acceptable.
-    sandbox.key_path.chmod(0o640)
     with pytest.raises(helper.HelperError) as excinfo:
         helper.launch(valid_request(), sandbox.config, runner=runner)
-    assert excinfo.value.code == "attestation_key_group_readable"
+    assert excinfo.value.code == "attestation_key_sandbox_group_readable"
+    assert runner.launch_calls() == []
 
-    # World-readable is rejected even without a group-read bit.
-    sandbox.key_path.chmod(0o604)
+
+def test_launch_rejects_attestation_key_readable_by_an_unrelated_group(sandbox):
+    if not sandbox.other_gids:
+        pytest.skip("needs a second supplementary group for this assertion")
+    _set_key(sandbox, 0o440, sandbox.other_gids[0])
+    _prepare(sandbox)
+    _write_task_files(sandbox)
+    _write_started(sandbox)
+    runner = ScriptedRunner([SHOW_NOT_FOUND, SHOW_ACTIVE])
+    with pytest.raises(helper.HelperError) as excinfo:
+        helper.launch(valid_request(), sandbox.config, runner=runner)
+    assert excinfo.value.code == "attestation_key_group_invalid"
+    assert runner.launch_calls() == []
+
+
+@pytest.mark.parametrize("mode", [0o640, 0o644, 0o604, 0o660])
+def test_launch_rejects_other_attestation_key_modes(sandbox, mode):
+    _set_key(sandbox, mode, sandbox.adapter_gid)
+    _prepare(sandbox)
+    _write_task_files(sandbox)
+    _write_started(sandbox)
+    runner = ScriptedRunner([SHOW_NOT_FOUND, SHOW_ACTIVE])
     with pytest.raises(helper.HelperError) as excinfo:
         helper.launch(valid_request(), sandbox.config, runner=runner)
     assert excinfo.value.code == "attestation_key_mode_invalid"
+    assert runner.launch_calls() == []
 
+
+def test_launch_rejects_attestation_key_with_wrong_owner(sandbox, monkeypatch):
+    monkeypatch.setattr(helper, "ATTESTATION_KEY_OWNER_UID", sandbox.uid + 1)
+    _set_key(sandbox, 0o440, sandbox.adapter_gid)
+    _prepare(sandbox)
+    _write_task_files(sandbox)
+    _write_started(sandbox)
+    runner = ScriptedRunner([SHOW_NOT_FOUND, SHOW_ACTIVE])
+    with pytest.raises(helper.HelperError) as excinfo:
+        helper.launch(valid_request(), sandbox.config, runner=runner)
+    assert excinfo.value.code == "attestation_key_owner_invalid"
+
+
+def test_launch_rejects_task_files_grouped_to_the_adapter_private_group(sandbox):
+    _prepare(sandbox)
+    _write_task_files(sandbox)
+    os.chown(sandbox.task_dir / "prompt.txt", sandbox.uid, sandbox.adapter_gid)
+    _write_started(sandbox)
+    runner = ScriptedRunner([SHOW_NOT_FOUND, SHOW_ACTIVE])
+    with pytest.raises(helper.HelperError) as excinfo:
+        helper.launch(valid_request(), sandbox.config, runner=runner)
+    assert excinfo.value.code == "prompt_group_invalid"
+    assert runner.launch_calls() == []
+
+
+def test_launch_accepts_task_files_grouped_to_the_sandbox_group(sandbox):
+    _prepare(sandbox)
+    _write_task_files(sandbox)
+    for name in ("prompt.txt", "profile.template.yaml", "egress.token"):
+        info = os.lstat(sandbox.task_dir / name)
+        assert info.st_gid == sandbox.gid
+        assert info.st_gid != sandbox.adapter_gid
+    _write_started(sandbox)
+    response = _launch_ready(sandbox, ScriptedRunner([SHOW_NOT_FOUND, SHOW_ACTIVE]))
+    assert response["started"] is True
+
+
+def test_launch_rejects_a_short_attestation_key(sandbox):
+    _prepare(sandbox)
+    _write_task_files(sandbox)
+    _write_started(sandbox)
     sandbox.key_path.write_bytes(b"short")
     sandbox.key_path.chmod(0o600)
+    runner = ScriptedRunner([SHOW_NOT_FOUND, SHOW_ACTIVE])
     with pytest.raises(helper.HelperError) as excinfo:
         helper.launch(valid_request(), sandbox.config, runner=runner)
     assert excinfo.value.code == "attestation_key_invalid"
@@ -1688,10 +1810,7 @@ def test_attest_keeps_strict_file_verification_while_active(sandbox):
 
 
 def test_run_request_dispatches_prepare(sandbox, monkeypatch):
-    monkeypatch.setattr(helper, "DEFAULT_INSTALL_CONFIG", sandbox.root / "install.json")
-    path = sandbox.root / "install.json"
-    path.write_text(json.dumps(_install_config_document(sandbox)), encoding="utf-8")
-    path.chmod(0o600)
+    monkeypatch.setattr(helper, "load_install_config", lambda path: sandbox.config)
 
     response = helper.run_request(base_request(operation="prepare"))
     assert response["ok"] is True
@@ -1702,10 +1821,7 @@ def test_run_request_dispatches_prepare(sandbox, monkeypatch):
 def test_main_roundtrips_one_prepare_request(capsys, sandbox, monkeypatch):
     import io
 
-    path = sandbox.root / "install.json"
-    path.write_text(json.dumps(_install_config_document(sandbox)), encoding="utf-8")
-    path.chmod(0o600)
-    monkeypatch.setattr(helper, "DEFAULT_INSTALL_CONFIG", path)
+    monkeypatch.setattr(helper, "load_install_config", lambda path: sandbox.config)
     monkeypatch.setattr(
         "sys.stdin", io.StringIO(json.dumps(base_request(operation="prepare")))
     )
@@ -1721,10 +1837,7 @@ def test_main_roundtrips_one_prepare_request(capsys, sandbox, monkeypatch):
 
 
 def test_run_request_dispatches_cleanup(sandbox, monkeypatch):
-    monkeypatch.setattr(helper, "DEFAULT_INSTALL_CONFIG", sandbox.root / "install.json")
-    path = sandbox.root / "install.json"
-    path.write_text(json.dumps(_install_config_document(sandbox)), encoding="utf-8")
-    path.chmod(0o600)
+    monkeypatch.setattr(helper, "load_install_config", lambda path: sandbox.config)
     assert helper.run_request(base_request(operation="prepare"))["ok"] is True
 
     response = helper.run_request(

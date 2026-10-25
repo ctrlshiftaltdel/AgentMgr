@@ -33,15 +33,22 @@ Deployment invariants
 
 * ``/etc/agentmgr/hermes-exec.json`` (root-owned, ``0600``/``0640``) fixes the
   task root, runtime root and trusted runtime root hash, broker socket,
-  workload path, adapter user, ``agentmgr-hermes`` group and attestation key.
-  The attestation key must live under ``/etc/agentmgr`` (masked in every unit),
-  must not be under the task root, and must not be group/other readable; it is
-  accepted only at mode ``0600``/``0400`` and never with the sandbox group.
+  workload path, adapter user and the adapter's **private** group.  The sandbox
+  group is the fixed ``agentmgr-hermes`` and is never taken from the config.
+  The adapter user must be a member of ``agentmgr-hermes`` so it can read the
+  task directories (verified via NSS when no numeric ids are configured).
+* The attestation HMAC key is root-owned and must live under ``/etc/agentmgr``
+  (masked in every unit) and never under the task root.  Accepted modes are
+  ``0600``/``0400`` (owner-only) and ``0440`` whose group is exactly the
+  adapter's private group; ``0440`` with the sandbox group, any other group, or
+  any other mode (e.g. ``0640``) is rejected.  The helper signs with the key and
+  the trusted adapter verifies with the same key; a sandbox unit never sees it.
 * The task directory is ``<task-root>/<unit>`` with ``out/`` at ``0770``,
-  owned by the trusted adapter user and group ``agentmgr-hermes``.  Existing
-  paths are never repaired: a symlink, wrong owner/group or wrong mode fails
-  closed.  ``prompt.txt``/``profile.template.yaml`` are accepted at most at
-  ``0640`` and ``egress.token`` exactly at ``0640``.
+  owned by the trusted adapter user and the fixed sandbox group
+  ``agentmgr-hermes``.  Existing paths are never repaired: a symlink, wrong
+  owner/group or wrong mode fails closed.
+  ``prompt.txt``/``profile.template.yaml`` are accepted at most at ``0640`` and
+  ``egress.token`` exactly at ``0640``.
 * ``systemd-run`` receives a fixed transient unit: private ``/run`` and
   ``/tmp``, isolated loopback only, read-only host minus the task directory, an
   empty capability set, ``@system-service`` and no caller supplied property.
@@ -159,8 +166,12 @@ RUNTIME_UNIT_PATH = "/runtime"
 EGRESS_UNIT_PATH = "/task/egress.sock"
 DESCRIPTION = "agentmgr-hermes-sandbox"
 
-#: The fixed shared group of the adapter and every sandbox unit.
+#: The fixed sandbox group: primary group of every unit and group of the task
+#: directory.  It is *not* the trusted adapter's private group.
 GROUP_NAME = "agentmgr-hermes"
+
+#: Unix group names accepted for the trusted adapter's private group.
+GROUP_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,31}$")
 
 #: Fixed derivation, identical to ``app.runtime.hermes_managed``.
 UNIT_PREFIX = "agentmgr-hermes-"
@@ -213,6 +224,11 @@ MASKED_SOURCE_PREFIXES: tuple[Path, ...] = (
 #: ``/etc/agentmgr`` is masked by ``InaccessiblePaths`` in every sandbox unit, so
 #: neither a task process nor a sibling group member can read it.
 ATTESTATION_KEY_ROOT = Path("/etc/agentmgr")
+
+#: Expected owner of the attestation key.  Production is always root; the
+#: unprivileged unit-test fixture overrides it to its own uid (a unit test
+#: cannot create a root-owned file).  The default is pinned by a test.
+ATTESTATION_KEY_OWNER_UID = 0
 
 #: ``PrivateTmp=yes`` replaces these with private tmpfs mounts, so they can
 #: never be bind sources.  ``InstallConfig`` rejects them; the module-level
@@ -422,6 +438,9 @@ class InstallConfig:
     model_name: str = ""
     adapter_uid: int | None = None
     adapter_gid: int | None = None
+    #: Test/deployment-only numeric override for the fixed sandbox group; never
+    #: read from the install-config JSON (``GROUP_NAME`` remains authoritative).
+    sandbox_gid: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -707,7 +726,14 @@ def _validate_install_config(config: object) -> InstallConfig:
     _config_text(config.helper_version)
     _config_timeout(config.stop_timeout_sec, "stop_timeout_sec")
     _config_timeout(config.start_timeout_sec, "start_timeout_sec")
-    if config.adapter_group != GROUP_NAME:
+    # ``adapter_group`` is the trusted adapter's *private* group (used only for
+    # attestation-key access).  It must be a valid group name and must differ
+    # from the fixed sandbox group, otherwise the sandbox could read the key.
+    adapter_group = _config_text(config.adapter_group)
+    if (
+        GROUP_NAME_PATTERN.fullmatch(adapter_group) is None
+        or adapter_group == GROUP_NAME
+    ):
         raise HelperError("install_config_invalid")
     if SHA256_REF_PATTERN.fullmatch(config.runtime_root_hash or "") is None:
         raise HelperError("install_config_invalid")
@@ -717,6 +743,10 @@ def _validate_install_config(config: object) -> InstallConfig:
         raise HelperError("install_config_invalid")
     if config.adapter_gid is not None and (
         type(config.adapter_gid) is not int or config.adapter_gid <= 0
+    ):
+        raise HelperError("install_config_invalid")
+    if config.sandbox_gid is not None and (
+        type(config.sandbox_gid) is not int or config.sandbox_gid <= 0
     ):
         raise HelperError("install_config_invalid")
 
@@ -748,24 +778,69 @@ def _validate_install_config(config: object) -> InstallConfig:
     return config
 
 
-def _adapter_ids(config: InstallConfig) -> tuple[int, int]:
+def _adapter_uid(config: InstallConfig) -> int:
+    """Resolve the trusted adapter UID without the group-membership probe."""
+
     uid = config.adapter_uid
     if uid is None:
         try:
             uid = pwd.getpwnam(config.adapter_user).pw_uid
         except KeyError:
             raise HelperError("user_unavailable") from None
+    if type(uid) is not int or uid <= 0:
+        raise HelperError("install_config_invalid")
+    return uid
+
+
+def _adapter_ids(config: InstallConfig) -> tuple[int, int]:
+    """Return the trusted adapter UID and its *private* group GID."""
+
+    uid = _adapter_uid(config)
     gid = config.adapter_gid
     if gid is None:
         try:
             gid = grp.getgrnam(config.adapter_group).gr_gid
         except KeyError:
             raise HelperError("group_unavailable") from None
-    if type(uid) is not int or uid <= 0:
-        raise HelperError("install_config_invalid")
     if type(gid) is not int or gid <= 0:
         raise HelperError("install_config_invalid")
+    if config.adapter_uid is None and config.adapter_gid is None:
+        # NSS was consulted, so verify the real membership the task-dir access
+        # depends on.  Numeric overrides (tests / NSS-less deployments) cannot
+        # be checked and are trusted as root-only configuration.
+        _require_adapter_sandbox_membership(
+            config.adapter_user, gid, _sandbox_gid(config)
+        )
     return uid, gid
+
+
+def _sandbox_gid(config: InstallConfig) -> int:
+    """Return the fixed ``agentmgr-hermes`` GID (or the test-only override)."""
+
+    if config.sandbox_gid is not None:
+        if type(config.sandbox_gid) is not int or config.sandbox_gid <= 0:
+            raise HelperError("install_config_invalid")
+        return config.sandbox_gid
+    try:
+        gid = grp.getgrnam(GROUP_NAME).gr_gid
+    except KeyError:
+        raise HelperError("group_unavailable") from None
+    if type(gid) is not int or gid <= 0:
+        raise HelperError("install_config_invalid")
+    return gid
+
+
+def _require_adapter_sandbox_membership(
+    adapter_user: str, adapter_gid: int, sandbox_gid: int
+) -> None:
+    """Fail closed unless the adapter user can reach task dirs via the group."""
+
+    try:
+        groups = os.getgrouplist(adapter_user, adapter_gid)
+    except OSError:
+        raise HelperError("user_unavailable") from None
+    if sandbox_gid not in groups:
+        raise HelperError("adapter_sandbox_group_missing")
 
 
 def _is_masked_source(path: Path) -> bool:
@@ -874,17 +949,20 @@ def _mkdir_owned(
 
 
 def _ensure_task_dir(config: InstallConfig, unit: str) -> tuple[Path, bool]:
-    uid, gid = _adapter_ids(config)
+    uid, _ = _adapter_ids(config)
+    sandbox_gid = _sandbox_gid(config)
     task_dir = config.task_root / unit
     created = False
     info = _lstat(task_dir)
     if info is None:
-        _mkdir_owned(task_dir, mode=TASK_DIR_MODE, uid=uid, gid=gid, code="task_dir")
+        _mkdir_owned(
+            task_dir, mode=TASK_DIR_MODE, uid=uid, gid=sandbox_gid, code="task_dir"
+        )
         created = True
     else:
         _require_fixed_directory(
             task_dir, code="task_dir", mode=TASK_DIR_MODE, check_owner=False,
-            group_id=gid,
+            group_id=sandbox_gid,
         )
         if info.st_uid != uid:
             raise HelperError("task_dir_owner_invalid")
@@ -892,12 +970,14 @@ def _ensure_task_dir(config: InstallConfig, unit: str) -> tuple[Path, bool]:
     out_dir = task_dir / "out"
     info = _lstat(out_dir)
     if info is None:
-        _mkdir_owned(out_dir, mode=TASK_DIR_MODE, uid=uid, gid=gid, code="out_dir")
+        _mkdir_owned(
+            out_dir, mode=TASK_DIR_MODE, uid=uid, gid=sandbox_gid, code="out_dir"
+        )
         created = True
     else:
         _require_fixed_directory(
             out_dir, code="out_dir", mode=TASK_DIR_MODE, check_owner=False,
-            group_id=gid,
+            group_id=sandbox_gid,
         )
         if info.st_uid != uid:
             raise HelperError("out_dir_owner_invalid")
@@ -905,26 +985,27 @@ def _ensure_task_dir(config: InstallConfig, unit: str) -> tuple[Path, bool]:
 
 
 def _require_task_dir(config: InstallConfig, unit: str) -> Path:
-    uid, gid = _adapter_ids(config)
+    uid, _ = _adapter_ids(config)
+    sandbox_gid = _sandbox_gid(config)
     task_dir = config.task_root / unit
     info = _lstat(task_dir)
     if info is None:
         raise HelperError("task_dir_missing")
     _require_fixed_directory(
         task_dir, code="task_dir", mode=TASK_DIR_MODE, check_owner=False,
-        group_id=gid,
+        group_id=sandbox_gid,
     )
     if info.st_uid != uid:
         raise HelperError("task_dir_owner_invalid")
     _require_fixed_directory(
         task_dir / "out", code="out_dir", mode=TASK_DIR_MODE, check_owner=False,
-        group_id=gid,
+        group_id=sandbox_gid,
     )
     return task_dir
 
 
 def _require_task_root(config: InstallConfig) -> None:
-    _, gid = _adapter_ids(config)
+    gid = _sandbox_gid(config)
     info = _require_fixed_directory(config.task_root, code="task_root",
                                     group_id=gid)
     if stat.S_IMODE(info.st_mode) & PROTECTED_MODE_MASK:
@@ -1524,15 +1605,25 @@ def _read_attestation_key(config: InstallConfig) -> bytes:
         raise HelperError("attestation_key_missing")
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         raise HelperError("attestation_key_invalid")
-    if info.st_uid != os.geteuid():
+    if info.st_uid != ATTESTATION_KEY_OWNER_UID:
         raise HelperError("attestation_key_owner_invalid")
-    _, sandbox_gid = _adapter_ids(config)
+    _, adapter_gid = _adapter_ids(config)
+    sandbox_gid = _sandbox_gid(config)
+    if adapter_gid == sandbox_gid:
+        # The adapter's private group must not be the sandbox group, otherwise
+        # a 0440 key would be readable by every sandbox unit.
+        raise HelperError("install_config_invalid")
     mode = stat.S_IMODE(info.st_mode)
-    # The key must never be readable by the shared sandbox group (or anyone
-    # else): a sibling task's terminal runs with that group.
-    if info.st_gid == sandbox_gid and mode & 0o070:
-        raise HelperError("attestation_key_group_readable")
-    if mode not in {0o600, 0o400}:
+    # Accepted: 0600/0400 (owner-only) and 0440 owned by the adapter's private
+    # group.  Any group read with the sandbox group or an unrelated group, and
+    # any other mode (e.g. 0640), is rejected: the sandbox unit must never be
+    # able to read the HMAC key.
+    if mode == 0o440:
+        if info.st_gid == sandbox_gid:
+            raise HelperError("attestation_key_sandbox_group_readable")
+        if info.st_gid != adapter_gid:
+            raise HelperError("attestation_key_group_invalid")
+    elif mode not in {0o600, 0o400}:
         raise HelperError("attestation_key_mode_invalid")
     if not MIN_ATTESTATION_KEY_BYTES <= info.st_size <= MAX_ATTESTATION_KEY_BYTES:
         raise HelperError("attestation_key_invalid")
@@ -1610,7 +1701,8 @@ def prepare(request: object, config: object) -> dict[str, object]:
     config = _validate_install_config(config)
     _require_task_root(config)
     task_dir, created = _ensure_task_dir(config, request.unit)
-    uid, gid = _adapter_ids(config)
+    uid, _ = _adapter_ids(config)
+    sandbox_gid = _sandbox_gid(config)
     binding = {
         "schema": MANIFEST_SCHEMA,
         "unit": request.unit,
@@ -1644,7 +1736,7 @@ def prepare(request: object, config: object) -> dict[str, object]:
         _canonical_json(manifest),
         mode=MANIFEST_MODE,
         uid=uid,
-        gid=gid,
+        gid=sandbox_gid,
         label="manifest",
     )
     return {
@@ -1792,7 +1884,7 @@ def cleanup(
     if not _process_gone(state):
         raise HelperError("unit_still_running")
 
-    uid, _ = _adapter_ids(config)
+    uid = _adapter_uid(config)
     task_dir = config.task_root / request.unit
     _require_task_root(config)
     info = _lstat(task_dir)
@@ -1882,8 +1974,7 @@ def _require_runtime_root(config: InstallConfig) -> None:
     info = _require_fixed_directory(config.runtime_root, code="runtime_root")
     if stat.S_IMODE(info.st_mode) & 0o022:
         raise HelperError("runtime_root_mode_invalid")
-    _, gid = _adapter_ids(config)
-    if not _unit_can_read(info, gid, execute=True):
+    if not _unit_can_read(info, _sandbox_gid(config), execute=True):
         raise HelperError("runtime_root_mode_invalid")
 
 
@@ -1910,8 +2001,7 @@ def _require_workload(config: InstallConfig) -> None:
         raise HelperError("workload_owner_invalid")
     if stat.S_IMODE(info.st_mode) & 0o022:
         raise HelperError("workload_mode_invalid")
-    _, gid = _adapter_ids(config)
-    if not _unit_can_read(info, gid, execute=False):
+    if not _unit_can_read(info, _sandbox_gid(config), execute=False):
         raise HelperError("workload_mode_invalid")
 
 
@@ -1936,7 +2026,8 @@ def _unit_can_read(
 def _verify_task_files(
     request: SandboxRequest, config: InstallConfig, task_dir: Path
 ) -> None:
-    uid, gid = _adapter_ids(config)
+    uid, _ = _adapter_ids(config)
+    gid = _sandbox_gid(config)
     _verify_task_file(
         task_dir / "prompt.txt",
         label="prompt",
