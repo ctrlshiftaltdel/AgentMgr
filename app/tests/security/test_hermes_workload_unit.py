@@ -316,7 +316,11 @@ def test_hermes_argv_uses_query_file_and_never_prompt_or_key():
             "base_url_invalid",
         ),
         (
-            {"model": MODEL, "base_url": "https://127.0.0.1:1/v1", "run_budget_sec": 60},
+            {
+                "model": MODEL,
+                "base_url": "https://127.0.0.1:1/v1",
+                "run_budget_sec": 60,
+            },
             "base_url_invalid",
         ),
         (
@@ -1164,6 +1168,57 @@ def test_run_workload_redacts_prompt_and_token_from_captured_output(tmp_path):
         assert PROMPT_CANARY not in text
         assert TOKEN_CANARY not in text
         assert "[redacted]" in text
+
+
+def test_run_workload_fails_closed_when_the_final_exit_marker_fails(
+    tmp_path, monkeypatch
+):
+    """A missing final exit marker must never be reported as success."""
+
+    runtime = _fake_runtime(tmp_path, "import sys\nsys.exit(0)\n")
+    task = _make_task(tmp_path)
+    socket_path = tmp_path / "e.sock"
+    real_write = workload.write_status_atomic
+
+    def flaky_write(path, payload):
+        if path.name == "exit.json":
+            raise workload.WorkloadError("status_write_failed")
+        real_write(path, payload)
+
+    monkeypatch.setattr(workload, "write_status_atomic", flaky_write)
+    with _upstream(socket_path):
+        with pytest.raises(workload.WorkloadError) as excinfo:
+            workload.run_workload(
+                task_dir=task,
+                runtime_root=runtime,
+                model=MODEL,
+                run_budget_sec=30,
+                proxy_socket=socket_path,
+                heartbeat_interval_sec=30.0,
+            )
+    assert excinfo.value.code == "status_write_failed"
+    assert not (task / "status" / "exit.json").exists()
+
+
+@pytest.mark.parametrize(
+    "interval",
+    [float("nan"), float("inf"), float("-inf"), 0, -1.0, 3601.0],
+)
+def test_run_workload_rejects_non_finite_or_out_of_range_intervals(
+    tmp_path, interval
+):
+    # A NaN interval would make every deadline comparison false and silently
+    # disable the run budget.
+    with pytest.raises(workload.WorkloadError) as excinfo:
+        workload.run_workload(
+            task_dir=tmp_path,
+            runtime_root=tmp_path / "runtime",
+            model=MODEL,
+            run_budget_sec=10,
+            proxy_socket=tmp_path / "e.sock",
+            heartbeat_interval_sec=interval,
+        )
+    assert excinfo.value.code == "interval_invalid"
 
 
 @pytest.mark.parametrize("runtime_max_sec", [10, 60, 600])

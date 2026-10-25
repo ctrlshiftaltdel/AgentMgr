@@ -62,6 +62,7 @@ from __future__ import annotations
 import http.client
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -692,7 +693,9 @@ def _validate_interval(value: object) -> float:
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise WorkloadError("interval_invalid")
     number = float(value)
-    if number < 0 or number > 3600:
+    # Reject NaN/inf and non-positive intervals: ``NaN`` would make every
+    # deadline comparison false and silently disable the run budget.
+    if not math.isfinite(number) or number <= 0 or number > 3600:
         raise WorkloadError("interval_invalid")
     return number
 
@@ -1425,7 +1428,7 @@ def _run_child(
     _stop_signal = None
     started_monotonic = time.monotonic()
 
-    def _write_exit_safely(error_code: str | None = None) -> None:
+    def _exit_payload(error_code: str | None = None) -> dict[str, object]:
         returncode = None if process is None else process.returncode
         payload: dict[str, object] = {
             "exit_code": returncode,
@@ -1439,8 +1442,13 @@ def _run_child(
             payload["child_pid"] = process.pid
         if error_code is not None:
             payload["error"] = error_code
+        return payload
+
+    def _write_exit_safely(error_code: str | None = None) -> None:
+        """Best-effort marker for the failure path; never masks the original."""
+
         try:
-            write_status_atomic(status_dir / "exit.json", payload)
+            write_status_atomic(status_dir / "exit.json", _exit_payload(error_code))
         except Exception:
             pass
 
@@ -1527,7 +1535,10 @@ def _run_child(
         for reader in readers:
             reader.join(5.0)
         returncode = process.returncode
-        _write_exit_safely()
+        # The normal path must not report success without a durable exit marker:
+        # a write failure raises ``status_write_failed`` and is handled by the
+        # ``except`` below (the child has already exited, so nothing is orphaned).
+        write_status_atomic(status_dir / "exit.json", _exit_payload())
         if type(returncode) is not int:
             return EXIT_INTERNAL
         if returncode < 0:
@@ -1740,6 +1751,9 @@ def main(argv: list[str] | None = None) -> int:
     except WorkloadError as error:
         if error.code.endswith("_unavailable"):
             return EXIT_UNAVAILABLE
+        if error.code.endswith("_write_failed"):
+            # A status/profile write failure is internal, not bad task input.
+            return EXIT_INTERNAL
         return EXIT_TASK_INVALID
     except Exception:
         # Never print a traceback: it can contain task paths or prompt content.
