@@ -1508,6 +1508,9 @@ def build_systemd_run_argv(
     task_root = task_dir.parent
     if task_root == Path("/"):
         raise HelperError("task_root_invalid")
+    broker_parent = broker_socket.parent
+    if broker_parent == Path("/"):
+        raise HelperError("broker_socket_invalid")
     for path in (task_dir, runtime_root, broker_socket, workload):
         if _is_masked_source(path):
             raise HelperError("masked_source")
@@ -1517,6 +1520,15 @@ def build_systemd_run_argv(
             # ``PrivateTmp=yes`` replaces /tmp and /var/tmp inside the unit, so
             # a bind source there cannot be resolved by systemd.
             raise HelperError("private_tmp_source")
+
+    # Directories hidden from the unit in addition to ``INACCESSIBLE_PATHS``:
+    # the task root (sibling task dirs/tokens) and the broker socket's control
+    # directory (its siblings are not covered by the ``/var/lib/agentmgr``
+    # prefix, e.g. ``/var/lib/agentmgr-hermes-control``).  Both bind sources stay
+    # available through the explicit binds below.
+    hidden_roots = [task_root]
+    if broker_parent != task_root:
+        hidden_roots.append(broker_parent)
 
     properties = [
         "--property=DynamicUser=yes",
@@ -1552,10 +1564,12 @@ def build_systemd_run_argv(
         "--property=ProtectProc=invisible",
         "--property=ProcSubset=pid",
         *(f"--property=InaccessiblePaths={item}" for item in INACCESSIBLE_PATHS),
-        # Hide the task root itself so a unit cannot list or read sibling task
-        # directories/tokens, while its own task dir stays available through
-        # the explicit bind below (verified on the approved host).
-        f"--property=InaccessiblePaths=-{task_root}",
+        # Hide the task root (sibling task dirs/tokens) and the broker control
+        # directory (siblings such as control state, outside the covered
+        # ``/var/lib/agentmgr`` prefix).  Both bind sources stay available
+        # through the explicit binds below; the host probe confirmed an
+        # ``InaccessiblePaths`` parent does not break a per-task bind source.
+        *(f"--property=InaccessiblePaths=-{root}" for root in hidden_roots),
         "--property=UMask=0007",
         "--property=KillMode=control-group",
         "--property=SendSIGKILL=yes",

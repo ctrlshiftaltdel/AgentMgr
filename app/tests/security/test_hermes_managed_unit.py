@@ -666,11 +666,15 @@ def test_systemd_argv_has_fixed_sandbox_properties():
         "InaccessiblePaths=-/var/lib/containers",
         "InaccessiblePaths=-/var/lib/containerd",
         f"InaccessiblePaths=-{TASK_DIR.parent}",
+        f"InaccessiblePaths=-{BROKER_SOCKET.parent}",
     ):
         assert f"--property={masked}" in argv
 
-    # The task root is hidden, but its own task directory stays bind-mounted.
+    # The task root and broker control dir are hidden, but both per-task bind
+    # sources stay mounted (Master's host probe confirmed the parent mask does
+    # not break an explicit bind source).
     assert f"--property=BindPaths={TASK_DIR}:/task" in argv
+    assert f"--property=BindReadOnlyPaths={BROKER_SOCKET}:/task/egress.sock" in argv
     assert not any("SupplementaryGroups=" in item for item in argv)
     assert "--property=Group=agentmgr-hermes" in argv
     assert "--property=PrivateDevices=yes" in argv
@@ -768,6 +772,55 @@ def test_systemd_argv_rejects_unsafe_or_unfixed_paths():
             broker_socket=BROKER_SOCKET,
             workload=WORKLOAD,
         )
+
+    # A broker socket directly under "/" would likewise mask the whole root.
+    with pytest.raises(helper.HelperError) as excinfo:
+        helper.build_systemd_run_argv(
+            valid_request(),
+            task_dir=TASK_DIR,
+            runtime_root=RUNTIME_ROOT,
+            broker_socket=Path("/egress.sock"),
+            workload=WORKLOAD,
+        )
+    assert excinfo.value.code == "broker_socket_invalid"
+
+
+def test_systemd_argv_masks_the_broker_control_directory_and_keeps_the_bind():
+    control_dir = Path("/var/lib/agentmgr-hermes-control")
+    broker_socket = control_dir / "egress.sock"
+    # The generic ``/var/lib/agentmgr`` prefix is component-aware and does not
+    # cover the hyphenated sibling, so the control dir must be masked itself.
+    assert Path("/var/lib/agentmgr") not in broker_socket.parents
+
+    argv = helper.build_systemd_run_argv(
+        valid_request(),
+        task_dir=TASK_DIR,
+        runtime_root=RUNTIME_ROOT,
+        broker_socket=broker_socket,
+        workload=WORKLOAD,
+    )
+    assert f"--property=InaccessiblePaths=-{control_dir}" in argv
+    assert (
+        f"--property=BindReadOnlyPaths={broker_socket}:/task/egress.sock" in argv
+    )
+
+
+def test_systemd_argv_does_not_duplicate_a_shared_hidden_root():
+    shared_root = TASK_DIR.parent
+    broker_socket = shared_root / "egress.sock"
+    argv = helper.build_systemd_run_argv(
+        valid_request(),
+        task_dir=TASK_DIR,
+        runtime_root=RUNTIME_ROOT,
+        broker_socket=broker_socket,
+        workload=WORKLOAD,
+    )
+    masks = [
+        item
+        for item in argv
+        if item == f"--property=InaccessiblePaths=-{shared_root}"
+    ]
+    assert len(masks) == 1
 
 
 def test_systemd_argv_rejects_private_tmp_sources(sandbox, monkeypatch):
