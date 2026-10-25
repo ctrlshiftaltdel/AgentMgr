@@ -578,7 +578,7 @@ git commit -m "test(tasks): drive hermes managed adapter through dispatcher"
 - [ ] **Step 1: Write failing/skip-gated live tests**
 
 Add tests that:
-- Run a probe unit with `PrivateNetwork=yes`; assert `/etc/shadow`, host home, DB socket, other task dir, `/run/systemd`, `/run/dbus`, Docker socket are denied; external `1.1.1.1:80` gives `ENETUNREACH`; loopback works.
+- Run a probe unit with `PrivateNetwork=yes`; assert `/etc/shadow`, host home, DB socket, other task dir, `/run/systemd`, `/run/dbus`, Docker socket are denied; external `<external-ipv4>:<port>` gives `ENETUNREACH`; loopback works.
 - Launch the production helper for a Hermes task with the stub broker (fixed assistant text, no tool calls); assert unit active, DynamicUser UID, read-only runtime root, task dir writable only, started marker, completed/exit status, stop/cgroup-gone, cleanup, and no artifact -> adapter result is unknown/needs_human (not success).
 - Assert the unit does not see the personal gateway lock/socket or profile.
 - Assert a malformed/second launch with the same key does not create a second unit.

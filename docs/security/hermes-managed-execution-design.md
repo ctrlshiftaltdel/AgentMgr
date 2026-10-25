@@ -48,7 +48,7 @@
 
 1. 测试机上已有个人/默认 Hermes gateway 在运行。Hermes 0.22.1 对同一 OS 用户实施 **one gateway per host**；第二个 gateway 会被拒绝，`--replace` 会替换现有 gateway。**#97 绝不复用、替换或停止该 gateway。**
 2. 一次性 CLI `hermes -z` 不经过 gateway，不参与 host lock；适合每任务进程模型。
-3. `PrivateNetwork=yes` 的 transient unit 具有可用的隔离 loopback；外部 IP（如 `1.1.1.1:80`）返回 `ENETUNREACH`。这允许单元内运行 Hermes 与本地模型代理，同时保持无直接外网。
+3. `PrivateNetwork=yes` 的 transient unit 具有可用的隔离 loopback；外部 IP（如 `<external-ipv4>:<port>`）返回 `ENETUNREACH`。这允许单元内运行 Hermes 与本地模型代理，同时保持无直接外网。
 4. `ProtectHome=yes` 下，使用 `BindReadOnlyPaths` 把宿主路径挂到单元内仍然可读；因此可以把 Hermes 运行时只读挂入，而不复制 2.6 GB 安装。
 5. 独立的 `HERMES_HOME` 首次启动会尝试安装依赖；每任务重新安装不可接受。设计使用 **一次 provision 的只读运行时根 + 每任务轻量 profile**。
 6. 个人 profile 的 gateway、auth、`.env`、session 和 lock 不属于运行时根；不得挂载。
