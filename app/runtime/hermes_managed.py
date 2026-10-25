@@ -42,6 +42,7 @@ import stat
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import Mapping
 
 from app.runtime.contract import (
@@ -65,6 +66,11 @@ __all__ = [
     "DEFAULT_RESULT_MAX_BYTES",
     "MANAGED_INSTRUCTION",
     "MANAGED_RUNTIME_ID",
+    "MAX_CPU_QUOTA_PERCENT",
+    "MAX_MEMORY_MAX_MB",
+    "MAX_PROMPT_MAX_BYTES",
+    "MAX_RUNTIME_MAX_SEC",
+    "MAX_TASKS_MAX",
     "RUNTIME_ATTESTATION_SCHEMA",
     "RUNTIME_HANDLE_PREFIX",
     "TASK_ATTESTATION_SCHEMA",
@@ -81,6 +87,7 @@ __all__ = [
     "SandboxStatus",
     "SandboxStop",
     "TaskAttestation",
+    "VerifiedRuntimeAttestation",
     "build_managed_prompt",
     "build_sandbox_spec",
     "managed_capabilities",
@@ -118,6 +125,15 @@ _DEFAULT_POLL_INTERVAL = 1.0
 _DEFAULT_HEALTH_BACKOFF_SECONDS = 5.0
 _DEFAULT_PROXY_TEMPLATE = "http://127.0.0.1:{port}/v1"
 _DEFAULT_EGRESS_PATH_PREFIX = "/v1"
+
+#: Upper bounds for the resource limits forwarded to the root helper.  Values
+#: outside these ranges are configuration mistakes, not policy choices, so the
+#: spec builder fails closed instead of forwarding them to systemd.
+MAX_RUNTIME_MAX_SEC = 86_400
+MAX_MEMORY_MAX_MB = 1_048_576
+MAX_CPU_QUOTA_PERCENT = 6_400
+MAX_TASKS_MAX = 65_536
+MAX_PROMPT_MAX_BYTES = 1_048_576
 
 _MIN_HMAC_KEY_BYTES = 32
 _ARTIFACT_CHUNK_BYTES = 65_536
@@ -283,6 +299,7 @@ class HermesManagedConfig:
 
     helper_path: Path
     runtime_root: Path
+    runtime_root_hash: str
     task_root: Path
     broker_socket: Path
     attestation_key_path: Path
@@ -313,9 +330,10 @@ class HermesManagedConfig:
 class SandboxSpec:
     """Launch contract shared with the root helper.
 
-    It carries hashes and sizes only.  The raw prompt, profile template and
-    egress token never leave the trusted adapter, so this object is safe to log
-    or persist in ``manifest.json``.
+    It carries hashes and sizes only: the raw prompt, profile template and
+    egress token never leave the trusted adapter.  ``task_dir`` is still a host
+    filesystem path, so redact it before writing this object to an external log
+    or evidence store.
     """
 
     task_id: str
@@ -429,7 +447,7 @@ class TaskAttestation:
             "runtime_root_hash": self.runtime_root_hash,
             "profile_template_sha256": self.profile_template_sha256,
             "prompt_sha256": self.prompt_sha256,
-            "sandbox_facts": dict(self.sandbox_facts),
+            "sandbox_facts": _thaw_facts(self.sandbox_facts),
             "issued_at": _iso_utc(self.issued_at),
             "expires_at": _iso_utc(self.expires_at),
             "nonce": self.nonce,
@@ -484,7 +502,7 @@ class RuntimeAttestation:
             "runtime_name": self.runtime_name,
             "runtime_version": self.runtime_version,
             "runtime_root_hash": self.runtime_root_hash,
-            "sandbox_facts": dict(self.sandbox_facts),
+            "sandbox_facts": _thaw_facts(self.sandbox_facts),
             "broker_socket_ok": self.broker_socket_ok,
             "evidence_ref": self.evidence_ref,
             "issued_at": _iso_utc(self.issued_at),
@@ -510,6 +528,40 @@ class RuntimeAttestation:
             nonce=_require_text(data, "nonce"),
             hmac=_require_hmac_text(data),
         )
+
+
+_VERIFIED_PROOF = object()
+
+
+class VerifiedRuntimeAttestation:
+    """Opaque proof that a runtime attestation passed HMAC verification.
+
+    Instances can only be produced by :func:`verify_runtime_attestation`; the
+    constructor requires a module-private proof token.  Capability snapshots
+    accept nothing else, so a structurally plausible but forged attestation can
+    never upgrade a capability label to ``verified``.
+    """
+
+    __slots__ = ("_attestation",)
+
+    def __init__(self, attestation: RuntimeAttestation, *, _proof: object) -> None:
+        if _proof is not _VERIFIED_PROOF:
+            raise TypeError(
+                "VerifiedRuntimeAttestation can only be created by "
+                "verify_runtime_attestation"
+            )
+        if not isinstance(attestation, RuntimeAttestation):
+            raise TypeError("verified runtime attestation requires an attestation")
+        self._attestation = attestation
+
+    @property
+    def attestation(self) -> RuntimeAttestation:
+        """The attestation whose HMAC was verified."""
+
+        return self._attestation
+
+    def __repr__(self) -> str:
+        return "VerifiedRuntimeAttestation(<verified>)"
 
 
 # ---------------------------------------------------------------------------
@@ -568,6 +620,7 @@ def build_sandbox_spec(
 
     unit = unit_name_for(task_id, idempotency_key)
     _require_text_value(grant_id, "grant_id")
+    _validate_resource_limits(config)
     prompt_bytes = _require_payload("prompt", prompt)
     if len(prompt_bytes) > config.prompt_max_bytes:
         raise SandboxSpecError("prompt exceeds the configured byte limit")
@@ -628,59 +681,89 @@ def build_managed_prompt(prompt: str, *, max_bytes: int | None = None) -> str:
 # ---------------------------------------------------------------------------
 
 
-def read_artifact(path: Path, *, max_bytes: int) -> ArtifactResult:
-    """Hash the single allowed result artifact without following symlinks.
+def read_artifact(task_dir: Path, *, max_bytes: int) -> ArtifactResult:
+    """Hash ``<task_dir>/out/result.txt`` without following symlinks.
 
-    Opens with ``O_NOFOLLOW``, requires a regular non-empty file within
-    ``max_bytes``, and streams the digest so an oversized or replaced file can
-    never be partially trusted.
+    The only artifact ever read is ``out/result.txt``.  ``task_dir`` and ``out``
+    are opened with ``O_DIRECTORY | O_NOFOLLOW`` and the artifact itself with
+    ``O_NOFOLLOW | O_NONBLOCK`` relative to the ``out`` descriptor, so a
+    symlinked parent, a symlinked artifact, a FIFO (which would otherwise block
+    on ``open``), a socket/device or a directory all fail closed before any byte
+    is read.  The digest is streamed and bounded by ``max_bytes``.
     """
 
     if type(max_bytes) is not int or max_bytes <= 0:
         raise ArtifactError("artifact size limit must be a positive integer")
-    if not isinstance(path, (str, os.PathLike)):
-        raise ArtifactError("artifact path is invalid")
-    target = Path(path)
-    if not hasattr(os, "O_NOFOLLOW"):
+    if not isinstance(task_dir, (str, os.PathLike)):
+        raise ArtifactError("artifact task directory is invalid")
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
         raise ArtifactError("artifact symlink protection is unavailable on this host")
-    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-    try:
-        descriptor = os.open(target, flags)
-    except OSError as exc:
-        if exc.errno == errno.ELOOP:
-            raise ArtifactError("artifact path is a symbolic link") from None
-        raise ArtifactError("artifact is unavailable") from None
 
+    root_fd = _open_directory(Path(task_dir), None)
     try:
-        info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode):
-            raise ArtifactError("artifact is not a regular file")
-        expected_size = info.st_size
-        if expected_size <= 0:
-            raise ArtifactError("artifact is empty")
-        if expected_size > max_bytes:
-            raise ArtifactError("artifact exceeds the size limit")
+        out_fd = _open_directory(Path("out"), root_fd)
+        try:
+            flags = (
+                os.O_RDONLY
+                | os.O_NOFOLLOW
+                | os.O_NONBLOCK
+                | getattr(os, "O_CLOEXEC", 0)
+            )
+            try:
+                descriptor = os.open("result.txt", flags, dir_fd=out_fd)
+            except OSError as exc:
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                    raise ArtifactError(
+                        "artifact path is a symbolic link or not a file"
+                    ) from None
+                raise ArtifactError("artifact is unavailable") from None
 
-        digest = hashlib.sha256()
-        total = 0
-        while True:
-            chunk = os.read(descriptor, _ARTIFACT_CHUNK_BYTES)
-            if not chunk:
-                break
-            total += len(chunk)
-            if total > max_bytes:
-                raise ArtifactError("artifact exceeds the size limit")
-            digest.update(chunk)
+            try:
+                info = os.fstat(descriptor)
+                if not stat.S_ISREG(info.st_mode):
+                    raise ArtifactError("artifact is not a regular file")
+                expected_size = info.st_size
+                if expected_size <= 0:
+                    raise ArtifactError("artifact is empty")
+                if expected_size > max_bytes:
+                    raise ArtifactError("artifact exceeds the size limit")
+
+                digest = hashlib.sha256()
+                total = 0
+                while True:
+                    chunk = os.read(descriptor, _ARTIFACT_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ArtifactError("artifact exceeds the size limit")
+                    digest.update(chunk)
+            finally:
+                os.close(descriptor)
+        finally:
+            os.close(out_fd)
     finally:
-        os.close(descriptor)
+        os.close(root_fd)
 
     if total != expected_size:
         raise ArtifactError("artifact changed while it was read")
     return ArtifactResult(
         sha256=digest.hexdigest(),
         size=total,
-        relative_path=_relative_artifact_path(target),
+        relative_path="out/result.txt",
     )
+
+
+def _open_directory(path: Path, dir_fd: int | None) -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        return os.open(path, flags, dir_fd=dir_fd)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise ArtifactError("artifact directory is a symbolic link") from None
+        if exc.errno == errno.ENOTDIR:
+            raise ArtifactError("artifact path is not a directory") from None
+        raise ArtifactError("artifact directory is unavailable") from None
 
 
 # ---------------------------------------------------------------------------
@@ -693,23 +776,30 @@ def verify_task_attestation(
     *,
     key: bytes,
     spec: SandboxSpec,
+    expected_runtime_root_hash: str,
     now: datetime,
 ) -> None:
     """Raise :class:`AttestationError` unless the task attestation is trusted.
 
     Checks the HMAC, schema, task/grant/unit/handle binding, the derived task
-    directory, prompt and profile-template digests, the runtime root reference,
-    the required sandbox facts and the validity window.
+    directory, prompt and profile-template digests, the runtime root hash
+    against the trusted operator value, the required sandbox facts and the
+    validity window.
     """
 
     signing_key = _require_key(key)
     current = _require_now(now)
+    _require_runtime_root_hash_value(expected_runtime_root_hash)
     if not isinstance(attestation, TaskAttestation):
         raise AttestationError("task attestation is missing")
     _verify_signature(attestation.to_document(), attestation.hmac, signing_key)
 
     if attestation.schema != TASK_ATTESTATION_SCHEMA:
         raise AttestationError("task attestation schema is not supported")
+    if attestation.runtime_root_hash != expected_runtime_root_hash:
+        raise AttestationError(
+            "task attestation runtime root hash does not match the trusted value"
+        )
 
     bindings = {
         "unit": (attestation.unit, getattr(spec, "unit", None)),
@@ -744,13 +834,13 @@ def verify_runtime_attestation(
     key: bytes,
     config: HermesManagedConfig,
     now: datetime,
-) -> None:
-    """Raise :class:`AttestationError` unless the runtime attestation is trusted.
+) -> VerifiedRuntimeAttestation:
+    """Verify a runtime attestation and return an opaque proof marker.
 
-    Checks the HMAC, schema, helper version, runtime name/version against the
-    trusted configuration, evidence reference, broker socket health, runtime
-    root reference, sandbox facts and validity window.  Capability labels only
-    follow from this verification plus a matching ``evidence_ref``.
+    Checks the HMAC, schema, helper version, runtime name/version and runtime
+    root hash against the trusted configuration, evidence reference, broker
+    socket health, sandbox facts and validity window.  Capability labels only
+    follow from this marker plus a matching ``evidence_ref``.
     """
 
     signing_key = _require_key(key)
@@ -761,18 +851,26 @@ def verify_runtime_attestation(
 
     if attestation.schema != RUNTIME_ATTESTATION_SCHEMA:
         raise AttestationError("runtime attestation schema is not supported")
+    if not attestation.helper_version:
+        raise AttestationError("runtime attestation helper version is missing")
     if attestation.runtime_name != getattr(config, "runtime_name", None):
         raise AttestationError("runtime attestation name does not match the configuration")
     if attestation.runtime_version != getattr(config, "runtime_version", None):
         raise AttestationError("runtime attestation version does not match the configuration")
     if attestation.evidence_ref != getattr(config, "evidence_ref", None):
         raise AttestationError("runtime attestation evidence does not match the configuration")
+    expected_root_hash = getattr(config, "runtime_root_hash", None)
+    _require_runtime_root_hash_value(expected_root_hash)
+    if attestation.runtime_root_hash != expected_root_hash:
+        raise AttestationError(
+            "runtime attestation runtime root hash does not match the trusted value"
+        )
     if attestation.broker_socket_ok is not True:
         raise AttestationError("runtime attestation reports the egress broker unavailable")
 
-    _require_runtime_root_hash_value(attestation.runtime_root_hash)
     _verify_sandbox_facts(attestation.sandbox_facts, "runtime attestation")
     _verify_window(attestation.issued_at, attestation.expires_at, current, "runtime attestation")
+    return VerifiedRuntimeAttestation(attestation, _proof=_VERIFIED_PROOF)
 
 
 # ---------------------------------------------------------------------------
@@ -782,24 +880,34 @@ def verify_runtime_attestation(
 
 def managed_capabilities(
     config: HermesManagedConfig,
-    runtime_attestation: RuntimeAttestation | None,
+    verified_runtime_attestation: VerifiedRuntimeAttestation | None,
     *,
     now: datetime | None = None,
 ) -> RuntimeCapabilities:
     """Build the fail-closed capability snapshot for the managed Hermes runtime.
 
-    Without a structurally valid, unexpired runtime attestation whose evidence
-    reference matches the trusted configuration, every managed entry is
-    ``unverified``.  The HMAC itself is verified by the adapter (Task 5) because
-    the signing key is not available to this pure function; callers must pass an
-    attestation that already passed :func:`verify_runtime_attestation`.
+    Only a :class:`VerifiedRuntimeAttestation` produced by
+    :func:`verify_runtime_attestation` can upgrade a managed label.  A raw
+    :class:`RuntimeAttestation` — even one with a well-formed 64-hex signature —
+    is a ``TypeError``, and ``None`` leaves every managed entry ``unverified``.
+    The verified attestation is re-checked against the trusted configuration and
+    the requested ``now`` so a later config change or expiry also fails closed.
     """
 
     current = _require_now(now)
-    trusted = (
-        runtime_attestation is not None
-        and _runtime_attestation_problem(config, runtime_attestation, current) is None
-    )
+    if verified_runtime_attestation is None:
+        trusted = False
+    elif isinstance(verified_runtime_attestation, VerifiedRuntimeAttestation):
+        trusted = (
+            _runtime_attestation_problem(
+                config, verified_runtime_attestation.attestation, current
+            )
+            is None
+        )
+    else:
+        raise TypeError(
+            "managed capabilities require a VerifiedRuntimeAttestation or None"
+        )
 
     capabilities: list[Capability] = []
     for name in RuntimeCapability:
@@ -886,6 +994,8 @@ def _runtime_attestation_problem(
         return "runtime attestation reports the egress broker unavailable"
     if not _SHA256_REF_RE.fullmatch(attestation.runtime_root_hash or ""):
         return "runtime attestation runtime root hash is malformed"
+    if attestation.runtime_root_hash != getattr(config, "runtime_root_hash", None):
+        return "runtime attestation runtime root hash does not match the trusted value"
     try:
         _verify_sandbox_facts(attestation.sandbox_facts, "runtime attestation")
         _verify_window(
@@ -904,11 +1014,29 @@ def _runtime_attestation_problem(
 def _require_binding(name: str, value: object) -> None:
     if not isinstance(value, str) or not value or not value.strip():
         raise SandboxSpecError(f"{name} must be non-empty text")
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+        raise SandboxSpecError(f"{name} must not contain control characters")
 
 
 def _require_text_value(value: object, name: str) -> None:
     if not isinstance(value, str) or not value or not value.strip():
         raise SandboxSpecError(f"{name} must be non-empty text")
+
+
+_RESOURCE_LIMITS = (
+    ("runtime_max_sec", MAX_RUNTIME_MAX_SEC),
+    ("memory_max_mb", MAX_MEMORY_MAX_MB),
+    ("cpu_quota_percent", MAX_CPU_QUOTA_PERCENT),
+    ("tasks_max", MAX_TASKS_MAX),
+    ("prompt_max_bytes", MAX_PROMPT_MAX_BYTES),
+)
+
+
+def _validate_resource_limits(config: HermesManagedConfig) -> None:
+    for name, upper in _RESOURCE_LIMITS:
+        value = getattr(config, name, None)
+        if type(value) is not int or value < 1 or value > upper:
+            raise SandboxSpecError(f"{name} must be an integer in 1..{upper}")
 
 
 def _require_payload(name: str, value: object) -> bytes:
@@ -928,10 +1056,6 @@ def _require_egress_token(value: object) -> str:
 def _sha256_hex(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
-
-def _relative_artifact_path(path: Path) -> str:
-    parent = path.parent.name
-    return f"{parent}/{path.name}" if parent else path.name
 
 
 def _require_key(key: object) -> bytes:
@@ -1079,7 +1203,27 @@ def _require_timestamp(data: Mapping[str, object], name: str) -> datetime:
 def _freeze_facts(value: object) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         raise AttestationError("attestation sandbox facts must be a mapping")
-    return dict(value)
+    return MappingProxyType(
+        {str(name): _freeze_fact_value(item) for name, item in value.items()}
+    )
+
+
+def _freeze_fact_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return _freeze_facts(value)
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_fact_value(item) for item in value)
+    return value
+
+
+def _thaw_facts(value: object) -> object:
+    """Return a JSON-serialisable copy of frozen sandbox facts."""
+
+    if isinstance(value, Mapping):
+        return {str(name): _thaw_facts(item) for name, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_facts(item) for item in value]
+    return value
 
 
 def _iso_utc(value: datetime) -> str:
