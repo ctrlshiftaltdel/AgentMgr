@@ -34,23 +34,42 @@ Deployment invariants
 * ``/etc/agentmgr/hermes-exec.json`` (root-owned, ``0600``/``0640``) fixes the
   task root, runtime root and trusted runtime root hash, broker socket,
   workload path, adapter user, ``agentmgr-hermes`` group and attestation key.
+  The attestation key must live under ``/etc/agentmgr`` (masked in every unit),
+  must not be under the task root, and must not be group/other readable; it is
+  accepted only at mode ``0600``/``0400`` and never with the sandbox group.
 * The task directory is ``<task-root>/<unit>`` with ``out/`` at ``0770``,
   owned by the trusted adapter user and group ``agentmgr-hermes``.  Existing
   paths are never repaired: a symlink, wrong owner/group or wrong mode fails
-  closed.
+  closed.  ``prompt.txt``/``profile.template.yaml`` are accepted at most at
+  ``0640`` and ``egress.token`` exactly at ``0640``.
 * ``systemd-run`` receives a fixed transient unit: private ``/run`` and
   ``/tmp``, isolated loopback only, read-only host minus the task directory, an
   empty capability set, ``@system-service`` and no caller supplied property.
-  ``/run`` is replaced with a private tmpfs and ``/tmp`` is private, so the bind
-  sources (task root, runtime root, broker socket, workload) must live on a
-  persistent host path: the install config rejects the masked prefixes, and
-  provisioning must not place them under ``/tmp`` or ``/var/tmp``.
+  ``Group=agentmgr-hermes`` is the unit's static primary group (not
+  ``SupplementaryGroups``), so unit-written status/artifact files inherit the
+  group and the adapter can read them without setgid.  ``PrivateDevices=yes``
+  and ``InaccessiblePaths=-<task-root>`` hide sibling task directories/tokens
+  while the task directory itself stays available through the single ``/task``
+  bind.  ``/run`` is replaced with a private tmpfs and ``/tmp`` is private, so
+  the bind sources (task root, runtime root, broker socket, workload) must live
+  on a persistent host path: the install config rejects the masked prefixes and
+  ``/tmp``/``/var/tmp``.
 * ``launch`` verifies the prompt/profile-template/egress-token file sizes and
   SHA-256 digests before starting, then waits for ``ActiveState=active`` and
   the workload's ``status/started.json`` marker, and binds the unit's real UID
   read from ``/proc/<MainPID>/status``.
+* ``status`` reads the task directory and its ``status/`` child through
+  ``O_DIRECTORY|O_NOFOLLOW`` directory fds, so a symlinked parent is rejected
+  rather than followed; a ``not-found`` unit reports ``result``/``exit_status``
+  as ``None`` instead of systemd's default ``success``/``0``.
+* ``attest`` inspects the unit first: a stopped/never-started/cleaned-up task
+  yields a runtime attestation with ``task_attestation=None``; strict task-file
+  verification and a signed task attestation only happen while the unit is
+  active with a readable UID.
 * ``stop_confirmed`` is only ever true when systemd and the cgroup hold no
   process; ``systemctl show`` strings never substitute for that fact.
+* The manifest written by ``prepare`` persists the idempotency key and a
+  canonical digest of the bound payload (design §12.3).
 
 Attestation documents are byte-compatible with
 ``app/runtime/hermes_managed.py``: canonical JSON (sorted keys, compact
@@ -190,15 +209,24 @@ MASKED_SOURCE_PREFIXES: tuple[Path, ...] = (
     Path("/var/lib/containerd"),
 )
 
+#: The attestation HMAC key must live in a root-only, unit-invisible directory:
+#: ``/etc/agentmgr`` is masked by ``InaccessiblePaths`` in every sandbox unit, so
+#: neither a task process nor a sibling group member can read it.
+ATTESTATION_KEY_ROOT = Path("/etc/agentmgr")
+
+#: ``PrivateTmp=yes`` replaces these with private tmpfs mounts, so they can
+#: never be bind sources.  ``InstallConfig`` rejects them; the module-level
+#: ``ALLOW_PRIVATE_TMP_SOURCES`` is a unit-test-only seam (never set in a
+#: deployment) because the unprivileged test fixture must live under ``/tmp``.
+PRIVATE_TMP_PREFIXES: tuple[Path, ...] = (Path("/tmp"), Path("/var/tmp"))
+ALLOW_PRIVATE_TMP_SOURCES = False
+
 SHOW_PROPERTIES = (
     "Id,LoadState,ActiveState,SubState,MainPID,Result,ExecMainStatus,"
     "ActiveEnterTimestamp,ExecMainStartTimestamp,ExecMainExitTimestamp,"
     "ControlGroup"
 )
 
-#: ``systemctl show`` keys the helper is allowed to echo back (see
-#: :func:`unit_state_document`); ``ControlGroup`` is deliberately absent from
-#: responses because it is a host path.
 MAX_STDIN_BYTES = 64 * 1024
 MAX_INSTALL_CONFIG_BYTES = 64 * 1024
 MAX_PROMPT_BYTES = 1_048_576
@@ -370,6 +398,7 @@ class SandboxRequest:
     memory_max_mb: int
     cpu_quota_percent: int
     tasks_max: int
+    result_read: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -464,10 +493,12 @@ def validate_request(raw: Mapping[str, object]) -> SandboxRequest:
     if keys & _FORBIDDEN_FIELDS:
         raise HelperError("forbidden_field")
     extra = keys - _REQUEST_FIELDS
+    result_read = False
     if extra:
         if raw.get("operation") == "cleanup" and extra == {"result_read"}:
             if raw.get("result_read") is not True:
                 raise HelperError("result_not_read")
+            result_read = True
         else:
             raise HelperError("unknown_field")
     missing = _REQUEST_FIELDS - keys
@@ -477,63 +508,72 @@ def validate_request(raw: Mapping[str, object]) -> SandboxRequest:
     operation = raw["operation"]
     if not isinstance(operation, str) or operation not in _OPERATIONS:
         raise HelperError("invalid_operation")
-    if operation == "cleanup":
-        if "result_read" not in raw:
-            raise HelperError("missing_field")
-        if raw["result_read"] is not True:
-            raise HelperError("result_not_read")
+    if operation == "cleanup" and not result_read:
+        raise HelperError("missing_field")
 
-    task_id = _require_text("task_id", raw["task_id"])
-    grant_id = _require_text("grant_id", raw["grant_id"])
-    idempotency_key = _require_text("idempotency_key", raw["idempotency_key"])
+    request = SandboxRequest(
+        operation=operation,
+        task_id=_require_text("task_id", raw["task_id"]),
+        grant_id=_require_text("grant_id", raw["grant_id"]),
+        unit=raw["unit"],  # type: ignore[arg-type]
+        runtime_handle=raw["runtime_handle"],  # type: ignore[arg-type]
+        idempotency_key=_require_text("idempotency_key", raw["idempotency_key"]),
+        prompt_sha256=raw["prompt_sha256"],  # type: ignore[arg-type]
+        prompt_bytes=raw["prompt_bytes"],  # type: ignore[arg-type]
+        profile_template_sha256=raw[  # type: ignore[arg-type]
+            "profile_template_sha256"
+        ],
+        egress_token_sha256=raw["egress_token_sha256"],  # type: ignore[arg-type]
+        ttl_seconds=raw["ttl_seconds"],  # type: ignore[arg-type]
+        runtime_max_sec=raw["runtime_max_sec"],  # type: ignore[arg-type]
+        memory_max_mb=raw["memory_max_mb"],  # type: ignore[arg-type]
+        cpu_quota_percent=raw["cpu_quota_percent"],  # type: ignore[arg-type]
+        tasks_max=raw["tasks_max"],  # type: ignore[arg-type]
+        result_read=result_read,
+    )
+    return _validate_request_values(request)
 
-    unit = raw["unit"]
-    validate_unit(unit)
-    assert isinstance(unit, str)
-    if unit != unit_for_task(task_id, idempotency_key):
+
+def _validate_request_values(request: SandboxRequest) -> SandboxRequest:
+    """Re-validate a possibly hand-built request (builder and every operation)."""
+
+    if not isinstance(request, SandboxRequest):
+        raise HelperError("invalid_request")
+    if request.operation not in _OPERATIONS:
+        raise HelperError("invalid_operation")
+    if request.result_read and request.operation != "cleanup":
+        raise HelperError("invalid_request")
+
+    task_id = _require_text("task_id", request.task_id)
+    _require_text("grant_id", request.grant_id)
+    idempotency_key = _require_text("idempotency_key", request.idempotency_key)
+
+    validate_unit(request.unit)
+    if request.unit != unit_for_task(task_id, idempotency_key):
         raise HelperError("unit_name_mismatch")
 
-    handle = raw["runtime_handle"]
+    handle = request.runtime_handle
     if not isinstance(handle, str) or HANDLE_PATTERN.fullmatch(handle) is None:
         raise HelperError("invalid_request")
-    if handle != runtime_handle_for(unit):
+    if handle != runtime_handle_for(request.unit):
         raise HelperError("runtime_handle_mismatch")
 
-    digests: dict[str, str] = {}
     for field in _HASH_FIELDS:
-        value = raw[field]
+        value = getattr(request, field)
         if not isinstance(value, str) or SHA256_HEX_PATTERN.fullmatch(value) is None:
             raise HelperError("invalid_digest")
-        digests[field] = value
 
-    prompt_bytes = raw["prompt_bytes"]
-    if type(prompt_bytes) is not int or not 1 <= prompt_bytes <= MAX_PROMPT_BYTES:
+    if (
+        type(request.prompt_bytes) is not int
+        or not 1 <= request.prompt_bytes <= MAX_PROMPT_BYTES
+    ):
         raise HelperError("invalid_limit")
-
-    limits: dict[str, int] = {}
     for field, (minimum, maximum) in _LIMITS.items():
-        value = raw[field]
+        value = getattr(request, field)
         if type(value) is not int or not minimum <= value <= maximum:
             raise HelperError("invalid_limit")
-        limits[field] = value
 
-    return SandboxRequest(
-        operation=operation,
-        task_id=task_id,
-        grant_id=grant_id,
-        unit=unit,
-        runtime_handle=handle,
-        idempotency_key=idempotency_key,
-        prompt_sha256=digests["prompt_sha256"],
-        prompt_bytes=prompt_bytes,
-        profile_template_sha256=digests["profile_template_sha256"],
-        egress_token_sha256=digests["egress_token_sha256"],
-        ttl_seconds=limits["ttl_seconds"],
-        runtime_max_sec=limits["runtime_max_sec"],
-        memory_max_mb=limits["memory_max_mb"],
-        cpu_quota_percent=limits["cpu_quota_percent"],
-        tasks_max=limits["tasks_max"],
-    )
+    return request
 
 
 def _require_text(name: str, value: object) -> str:
@@ -684,12 +724,27 @@ def _validate_install_config(config: object) -> InstallConfig:
         path = getattr(config, name)
         if not isinstance(path, Path) or _normalise_absolute(str(path)) is None:
             raise HelperError("install_config_invalid")
+        if path == Path("/"):
+            raise HelperError("install_config_invalid")
         if _is_masked_source(path):
             raise HelperError("install_config_masked_source")
-    if not isinstance(config.attestation_key_path, Path):
+        if not ALLOW_PRIVATE_TMP_SOURCES and _is_under_any(
+            path, PRIVATE_TMP_PREFIXES
+        ):
+            raise HelperError("install_config_private_tmp_source")
+
+    key_path = config.attestation_key_path
+    if not isinstance(key_path, Path):
         raise HelperError("install_config_invalid")
-    if _normalise_absolute(str(config.attestation_key_path)) is None:
+    if _normalise_absolute(str(key_path)) is None:
         raise HelperError("install_config_invalid")
+    # The HMAC key must be invisible to every sandbox unit and to the shared
+    # ``agentmgr-hermes`` group: only ``/etc/agentmgr`` (masked with
+    # ``InaccessiblePaths`` and never bind-mounted) qualifies.
+    if not _is_under(key_path, ATTESTATION_KEY_ROOT):
+        raise HelperError("attestation_key_path_invalid")
+    if _is_under(key_path, config.task_root):
+        raise HelperError("attestation_key_path_invalid")
     return config
 
 
@@ -714,7 +769,17 @@ def _adapter_ids(config: InstallConfig) -> tuple[int, int]:
 
 
 def _is_masked_source(path: Path) -> bool:
-    return any(path == prefix or prefix in path.parents for prefix in MASKED_SOURCE_PREFIXES)
+    return _is_under_any(path, MASKED_SOURCE_PREFIXES)
+
+
+def _is_under(path: Path, root: Path) -> bool:
+    """Boundary-aware containment: ``/a/b`` is under ``/a`` but not ``/ab``."""
+
+    return path == root or root in path.parents
+
+
+def _is_under_any(path: Path, roots: tuple[Path, ...]) -> bool:
+    return any(_is_under(path, root) for root in roots)
 
 
 # ---------------------------------------------------------------------------
@@ -951,7 +1016,9 @@ def _verify_task_file(
     if exact_mode is not None:
         if mode != exact_mode:
             raise HelperError(f"{label}_mode_invalid")
-    elif mode & PROTECTED_MODE_MASK:
+    elif mode & 0o037 or not mode & 0o400:
+        # At most 0640: no group write/execute and no "other" access; the unit
+        # reads through its ``agentmgr-hermes`` primary group.
         raise HelperError(f"{label}_mode_invalid")
     if info.st_size <= 0 or info.st_size > max_size:
         raise HelperError(f"{label}_size_mismatch")
@@ -980,15 +1047,58 @@ def _verify_task_file(
         raise HelperError(f"{label}_hash_mismatch")
 
 
-def _read_json_marker(path: Path, label: str) -> dict[str, object] | None:
-    info = _lstat(path)
-    if info is None:
+_DIRECTORY_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+_FILE_FLAGS = (
+    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+)
+
+
+def _open_child_directory(parent_fd: int, name: str, label: str) -> int | None:
+    """Open a real child directory (never a symlink) relative to ``parent_fd``."""
+
+    try:
+        return os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+    except FileNotFoundError:
         return None
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-        raise HelperError(f"{label}_invalid")
-    if info.st_size <= 0 or info.st_size > MAX_MARKER_BYTES:
-        raise HelperError(f"{label}_invalid")
-    raw = _read_file(path, MAX_MARKER_BYTES, label)
+    except OSError:
+        raise HelperError(f"{label}_invalid") from None
+
+
+def _read_fd(descriptor: int, limit: int, label: str) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = os.read(descriptor, _SHA256_CHUNK_BYTES)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            raise HelperError(f"{label}_invalid")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _read_json_at(dir_fd: int, name: str, label: str) -> dict[str, object] | None:
+    """Read one bounded JSON object relative to a verified directory fd."""
+
+    try:
+        descriptor = os.open(name, _FILE_FLAGS, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise HelperError(f"{label}_invalid") from None
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= MAX_MARKER_BYTES:
+            raise HelperError(f"{label}_invalid")
+        raw = _read_fd(descriptor, MAX_MARKER_BYTES, label)
+    finally:
+        os.close(descriptor)
     try:
         document = json.loads(raw)
     except (TypeError, ValueError):
@@ -998,18 +1108,69 @@ def _read_json_marker(path: Path, label: str) -> dict[str, object] | None:
     return document
 
 
-def _read_started_marker(
-    task_dir: Path, request: SandboxRequest
-) -> dict[str, object] | None:
-    document = _read_json_marker(task_dir / "status" / "started.json", "started_marker")
-    if document is None:
+def _open_task_root(task_root: Path) -> int | None:
+    """Open the configured task root without following a symlinked root."""
+
+    try:
+        return os.open(task_root, _DIRECTORY_FLAGS)
+    except FileNotFoundError:
         return None
+    except OSError:
+        raise HelperError("task_root_invalid") from None
+
+
+def _open_unit_directory(task_root: Path, unit: str) -> int | None:
+    """Open ``<task_root>/<unit>`` through real, non-symlinked directory fds."""
+
+    root_fd = _open_task_root(task_root)
+    if root_fd is None:
+        return None
+    try:
+        return _open_child_directory(root_fd, unit, "task_dir")
+    finally:
+        os.close(root_fd)
+
+
+def _read_task_marker(
+    task_root: Path, unit: str, name: str, label: str
+) -> dict[str, object] | None:
+    """Read ``<task_root>/<unit>/status/<name>`` without following symlinks."""
+
+    task_fd = _open_unit_directory(task_root, unit)
+    if task_fd is None:
+        return None
+    try:
+        status_fd = _open_child_directory(task_fd, "status", "status_dir")
+        if status_fd is None:
+            return None
+        try:
+            return _read_json_at(status_fd, name, label)
+        finally:
+            os.close(status_fd)
+    finally:
+        os.close(task_fd)
+
+
+def _validate_started_document(
+    document: Mapping[str, object], request: SandboxRequest
+) -> None:
     if (
         document.get("unit") != request.unit
         or document.get("task_id") != request.task_id
         or document.get("runtime_handle") != request.runtime_handle
     ):
         raise HelperError("started_marker_invalid")
+
+
+def _read_started_marker(
+    task_root: Path, request: SandboxRequest
+) -> dict[str, object] | None:
+    document = _read_task_marker(
+        task_root, request.unit, "started.json", "started_marker"
+    )
+    if document is None:
+        return None
+    _validate_started_document(document, request)
     return document
 
 
@@ -1146,15 +1307,21 @@ def _parse_optional_int(value: object) -> int | None:
 
 
 def unit_state_document(state: UnitState) -> dict[str, object]:
-    """Render only the whitelisted, path-free unit facts."""
+    """Render only the whitelisted, path-free unit facts.
 
+    ``systemctl show`` reports ``Result=success``/``ExecMainStatus=0`` even for
+    a unit that does not exist, so a ``not-found`` unit is normalised to
+    ``None`` instead of claiming a successful exit.
+    """
+
+    not_found = state.load_state == "not-found"
     return {
         "load_state": state.load_state,
         "active_state": state.active_state,
         "sub_state": state.sub_state,
         "main_pid": state.main_pid,
-        "result": state.result,
-        "exit_status": state.exec_main_status,
+        "result": None if not_found else state.result,
+        "exit_status": None if not_found else state.exec_main_status,
         "active_enter": state.active_enter,
         "exec_main_start": state.exec_main_start,
         "exec_main_exit": state.exec_main_exit,
@@ -1162,12 +1329,20 @@ def unit_state_document(state: UnitState) -> dict[str, object]:
     }
 
 
-def _read_cgroup_pids(control_group: str) -> list[int] | None:
-    """Return the cgroup's PIDs, or ``None`` when it cannot be inspected."""
+def _cgroup_procs_path(control_group: str) -> Path | None:
+    """Return ``cgroup.procs`` for a unit cgroup, or ``None`` when unusable."""
 
     if not control_group or not control_group.startswith("/"):
         return None
-    path = Path("/sys/fs/cgroup") / control_group.lstrip("/") / "cgroup.procs"
+    return Path("/sys/fs/cgroup") / control_group.lstrip("/") / "cgroup.procs"
+
+
+def _read_cgroup_pids(control_group: str) -> list[int] | None:
+    """Return the cgroup's PIDs, or ``None`` when it cannot be inspected."""
+
+    path = _cgroup_procs_path(control_group)
+    if path is None:
+        return None
     try:
         text = path.read_text(encoding="ascii", errors="replace")
     except OSError:
@@ -1202,11 +1377,7 @@ def build_systemd_run_argv(
 ) -> list[str]:
     """Return the fixed transient-unit argv for one validated request."""
 
-    if not isinstance(request, SandboxRequest):
-        raise HelperError("invalid_request")
-    validate_unit(request.unit)
-    if request.unit != unit_for_task(request.task_id, request.idempotency_key):
-        raise HelperError("unit_name_mismatch")
+    request = _require_sandbox_request(request)
     if (
         type(stop_timeout_sec) is not int
         or not MIN_TIMEOUT_SEC <= stop_timeout_sec <= MAX_TIMEOUT_SEC
@@ -1219,16 +1390,23 @@ def build_systemd_run_argv(
     workload = _require_argv_path(workload, "workload")
     if task_dir.name != request.unit:
         raise HelperError("task_dir_invalid")
+    task_root = task_dir.parent
+    if task_root == Path("/"):
+        raise HelperError("task_root_invalid")
     for path in (task_dir, runtime_root, broker_socket, workload):
         if _is_masked_source(path):
             raise HelperError("masked_source")
 
     properties = [
         "--property=DynamicUser=yes",
-        f"--property=SupplementaryGroups={GROUP_NAME}",
+        # A static primary group (instead of SupplementaryGroups) means files
+        # the unit writes inherit ``agentmgr-hermes`` and the adapter can read
+        # them even though the unit UID is dynamic.
+        f"--property=Group={GROUP_NAME}",
         "--property=ProtectSystem=strict",
         "--property=ProtectHome=yes",
         "--property=PrivateTmp=yes",
+        "--property=PrivateDevices=yes",
         "--property=TemporaryFileSystem=/run",
         "--property=PrivateNetwork=yes",
         "--property=RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX",
@@ -1253,6 +1431,10 @@ def build_systemd_run_argv(
         "--property=ProtectProc=invisible",
         "--property=ProcSubset=pid",
         *(f"--property=InaccessiblePaths={item}" for item in INACCESSIBLE_PATHS),
+        # Hide the task root itself so a unit cannot list or read sibling task
+        # directories/tokens, while its own task dir stays available through
+        # the explicit bind below (verified on the approved host).
+        f"--property=InaccessiblePaths=-{task_root}",
         "--property=UMask=0007",
         "--property=KillMode=control-group",
         "--property=SendSIGKILL=yes",
@@ -1344,8 +1526,13 @@ def _read_attestation_key(config: InstallConfig) -> bytes:
         raise HelperError("attestation_key_invalid")
     if info.st_uid != os.geteuid():
         raise HelperError("attestation_key_owner_invalid")
+    _, sandbox_gid = _adapter_ids(config)
     mode = stat.S_IMODE(info.st_mode)
-    if mode not in {0o600, 0o400, 0o640, 0o440}:
+    # The key must never be readable by the shared sandbox group (or anyone
+    # else): a sibling task's terminal runs with that group.
+    if info.st_gid == sandbox_gid and mode & 0o070:
+        raise HelperError("attestation_key_group_readable")
+    if mode not in {0o600, 0o400}:
         raise HelperError("attestation_key_mode_invalid")
     if not MIN_ATTESTATION_KEY_BYTES <= info.st_size <= MAX_ATTESTATION_KEY_BYTES:
         raise HelperError("attestation_key_invalid")
@@ -1424,12 +1611,13 @@ def prepare(request: object, config: object) -> dict[str, object]:
     _require_task_root(config)
     task_dir, created = _ensure_task_dir(config, request.unit)
     uid, gid = _adapter_ids(config)
-    manifest = {
+    binding = {
         "schema": MANIFEST_SCHEMA,
         "unit": request.unit,
         "task_id": request.task_id,
         "grant_id": request.grant_id,
         "runtime_handle": request.runtime_handle,
+        "idempotency_key": request.idempotency_key,
         "runtime_root_hash": config.runtime_root_hash,
         "prompt_sha256": request.prompt_sha256,
         "prompt_bytes": request.prompt_bytes,
@@ -1442,8 +1630,13 @@ def prepare(request: object, config: object) -> dict[str, object]:
         "tasks_max": request.tasks_max,
         "egress_socket": EGRESS_UNIT_PATH,
         "toolset": "terminal",
-        "created_at": _iso_utc(_utcnow()),
     }
+    # Design §12.3: the manifest persists the dispatcher idempotency key and a
+    # digest of the bound payload so a replay/conflict decision can be made
+    # without trusting caller input. ``created_at`` is deliberately excluded.
+    manifest = dict(binding)
+    manifest["payload_sha256"] = hashlib.sha256(_canonical_json(binding)).hexdigest()
+    manifest["created_at"] = _iso_utc(_utcnow())
     if config.model_name:
         manifest["model"] = config.model_name
     _write_task_file(
@@ -1491,7 +1684,7 @@ def launch(
             request.unit, timeout_sec=config.start_timeout_sec, runner=runner
         )
         _wait_for_started_marker(
-            task_dir, request, timeout_sec=config.start_timeout_sec
+            config.task_root, request, timeout_sec=config.start_timeout_sec
         )
         uid = read_process_uid(state.main_pid)
     except BaseException:
@@ -1524,34 +1717,11 @@ def status(
         except HelperError:
             uid = None
 
-    task_dir = config.task_root / request.unit
-    started = False
-    heartbeat_at: str | None = None
-    exit_code: int | None = None
-    timed_out = False
-    cancelled = False
-    if _lstat(task_dir) is not None:
-        started = _read_started_marker(task_dir, request) is not None
-        heartbeat = _read_json_marker(task_dir / "status" / "heartbeat.json",
-                                      "heartbeat")
-        if heartbeat is not None:
-            heartbeat_at = _heartbeat_value(heartbeat)
-        exit_document = _read_json_marker(task_dir / "status" / "exit.json", "exit")
-        if exit_document is not None:
-            exit_code, timed_out, cancelled = _exit_values(exit_document)
-
     return {
         "unit": request.unit,
         "uid": uid,
         "unit_state": unit_state_document(state),
-        "task": {
-            "started": started,
-            "heartbeat_at": heartbeat_at,
-            "exit_code": exit_code,
-            "timed_out": timed_out,
-            "cancelled": cancelled,
-            "result_present": _result_present(task_dir),
-        },
+        "task": _task_facts(config.task_root, request),
         "observed_at": _iso_utc(_utcnow()),
     }
 
@@ -1607,14 +1777,15 @@ def cleanup(
     request: object,
     config: object,
     *,
-    result_read: bool,
+    result_read: bool | None = None,
     runner: Runner = run_checked,
 ) -> dict[str, object]:
     """Delete only the derived task directory once the unit is gone."""
 
     request = _require_sandbox_request(request)
     config = _validate_install_config(config)
-    if result_read is not True:
+    declared = request.result_read if result_read is None else result_read
+    if declared is not True:
         raise HelperError("result_not_read")
 
     state = inspect_unit(request.unit, runner=runner)
@@ -1649,12 +1820,20 @@ def cleanup(
 def attest(
     request: object, config: object, *, runner: Runner = run_checked
 ) -> dict[str, object]:
-    """Re-read unit state and file digests, then reissue the attestations."""
+    """Inspect the unit, then reissue runtime and (when live) task attestations.
+
+    The runtime attestation is task independent, so ``attest`` must work after
+    the token/result were deleted or the task directory was cleaned up: only an
+    active unit with a readable UID triggers the strict task-file verification
+    and a non-null task attestation.
+    """
 
     request = _require_sandbox_request(request)
     config = _validate_install_config(config)
-    task_dir = _require_task_dir_and_runtime(request, config)
-    _verify_task_files(request, config, task_dir)
+    _require_runtime_root(config)
+    _require_broker_socket(config)
+    _require_workload(config)
+
     key = _read_attestation_key(config)
     state = inspect_unit(request.unit, runner=runner)
 
@@ -1664,6 +1843,9 @@ def attest(
         and state.main_pid > 0
         and not _process_gone(state)
     ):
+        _require_task_root(config)
+        task_dir = _require_task_dir(config, request.unit)
+        _verify_task_files(request, config, task_dir)
         uid = read_process_uid(state.main_pid)
         task_document = task_attestation(request, config, uid=uid, key=key)
 
@@ -1683,14 +1865,7 @@ def attest(
 def _require_sandbox_request(request: object) -> SandboxRequest:
     if not isinstance(request, SandboxRequest):
         raise HelperError("invalid_request")
-    if request.operation not in _OPERATIONS:
-        raise HelperError("invalid_operation")
-    validate_unit(request.unit)
-    if request.unit != unit_for_task(request.task_id, request.idempotency_key):
-        raise HelperError("unit_name_mismatch")
-    if request.runtime_handle != runtime_handle_for(request.unit):
-        raise HelperError("runtime_handle_mismatch")
-    return request
+    return _validate_request_values(request)
 
 
 def _require_task_dir_and_runtime(
@@ -1707,8 +1882,9 @@ def _require_runtime_root(config: InstallConfig) -> None:
     info = _require_fixed_directory(config.runtime_root, code="runtime_root")
     if stat.S_IMODE(info.st_mode) & 0o022:
         raise HelperError("runtime_root_mode_invalid")
-    if not os.access(config.runtime_root, os.R_OK | os.X_OK):
-        raise HelperError("runtime_root_invalid")
+    _, gid = _adapter_ids(config)
+    if not _unit_can_read(info, gid, execute=True):
+        raise HelperError("runtime_root_mode_invalid")
 
 
 def _require_broker_socket(config: InstallConfig) -> None:
@@ -1734,8 +1910,27 @@ def _require_workload(config: InstallConfig) -> None:
         raise HelperError("workload_owner_invalid")
     if stat.S_IMODE(info.st_mode) & 0o022:
         raise HelperError("workload_mode_invalid")
-    if not os.access(config.workload, os.R_OK):
-        raise HelperError("workload_invalid")
+    _, gid = _adapter_ids(config)
+    if not _unit_can_read(info, gid, execute=False):
+        raise HelperError("workload_mode_invalid")
+
+
+def _unit_can_read(
+    info: os.stat_result, sandbox_gid: int, *, execute: bool
+) -> bool:
+    """Check read (and optional execute) for the dynamic unit, not for root.
+
+    ``os.access`` is useless here because the helper runs as root, which
+    bypasses mode bits.  The unit's primary group is ``agentmgr-hermes``, so
+    either the "other" bits or the matching group bits grant access.
+    """
+
+    mode = stat.S_IMODE(info.st_mode)
+    other = (0o004 if not execute else 0o005)
+    group = (0o040 if not execute else 0o050)
+    if mode & other == other:
+        return True
+    return info.st_gid == sandbox_gid and mode & group == group
 
 
 def _verify_task_files(
@@ -1792,11 +1987,11 @@ def _wait_for_active(
 
 
 def _wait_for_started_marker(
-    task_dir: Path, request: SandboxRequest, *, timeout_sec: int
+    task_root: Path, request: SandboxRequest, *, timeout_sec: int
 ) -> None:
     deadline = _monotonic() + timeout_sec
     while True:
-        if _read_started_marker(task_dir, request) is not None:
+        if _read_started_marker(task_root, request) is not None:
             return
         if _monotonic() >= deadline:
             raise HelperError("started_marker_timeout")
@@ -1863,11 +2058,68 @@ def _exit_values(document: Mapping[str, object]) -> tuple[int | None, bool, bool
     return exit_code, timed_out, cancelled
 
 
-def _result_present(task_dir: Path) -> bool:
-    info = _lstat(task_dir / "out" / "result.txt")
-    return bool(
-        info is not None and not stat.S_ISLNK(info.st_mode) and stat.S_ISREG(info.st_mode)
-    )
+def _result_present_fd(root_fd: int) -> bool:
+    """Return whether ``out/result.txt`` is a regular file (fd-relative)."""
+
+    out_fd = _open_child_directory(root_fd, "out", "out_dir")
+    if out_fd is None:
+        return False
+    try:
+        try:
+            descriptor = os.open("result.txt", _FILE_FLAGS, dir_fd=out_fd)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            # A symlink or otherwise unsafe artifact is never "present"; the
+            # adapter's artifact reader also fails closed on it.
+            return False
+        try:
+            return stat.S_ISREG(os.fstat(descriptor).st_mode)
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(out_fd)
+
+
+def _task_facts(
+    task_root: Path, request: SandboxRequest
+) -> dict[str, object]:
+    """Read the task-directory markers through verified directory fds."""
+
+    facts: dict[str, object] = {
+        "started": False,
+        "heartbeat_at": None,
+        "exit_code": None,
+        "timed_out": False,
+        "cancelled": False,
+        "result_present": False,
+    }
+    task_fd = _open_unit_directory(task_root, request.unit)
+    if task_fd is None:
+        return facts
+    try:
+        status_fd = _open_child_directory(task_fd, "status", "status_dir")
+        if status_fd is not None:
+            try:
+                document = _read_json_at(status_fd, "started.json", "started_marker")
+                if document is not None:
+                    _validate_started_document(document, request)
+                    facts["started"] = True
+                heartbeat = _read_json_at(status_fd, "heartbeat.json", "heartbeat")
+                if heartbeat is not None:
+                    facts["heartbeat_at"] = _heartbeat_value(heartbeat)
+                exit_document = _read_json_at(status_fd, "exit.json", "exit")
+                if exit_document is not None:
+                    exit_code, timed_out, cancelled = _exit_values(exit_document)
+                    facts["exit_code"] = exit_code
+                    facts["timed_out"] = timed_out
+                    facts["cancelled"] = cancelled
+            finally:
+                os.close(status_fd)
+        facts["result_present"] = _result_present_fd(task_fd)
+    finally:
+        os.close(task_fd)
+    return facts
 
 
 def _monotonic() -> float:

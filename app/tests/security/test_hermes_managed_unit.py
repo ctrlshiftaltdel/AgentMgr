@@ -23,6 +23,7 @@ import importlib.util
 import json
 import os
 import pwd
+import re
 import shutil
 import socket
 import stat
@@ -270,6 +271,15 @@ def sandbox(monkeypatch: pytest.MonkeyPatch):
         pytest.skip("ownership checks require an unprivileged test user")
     root = Path(tempfile.mkdtemp(prefix="hermes-unit-"))
     try:
+        # Unit tests must live under /tmp, which the production helper rejects
+        # as a bind source (PrivateTmp). The key root is redirected to a
+        # synthetic ``etc/agentmgr`` so the "unit-invisible root" rule can be
+        # exercised without root privileges.
+        key_root = root / "etc" / "agentmgr"
+        key_root.mkdir(parents=True)
+        monkeypatch.setattr(helper, "ATTESTATION_KEY_ROOT", key_root)
+        monkeypatch.setattr(helper, "ALLOW_PRIVATE_TMP_SOURCES", True)
+
         task_root = root / "tasks"
         task_root.mkdir()
         task_root.chmod(0o770)
@@ -282,7 +292,7 @@ def sandbox(monkeypatch: pytest.MonkeyPatch):
         broker_socket = root / "s.sock"
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         listener.bind(str(broker_socket))
-        key_path = root / "attestation.key"
+        key_path = key_root / "attestation.key"
         key_path.write_bytes(KEY)
         key_path.chmod(0o600)
 
@@ -305,6 +315,7 @@ def sandbox(monkeypatch: pytest.MonkeyPatch):
         )
         yield SimpleNamespace(
             root=root,
+            key_root=key_root,
             task_root=task_root,
             runtime_root=runtime_root,
             workload=workload,
@@ -554,10 +565,11 @@ def test_systemd_argv_has_fixed_sandbox_properties():
 
     for prop in (
         "DynamicUser=yes",
-        f"SupplementaryGroups={helper.GROUP_NAME}",
+        f"Group={helper.GROUP_NAME}",
         "ProtectSystem=strict",
         "ProtectHome=yes",
         "PrivateTmp=yes",
+        "PrivateDevices=yes",
         "TemporaryFileSystem=/run",
         "PrivateNetwork=yes",
         "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX",
@@ -605,15 +617,26 @@ def test_systemd_argv_has_fixed_sandbox_properties():
         "InaccessiblePaths=-/var/lib/docker",
         "InaccessiblePaths=-/var/lib/containers",
         "InaccessiblePaths=-/var/lib/containerd",
+        f"InaccessiblePaths=-{TASK_DIR.parent}",
     ):
         assert f"--property={masked}" in argv
+
+    # The task root is hidden, but its own task directory stays bind-mounted.
+    assert f"--property=BindPaths={TASK_DIR}:/task" in argv
+    assert not any("SupplementaryGroups=" in item for item in argv)
+    assert "--property=Group=agentmgr-hermes" in argv
+    assert "--property=PrivateDevices=yes" in argv
 
     worklaod_argv = list(helper.WORKLOAD_ARGV)
     assert argv[-len(worklaod_argv) :] == worklaod_argv
     assert not any(item.startswith("--property=ExecStart") for item in argv)
     assert not any(item.startswith("--property=Environment=") for item in argv)
     assert not any(item.startswith("--property=User=") for item in argv)
-    assert not any(item.startswith("--property=Group=") for item in argv)
+    # ``Group`` is fixed by the helper (static sandbox group); a request can
+    # never express it because ``Group`` is a forbidden request field.
+    assert [item for item in argv if item.startswith("--property=Group=")] == [
+        "--property=Group=agentmgr-hermes"
+    ]
     assert not any(item.startswith("--property=PrivateNetwork=no") for item in argv)
     assert "--property=RuntimeMaxSec=60s" in argv
     assert "--property=RestrictAddressFamilies=AF_UNIX" not in argv
@@ -688,6 +711,40 @@ def test_systemd_argv_rejects_unsafe_or_unfixed_paths():
         with pytest.raises(helper.HelperError):
             helper.build_systemd_run_argv(valid_request(), **arguments)
 
+    # A task directory directly under "/" would mask the whole root.
+    with pytest.raises(helper.HelperError):
+        helper.build_systemd_run_argv(
+            valid_request(),
+            task_dir=Path("/") / UNIT,
+            runtime_root=RUNTIME_ROOT,
+            broker_socket=BROKER_SOCKET,
+            workload=WORKLOAD,
+        )
+
+
+def test_systemd_argv_revalidates_hand_built_request_limits():
+    for overrides in (
+        {"ttl_seconds": 0},
+        {"ttl_seconds": 301},
+        {"prompt_bytes": 0},
+        {"runtime_max_sec": 0},
+        {"memory_max_mb": 0},
+        {"cpu_quota_percent": 0},
+        {"tasks_max": 0},
+        {"prompt_sha256": "0" * 63},
+        {"runtime_handle": "rtask_hermes_" + "0" * 32},
+        {"grant_id": ""},
+    ):
+        hand_built = dataclasses.replace(valid_request(), **overrides)
+        with pytest.raises(helper.HelperError):
+            helper.build_systemd_run_argv(
+                hand_built,
+                task_dir=TASK_DIR,
+                runtime_root=RUNTIME_ROOT,
+                broker_socket=BROKER_SOCKET,
+                workload=WORKLOAD,
+            )
+
 
 # ---------------------------------------------------------------------------
 # systemctl show parsing
@@ -752,6 +809,18 @@ def test_parse_systemctl_show_maps_the_whitelist():
 )
 def test_parse_systemctl_show_process_gone(text: str, gone: bool):
     assert helper.parse_systemctl_show(text).process_gone is gone
+
+
+def test_unit_state_document_nulls_not_found_result_and_exit_status():
+    state = helper.parse_systemctl_show(SHOW_NOT_FOUND)
+    assert state.result == "success"
+    assert state.exec_main_status == 0
+
+    document = helper.unit_state_document(state)
+    assert document["load_state"] == "not-found"
+    assert document["result"] is None
+    assert document["exit_status"] is None
+    assert document["process_gone"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -961,6 +1030,31 @@ def test_load_install_config_accepts_read_only_group_variant(sandbox):
     assert config.adapter_group == helper.GROUP_NAME
 
 
+def test_attestation_key_root_defaults_to_the_unit_invisible_directory():
+    assert helper.ATTESTATION_KEY_ROOT == Path("/etc/agentmgr")
+    assert "-/etc/agentmgr" in helper.INACCESSIBLE_PATHS
+
+
+def test_install_config_rejects_private_tmp_bind_sources(sandbox, monkeypatch):
+    monkeypatch.setattr(helper, "ALLOW_PRIVATE_TMP_SOURCES", False)
+
+    path = sandbox.root / "install.json"
+    path.write_text(json.dumps(_install_config_document(sandbox)), encoding="utf-8")
+    path.chmod(0o600)
+    with pytest.raises(helper.HelperError) as excinfo:
+        helper.load_install_config(path)
+    assert excinfo.value.code == "install_config_private_tmp_source"
+
+    with pytest.raises(helper.HelperError) as excinfo:
+        helper.prepare(valid_request(operation="prepare"), sandbox.config)
+    assert excinfo.value.code == "install_config_private_tmp_source"
+
+    monkeypatch.setattr(helper, "ALLOW_PRIVATE_TMP_SOURCES", True)
+    assert helper.prepare(valid_request(operation="prepare"), sandbox.config)[
+        "prepared"
+    ] is True
+
+
 # ---------------------------------------------------------------------------
 # prepare
 # ---------------------------------------------------------------------------
@@ -995,14 +1089,20 @@ def test_prepare_creates_task_and_out_dirs_with_fixed_owner_group_and_mode(sandb
     assert document["grant_id"] == GRANT_ID
     assert document["runtime_handle"] == HANDLE
     assert document["runtime_root_hash"] == RUNTIME_ROOT_HASH
+    assert document["idempotency_key"] == IDEMPOTENCY_KEY
+    assert re.fullmatch(r"[0-9a-f]{64}", str(document["payload_sha256"]))
+    assert len(str(document["payload_sha256"])) == 64
     assert document["prompt_sha256"] == _sha256(PROMPT)
     assert document["toolset"] == "terminal"
     assert document["egress_socket"] == "/task/egress.sock"
     assert TOKEN not in manifest.read_text(encoding="utf-8")
     assert PROMPT.decode("utf-8") not in manifest.read_text(encoding="utf-8")
 
+    digest = document["payload_sha256"]
     again = helper.prepare(valid_request(operation="prepare"), sandbox.config)
     assert again["created"] is False
+    # The payload digest is stable across idempotent re-prepares.
+    assert json.loads(manifest.read_text(encoding="utf-8"))["payload_sha256"] == digest
 
 
 def test_prepare_rejects_symlinked_task_root(sandbox):
@@ -1130,7 +1230,10 @@ def test_launch_waits_through_activating(sandbox):
         (lambda sandbox: (sandbox.task_dir / "prompt.txt").write_bytes(b"x" * len(PROMPT)), "prompt_hash_mismatch"),
         (lambda sandbox: (sandbox.task_dir / "profile.template.yaml").write_bytes(b"other"), "profile_hash_mismatch"),
         (lambda sandbox: (sandbox.task_dir / "egress.token").chmod(0o644), "token_mode_invalid"),
+        (lambda sandbox: (sandbox.task_dir / "egress.token").chmod(0o660), "token_mode_invalid"),
         (lambda sandbox: (sandbox.task_dir / "prompt.txt").chmod(0o604), "prompt_mode_invalid"),
+        (lambda sandbox: (sandbox.task_dir / "prompt.txt").chmod(0o660), "prompt_mode_invalid"),
+        (lambda sandbox: (sandbox.task_dir / "profile.template.yaml").chmod(0o666), "profile_mode_invalid"),
     ],
 )
 def test_launch_rejects_modified_task_files_before_starting(sandbox, mutate, code):
@@ -1238,13 +1341,39 @@ def test_launch_fails_closed_when_the_unit_uid_is_unreadable(sandbox):
     assert any("--signal=SIGTERM" in call for call in runner.calls)
 
 
+def test_launch_rejects_runtime_root_and_workload_unreadable_by_the_unit(sandbox):
+    _prepare(sandbox)
+    _write_task_files(sandbox)
+    _write_started(sandbox)
+    runner = ScriptedRunner([SHOW_NOT_FOUND])
+
+    sandbox.runtime_root.chmod(0o700)
+    with pytest.raises(helper.HelperError) as excinfo:
+        helper.launch(valid_request(), sandbox.config, runner=runner)
+    assert excinfo.value.code == "runtime_root_mode_invalid"
+
+    sandbox.runtime_root.chmod(0o755)
+    sandbox.workload.chmod(0o600)
+    with pytest.raises(helper.HelperError) as excinfo:
+        helper.launch(valid_request(), sandbox.config, runner=runner)
+    assert excinfo.value.code == "workload_mode_invalid"
+    assert runner.launch_calls() == []
+
+
 def test_launch_rejects_an_unsafe_attestation_key(sandbox):
     _prepare(sandbox)
     _write_task_files(sandbox)
     _write_started(sandbox)
     runner = ScriptedRunner([SHOW_NOT_FOUND, SHOW_ACTIVE])
 
-    sandbox.key_path.chmod(0o644)
+    # Group can read (and it is the sandbox group): never acceptable.
+    sandbox.key_path.chmod(0o640)
+    with pytest.raises(helper.HelperError) as excinfo:
+        helper.launch(valid_request(), sandbox.config, runner=runner)
+    assert excinfo.value.code == "attestation_key_group_readable"
+
+    # World-readable is rejected even without a group-read bit.
+    sandbox.key_path.chmod(0o604)
     with pytest.raises(helper.HelperError) as excinfo:
         helper.launch(valid_request(), sandbox.config, runner=runner)
     assert excinfo.value.code == "attestation_key_mode_invalid"
@@ -1255,6 +1384,26 @@ def test_launch_rejects_an_unsafe_attestation_key(sandbox):
         helper.launch(valid_request(), sandbox.config, runner=runner)
     assert excinfo.value.code == "attestation_key_invalid"
     assert runner.launch_calls() == []
+
+
+def test_install_config_rejects_an_attestation_key_outside_the_unit_invisible_root(
+    sandbox,
+):
+    outside = sandbox.root / "outside.key"
+    outside.write_bytes(KEY)
+    outside.chmod(0o600)
+    config = dataclasses.replace(sandbox.config, attestation_key_path=outside)
+    with pytest.raises(helper.HelperError) as excinfo:
+        helper.prepare(valid_request(operation="prepare"), config)
+    assert excinfo.value.code == "attestation_key_path_invalid"
+
+    in_task_root = sandbox.task_root / "attestation.key"
+    in_task_root.write_bytes(KEY)
+    in_task_root.chmod(0o600)
+    config = dataclasses.replace(sandbox.config, attestation_key_path=in_task_root)
+    with pytest.raises(helper.HelperError) as excinfo:
+        helper.prepare(valid_request(operation="prepare"), config)
+    assert excinfo.value.code == "attestation_key_path_invalid"
 
 
 def test_operations_reject_a_cross_task_binding(sandbox):
@@ -1325,8 +1474,53 @@ def test_status_of_never_started_unit_reports_gone_and_no_started(sandbox):
     runner = ScriptedRunner([SHOW_NOT_FOUND])
     response = helper.status(valid_request(operation="status"), sandbox.config, runner=runner)
     assert response["unit_state"]["process_gone"] is True
+    assert response["unit_state"]["result"] is None
+    assert response["unit_state"]["exit_status"] is None
     assert response["task"]["started"] is False
     assert response["uid"] is None
+
+
+def test_status_rejects_a_symlinked_status_directory(sandbox):
+    _prepare(sandbox)
+    outside = sandbox.root / "outside-status"
+    outside.mkdir()
+    (outside / "started.json").write_text(
+        json.dumps(
+            {"unit": UNIT, "task_id": TASK_ID, "runtime_handle": HANDLE}
+        ),
+        encoding="utf-8",
+    )
+    (sandbox.task_dir / "status").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(helper.HelperError) as excinfo:
+        helper.status(
+            valid_request(operation="status"),
+            sandbox.config,
+            runner=ScriptedRunner([SHOW_ACTIVE]),
+        )
+    assert excinfo.value.code == "status_dir_invalid"
+
+
+def test_status_rejects_a_symlinked_task_root(sandbox):
+    outside = sandbox.root / "outside-root"
+    outside.mkdir()
+    (outside / UNIT).mkdir()
+    (outside / UNIT / "status").mkdir()
+    (outside / UNIT / "status" / "started.json").write_text(
+        json.dumps({"unit": UNIT, "task_id": TASK_ID, "runtime_handle": HANDLE}),
+        encoding="utf-8",
+    )
+    link_root = sandbox.root / "linked-tasks"
+    link_root.symlink_to(outside, target_is_directory=True)
+    config = dataclasses.replace(sandbox.config, task_root=link_root)
+
+    with pytest.raises(helper.HelperError) as excinfo:
+        helper.status(
+            valid_request(operation="status"),
+            config,
+            runner=ScriptedRunner([SHOW_ACTIVE]),
+        )
+    assert excinfo.value.code == "task_root_invalid"
 
 
 def test_stop_escalates_to_sigkill_and_confirms_only_when_gone(sandbox, monkeypatch):
@@ -1350,6 +1544,44 @@ def test_stop_of_never_started_unit_is_confirmed_without_signals(sandbox):
     assert response["stop_confirmed"] is True
     assert not any("--signal=SIGTERM" in call for call in runner.calls)
     assert not any("--signal=SIGKILL" in call for call in runner.calls)
+
+
+def test_stop_is_not_confirmed_while_the_unit_stays_active(sandbox, monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr(helper, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(helper, "_sleep", clock.sleep)
+
+    runner = ScriptedRunner([SHOW_ACTIVE])
+    response = helper.stop(valid_request(operation="stop"), sandbox.config, runner=runner)
+
+    assert any("--signal=SIGTERM" in call for call in runner.calls)
+    assert any("--signal=SIGKILL" in call for call in runner.calls)
+    assert response["process_gone"] is False
+    assert response["stop_confirmed"] is False
+
+
+def test_stop_is_not_confirmed_while_the_cgroup_holds_a_pid(sandbox, monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr(helper, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(helper, "_sleep", clock.sleep)
+
+    procs = sandbox.root / "cgroup.procs"
+    procs.write_text("4242\n", encoding="utf-8")
+    monkeypatch.setattr(
+        helper, "_cgroup_procs_path", lambda control_group: procs
+    )
+
+    show = _show(active_state="inactive", control_group="/system.slice/fake.service")
+    runner = ScriptedRunner([show])
+    response = helper.stop(
+        valid_request(operation="stop"),
+        sandbox.config,
+        runner=runner,
+    )
+    assert any("--signal=SIGTERM" in call for call in runner.calls)
+    assert any("--signal=SIGKILL" in call for call in runner.calls)
+    assert response["process_gone"] is False
+    assert response["stop_confirmed"] is False
 
 
 def test_cleanup_requires_result_read_and_a_stopped_unit(sandbox):
@@ -1400,18 +1632,54 @@ def test_cleanup_refuses_a_symlinked_task_dir(sandbox):
     assert (outside / "keep.txt").exists()
 
 
-def test_attest_for_a_stopped_unit_returns_runtime_only_and_no_paths(sandbox):
-    _prepare(sandbox)
-    _write_task_files(sandbox)
-    _write_started(sandbox)
-    runner = ScriptedRunner([SHOW_INACTIVE])
-    response = helper.attest(valid_request(operation="attest"), sandbox.config, runner=runner)
+def test_attest_without_a_task_dir_returns_runtime_only(sandbox):
+    # Never prepared: attest must still issue a runtime attestation.
+    response = helper.attest(
+        valid_request(operation="attest"),
+        sandbox.config,
+        runner=ScriptedRunner([SHOW_INACTIVE]),
+    )
     assert response["task_attestation"] is None
     assert response["runtime_attestation"]["schema"] == RUNTIME_ATTESTATION_SCHEMA
+    assert response["runtime_attestation"]["runtime_root_hash"] == RUNTIME_ROOT_HASH
     serialized = json.dumps(response)
     assert str(sandbox.task_root) not in serialized
     assert str(sandbox.task_dir) not in serialized
     assert TOKEN not in serialized
+
+
+def test_attest_after_cleanup_returns_runtime_only(sandbox):
+    _prepare(sandbox)
+    helper.cleanup(
+        valid_request(operation="cleanup", result_read=True),
+        sandbox.config,
+        result_read=True,
+        runner=ScriptedRunner([SHOW_INACTIVE]),
+    )
+    assert not sandbox.task_dir.exists()
+
+    response = helper.attest(
+        valid_request(operation="attest"),
+        sandbox.config,
+        runner=ScriptedRunner([SHOW_INACTIVE]),
+    )
+    assert response["task_attestation"] is None
+    assert response["runtime_attestation"]["broker_socket_ok"] is True
+
+
+def test_attest_keeps_strict_file_verification_while_active(sandbox):
+    _prepare(sandbox)
+    _write_task_files(sandbox)
+    _write_started(sandbox)
+    (sandbox.task_dir / "egress.token").unlink()
+
+    with pytest.raises(helper.HelperError) as excinfo:
+        helper.attest(
+            valid_request(operation="attest"),
+            sandbox.config,
+            runner=ScriptedRunner([SHOW_ACTIVE]),
+        )
+    assert excinfo.value.code == "token_missing"
 
 
 # ---------------------------------------------------------------------------
