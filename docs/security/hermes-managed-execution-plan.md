@@ -238,7 +238,7 @@ git commit -m "feat(runtime): add hermes managed contracts and egress tokens"
 - Modify: `app/tests/security/test_helper.py` only if a pinned-constant parity test is needed; otherwise no change.
 
 **Interfaces:**
-- Produces: `SandboxRequest` (frozen dataclass: operation, task_id, grant_id, unit, runtime_handle, idempotency_key, prompt_sha256, prompt_bytes, profile_template_sha256, egress_token_sha256, ttl_seconds, runtime_max_sec, memory_max_mb, cpu_quota_percent, tasks_max)
+- Produces: `SandboxRequest` (frozen dataclass: operation, task_id, grant_id, unit, runtime_handle, idempotency_key, prompt_sha256, prompt_bytes, profile_template_sha256, egress_token_sha256, ttl_seconds, runtime_max_sec, memory_max_mb, cpu_quota_percent, tasks_max, `result_read: bool = False` accepted only for `cleanup`)
 - Produces: `InstallConfig` (fixed task root, runtime root, trusted runtime root hash, broker socket, workload path, adapter user, group)
 - Produces: `load_install_config(path: Path) -> InstallConfig`
 - Produces: `validate_request(raw: Mapping[str, object]) -> SandboxRequest`
@@ -436,7 +436,7 @@ git commit -m "feat(runtime): add hermes egress broker"
 - Test: `app/tests/runtime/test_hermes_managed_adapter.py`
 
 **Interfaces:**
-- Produces: `SandboxSupervisor` Protocol with `prepare(spec) -> None`, `launch(spec) -> TaskAttestation`, `status(unit) -> SandboxStatus`, `stop(unit, *, reason) -> SandboxStop`, `cleanup(unit) -> None`, `runtime_attestation() -> RuntimeAttestation`
+- Produces: `SandboxSupervisor` Protocol with `prepare(spec) -> None`, `launch(spec) -> TaskAttestation`, `status(unit) -> SandboxStatus`, `stop(unit, *, reason) -> SandboxStop`, `cleanup(unit, *, result_read: bool = False) -> None`, `runtime_attestation() -> RuntimeAttestation`
 - Produces: `HelperSandboxSupervisor(config, *, runner=subprocess.run)` — stdin JSON, no shell, fixed helper path, JSON response parsing, stable error mapping.
 - Produces: `HermesManagedAdapter(config, supervisor)` implementing every `RuntimeAdapter` method.
 - Consumes: Task 1 dataclasses/`build_sandbox_spec`/artifact/capabilities/prompt; Task 2 helper protocol; Task 4 token minting (using `config.egress_token_key_path`).
@@ -500,7 +500,7 @@ Expected: FAIL with missing adapter/supervisor.
 
 Implement `HelperSandboxSupervisor` with a fixed helper path, mapping `SandboxSpec` to the helper's exact-key JSON request (hashes/sizes only, no prompt/token content, no caller paths), stdin JSON, `subprocess.run(..., shell=False, timeout=...)`, no argv secrets, strict JSON parsing, and error mapping. Implement `HermesManagedAdapter`:
 - `capabilities` calls `verify_runtime_attestation` first and passes only the returned `VerifiedRuntimeAttestation` to `managed_capabilities`; default unverified. A structurally valid forged 64-hex HMAC must not yield `VERIFIED`.
-- `submit_task` validates the managed grant shape, calls `verify_task_attestation(..., expected_runtime_root_hash=config.runtime_root_hash)`, uses `build_sandbox_spec` with the dispatcher's idempotency key, creates the task dir via supervisor, writes `prompt.txt`, `profile.template.yaml` (with `__PORT__`), and `egress.token`, then calls helper `launch`. The helper returns only after the unit is active and the `started` marker exists; a launch response without that evidence is treated as `unknown` + stop/cleanup. Duplicate same key/payload -> same handle/`replayed=True`; different payload -> conflict.
+- `submit_task` validates the managed grant shape, calls `verify_task_attestation(..., expected_runtime_root_hash=config.runtime_root_hash)`, uses `build_sandbox_spec` with the dispatcher's idempotency key, creates the task dir via supervisor, writes `prompt.txt`, `profile.template.yaml` (with `__PORT__`), and `egress.token` with the helper's required modes/group (prompt/profile group `agentmgr-hermes`, token exactly `0640`, `out/` `0770`), then calls helper `launch`. The helper returns only after the unit is active and the `started` marker exists; a launch response without that evidence is treated as `unknown` + stop/cleanup. Duplicate same key/payload -> same handle/`replayed=True`; different payload -> conflict.
 - `get_status` verifies task binding and maps `SandboxStatus`; `stop_confirmed` only from `process_gone`.
 - `get_result` calls `read_artifact(spec.task_dir, max_bytes=...)` (fixed `out/result.txt`, dir_fd/O_NOFOLLOW/O_NONBLOCK); returns result/evidence or unknown/needs_human.
 - `cancel_task` maps helper stop; `requested` vs `stopped`/`already_terminal`.
@@ -741,7 +741,7 @@ Implement the trusted config loader (root-only path passed by the launcher; no s
 
 - [ ] **Step 4: Implement provisioning/verification scripts**
 
-`provision_hermes_runtime.sh` must be idempotent and fail closed: create group/user/dirs, compute and record the trusted runtime root manifest hash, verify runtime root excludes personal profile/auth, install helper/wrapper/workload/broker unit/sudoers (root-owned), write no secrets, print the required root-only inputs. `verify_hermes_isolation.sh`/`.py` must check helper/wrapper modes, sudoers exactness, unit property builder, runtime root manifest hash equality against the configured `runtime_root_hash`, personal profile not mounted, broker socket/key permissions, and fail on any mismatch. Tests may inspect script text for forbidden `eval`/`sh -c` and fixed paths.
+`provision_hermes_runtime.sh` must be idempotent and fail closed: create group/user/dirs, compute and record the trusted runtime root manifest hash, verify runtime root excludes personal profile/auth, install helper/wrapper/workload/broker unit/sudoers (root-owned) at the fixed deployment names used by the helper (`/usr/local/libexec/agentmgr_hermes_exec.py`, `/usr/local/libexec/agentmgr-hermes-exec`, `/etc/sudoers.d/agentmgr-hermes`, `/etc/agentmgr/hermes-exec.json`), write no secrets, print the required root-only inputs. The broker socket must live outside the unit's private `/run`, `/tmp` and `/var/tmp` (for example under the task root's parent with group `agentmgr-hermes`), because it is bind-mounted into the unit. `verify_hermes_isolation.sh`/`.py` must check helper/wrapper modes, sudoers exactness, unit property builder, runtime root manifest hash equality against the configured `runtime_root_hash`, personal profile not mounted, broker socket/key permissions, and fail on any mismatch. Tests may inspect script text for forbidden `eval`/`sh -c` and fixed paths.
 
 - [ ] **Step 5: Write docs**
 
