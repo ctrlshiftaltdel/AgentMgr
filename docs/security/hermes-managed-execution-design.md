@@ -122,21 +122,21 @@ unit = "agentmgr-hermes-" + sha256(("agentmgr-hermes:v1:" + task_id + "\n" + att
 | 属性 | 值/要求 |
 |---|---|
 | 类型 | transient `systemd-run` 单元；`Type=simple`/默认 |
-| 用户 | `DynamicUser=yes`；每任务独立 UID；`SupplementaryGroups=agentmgr-hermes` |
+| 用户 | `DynamicUser=yes`；每任务独立 UID；`Group=agentmgr-hermes`（静态主组，使 unit 写出的文件可被 adapter 组读） |
 | 工作目录 | `/task`（任务目录 bind mount 后的固定路径） |
-| 文件系统 | `ProtectSystem=strict`、`ProtectHome=yes`、`PrivateTmp=yes`、`TemporaryFileSystem=/run`（或等价私有 `/run`） |
+| 文件系统 | `ProtectSystem=strict`、`ProtectHome=yes`、`PrivateTmp=yes`、`TemporaryFileSystem=/run`（或等价私有 `/run`）；`InaccessiblePaths=-<task-root>` 隐藏兄弟任务目录 |
 | 运行时根 | 只读 bind mount；不包含 Profile/auth/.env/session；路径由 helper 固定 |
 | 任务目录 | bind mount 到 `/task`，唯一可写区；`agentmgr-hermes` 组可读写；`UMask=0007` |
 | 出口 socket | broker socket 只读 bind mount 到 `/task/egress.sock`；不依赖宿主 `/run` |
 | 网络 | `PrivateNetwork=yes`；仅隔离 loopback；无外部 IP；`RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX` |
 | 特权 | `NoNewPrivileges=yes`、`CapabilityBoundingSet=`、`AmbientCapabilities=` |
 | syscall/namespace | `SystemCallFilter=@system-service`、`SystemCallArchitectures=native`、`RestrictNamespaces=yes`、`LockPersonality=yes`、`MemoryDenyWriteExecute=yes`、`RestrictRealtime=yes`、`RestrictSUIDSGID=yes`、`RemoveIPC=yes` |
-| 内核面 | `ProtectClock/KernelTunables/KernelModules/KernelLogs/ControlGroups/Hostname=yes`、`ProtectProc=invisible`、`ProcSubset=pid` |
+| 内核面 | `ProtectClock/KernelTunables/KernelModules/KernelLogs/ControlGroups/Hostname=yes`、`ProtectProc=invisible`、`ProcSubset=pid`、`PrivateDevices=yes` |
 | 资源 | `MemoryMax`、`CPUQuota`、`TasksMax`、`RuntimeMaxSec`、`LimitNOFILE` 由 helper 白名单校验 |
 | 停止 | `KillMode=control-group`、`SendSIGKILL=yes`、`ExitType=cgroup`、`TimeoutStopSec` |
 | 重启 | 不自动重启；失败/超时由 adapter 映射 |
 
-`/etc/agentmgr`、`/var/lib/agentmgr`、`/var/lib/postgresql`、`/srv`、宿主 home、其他任务目录、Docker/容器 socket、宿主 gateway lock/socket 必须不可访问。运行时根是唯一允许的只读宿主代码挂载。
+`/etc/agentmgr`、`/var/lib/agentmgr`、`/var/lib/postgresql`、`/srv`、宿主 home、任务根（含其他任务目录）、Docker/容器 socket、宿主 gateway lock/socket 必须不可访问。任务目录通过唯一的 `/task` bind mount 暴露；兄弟目录即使同组也不可遍历（`InaccessiblePaths=-<task-root>`，已用真实 transient unit 验证 bind source 仍可用）。运行时根是唯一允许的只读宿主代码挂载。
 
 ### 6.3 任务目录布局
 
@@ -278,7 +278,7 @@ model:
 
 ### 9.1 组件
 
-- **宿主 broker**：`agentmgr-hermes-egress.service`，独立服务用户；监听固定 Unix socket（`<broker-socket>`），group `agentmgr-hermes`，mode 0660。
+- **宿主 broker**：`agentmgr-hermes-egress.service`，独立服务用户；监听固定 Unix socket（`<broker-socket>`），group `agentmgr-hermes`，mode 0660。socket 不得放在 unit 的私有 `/run`、`/tmp` 或 `/var/tmp` 下；它必须是一个可在宿主侧 bind mount 的稳定路径（例如任务根父目录下的控制目录）。
 - **单元内 local proxy**：workload 启动的 stdlib HTTP 服务，监听 127.0.0.1；只接受来自 Hermes 的请求，转发到 `/task/egress.sock`。
 - **真实 key**：只存在于 broker 可读的 root-only 文件/credential；adapter、workload、Hermes、任务目录都不可读。
 
@@ -483,8 +483,8 @@ class HermesManagedAdapter:
 1. 创建 `agentmgr-hermes` 组/服务用户；把受信 AgentMgr 服务用户加入组。
 2. 安装 root-owned helper/wrapper/workload/broker unit；sudoers 只允许固定 helper 路径、无参数。
 3. 准备只读运行时根（根所有；Hermes 安装 + Python tools；不含 Profile/auth/.env/session）；计算并记录 runtime root manifest 哈希。
-4. 创建任务根/状态根，group `agentmgr-hermes`，mode 0770；其他用户不可遍历。
-5. 写入 root-only provider key/credential 和 attestation HMAC key；key 只对 broker/helper+adapter 可读。
+4. 创建任务根/状态根，group `agentmgr-hermes`，mode 0770；unit 以 `InaccessiblePaths=-<task-root>` 隐藏兄弟目录；broker socket 放在不落入 unit 私有 `/run`/`/tmp`/`/var/tmp` 的固定控制目录。
+5. 写入 root-only provider key/credential 和 attestation HMAC key；key 只对 broker/helper+adapter 可读；attestation key 必须在 `/etc/agentmgr` 等 unit 不可见路径，且不得对 `agentmgr-hermes` 组可读。
 6. 启动 broker；配置只允许 provider host/path；验证 broker 健康。
 7. 运行 `ops/security/verify_hermes_isolation.sh`；校验 helper 版本、unit 属性、运行时根哈希、个人 profile 未挂载、broker key 不可被 unit 读取。
 8. 创建/验证专用 service identity；记录 ID；不创建公开 Managed API。

@@ -265,6 +265,9 @@ def test_systemd_argv_has_fixed_sandbox_properties():
         runtime_root=RUNTIME_ROOT, broker_socket=BROKER_SOCKET, workload=WORKLOAD)
     assert argv[0] == "systemd-run"
     assert "--property=DynamicUser=yes" in argv
+    assert "--property=Group=agentmgr-hermes" in argv
+    assert f"--property=InaccessiblePaths=-{TASK_DIR.parent}" in argv
+    assert "--property=PrivateDevices=yes" in argv
     assert "--property=PrivateNetwork=yes" in argv
     assert "--property=ProtectHome=yes" in argv
     assert f"--property=BindPaths={TASK_DIR}:/task" in argv
@@ -276,7 +279,7 @@ def test_systemd_argv_has_fixed_sandbox_properties():
     assert argv[-len(WORKLOAD_ARGV):] == WORKLOAD_ARGV
 ```
 
-Also test unit-name parity with `unit_name_for` (including control-character rejection), task/grant/unit binding, path traversal/symlink/wrong-owner rejection, numeric limits, response file hash validation, `parse_systemctl_show` mapping, HMAC tamper, runtime-root-hash parity, stable error codes, no secrets in error strings.
+Also test unit-name parity with `unit_name_for` (including control-character rejection), task/grant/unit binding, path traversal/symlink/wrong-owner rejection, numeric limits, response file hash validation, `parse_systemctl_show` mapping, HMAC tamper, runtime-root-hash parity, `Group=agentmgr-hermes`/`InaccessiblePaths=-<task-root>`/`PrivateDevices=yes`, `status` not-found nulling, `attest` after token deletion/cleanup returning runtime attestation with `task_attestation=None`, stop negative (active/cgroup non-empty -> `stop_confirmed=False`), attestation-key group/path rejection, `/tmp` source rejection, manifest idempotency/payload digest, stable error codes, no secrets in error strings.
 
 - [ ] **Step 2: Run to verify RED**
 
@@ -285,7 +288,7 @@ Expected: FAIL with missing module/names.
 
 - [ ] **Step 3: Implement the helper**
 
-Implement exact-key validation, fixed path roots, root-owned wrapper contract, `prepare/launch/status/stop/cleanup/attest` dispatch, `systemd-run` argv builder, `systemctl show` parser, atomic JSON response, HMAC attestation. The helper derives `task_dir` as `<fixed task root>/<unit>`, creates it and `out/` mode 0770 with the configured trusted adapter user as owner and `agentmgr-hermes` as group, and refuses symlinks/wrong ownership. `out/` must remain group-readable by the adapter and group-writable by the unit. `launch` verifies the prompt/profile-template/token file hashes and sizes before starting; it never receives their contents. `stop` waits for `ActiveState=inactive/failed` and `MainPID=0`/empty cgroup before `stop_confirmed=true`. Mask host `/run` (private tmpfs) and any optional Docker/container socket/state paths; add only explicit syscalls Hermes needs if `@system-service` is insufficient, and record the exception in the evidence doc. No `shell=True`, no argv input, no logging of stdin or secrets.
+Implement exact-key validation, fixed path roots, root-owned wrapper contract, `prepare/launch/status/stop/cleanup/attest` dispatch, `systemd-run` argv builder, `systemctl show` parser, atomic JSON response, HMAC attestation. The helper derives `task_dir` as `<fixed task root>/<unit>`, creates it and `out/` mode 0770 with the configured trusted adapter user as owner and `agentmgr-hermes` as group, and refuses symlinks/wrong ownership. The unit uses `Group=agentmgr-hermes` as its static primary group (confirmed with a transient-unit probe) so unit-written files inherit the group and the adapter can read them; `out/` stays group-writable. Add `InaccessiblePaths=-<task_root>` (confirmed bind source still works) so siblings/tokens are not readable, and `PrivateDevices=yes`. `launch` verifies the prompt/profile-template/token file hashes and sizes before starting; it never receives their contents. `stop` waits for `ActiveState=inactive/failed` and `MainPID=0`/empty cgroup before `stop_confirmed=true`; add a negative test where the unit stays active or the cgroup still holds a PID and `stop_confirmed` must be false. `status` must emit `result=None`/`exit_status=None` when `LoadState=not-found` (systemd otherwise defaults to `Result=success`/`ExecMainStatus=0`). `attest` must inspect the unit first and return a runtime attestation with `task_attestation=None` when the unit is stopped or the task dir/token is already cleaned, while still requiring the runtime root/broker/workload. Reject an attestation key readable by the sandbox group or under the task root; require `/etc/agentmgr`. Reject `/tmp`/`/var/tmp` bind sources (private tmpfs). Add idempotency key + payload digest to the manifest. Mask host `/run` (private tmpfs) and any optional Docker/container socket/state paths; add only explicit syscalls Hermes needs if `@system-service` is insufficient, and record the exception in the evidence doc. No `shell=True`, no argv input, no logging of stdin or secrets.
 
 - [ ] **Step 4: Add wrapper and sudoers**
 
@@ -610,7 +613,7 @@ git commit -m "test(tasks): drive hermes managed adapter through dispatcher"
 - [ ] **Step 1: Write failing/skip-gated live tests**
 
 Add tests that:
-- Run a probe unit with `PrivateNetwork=yes`; assert `/etc/shadow`, host home, DB socket, other task dir, `/run/systemd`, `/run/dbus`, Docker socket are denied; external `<external-ipv4>:<port>` gives `ENETUNREACH`; loopback works.
+- Run a probe unit with `PrivateNetwork=yes`; assert `/etc/shadow`, host home, DB socket, other task dir/prompt/token, `/run/systemd`, `/run/dbus`, Docker socket are denied; external `<external-ipv4>:<port>` gives `ENETUNREACH`; loopback works.
 - Launch the production helper for a Hermes task with the stub broker (fixed assistant text, no tool calls); assert unit active, DynamicUser UID, read-only runtime root, task dir writable only, started marker, completed/exit status, stop/cgroup-gone, cleanup, and no artifact -> adapter result is unknown/needs_human (not success).
 - Assert the unit does not see the personal gateway lock/socket or profile.
 - Assert a malformed/second launch with the same key does not create a second unit.
