@@ -11,7 +11,7 @@
 - **没有默认配置。** 启动器必须显式传入受信、root-only 的 `--config`；没有配置、attestation、密钥、helper 或 service principal 时**非零退出**，不会回退到 Fake/Advisory/宿主 Hermes。
 - **调度器只到 `verifying`。** 启动器复用 #96 `RuntimeDispatcher`，从不写 `succeeded`；`stop_confirmed` 是停止证据，不是业务副作用对账。
 - **不触碰个人/默认 Hermes。** 安装、运行、回滚都不读取、挂载、启动、停止或替换个人 Profile、认证、`.env`、会话、lock 或 gateway。
-- **#83 仍被阻塞。** 业务工具/PEP 连接器、真实业务资源访问与商业化就绪不在 #97 内。
+- **#83 不再被 #97 阻塞。** #97 的测试机 live 门禁已完成；业务工具/PEP 连接器、真实客户端 E2E、真实业务资源访问与商业化就绪仍属于 #83。
 
 ## 2 组件与固定路径
 

@@ -4,7 +4,7 @@
 - 日期：2026-10-25
 - 关联：Issue #97、#96、#82、#83、#81；[Runtime Adapter 契约](../contracts/runtime-adapter.md)、[任务状态机](../architecture/task-state-machine.md)、[#96 调度器](../architecture/runtime-dispatch.md)、[#82 隔离设计](managed-execution-isolation-design.md)、[#82 边界记录](managed-execution-boundary.md)。
 - 依赖：`RuntimeAdapter` v1.0.0、#96 的 `RuntimeDispatcher`、#82 的 transient systemd 基座与 PEP 设计。
-- 证据边界：本文是设计，不是运行时证据。真实 Hermes Managed Execution 在 #97 合并并完成真实测试前仍为 `unverified`；Fake/Mock 证据不得升级本设计中的能力标签。
+- 证据边界：本文是设计，不是运行时证据。真实 Hermes Managed Execution 已在批准测试机完成 sandbox/lifecycle/stub-broker/真实 key artifact live 测试；生产部署与容量仍未验证；Fake/Mock 证据不得升级本设计中的能力标签。
 
 ## 1. 目标与非目标
 

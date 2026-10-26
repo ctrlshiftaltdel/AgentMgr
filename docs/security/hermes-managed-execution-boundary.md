@@ -21,7 +21,7 @@
 |---|---|---|
 | 纯契约、令牌、attestation、artifact、能力矩阵 | `app/runtime/hermes_managed.py`、`app/runtime/hermes_egress.py` | 单元测试 + 真实 PostgreSQL dispatcher E2E + live helper/broker |
 | root helper / wrapper / sudoers | `ops/security/agentmgr_hermes_exec.py`、`agentmgr-hermes-exec`、`agentmgr-hermes.sudoers` | 已安装；真实 transient unit 验证 |
-| 单元内 workload / 本地模型代理 / in-process `run_oneshot` | `ops/security/agentmgr_hermes_workload.py` | 已安装；真实单元内运行（stub 模型上游） |
+| 单元内 workload / 本地模型代理 / in-process `run_oneshot` | `ops/security/agentmgr_hermes_workload.py` | 已安装；真实单元内运行（stub + 真实 provider key） |
 | 宿主 egress broker | `app/runtime/hermes_egress.py`、`ops/security/agentmgr-hermes-egress.service` | 单元测试 + live stub broker + 真实 provider 上游（专用测试 key） |
 | Managed adapter / helper 客户端 | `app/runtime/hermes_managed.py` | fake supervisor + 真实 helper live 生命周期 |
 | #96 dispatcher 集成 | `app/tasks/execution.py` | fake supervisor + 真实 PostgreSQL E2E；dispatcher 只到 `verifying` |
@@ -29,7 +29,7 @@
 | 安装/验证脚本 | `ops/security/provision_hermes_runtime.sh`、`verify_hermes_isolation.sh/.py` | 测试机真实安装；18/18 检查通过 |
 | 运维/边界文档 | 本文件、[运维手册](../operations/hermes-managed-execution.md)、[Hermes 运行时](../integrations/runtimes/hermes.md) | 文档 |
 
-这些测试仍然**不**证明：真实 provider key 的模型出口、真实 artifact 信任链、生产 service principal/CLI、并发容量或 #83 的业务工具治理。
+这些测试仍然**不**证明：生产 service principal/CLI、生产 key 轮换/配额、并发容量或 #83 的业务工具治理。
 
 ## 3 真实证据
 
