@@ -136,6 +136,8 @@ def make_config(tmp_path: Path, **overrides: object) -> HermesManagedConfig:
 
 
 def runtime_document(config: HermesManagedConfig, **overrides: object) -> dict[str, object]:
+    issued = datetime.now(UTC) - timedelta(seconds=60)
+    expires = datetime.now(UTC) + timedelta(seconds=600)
     document: dict[str, object] = {
         "schema": RUNTIME_ATTESTATION_SCHEMA,
         "helper_version": "1.0.0",
@@ -145,8 +147,8 @@ def runtime_document(config: HermesManagedConfig, **overrides: object) -> dict[s
         "sandbox_facts": dict(SANDBOX_FACTS),
         "broker_socket_ok": True,
         "evidence_ref": config.evidence_ref,
-        "issued_at": _iso(NOW - timedelta(seconds=60)),
-        "expires_at": _iso(NOW + timedelta(seconds=600)),
+        "issued_at": _iso(issued),
+        "expires_at": _iso(expires),
         "nonce": "m" * 32,
     }
     document.update(overrides)
@@ -163,6 +165,8 @@ def runtime_attestation(
 
 
 def task_document(spec: SandboxSpec, *, key: bytes = KEY, **overrides: object) -> dict[str, object]:
+    issued = datetime.now(UTC) - timedelta(seconds=60)
+    expires = datetime.now(UTC) + timedelta(seconds=240)
     document: dict[str, object] = {
         "schema": TASK_ATTESTATION_SCHEMA,
         "unit": spec.unit,
@@ -174,8 +178,8 @@ def task_document(spec: SandboxSpec, *, key: bytes = KEY, **overrides: object) -
         "profile_template_sha256": spec.profile_template_sha256,
         "prompt_sha256": spec.prompt_sha256,
         "sandbox_facts": dict(SANDBOX_FACTS),
-        "issued_at": _iso(NOW - timedelta(seconds=60)),
-        "expires_at": _iso(NOW + timedelta(seconds=240)),
+        "issued_at": _iso(issued),
+        "expires_at": _iso(expires),
         "nonce": "n" * 32,
     }
     document.update(overrides)
@@ -625,6 +629,53 @@ def test_invalid_task_attestation_is_unknown_and_never_selects_success(tmp_path)
     assert result.outcome is SubmitOutcome.UNKNOWN
     assert supervisor.launch_calls == 1
     assert supervisor.stop_calls == 1
+
+
+def test_runtime_attestation_uses_a_fresh_clock_not_the_stale_caller_time(tmp_path):
+    config, supervisor, adapter = build_adapter(tmp_path)
+    stale = datetime.now(UTC) - timedelta(hours=2)
+    assert stale < supervisor.attestation_value.issued_at
+
+    assert adapter._runtime_attestation_verified(stale) is True  # type: ignore[attr-defined]
+    result = adapter.submit_task("task_1", "PROMPT-CANARY", "idem_1", managed_grant())
+
+    assert result.outcome is SubmitOutcome.ACCEPTED
+    assert supervisor.prepare_calls == 1
+    assert supervisor.launch_calls == 1
+
+
+def test_expired_or_not_yet_valid_runtime_attestation_fails_closed(tmp_path):
+    config, supervisor, adapter = build_adapter(tmp_path)
+    now = datetime.now(UTC)
+    expired_document = runtime_document(
+        config,
+        issued_at=_iso(now - timedelta(minutes=10)),
+        expires_at=_iso(now - timedelta(minutes=5)),
+    )
+    supervisor.attestation_value = RuntimeAttestation.from_document(
+        {**expired_document, "hmac": _sign(expired_document)}
+    )
+
+    expired = adapter.submit_task(
+        "task_1", "PROMPT-CANARY", "idem_1", managed_grant()
+    )
+
+    not_yet_document = runtime_document(
+        config,
+        issued_at=_iso(now + timedelta(minutes=5)),
+        expires_at=_iso(now + timedelta(minutes=10)),
+    )
+    supervisor.attestation_value = RuntimeAttestation.from_document(
+        {**not_yet_document, "hmac": _sign(not_yet_document)}
+    )
+    not_yet = adapter.submit_task(
+        "task_1", "PROMPT-CANARY", "idem_1", managed_grant()
+    )
+
+    assert expired.outcome is SubmitOutcome.UNSUPPORTED
+    assert not_yet.outcome is SubmitOutcome.UNSUPPORTED
+    assert supervisor.prepare_calls == 0
+    assert supervisor.launch_calls == 0
 
 
 def test_manifest_missing_after_prepare_is_unknown_and_does_not_launch(tmp_path):
@@ -1982,6 +2033,7 @@ def test_helper_cleanup_unconfirmed_or_malformed_fails_closed(tmp_path):
 
 def test_helper_runtime_attestation_uses_a_task_free_sentinel(tmp_path):
     config = helper_config(tmp_path)
+    runtime_doc = runtime_document(config)
     runner = Runner(
         [
             {
@@ -1995,8 +2047,8 @@ def test_helper_runtime_attestation_uses_a_task_free_sentinel(tmp_path):
                             "agentmgr-runtime-attestation",
                         ),
                         "runtime_attestation": {
-                            **runtime_document(config),
-                            "hmac": _sign(runtime_document(config)),
+                            **runtime_doc,
+                            "hmac": _sign(runtime_doc),
                         },
                         "task_attestation": None,
                         "observed_at": _iso(NOW),

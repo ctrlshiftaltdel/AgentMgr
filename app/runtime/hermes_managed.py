@@ -1981,16 +1981,21 @@ class HermesManagedAdapter:
 
         del probe  # a probe has the same read-only checks as the default path
         current = self._clock()
+        reference_now = current
         verified = None
         try:
             attestation = self._supervisor.runtime_attestation()
+            # The helper signs immediately before returning, so the stale
+            # caller-owned clock can be microseconds before ``issued_at``.
+            # Freshness is checked against the real clock *after* the call.
+            reference_now = datetime.now(UTC)
             key = _read_key_file(self._config.attestation_key_path, "attestation key")
             verified = verify_runtime_attestation(
-                attestation, key=key, config=self._config, now=current
+                attestation, key=key, config=self._config, now=reference_now
             )
         except Exception:  # noqa: BLE001 - capabilities must fail closed
             verified = None
-        return managed_capabilities(self._config, verified, now=current)
+        return managed_capabilities(self._config, verified, now=reference_now)
 
     def health(self) -> HealthResult:
         """Check helper, runtime root, broker socket and runtime attestation."""
@@ -2021,9 +2026,10 @@ class HermesManagedAdapter:
 
         try:
             attestation = self._supervisor.runtime_attestation()
+            verification_now = datetime.now(UTC)
             key = _read_key_file(self._config.attestation_key_path, "attestation key")
             verify_runtime_attestation(
-                attestation, key=key, config=self._config, now=current
+                attestation, key=key, config=self._config, now=verification_now
             )
             details["attestation"] = "verified"
             details["helper_version"] = attestation.helper_version
@@ -2231,7 +2237,7 @@ class HermesManagedAdapter:
                     key=key,
                     spec=spec,
                     expected_runtime_root_hash=self._config.runtime_root_hash,
-                    now=self._clock(),
+                    now=datetime.now(UTC),
                 )
             except Exception:  # noqa: BLE001 - any verification failure is unknown
                 self._remember_intent(task_id, idempotency_key, digest, "unknown")
@@ -2744,13 +2750,21 @@ class HermesManagedAdapter:
         return None
 
     def _runtime_attestation_verified(self, now: datetime) -> bool:
-        """Verify the runtime attestation before creating any task directory."""
+        """Verify the runtime attestation before creating any task directory.
 
+        ``now`` is deliberately ignored: it was captured before the helper call
+        and can predate the freshly signed ``issued_at``.  The attestation is
+        checked against the real clock read *after* the helper returns; the
+        caller's clock is still used for task-state timestamps.
+        """
+
+        del now
         try:
             attestation = self._supervisor.runtime_attestation()
+            verification_now = datetime.now(UTC)
             key = _read_key_file(self._config.attestation_key_path, "attestation key")
             verify_runtime_attestation(
-                attestation, key=key, config=self._config, now=now
+                attestation, key=key, config=self._config, now=verification_now
             )
         except Exception:  # noqa: BLE001 - an unverified runtime fails closed
             return False
