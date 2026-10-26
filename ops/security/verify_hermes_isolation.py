@@ -33,6 +33,7 @@ after starting the host egress broker; no task unit is required.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import grp
 import hashlib
 import importlib.util
@@ -248,30 +249,23 @@ def _user_entry(name: str, code: str) -> pwd.struct_passwd:
 # ---------------------------------------------------------------------------
 
 
-def _forbidden_symlink_targets() -> tuple[str, ...]:
-    return (
-        str(AGENTMGR_ETC),
-        "/home",
-        "/root",
-        "/run",
-        "/srv",
-        "/tmp",
-        str(RUNTIME_ROOT),
-        "/var/lib/agentmgr",
-        "/var/lib/containerd",
-        "/var/lib/containers",
-        "/var/lib/docker",
-        "/var/lib/postgresql",
-        "/var/tmp",
-    )
+def _runtime_marker(name: str) -> bool:
+    """Return whether an entry name is a personal-profile marker at any depth."""
+
+    return name in PROFILE_MARKERS
 
 
 def _runtime_manifest(root: Path) -> str:
-    """Return the deterministic runtime-root manifest hash or raise."""
+    """Return the deterministic runtime-root manifest hash or raise.
+
+    Every directory is walked.  A profile marker at **any** depth, an absolute
+    symlink (which could point at host home/profile state) and a relative
+    symlink escaping the root are rejected before they can be hashed.  The
+    provisioner uses the identical rules; a test pins the two implementations.
+    """
 
     if not root.is_dir():
         _fail("runtime_root_unavailable", str(root))
-    forbidden = _forbidden_symlink_targets()
     entries: list[tuple[str, str, int, str]] = []
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         rel_dir = os.path.relpath(dirpath, root)
@@ -281,9 +275,14 @@ def _runtime_manifest(root: Path) -> str:
                 dirnames.remove(name)
                 filenames.append(name)
         dirnames.sort()
+        for name in dirnames:
+            if _runtime_marker(name):
+                _fail("runtime_root_profile_marker", name)
         if rel_dir != ".":
             entries.append(("d", rel_dir, 0, ""))
         for name in sorted(filenames):
+            if _runtime_marker(name):
+                _fail("runtime_root_profile_marker", name)
             full = os.path.join(dirpath, name)
             rel = os.path.normpath(os.path.join(rel_dir, name)) if rel_dir != "." else name
             try:
@@ -293,16 +292,12 @@ def _runtime_manifest(root: Path) -> str:
             if stat.S_ISLNK(info.st_mode):
                 target = os.readlink(full)
                 if os.path.isabs(target):
-                    normalized = os.path.normpath(target)
-                    if any(
-                        normalized == prefix or normalized.startswith(prefix + "/")
-                        for prefix in forbidden
-                    ):
-                        _fail("runtime_root_symlink_escape", rel)
-                else:
-                    normalized = os.path.normpath(os.path.join(rel_dir, target))
-                    if normalized == ".." or normalized.startswith("../"):
-                        _fail("runtime_root_symlink_escape", rel)
+                    # Even a read-only runtime may not reach an absolute host
+                    # path outside itself; the unit only sees this root.
+                    _fail("runtime_root_symlink_escape", rel)
+                normalized = os.path.normpath(os.path.join(rel_dir, target))
+                if normalized == ".." or normalized.startswith("../"):
+                    _fail("runtime_root_symlink_escape", rel)
                 entries.append(("l", rel, len(target), target))
                 continue
             if not stat.S_ISREG(info.st_mode):
@@ -322,13 +317,17 @@ def _runtime_manifest(root: Path) -> str:
 
 
 def _profile_marker(path: Path) -> str | None:
+    """Return the first profile marker below ``path`` (any depth), or ``None``."""
+
     try:
-        entries = {entry.name for entry in os.scandir(path)}
+        for dirpath, dirnames, filenames in os.walk(path, followlinks=False):
+            for name in (*dirnames, *filenames):
+                if _runtime_marker(name):
+                    return os.path.normpath(
+                        os.path.join(os.path.relpath(dirpath, path), name)
+                    )
     except OSError:
         _fail("runtime_root_unreadable", str(path))
-    for marker in PROFILE_MARKERS:
-        if marker in entries:
-            return marker
     return None
 
 
@@ -581,13 +580,39 @@ def _check_runtime_hash(deployment: Deployment) -> None:
             _fail("runtime_root_hash_mismatch", name)
 
 
+def _runtime_root_mount_is_read_only() -> bool:
+    """True when the runtime root itself is a read-only bind mount."""
+
+    try:
+        lines = Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    for line in lines:
+        fields = line.split()
+        try:
+            separator = fields.index("-")
+        except ValueError:
+            continue
+        if len(fields) < separator + 4:
+            continue
+        target = Path(_unescape_mountinfo(fields[4]))
+        if target != RUNTIME_ROOT:
+            continue
+        options = set(fields[5].split(","))
+        super_options = set(fields[separator + 3].split(","))
+        return "ro" in options or "ro" in super_options
+    return False
+
+
 @check("runtime-root-content")
 def _check_runtime_content(deployment: Deployment) -> None:
     marker = _profile_marker(RUNTIME_ROOT)
     if marker is not None:
         _fail("runtime_root_profile_marker", marker)
     info = _lstat(RUNTIME_ROOT, "runtime_root_unavailable")
-    if _mode(info) & 0o222:
+    # A copy provisioned by the installer is 0555.  A bind source may carry its
+    # original mode; the read-only remount is then the enforcement.
+    if _mode(info) & 0o222 and not _runtime_root_mount_is_read_only():
         _fail("runtime_root_writable", oct(_mode(info)))
 
 
@@ -666,6 +691,57 @@ def _check_broker_unit(deployment: Deployment) -> None:
             _fail("broker_unit_mismatch", forbidden)
 
 
+def _provider_endpoint(value: str) -> tuple[str, int] | None:
+    """Return ``(host, port)`` for an https base URL, or ``None`` if invalid."""
+
+    from urllib.parse import urlsplit
+
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return None
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+    try:
+        port = parsed.port or 443
+    except ValueError:
+        return None
+    return parsed.hostname, port
+
+
+def _provider_host_endpoint(value: str) -> tuple[str, int] | None:
+    """Return ``(host, port)`` for the broker's claimed provider host."""
+
+    from urllib.parse import urlsplit
+
+    try:
+        parsed = urlsplit("//" + value)
+    except ValueError:
+        return None
+    if not parsed.hostname:
+        return None
+    try:
+        port = parsed.port or 443
+    except ValueError:
+        return None
+    return parsed.hostname, port
+
+
+def _provider_target_matches(upstream_base_url: str, provider_host: str) -> bool:
+    """True only when the real-key destination equals the token's host claim."""
+
+    target = _provider_endpoint(upstream_base_url)
+    claim = _provider_host_endpoint(provider_host)
+    return target is not None and claim is not None and target == claim
+
+
 @check("broker-config")
 def _check_broker_config(deployment: Deployment) -> None:
     info = _require_regular(BROKER_CONFIG, "broker_config_missing")
@@ -687,11 +763,21 @@ def _check_broker_config(deployment: Deployment) -> None:
         if document.get(name) != value:
             _fail("broker_config_mismatch", name)
     launcher = _read_json(CLI_CONFIG, "launcher_config_invalid")
-    if document.get("provider_host") != launcher.get("egress_provider_host"):
+    provider_host = document.get("provider_host")
+    launcher_host = launcher.get("egress_provider_host")
+    if (
+        not isinstance(provider_host, str)
+        or not isinstance(launcher_host, str)
+        or provider_host != launcher_host
+    ):
         _fail("broker_config_mismatch", "provider_host")
     upstream = document.get("upstream_base_url")
-    if not isinstance(upstream, str) or not upstream.startswith("https://"):
-        _fail("broker_config_invalid", "upstream_base_url")
+    if not isinstance(upstream, str) or not _provider_target_matches(
+        upstream, provider_host
+    ):
+        _fail("broker_config_mismatch", "upstream_base_url/provider_host")
+    if not _provider_target_matches(upstream, launcher_host):
+        _fail("broker_config_mismatch", "upstream_base_url/launcher-host")
 
 
 @check("control-directory")
@@ -844,32 +930,62 @@ def _request_document(helper: ModuleType) -> dict[str, object]:
     }
 
 
-@check("sandbox-argv")
-def _check_sandbox_argv(deployment: Deployment) -> None:
-    del deployment
-    helper = _load_helper()
-    document = _request_document(helper)
-    try:
-        request = helper.validate_request(document)
-    except Exception:  # noqa: BLE001 - stable failure only
-        _fail("helper_request_rejected")
-    unit = str(document["unit"])
-    task_dir = TASK_ROOT / unit
-    try:
-        argv = helper.build_systemd_run_argv(
-            request,
-            task_dir=task_dir,
-            runtime_root=RUNTIME_ROOT,
-            broker_socket=CONTROL_SOCKET,
-            workload=WORKLOAD_PATH,
-            stop_timeout_sec=30,
-        )
-    except Exception:  # noqa: BLE001 - stable failure only
-        _fail("helper_argv_failed")
-    if not argv or argv[0] != "/usr/bin/systemd-run":
-        _fail("helper_argv_failed", "systemd-run")
-    properties = set(argv[2:])
-    expected = {
+def _normalize_sandbox_argv(
+    argv: object,
+) -> tuple[str | None, str | None, list[str], tuple[str, ...]]:
+    """Split the fixed helper argv into unit, description, properties, workload.
+
+    Task 2 emits ``--property=<name>=<value>`` entries; comparing the bare
+    ``name=value`` part is what the systemd unit actually receives.  Unknown
+    options or duplicate unit/description entries fail closed.
+    """
+
+    if not isinstance(argv, list) or not argv:
+        _fail("helper_argv_failed", "argv")
+    unit: str | None = None
+    description: str | None = None
+    properties: list[str] = []
+    workload: list[str] = []
+    for index, value in enumerate(argv):
+        if not isinstance(value, str):
+            _fail("helper_argv_failed", "arg-type")
+        if index == 0:
+            if value != "/usr/bin/systemd-run":
+                _fail("helper_argv_failed", "systemd-run")
+            continue
+        if value.startswith("--property="):
+            properties.append(value[len("--property=") :])
+        elif value.startswith("--unit="):
+            if unit is not None:
+                _fail("helper_argv_failed", "duplicate-unit")
+            unit = value[len("--unit=") :]
+        elif value.startswith("--description="):
+            if description is not None:
+                _fail("helper_argv_failed", "duplicate-description")
+            description = value[len("--description=") :]
+        elif value.startswith("--"):
+            _fail("helper_argv_failed", "unexpected-option")
+        else:
+            workload.append(value)
+    return unit, description, properties, tuple(workload)
+
+
+def _expected_sandbox_properties(
+    *,
+    task_dir: Path,
+    runtime_root: Path,
+    control_socket: Path,
+    workload: Path,
+    document: dict[str, object],
+    stop_timeout_sec: int = 30,
+) -> Counter[str]:
+    """Return the exact property multiset Task 2 must emit for the request."""
+
+    task_root = task_dir.parent
+    hidden_roots = [task_root]
+    if control_socket.parent != task_root:
+        hidden_roots.append(control_socket.parent)
+    properties = [
         "DynamicUser=yes",
         "Group=" + SANDBOX_GROUP,
         "ProtectSystem=strict",
@@ -900,38 +1016,124 @@ def _check_sandbox_argv(deployment: Deployment) -> None:
         "ProtectProc=invisible",
         "ProcSubset=pid",
         "InaccessiblePaths=-" + str(AGENTMGR_ETC),
-        "InaccessiblePaths=-" + str(TASK_ROOT),
-        "InaccessiblePaths=-" + str(CONTROL_DIR),
+        "InaccessiblePaths=-/var/lib/agentmgr",
+        "InaccessiblePaths=-/var/lib/postgresql",
+        "InaccessiblePaths=-/srv",
+        "InaccessiblePaths=-/var/lib/docker",
+        "InaccessiblePaths=-/var/lib/containers",
+        "InaccessiblePaths=-/var/lib/containerd",
+        *(f"InaccessiblePaths=-{root}" for root in hidden_roots),
         "UMask=0007",
         "KillMode=control-group",
         "SendSIGKILL=yes",
         "ExitType=cgroup",
-        "TimeoutStopSec=30",
-        "RuntimeMaxSec=60s",
-        "MemoryMax=256M",
-        "CPUQuota=50%",
-        "TasksMax=16",
+        f"TimeoutStopSec={stop_timeout_sec}",
+        f"RuntimeMaxSec={document['runtime_max_sec']}s",
+        f"MemoryMax={document['memory_max_mb']}M",
+        f"CPUQuota={document['cpu_quota_percent']}%",
+        f"TasksMax={document['tasks_max']}",
         "LimitNOFILE=1024",
         "WorkingDirectory=/task",
         "BindPaths=" + str(task_dir) + ":/task",
-        "BindReadOnlyPaths=" + str(RUNTIME_ROOT) + ":/runtime",
-        "BindReadOnlyPaths=" + str(CONTROL_SOCKET) + ":/task/egress.sock",
-        "BindReadOnlyPaths=" + str(WORKLOAD_PATH) + ":/workload.py",
-    }
-    if "--unit=" + unit not in argv:
+        "BindReadOnlyPaths=" + str(runtime_root) + ":/runtime",
+        "BindReadOnlyPaths=" + str(control_socket) + ":/task/egress.sock",
+        "BindReadOnlyPaths=" + str(workload) + ":/workload.py",
+    ]
+    return Counter(properties)
+
+
+def _verify_sandbox_argv(
+    argv: object,
+    *,
+    unit: str,
+    task_dir: Path,
+    runtime_root: Path,
+    control_socket: Path,
+    workload: Path,
+    document: dict[str, object],
+    stop_timeout_sec: int = 30,
+) -> None:
+    """Fail unless ``argv`` is exactly the fixed Task 2 transient-unit argv."""
+
+    normalized_unit, description, properties, workload_argv = _normalize_sandbox_argv(
+        argv
+    )
+    if normalized_unit != unit:
         _fail("helper_argv_failed", "unit")
-    for expected_property in expected:
-        if expected_property not in properties:
-            _fail("helper_argv_failed", expected_property)
+    if description != "agentmgr-hermes-sandbox":
+        _fail("helper_argv_failed", "description")
+
+    task_bind = "BindPaths=" + str(task_dir) + ":/task"
+    allowed_read_only = {
+        "BindReadOnlyPaths=" + str(runtime_root) + ":/runtime",
+        "BindReadOnlyPaths=" + str(control_socket) + ":/task/egress.sock",
+        "BindReadOnlyPaths=" + str(workload) + ":/workload.py",
+    }
     for property_name in properties:
         if property_name.startswith(
             ("User=", "Environment=", "EnvironmentFile=", "ExecStart=")
         ):
             _fail("helper_argv_failed", property_name)
-        if property_name.startswith("BindPaths=") and any(
-            marker in property_name for marker in ("/home/", "/root/", ".hermes")
+        if property_name.startswith("BindPaths=") and property_name != task_bind:
+            _fail("helper_argv_failed", "extra-bind-path")
+        if (
+            property_name.startswith("BindReadOnlyPaths=")
+            and property_name not in allowed_read_only
         ):
-            _fail("helper_argv_failed", "personal bind")
+            _fail("helper_argv_failed", "extra-read-only-bind")
+
+    expected = _expected_sandbox_properties(
+        task_dir=task_dir,
+        runtime_root=runtime_root,
+        control_socket=control_socket,
+        workload=workload,
+        document=document,
+        stop_timeout_sec=stop_timeout_sec,
+    )
+    actual = Counter(properties)
+    if actual != expected:
+        missing = sorted((expected - actual).elements())
+        extra = sorted((actual - expected).elements())
+        _fail(
+            "helper_argv_failed",
+            f"properties missing={missing} extra={extra}",
+        )
+    if workload_argv != ("/usr/bin/python3", "/workload.py"):
+        _fail("helper_argv_failed", "workload-argv")
+
+
+@check("sandbox-argv")
+def _check_sandbox_argv(deployment: Deployment) -> None:
+    del deployment
+    helper = _load_helper()
+    document = _request_document(helper)
+    try:
+        request = helper.validate_request(document)
+    except Exception:  # noqa: BLE001 - stable failure only
+        _fail("helper_request_rejected")
+    unit = str(document["unit"])
+    task_dir = TASK_ROOT / unit
+    try:
+        argv = helper.build_systemd_run_argv(
+            request,
+            task_dir=task_dir,
+            runtime_root=RUNTIME_ROOT,
+            broker_socket=CONTROL_SOCKET,
+            workload=WORKLOAD_PATH,
+            stop_timeout_sec=30,
+        )
+    except Exception:  # noqa: BLE001 - stable failure only
+        _fail("helper_argv_failed")
+    _verify_sandbox_argv(
+        argv,
+        unit=unit,
+        task_dir=task_dir,
+        runtime_root=RUNTIME_ROOT,
+        control_socket=CONTROL_SOCKET,
+        workload=WORKLOAD_PATH,
+        document=document,
+        stop_timeout_sec=30,
+    )
 
     for forbidden in ("ExecStart", "BindPaths", "Environment", "PrivateNetwork"):
         try:

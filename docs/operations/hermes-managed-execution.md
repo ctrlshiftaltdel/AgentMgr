@@ -91,7 +91,9 @@ sudo ops/security/provision_hermes_runtime.sh ...
 - `--install-root`/`--venv` 不能位于个人 home、`/root` 或 `.hermes` 下：broker 单元有 `ProtectHome=yes`，装在 home 下会在运行时不可访问。`--source` 与所有部署目录也不能位于仓库或个人 profile 内。
 - `--adapter-user` 必须已存在；脚本**不会创建**受信适配器账号。脚本会创建 `agentmgr-hermes` sandbox 组、`agentmgr-hermes-adapter` 私有组和专用 broker 用户，并把 adapter 用户加入前两个组。
 - `--runtime-mode copy`（默认）把 `--source` 复制为 root-owned 只读运行时根；`--runtime-mode bind` 立即做只读 bind mount（**不跨重启持久化**，需要部署层自行配置 fstab/systemd mount unit；验证脚本会要求 bind source 与安装记录一致）。
-- 脚本拒绝：非 root 运行、仓库/个人 home/`.hermes` 路径、包含 `profiles`/`auth.json`/`.env`/`sessions`/`gateway.lock` 的 source、非 https 的 provider URL、空/多行 provider key、已存在但 manifest 不匹配的 runtime root（除非 `--refresh-runtime`）。
+- 脚本拒绝：非 root 运行、仓库/个人 home/`.hermes` 路径、source **任意深度**包含 `profiles`/`auth.json`/`.env`/`sessions`/`gateway.lock`/`locks`、source 中的绝对 symlink 或逃逸 root 的相对 symlink、非 https 的 provider URL、URL host/port 与 `--provider-host` 不一致、空/多行 provider key、已存在但 manifest 不匹配的 runtime root（除非 `--refresh-runtime`）、以及固定目录/安装目标是 symlink 或非目录/非常规文件。
+- 固定部署目录（`/etc/agentmgr`、`/var/lib/agentmgr-hermes-*`、`/usr/local/libexec`）会被 lstat 检查；owner/group/mode 不符时会记录并修复，symlink 直接失败。
+- 已存在的 attestation/egress key 会保留并记录“rotation is an explicit operator action”；已存在的 provider key 若与 `--provider-key-file` 不同则失败，必须显式删除后才能轮换。
 - 脚本是幂等的：重复执行为同一组路径安装相同内容；runtime root 用确定性 manifest 哈希（斜杠文件、目录、symlink 目标）比较，不靠 mtime。
 - **脚本不启动任何单元**，也不会触碰个人/默认 Hermes gateway。密钥内容从不打印。
 
@@ -116,8 +118,8 @@ sudo ops/security/verify_hermes_isolation.sh
 | `schema` | 固定 `agentmgr.hermes.managed-cli.v1` |
 | `service_identity_id` | `svc_<正整数>`；启动器解析为 active service principal |
 | `helper_path` | 只能是 `/usr/local/libexec/agentmgr-hermes-exec` |
-| `runtime_root` / `runtime_root_hash` | 只读运行时根与受信 `sha256:<64 hex>` manifest |
-| `task_root` / `control_dir` / `broker_socket` / `revocation_dir` | 固定部署路径；control/socket 必须是 `/var/lib/agentmgr-hermes-control[/egress.sock]` |
+| `runtime_root` / `runtime_root_hash` | 只读运行时根（固定 `/var/lib/agentmgr-hermes-runtime`）与受信 `sha256:<64 hex>` manifest 形式 |
+| `task_root` / `control_dir` / `broker_socket` / `revocation_dir` | 全部固定部署路径（启动器拒绝其他绝对路径）：`/var/lib/agentmgr-hermes-tasks`、`/var/lib/agentmgr-hermes-control`、`.../egress.sock`、`/var/lib/agentmgr-hermes-revoked` |
 | `attestation_key_path` / `egress_token_key_path` / `runtime_attestation_path` | 必须在 `/etc/agentmgr` 下，且三者互不相同 |
 | `evidence_ref` | `evidence:` 前缀的稳定引用；与 attestation 匹配 |
 | `runtime_name` / `runtime_version` | 由 runtime attestation 绑定 |
@@ -127,7 +129,9 @@ sudo ops/security/verify_hermes_isolation.sh
 | `runtime_max_sec` | **至少 9 秒**；上限 86400，同时受 systemd `RuntimeMaxSec` 兜底 |
 | 资源/大小上限 | memory/cpu/tasks/stop timeout/prompt/result/token TTL，均在安全范围内 |
 
-启动器加载时验证：配置文件必须 root-owned（或由调用身份拥有）、非 symlink、非 group/world 可写、非 world-readable；未知字段、内联 secret 字段、错误 helper 路径、错误 control/socket、key 路径不在 `/etc/agentmgr`、模型/worker/limit 越界都 fail closed，错误只报稳定码，不打印路径或值。
+启动器加载时验证：配置文件必须 root-owned、非 symlink、非 group/world 可写、非 world-readable；未知字段、内联 secret 字段、错误 helper 路径、非固定 runtime/task/control/socket/revocation 路径、key 路径不在 `/etc/agentmgr`、模型/worker/limit 越界都 fail closed，错误只报稳定码，不打印路径或值。预检还要求两个 HMAC key 为 root-owned、group 不是 `agentmgr-hermes`、非 group/world 可写，wrapper 为 root-owned 且 group/world 不可写。
+
+启动器只校验配置中的 `runtime_root_hash` **形式**及 attestation 绑定；它不重算目录 manifest。重算与比较由安装脚本和 `verify_hermes_isolation.sh` 完成。
 
 ## 5 启动、停止与运行模式
 
@@ -203,7 +207,7 @@ sudo ops/security/provision_hermes_runtime.sh --rollback --purge-groups
 | 同上 | `config_helper_path_invalid`、`config_control_path_invalid`、`config_key_path_invalid` | 使用固定 wrapper、control socket 与 `/etc/agentmgr` 下的 key |
 | 同上 | `config_runtime_hash_invalid`、`config_model_invalid`、`config_limit_invalid` | 检查 manifest 哈希/模型名/`runtime_max_sec >= 9` 等范围 |
 | 同上 | `attestation_unavailable`、`attestation_invalid` | 检查 `runtime-attestation.json` 是否存在并绑定当前 runtime/evidence |
-| 同上 | `attestation_key_unavailable`、`egress_token_key_unavailable` | 检查 key 文件 owner/mode/大小 |
+| 同上 | `attestation_key_unavailable`、`egress_token_key_unavailable` | 检查 key owner 为 root、group 不是 `agentmgr-hermes`、mode/大小安全 |
 | 同上 | `runtime_root_unavailable`、`task_root_unavailable`、`control_dir_unavailable`、`revocation_dir_unavailable` | 检查安装目录与权限 |
 | 同上 | `helper_unavailable` | 检查 `/usr/local/libexec/agentmgr-hermes-exec` root:root 0755 且 sudoers 已安装 |
 | 同上 | `principal_unbound`、`principal_disabled`、`service_principal_invalid` | 检查 `service_identity_id` 是否存在、active、owner active |
@@ -247,5 +251,5 @@ AGENTMGR_HERMES_LIVE=1 ... \
 - 不新增公开 Managed API、数据库迁移或 Python 依赖。
 - 不修改 #96 的状态机/Grant/lease 语义。
 - 不治理业务工具、PEP、浏览器/Web/MCP/记忆/插件/连接器；这些在 #97 中关闭，不是“已治理”。
-- 不声称多主机、多租户、生产容量、key 轮换或计费流程。
+- 不声称多主机、多租户、生产容量、自动化 key 轮换/配额/计费流程；key 轮换是显式人工操作（删除后重跑安装）。
 - #83 仍负责真实业务工具治理与商业化就绪；Hermes 内执行的工具调用不经过 AgentMgr PEP。

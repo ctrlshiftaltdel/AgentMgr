@@ -259,20 +259,7 @@ import stat
 import sys
 
 root = sys.argv[1]
-forbidden_prefixes = (
-    "/etc/agentmgr",
-    "/home",
-    "/root",
-    "/run",
-    "/srv",
-    "/tmp",
-    "/var/lib/agentmgr",
-    "/var/lib/containerd",
-    "/var/lib/containers",
-    "/var/lib/docker",
-    "/var/lib/postgresql",
-    "/var/tmp",
-)
+profile_markers = {"profiles", "auth.json", ".env", "sessions", "gateway.lock", "locks"}
 
 entries = []
 for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
@@ -283,29 +270,28 @@ for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
             dirnames.remove(name)
             filenames.append(name)
     dirnames.sort()
+    for name in dirnames:
+        if name in profile_markers:
+            raise SystemExit("runtime root contains a personal-profile marker: " + name)
     if rel_dir != ".":
         entries.append(("d", rel_dir, 0, ""))
     for name in sorted(filenames):
+        if name in profile_markers:
+            raise SystemExit("runtime root contains a personal-profile marker: " + name)
         full = os.path.join(dirpath, name)
         rel = os.path.normpath(os.path.join(rel_dir, name)) if rel_dir != "." else name
         info = os.lstat(full)
         if stat.S_ISLNK(info.st_mode):
             target = os.readlink(full)
             if os.path.isabs(target):
-                normalized = os.path.normpath(target)
-                if any(
-                    normalized == prefix or normalized.startswith(prefix + "/")
-                    for prefix in forbidden_prefixes
-                ):
-                    raise SystemExit(
-                        "runtime root symlink escapes to a protected path: " + rel
-                    )
-            else:
-                normalized = os.path.normpath(os.path.join(rel_dir, target))
-                if normalized == ".." or normalized.startswith("../"):
-                    raise SystemExit(
-                        "runtime root symlink escapes the root: " + rel
-                    )
+                raise SystemExit(
+                    "runtime root contains an absolute symlink: " + rel
+                )
+            normalized = os.path.normpath(os.path.join(rel_dir, target))
+            if normalized == ".." or normalized.startswith("../"):
+                raise SystemExit(
+                    "runtime root symlink escapes the root: " + rel
+                )
             entries.append(("l", rel, len(target), target))
             continue
         if not stat.S_ISREG(info.st_mode):
@@ -495,6 +481,44 @@ case "${PROVIDER_BASE_URL}" in
     *) fail "--provider-base-url is invalid" ;;
 esac
 
+# The broker injects the real provider key into this URL.  A token claims
+# --provider-host, so the URL host and port must be exactly the same endpoint.
+if ! python3 - "${PROVIDER_BASE_URL}" "${PROVIDER_HOST}" <<'PY'
+import sys
+from urllib.parse import urlsplit
+
+
+def url_endpoint(value):
+    parsed = urlsplit(value)
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise SystemExit(1)
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise SystemExit(1)
+    try:
+        port = parsed.port or 443
+    except ValueError:
+        raise SystemExit(1)
+    return parsed.hostname, port
+
+
+def provider_endpoint(value):
+    parsed = urlsplit("//" + value)
+    if not parsed.hostname:
+        raise SystemExit(1)
+    try:
+        port = parsed.port or 443
+    except ValueError:
+        raise SystemExit(1)
+    return parsed.hostname, port
+
+
+if url_endpoint(sys.argv[1]) != provider_endpoint(sys.argv[2]):
+    raise SystemExit(1)
+PY
+then
+    fail "--provider-base-url host/port must equal --provider-host"
+fi
+
 require_repo_file "${PROVIDER_KEY_FILE}" "--provider-key-file"
 [ ! -L "${PROVIDER_KEY_FILE}" ] || fail "--provider-key-file must not be a symlink"
 case "${PROVIDER_KEY_FILE}" in
@@ -543,12 +567,50 @@ add_to_group() {
     run usermod -aG "${group}" "${user}"
 }
 
+# ensure_directory PATH OWNER GROUP MODE
+#
+# Fixed deployment directories are fail-closed against symlinks and non-
+# directories, and are repaired to the expected owner/group/mode.  A repair is
+# logged, so a pre-existing world-writable or wrong-owner directory cannot be
+# silently reused by the helper or broker.
 ensure_directory() {
     local path=$1 owner=$2 group=$3 mode=$4
-    if [ -d "${path}" ]; then
+    if [ -L "${path}" ]; then
+        fail "refusing a symlinked directory: ${path}"
+    fi
+    if [ -e "${path}" ]; then
+        [ -d "${path}" ] || fail "not a directory: ${path}"
+        local current_owner current_group current_mode expected_mode
+        current_owner=$(stat -c '%U' "${path}")
+        current_group=$(stat -c '%G' "${path}")
+        current_mode=$(stat -c '%a' "${path}")
+        expected_mode=$(printf '%o' "$((8#${mode}))")
+        if [ "${current_owner}" != "${owner}" ] || \
+            [ "${current_group}" != "${group}" ] || \
+            [ "${current_mode}" != "${expected_mode}" ]; then
+            log "repairing directory ${path} (${current_owner}:${current_group} ${current_mode})"
+            run chown "${owner}:${group}" "${path}"
+            run chmod "${mode}" "${path}"
+        fi
         return 0
     fi
     run install -d -o "${owner}" -g "${group}" -m "${mode}" "${path}"
+}
+
+# install_file SRC DST OWNER GROUP MODE
+#
+# A destination symlink would make `install` write through it, potentially into
+# a personal profile or another host path.  Refuse anything that is not an
+# absent path or a regular file before installing.
+install_file() {
+    local src=$1 dst=$2 owner=$3 group=$4 mode=$5
+    if [ -L "${dst}" ]; then
+        fail "refusing a symlinked install target: ${dst}"
+    fi
+    if [ -e "${dst}" ] && [ ! -f "${dst}" ]; then
+        fail "install target is not a regular file: ${dst}"
+    fi
+    run install -o "${owner}" -g "${group}" -m "${mode}" -- "${src}" "${dst}"
 }
 
 ensure_group "${SANDBOX_GROUP}"
@@ -581,8 +643,14 @@ prepare_runtime_root() {
     if [ "${RUNTIME_MODE}" = "bind" ]; then
         require_cmd mount
         require_cmd mountpoint
-        ensure_directory "${RUNTIME_ROOT}" root root 0555
-        if ! mountpoint -q "${RUNTIME_ROOT}" 2>/dev/null; then
+        if [ -L "${RUNTIME_ROOT}" ]; then
+            fail "refusing a symlinked runtime root: ${RUNTIME_ROOT}"
+        fi
+        if [ "${DRY_RUN}" -eq 1 ]; then
+            log "dry run: would ensure a read-only bind mount of --source"
+        elif ! mountpoint -q "${RUNTIME_ROOT}" 2>/dev/null; then
+            # Repair/create the mount point before mounting over it.
+            ensure_directory "${RUNTIME_ROOT}" root root 0555
             log "bind-mounting the runtime source read-only"
             run mount --bind "${SOURCE}" "${RUNTIME_ROOT}"
             run mount -o remount,bind,ro "${RUNTIME_ROOT}"
@@ -595,10 +663,20 @@ prepare_runtime_root() {
                 run mount -o remount,bind,ro "${RUNTIME_ROOT}"
             fi
         fi
-        installed_hash=$(compute_runtime_hash "${RUNTIME_ROOT}")
-        [ "${installed_hash}" = "${source_hash}" ] || \
-            fail "the bind-mounted runtime root does not match the source manifest"
+        if [ "${DRY_RUN}" -eq 1 ]; then
+            installed_hash="${source_hash}"
+        else
+            installed_hash=$(compute_runtime_hash "${RUNTIME_ROOT}")
+            [ "${installed_hash}" = "${source_hash}" ] || \
+                fail "the bind-mounted runtime root does not match the source manifest"
+        fi
     else
+        if [ -L "${RUNTIME_ROOT}" ]; then
+            fail "refusing a symlinked runtime root: ${RUNTIME_ROOT}"
+        fi
+        if [ -d "${RUNTIME_ROOT}" ] && mountpoint -q "${RUNTIME_ROOT}" 2>/dev/null; then
+            fail "the runtime root is a mount point in copy mode; use --runtime-mode bind or unmount it"
+        fi
         if [ -d "${RUNTIME_ROOT}" ] && [ -n "$(ls -A "${RUNTIME_ROOT}" 2>/dev/null || true)" ]; then
             installed_hash=$(compute_runtime_hash "${RUNTIME_ROOT}")
             if [ "${installed_hash}" != "${source_hash}" ]; then
@@ -612,6 +690,10 @@ prepare_runtime_root() {
         fi
         if [ ! -d "${RUNTIME_ROOT}" ] || [ -z "$(ls -A "${RUNTIME_ROOT}" 2>/dev/null || true)" ]; then
             ensure_directory "${RUNTIME_ROOT}" root root 0755
+            if [ "${DRY_RUN}" -eq 0 ] && \
+                { [ -L "${RUNTIME_ROOT}" ] || [ ! -d "${RUNTIME_ROOT}" ]; }; then
+                fail "the runtime root is not a real directory: ${RUNTIME_ROOT}"
+            fi
             log "copying the runtime source into the read-only runtime root"
             run cp -a --no-preserve=ownership -- "${SOURCE}/." "${RUNTIME_ROOT}/"
         fi
@@ -653,7 +735,12 @@ verify_key_file() {
     mode=$(stat -c '%a' "${path}")
     size=$(stat -c '%s' "${path}")
     [ "${owner}" = "${expected_owner}" ] || fail "key file has the wrong owner: ${path}"
-    [ "${group}" = "${expected_group}" ] || fail "key file has the wrong group: ${path}"
+    if [ "${group}" != "${expected_group}" ]; then
+        # The design also allows a root-only 0400 variant for the HMAC keys.
+        if [ "${mode}" != "400" ] || [ "${group}" != "root" ]; then
+            fail "key file has the wrong group: ${path}"
+        fi
+    fi
     for allowed in "$@"; do
         [ "${mode}" = "${allowed}" ] && break
     done
@@ -665,6 +752,7 @@ verify_key_file() {
 generate_key() {
     local path=$1
     if [ -e "${path}" ]; then
+        log "key ${path} already exists; keeping it (rotation is an explicit operator action)"
         verify_key_file "${path}" root "${ADAPTER_GROUP}" 32 400 440
         return 0
     fi
@@ -705,9 +793,13 @@ fi
 
 if [ -e "${PROVIDER_KEY}" ]; then
     verify_key_file "${PROVIDER_KEY}" root root 1 400
+    if ! cmp -s -- "${PROVIDER_KEY}" "${PROVIDER_KEY_FILE}"; then
+        fail "the existing provider key differs from --provider-key-file; remove ${PROVIDER_KEY} explicitly to rotate it"
+    fi
+    log "provider key already installed; keeping it (rotation is an explicit operator action)"
 else
     log "installing the dedicated provider key (contents are never printed)"
-    run install -o root -g root -m 0400 -- "${PROVIDER_KEY_FILE}" "${PROVIDER_KEY}"
+    install_file "${PROVIDER_KEY_FILE}" "${PROVIDER_KEY}" root root 0400
 fi
 
 # ---------------------------------------------------------------------------
@@ -932,20 +1024,20 @@ visudo -cf "${STAGING}/sudoers" >/dev/null
 # install files and the read-only helper assets
 # ---------------------------------------------------------------------------
 
-install -o root -g root -m 0644 "${INSTALL_ROOT}/ops/security/agentmgr_hermes_exec.py" "${HELPER_PATH}"
-install -o root -g root -m 0755 "${INSTALL_ROOT}/ops/security/agentmgr-hermes-exec" "${WRAPPER_PATH}"
-install -o root -g root -m 0555 "${INSTALL_ROOT}/ops/security/agentmgr_hermes_workload.py" "${WORKLOAD_PATH}"
+install_file "${INSTALL_ROOT}/ops/security/agentmgr_hermes_exec.py" "${HELPER_PATH}" root root 0644
+install_file "${INSTALL_ROOT}/ops/security/agentmgr-hermes-exec" "${WRAPPER_PATH}" root root 0755
+install_file "${INSTALL_ROOT}/ops/security/agentmgr_hermes_workload.py" "${WORKLOAD_PATH}" root root 0555
 
-install -o root -g root -m 0640 "${STAGING}/hermes-exec.json" "${INSTALL_CONFIG}"
-install -o root -g "${ADAPTER_GROUP}" -m 0440 "${STAGING}/managed-cli.json" "${CLI_CONFIG}"
-install -o root -g "${SANDBOX_GROUP}" -m 0440 "${STAGING}/egress-broker.json" "${BROKER_CONFIG}"
-install -o root -g root -m 0640 "${STAGING}/deployment.json" "${DEPLOYMENT_RECORD}"
-install -o root -g root -m 0440 "${STAGING}/sudoers" "${SUDOERS_PATH}"
+install_file "${STAGING}/hermes-exec.json" "${INSTALL_CONFIG}" root root 0640
+install_file "${STAGING}/managed-cli.json" "${CLI_CONFIG}" root "${ADAPTER_GROUP}" 0440
+install_file "${STAGING}/egress-broker.json" "${BROKER_CONFIG}" root "${SANDBOX_GROUP}" 0440
+install_file "${STAGING}/deployment.json" "${DEPLOYMENT_RECORD}" root root 0640
+install_file "${STAGING}/sudoers" "${SUDOERS_PATH}" root root 0440
 visudo -c >/dev/null
-install -o root -g root -m 0644 "${STAGING}/agentmgr-hermes-egress.service" "${UNIT_PATH}"
+install_file "${STAGING}/agentmgr-hermes-egress.service" "${UNIT_PATH}" root root 0644
 
 printf '%s\n' "${RUNTIME_ROOT_HASH}" > "${STAGING}/runtime-root.hash"
-install -o root -g root -m 0444 "${STAGING}/runtime-root.hash" "${RUNTIME_HASH_FILE}"
+install_file "${STAGING}/runtime-root.hash" "${RUNTIME_HASH_FILE}" root root 0444
 
 # The runtime-attestation record is the provisioning snapshot the launcher
 # preflight checks; the live helper issue remains the verification authority.
@@ -975,7 +1067,7 @@ try:
 finally:
     os.close(descriptor)
 PY
-install -o root -g "${ADAPTER_GROUP}" -m 0440 "${STAGING}/runtime-attestation.json" "${RUNTIME_ATTESTATION}"
+install_file "${STAGING}/runtime-attestation.json" "${RUNTIME_ATTESTATION}" root "${ADAPTER_GROUP}" 0440
 
 # The attestation snapshot carries broker health at provisioning time; the
 # launcher only checks static bindings, so a not-yet-started broker does not

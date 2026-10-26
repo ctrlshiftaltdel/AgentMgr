@@ -263,7 +263,15 @@ The script:
 - prepares `/var/lib/agentmgr-hermes-runtime` from `--source` (`copy` default or
   a read-only `bind`) and records a deterministic `sha256:` manifest hash; it
   refuses a source with `profiles`, `auth.json`, `.env`, `sessions`,
-  `gateway.lock` or `locks`, and refuses home/repository/personal-profile paths;
+  `gateway.lock` or `locks` at **any depth**, any absolute symlink or relative
+  symlink escaping the root, and home/repository/personal-profile paths;
+- refuses symlinked or non-directory fixed paths (repairing owner/group/mode on
+  a real directory) and symlinked install targets; never copies through a
+  pre-existing runtime-root symlink or mount;
+- requires the `https://` provider URL host/port to exactly equal
+  `--provider-host`, because the broker injects the real key into that URL;
+- keeps existing HMAC keys and logs that rotation is an explicit operator
+  action; refuses to replace a different existing provider key;
 - installs the helper, wrapper, workload, sudoers rule, broker unit, helper
   install config, launcher config, broker config and deployment record;
 - generates the attestation and egress-token HMAC keys (root:adapter-private
@@ -284,9 +292,12 @@ sudo ops/security/verify_hermes_isolation.sh
 `verify_hermes_isolation.sh` (root, read-only) checks installed hashes and
 modes, the exact sudoers rule, group memberships, the runtime manifest hash
 against the install/launcher/broker configs, the task/control/revocation
-directories, the broker socket, key permissions, the absence of personal
-profiles/bind mounts, and the installed helper's fixed `systemd-run` argv. It
-exits non-zero on any mismatch and starts no task unit.
+directories, the broker socket, key permissions/ownership, the absence of
+personal profiles/bind mounts, the provider URL host/port against the claimed
+provider host, and the installed helper's full normalized `systemd-run` argv
+(including every `InaccessiblePaths`/`BindPaths`/`BindReadOnlyPaths` property
+and the fixed workload argv). It exits non-zero on any mismatch and starts no
+task unit.
 
 ### Rollback
 

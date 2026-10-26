@@ -85,9 +85,14 @@ def _layout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     monkeypatch.setattr(cli, "ATTESTATION_KEY_ROOT", agentmgr_etc)
     monkeypatch.setattr(cli, "CONTROL_DIR", control)
     monkeypatch.setattr(cli, "BROKER_SOCKET", control / "egress.sock")
-    # The trusted config is root-owned in production; the unprivileged test
-    # fixture owns its file instead (same seam as the root-helper tests).
+    monkeypatch.setattr(cli, "RUNTIME_ROOT", runtime)
+    monkeypatch.setattr(cli, "TASK_ROOT", tasks)
+    monkeypatch.setattr(cli, "REVOCATION_DIR", revoked)
+    # The trusted config and key files are root-owned in production; the
+    # unprivileged test fixture owns them instead (same seam as the helper).
     monkeypatch.setattr(cli, "CONFIG_OWNER_UID", os.geteuid())
+    monkeypatch.setattr(cli, "KEY_OWNER_UID", os.geteuid())
+    monkeypatch.setattr(cli, "HELPER_OWNER_UID", os.geteuid())
 
     layout = SimpleNamespace(
         root=tmp_path,
@@ -138,12 +143,12 @@ def _config_document(
         "schema": cli.CONFIG_SCHEMA,
         "service_identity_id": "svc_1",
         "helper_path": str(cli.SUDOERS_WRAPPER),
-        "runtime_root": str(layout.runtime),
+        "runtime_root": str(cli.RUNTIME_ROOT),
         "runtime_root_hash": RUNTIME_ROOT_HASH,
-        "task_root": str(layout.tasks),
-        "control_dir": str(layout.control),
+        "task_root": str(cli.TASK_ROOT),
+        "control_dir": str(cli.CONTROL_DIR),
         "broker_socket": str(cli.BROKER_SOCKET),
-        "revocation_dir": str(layout.revoked),
+        "revocation_dir": str(cli.REVOCATION_DIR),
         "attestation_key_path": str(layout.attestation_key),
         "egress_token_key_path": str(layout.egress_key),
         "runtime_attestation_path": str(layout.attestation),
@@ -192,13 +197,14 @@ def test_load_config_accepts_the_trusted_document(layout):
 
     assert isinstance(config, HermesManagedConfig)
     assert config.helper_path == cli.SUDOERS_WRAPPER
-    assert config.runtime_root == layout.runtime
+    assert config.runtime_root == cli.RUNTIME_ROOT
     assert config.runtime_root_hash == RUNTIME_ROOT_HASH
-    assert config.task_root == layout.tasks
+    assert config.task_root == cli.TASK_ROOT
     assert config.broker_socket == cli.BROKER_SOCKET
     assert config.attestation_key_path == layout.attestation_key
     assert config.egress_token_key_path == layout.egress_key
     assert config.runtime_attestation_path == layout.attestation
+    assert config.revocation_dir == cli.REVOCATION_DIR
     assert config.evidence_ref == EVIDENCE_REF
     assert config.model_name == "test-model"
     assert config.egress_provider_host == "provider.example"
@@ -268,7 +274,10 @@ def test_load_config_rejects_malformed_json_without_echoing_it(layout):
         ({"runtime_root_hash": "sha256:" + "A" * 64}, "config_runtime_hash_invalid"),
         ({"runtime_root_hash": "not-a-digest"}, "config_runtime_hash_invalid"),
         ({"runtime_root": "relative/runtime"}, "config_unsafe_path"),
+        ({"runtime_root": "/var/lib/other-hermes-runtime"}, "config_unsafe_path"),
         ({"task_root": str(Path("/") / ".." / "tasks")}, "config_unsafe_path"),
+        ({"task_root": "/var/lib/other-hermes-tasks"}, "config_unsafe_path"),
+        ({"revocation_dir": "/var/lib/other-hermes-revoked"}, "config_unsafe_path"),
         ({"control_dir": "/var/lib/other-control"}, "config_control_path_invalid"),
         (
             {"broker_socket": "/run/agentmgr-hermes-control/egress.sock"},
@@ -526,7 +535,7 @@ def test_once_calls_run_once_with_the_trusted_config(layout, capsys):
     assert calls == ["run_once"]
     assert len(seen) == 1
     assert isinstance(seen[0], HermesManagedConfig)
-    assert seen[0].runtime_root == layout.runtime
+    assert seen[0].runtime_root == cli.RUNTIME_ROOT
     captured = capsys.readouterr()
     assert captured.out == "idle\n"
     assert captured.err == ""
@@ -658,11 +667,29 @@ def _load_verifier():
     return module
 
 
-def test_runtime_manifest_hash_matches_the_provisioning_script(tmp_path):
+def _provisioning_python_block(needle: str) -> str:
     import re
+
+    source = _operations_script("provision_hermes_runtime.sh").read_text(encoding="utf-8")
+    for block in re.findall(r"<<'PY'\n(.*?)\nPY\n", source, re.S):
+        if needle in block:
+            return block
+    raise AssertionError(f"no provisioning block contains {needle!r}")
+
+
+def _run_provisioning_block(block: str, *args: str):
     import subprocess
     import sys
 
+    return subprocess.run(
+        [sys.executable, "-", *args],
+        input=block,
+        text=True,
+        capture_output=True,
+    )
+
+
+def test_runtime_manifest_hash_matches_the_provisioning_script(tmp_path):
     verifier = _load_verifier()
     root = tmp_path / "runtime"
     (root / "bin").mkdir(parents=True)
@@ -671,32 +698,183 @@ def test_runtime_manifest_hash_matches_the_provisioning_script(tmp_path):
     (root / "README").write_text("runtime\n", encoding="utf-8")
     (root / "link").symlink_to("README")
 
-    source = _operations_script("provision_hermes_runtime.sh").read_text(encoding="utf-8")
-    block = re.findall(r"<<'PY'\n(.*?)\nPY\n", source, re.S)[0]
-    completed = subprocess.run(
-        [sys.executable, "-", str(root)],
-        input=block,
-        text=True,
-        capture_output=True,
+    completed = _run_provisioning_block(
+        _provisioning_python_block("profile_markers"), str(root)
     )
     assert completed.returncode == 0, completed.stderr
     assert verifier._runtime_manifest(root) == completed.stdout.strip()
 
 
-def test_verifier_rejects_a_runtime_symlink_escape(tmp_path):
+def test_nested_profile_marker_is_rejected_everywhere(tmp_path):
     verifier = _load_verifier()
     root = tmp_path / "runtime"
-    root.mkdir()
-    (root / ".env").write_text("canary\n", encoding="utf-8")
-    assert verifier._profile_marker(root) == ".env"
+    (root / "lib" / "hermes").mkdir(parents=True)
+    (root / "lib" / "hermes" / ".env").write_text("canary\n", encoding="utf-8")
 
-    (root / "escape").symlink_to("/home/<user>/.hermes/profile")
+    assert verifier._profile_marker(root) == "lib/hermes/.env"
     try:
         verifier._runtime_manifest(root)
     except verifier.VerificationError as exc:
-        assert exc.code == "runtime_root_symlink_escape"
+        assert exc.code == "runtime_root_profile_marker"
     else:  # pragma: no cover - the assertion above is the expected path
-        raise AssertionError("a personal-profile symlink must be rejected")
+        raise AssertionError("a nested profile marker must be rejected")
+
+    completed = _run_provisioning_block(
+        _provisioning_python_block("profile_markers"), str(root)
+    )
+    assert completed.returncode != 0
+    assert "personal-profile marker" in completed.stderr
+
+
+def test_absolute_and_escaping_symlinks_are_rejected(tmp_path):
+    verifier = _load_verifier()
+
+    absolute = tmp_path / "absolute"
+    absolute.mkdir()
+    (absolute / "python").symlink_to("/usr/bin/python3")
+    try:
+        verifier._runtime_manifest(absolute)
+    except verifier.VerificationError as exc:
+        assert exc.code == "runtime_root_symlink_escape"
+    else:  # pragma: no cover
+        raise AssertionError("an absolute symlink must be rejected")
+    completed = _run_provisioning_block(
+        _provisioning_python_block("profile_markers"), str(absolute)
+    )
+    assert completed.returncode != 0
+    assert "absolute symlink" in completed.stderr
+
+    escaping = tmp_path / "escaping"
+    escaping.mkdir()
+    (escaping / "up").symlink_to("../outside")
+    try:
+        verifier._runtime_manifest(escaping)
+    except verifier.VerificationError as exc:
+        assert exc.code == "runtime_root_symlink_escape"
+    else:  # pragma: no cover
+        raise AssertionError("an escaping relative symlink must be rejected")
+
+
+def test_provisioning_provider_host_must_match_the_url():
+    block = _provisioning_python_block("url_endpoint")
+
+    matching = _run_provisioning_block(
+        block, "https://provider.example", "provider.example"
+    )
+    assert matching.returncode == 0, matching.stderr
+
+    host_mismatch = _run_provisioning_block(
+        block, "https://other.example", "provider.example"
+    )
+    assert host_mismatch.returncode != 0
+
+    port_mismatch = _run_provisioning_block(
+        block, "https://provider.example:8443", "provider.example"
+    )
+    assert port_mismatch.returncode != 0
+
+    with_port = _run_provisioning_block(
+        block, "https://provider.example:8443", "provider.example:8443"
+    )
+    assert with_port.returncode == 0, with_port.stderr
+
+
+def test_verifier_provider_target_requires_an_exact_host_and_port():
+    verifier = _load_verifier()
+
+    assert verifier._provider_target_matches(
+        "https://provider.example/v1", "provider.example"
+    )
+    assert not verifier._provider_target_matches(
+        "https://other.example/v1", "provider.example"
+    )
+    assert not verifier._provider_target_matches(
+        "https://provider.example:8443/v1", "provider.example"
+    )
+    assert verifier._provider_target_matches(
+        "https://provider.example:8443/v1", "provider.example:8443"
+    )
+    assert not verifier._provider_target_matches(
+        "http://provider.example/v1", "provider.example"
+    )
+
+
+def _load_task2_helper():
+    import importlib.util
+    import sys
+
+    path = _operations_script("agentmgr_hermes_exec.py")
+    spec = importlib.util.spec_from_file_location("agentmgr_hermes_exec_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_verifier_accepts_the_real_task2_argv_and_rejects_tampering():
+    verifier = _load_verifier()
+    helper = _load_task2_helper()
+    document = verifier._request_document(helper)
+    request = helper.validate_request(document)
+    unit = str(document["unit"])
+    task_dir = verifier.TASK_ROOT / unit
+    argv = helper.build_systemd_run_argv(
+        request,
+        task_dir=task_dir,
+        runtime_root=verifier.RUNTIME_ROOT,
+        broker_socket=verifier.CONTROL_SOCKET,
+        workload=verifier.WORKLOAD_PATH,
+        stop_timeout_sec=30,
+    )
+
+    def verify(candidate):
+        verifier._verify_sandbox_argv(
+            candidate,
+            unit=unit,
+            task_dir=task_dir,
+            runtime_root=verifier.RUNTIME_ROOT,
+            control_socket=verifier.CONTROL_SOCKET,
+            workload=verifier.WORKLOAD_PATH,
+            document=document,
+            stop_timeout_sec=30,
+        )
+
+    verify(argv)
+
+    def failure_code(candidate: list[str]) -> str:
+        try:
+            verify(candidate)
+        except verifier.VerificationError as exc:
+            return exc.code
+        raise AssertionError("tampered argv must fail verification")
+
+    changed = list(argv)
+    index = changed.index("--property=DynamicUser=yes")
+    changed[index] = "--property=DynamicUser=no"
+    assert failure_code(changed) == "helper_argv_failed"
+
+    missing = [value for value in argv if value != "--property=PrivateDevices=yes"]
+    assert failure_code(missing) == "helper_argv_failed"
+
+    assert failure_code([*argv, "--property=User=root"]) == "helper_argv_failed"
+    assert (
+        failure_code([*argv, "--property=BindPaths=/home/<user>:/task"])
+        == "helper_argv_failed"
+    )
+    assert (
+        failure_code(
+            [*argv, "--property=BindReadOnlyPaths=/home/<user>:/extra"]
+        )
+        == "helper_argv_failed"
+    )
+    assert failure_code([*argv, "/bin/sh"]) == "helper_argv_failed"
+    assert (
+        failure_code(
+            [value for value in argv if not value.startswith("--unit=")]
+        )
+        == "helper_argv_failed"
+    )
 
 
 def test_build_runner_wires_the_managed_adapter_and_dispatcher(layout, monkeypatch):
@@ -756,3 +934,82 @@ def test_build_runner_wires_the_managed_adapter_and_dispatcher(layout, monkeypat
     assert dispatcher_config.worker_id == "worker-1"
     assert dispatcher_config.lease_seconds == 60
     assert captured["closed"] is True
+
+
+def test_deployment_owner_defaults_are_root():
+    assert cli.CONFIG_OWNER_UID == 0
+    assert cli.KEY_OWNER_UID == 0
+    assert cli.HELPER_OWNER_UID == 0
+
+
+def test_preflight_rejects_a_non_root_key(layout, capsys, monkeypatch):
+    path = _write_config(layout)
+    monkeypatch.setattr(cli, "KEY_OWNER_UID", os.geteuid() + 1)
+
+    assert cli.main(["--once", "--config", str(path)]) == 2
+    err = capsys.readouterr().err
+    assert "attestation_key_unavailable" in err
+    assert str(layout.attestation_key) not in err
+
+
+def test_preflight_rejects_a_sandbox_group_key(layout, capsys, monkeypatch):
+    path = _write_config(layout)
+    monkeypatch.setattr(
+        cli, "_sandbox_gid", lambda: layout.attestation_key.stat().st_gid
+    )
+
+    assert cli.main(["--once", "--config", str(path)]) == 2
+    err = capsys.readouterr().err
+    assert "attestation_key_unavailable" in err
+
+
+def test_helper_check_rejects_group_or_world_writable_wrapper(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "HELPER_OWNER_UID", os.geteuid())
+    wrapper = tmp_path / "agentmgr-hermes-exec"
+    wrapper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+    config = SimpleNamespace(helper_path=wrapper)
+
+    assert cli._helper_is_executable(config) is True
+
+    wrapper.chmod(0o775)
+    assert cli._helper_is_executable(config) is False
+
+    wrapper.chmod(0o757)
+    assert cli._helper_is_executable(config) is False
+
+
+def test_provisioning_fails_closed_and_logs_key_rotation():
+    source = _operations_script("provision_hermes_runtime.sh").read_text(encoding="utf-8")
+
+    # Fixed directories/targets are never followed through a symlink, and an
+    # existing directory is repaired to the expected owner/group/mode.
+    assert "refusing a symlinked directory" in source
+    assert "repairing directory" in source
+    assert "refusing a symlinked install target" in source
+    assert 'if [ -L "${RUNTIME_ROOT}" ]' in source
+    assert "the runtime root is a mount point in copy mode" in source
+
+    # Bind-mode dry-run must not try to hash an unmounted empty root.
+    assert 'installed_hash="${source_hash}"' in source
+
+    # Key rotation is explicit; an existing different provider key is refused.
+    assert "rotation is an explicit operator action" in source
+    assert "existing provider key differs" in source
+
+
+def test_verifier_registers_each_check_once():
+    verifier = _load_verifier()
+    names = [name for name, _ in verifier.CHECKS]
+    assert len(names) == len(set(names))
+    assert {
+        "deployment-record",
+        "runtime-root-hash",
+        "runtime-root-content",
+        "runtime-mounts",
+        "broker-config",
+        "broker-unit",
+        "key-files",
+        "sandbox-argv",
+    } <= set(names)
+    assert dict(verifier.CHECKS)["sandbox-argv"].__name__ == "_check_sandbox_argv"

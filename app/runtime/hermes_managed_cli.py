@@ -30,6 +30,7 @@ prompt, token, key, task payload and runtime paths never reach stdout/stderr.
 from __future__ import annotations
 
 import argparse
+import grp
 import json
 import os
 import re
@@ -67,9 +68,14 @@ __all__ = [
     "CONFIG_OWNER_UID",
     "CONFIG_SCHEMA",
     "CONTROL_DIR",
+    "HELPER_OWNER_UID",
     "HermesCliError",
+    "KEY_OWNER_UID",
     "LauncherConfig",
+    "REVOCATION_DIR",
+    "RUNTIME_ROOT",
     "SUDOERS_WRAPPER",
+    "TASK_ROOT",
     "load_config",
     "load_launcher_config",
     "main",
@@ -96,11 +102,24 @@ ATTESTATION_KEY_ROOT = Path("/etc/agentmgr")
 #: never changes it.
 CONFIG_OWNER_UID = 0
 
+#: The fixed deployment roots.  The launcher accepts no other absolute path for
+#: any of them: a task root, runtime root, revocation store or control socket
+#: that differs from provisioning is a deployment error, not an operator choice.
+RUNTIME_ROOT = Path("/var/lib/agentmgr-hermes-runtime")
+TASK_ROOT = Path("/var/lib/agentmgr-hermes-tasks")
+REVOCATION_DIR = Path("/var/lib/agentmgr-hermes-revoked")
+
 #: Host-visible broker control directory and socket (design §9.1).  The socket
 #: cannot live under ``/run``, ``/tmp`` or ``/var/tmp`` because a task unit
 #: replaces ``/run`` and ``/tmp`` and cannot bind a source from them.
 CONTROL_DIR = Path("/var/lib/agentmgr-hermes-control")
 BROKER_SOCKET = CONTROL_DIR / "egress.sock"
+
+#: Ownership seams for the unprivileged unit-test fixture.  Production requires
+#: a root-owned sudoers wrapper and root-owned HMAC key files; the fixture moves
+#: these to its own uid exactly like the root-helper tests.
+HELPER_OWNER_UID = 0
+KEY_OWNER_UID = 0
 
 #: Fixed local loopback proxy template rendered into the per-task profile.
 _DEFAULT_PROXY_TEMPLATE = "http://127.0.0.1:{port}/v1"
@@ -440,6 +459,12 @@ def load_launcher_config(path: Path) -> LauncherConfig:
     runtime_root = _safe_path(document["runtime_root"], "config_unsafe_path")
     task_root = _safe_path(document["task_root"], "config_unsafe_path")
     revocation_dir = _safe_path(document["revocation_dir"], "config_unsafe_path")
+    if (
+        runtime_root != RUNTIME_ROOT
+        or task_root != TASK_ROOT
+        or revocation_dir != REVOCATION_DIR
+    ):
+        raise HermesCliError("config_unsafe_path")
 
     runtime_root_hash = document["runtime_root_hash"]
     if (
@@ -524,9 +549,8 @@ def load_launcher_config(path: Path) -> LauncherConfig:
     ):
         raise HermesCliError("config_path_prefix_invalid")
 
-    # Directory topology: the runtime root is read-only host code, the task and
-    # revocation roots are writable state, and the control directory is the
-    # broker's host-visible state.  They must never nest inside each other.
+    # The four fixed roots must remain distinct even if the constants are
+    # changed together (defence in depth for a future deployment layout).
     for value in (task_root, CONTROL_DIR, revocation_dir):
         if _overlaps(runtime_root, value):
             raise HermesCliError("config_unsafe_path")
@@ -634,12 +658,30 @@ def _require_directory(path: Path, code: str) -> None:
         raise HermesCliError(code)
 
 
+def _sandbox_gid() -> int | None:
+    """Return the fixed sandbox group's gid, or ``None`` when it is absent."""
+
+    try:
+        return grp.getgrnam("agentmgr-hermes").gr_gid
+    except KeyError:
+        return None
+
+
 def _require_key_file(path: Path, code: str) -> None:
     try:
         info = os.lstat(path)
     except OSError:
         raise HermesCliError(code) from None
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise HermesCliError(code)
+    if info.st_uid != KEY_OWNER_UID:
+        # The HMAC keys are root-owned; the adapter reads them through its
+        # private group, never by owning them.
+        raise HermesCliError(code)
+    sandbox_gid = _sandbox_gid()
+    if sandbox_gid is not None and info.st_gid == sandbox_gid:
+        # A key readable by the sandbox group would let every task forge
+        # attestations or egress tokens.
         raise HermesCliError(code)
     mode = stat.S_IMODE(info.st_mode)
     if mode & 0o007 or mode & 0o020:
@@ -652,7 +694,12 @@ def _require_key_file(path: Path, code: str) -> None:
 
 
 def _helper_is_executable(config: HermesManagedConfig) -> bool:
-    """Return whether the fixed root-owned sudoers wrapper is installed."""
+    """Return whether the fixed root-owned sudoers wrapper is installed.
+
+    A group- or world-writable wrapper could be replaced by the adapter (or any
+    local process in that group) and would make the sudoers rule meaningless, so
+    it fails closed even when it is executable.
+    """
 
     path = Path(config.helper_path)
     try:
@@ -661,7 +708,8 @@ def _helper_is_executable(config: HermesManagedConfig) -> bool:
         return False
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         return False
-    if info.st_uid != 0 or not stat.S_IMODE(info.st_mode) & 0o111:
+    mode = stat.S_IMODE(info.st_mode)
+    if info.st_uid != HELPER_OWNER_UID or mode & 0o022 or not mode & 0o111:
         return False
     return os.access(path, os.X_OK)
 
