@@ -853,7 +853,7 @@ export AGENTMGR_PROVISION_SOURCE="${SOURCE}"
 export AGENTMGR_PROVISION_REPO_ROOT="${REPO_ROOT}"
 export AGENTMGR_PROVISION_DRY_RUN="${DRY_RUN}"
 
-python3 "${PY_ARGS[@]}" <<'PY'
+python3 - "${PY_ARGS[@]}" <<'PY'
 import datetime
 import json
 import os

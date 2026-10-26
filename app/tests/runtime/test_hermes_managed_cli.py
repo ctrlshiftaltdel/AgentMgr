@@ -1013,3 +1013,98 @@ def test_verifier_registers_each_check_once():
         "sandbox-argv",
     } <= set(names)
     assert dict(verifier.CHECKS)["sandbox-argv"].__name__ == "_check_sandbox_argv"
+
+
+def test_provisioner_renderer_accepts_staging_arguments(tmp_path, monkeypatch):
+    """Regression: the renderer must be invoked with script arguments.
+
+    ``python3 --staging DIR`` treats ``--staging`` as a Python option and exits
+    with ``unknown option`` before writing anything.  The provisioner must use
+    ``python3 - --staging DIR`` so ``--staging`` reaches the script.
+    """
+
+    import subprocess
+    import sys
+
+    monkeypatch.setattr(cli, "CONFIG_OWNER_UID", os.geteuid())
+    staging = tmp_path / "staging"
+    staging.mkdir()
+
+    block = _provisioning_python_block("--staging")
+    values = {
+        "INSTALL_ROOT": str(Path(cli.__file__).resolve().parents[2]),
+        "REPO_ROOT": str(Path(cli.__file__).resolve().parents[2]),
+        "VENV": "/opt/agentmgr/venv/bin",
+        "SANDBOX_GROUP": "agentmgr-hermes",
+        "ADAPTER_GROUP": "agentmgr-hermes-adapter",
+        "ADAPTER_USER": "agentmgr-adapter",
+        "BROKER_USER": "agentmgr-hermes-broker",
+        "RUNTIME_ROOT": "/var/lib/agentmgr-hermes-runtime",
+        "RUNTIME_ROOT_HASH": "sha256:" + "1" * 64,
+        "TASK_ROOT": "/var/lib/agentmgr-hermes-tasks",
+        "CONTROL_DIR": "/var/lib/agentmgr-hermes-control",
+        "CONTROL_SOCKET": "/var/lib/agentmgr-hermes-control/egress.sock",
+        "REVOCATION_DIR": "/var/lib/agentmgr-hermes-revoked",
+        "INSTALL_CONFIG": "/etc/agentmgr/hermes-exec.json",
+        "HELPER_PATH": "/usr/local/libexec/agentmgr_hermes_exec.py",
+        "WORKLOAD_PATH": "/usr/local/libexec/agentmgr_hermes_workload.py",
+        "ATTESTATION_KEY": "/etc/agentmgr/hermes/attestation-key",
+        "EGRESS_TOKEN_KEY": "/etc/agentmgr/hermes/egress-token-key",
+        "PROVIDER_KEY": "/etc/agentmgr/hermes/provider-key",
+        "RUNTIME_ATTESTATION": "/etc/agentmgr/hermes/runtime-attestation.json",
+        "CLI_CONFIG": "/etc/agentmgr/hermes/managed-cli.json",
+        "BROKER_CONFIG": "/etc/agentmgr/hermes/egress-broker.json",
+        "BROKER_CREDENTIAL_PREFIX": (
+            "/run/credentials/agentmgr-hermes-egress.service"
+        ),
+        "DEPLOYMENT_RECORD": "/etc/agentmgr/hermes/deployment.json",
+        "SUDOERS_PATH": "/etc/sudoers.d/agentmgr-hermes",
+        "UNIT_PATH": "/etc/systemd/system/agentmgr-hermes-egress.service",
+        "WRAPPER_PATH": "/usr/local/libexec/agentmgr-hermes-exec",
+        "SERVICE_IDENTITY_ID": "svc_1",
+        "WORKER_ID": "hermes-managed-1",
+        "RUNTIME_MAX_SEC": "900",
+        "RUNTIME_NAME": "hermes",
+        "RUNTIME_VERSION": "0.22.1",
+        "MODEL": "test-model",
+        "PROVIDER_HOST": "provider.example",
+        "PROVIDER_BASE_URL": "https://provider.example",
+        "EVIDENCE_REF": "evidence:hermes:managed:test-0001",
+        "RUNTIME_MODE": "copy",
+        "SOURCE": "/opt/hermes-runtime",
+        "DRY_RUN": "0",
+    }
+    env = os.environ.copy()
+    env.update(
+        {
+            "AGENTMGR_PROVISION_" + name: value
+            for name, value in values.items()
+        }
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-", "--staging", str(staging)],
+        input=block,
+        text=True,
+        env=env,
+        capture_output=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "unknown option" not in completed.stderr
+    assert {
+        "hermes-exec.json",
+        "managed-cli.json",
+        "egress-broker.json",
+        "deployment.json",
+        "sudoers",
+        "agentmgr-hermes-egress.service",
+    } <= {path.name for path in staging.iterdir()}
+
+    launcher = cli.load_launcher_config(staging / "managed-cli.json")
+    assert launcher.service_identity_id == "svc_1"
+    assert launcher.managed.helper_path == cli.SUDOERS_WRAPPER
+    assert launcher.managed.runtime_root == cli.RUNTIME_ROOT
+    assert launcher.managed.task_root == cli.TASK_ROOT
+    assert launcher.managed.revocation_dir == cli.REVOCATION_DIR
+    assert launcher.managed.broker_socket == cli.BROKER_SOCKET
