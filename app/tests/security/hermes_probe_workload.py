@@ -11,9 +11,30 @@ to the task directory, and then waits for a release file so the caller can read
 ``systemctl show`` *while the unit is still active*.  It never creates, reads or
 modifies ``out/result.txt`` and never touches a real runtime.
 
+Denial oracles
+--------------
+
+Every denied path carries the observation that *proves* the denial kind, so a
+bare permission error cannot be mistaken for isolation:
+
+``permission``
+    Ordinary DAC denial (``EACCES``) with no inaccessible overmount on the path
+    or an ancestor.  Used only for ``/etc/shadow`` as a permission baseline.
+
+``hidden``
+    The path is an inaccessible overmount (mode ``0000``, uid 0 -- what systemd's
+    ``InaccessiblePaths=``/``ProtectHome=yes`` mount over a target) or is
+    unreachable because such an overmount sits on an ancestor.  Reported as
+    ``hidden`` with ``mask``/``ancestor_mask``.  ``ENOENT`` is also reported as
+    ``absent``; the caller decides whether that is the expected proof.
+
+``absent``
+    ``ENOENT`` because the path lives on a filesystem the unit replaced (private
+    ``/run`` tmpfs).  This is the expected observation for ``/run/*`` oracles.
+
 Input (written by the test into the task directory, the only writable area)::
 
-    /task/probe-config.json    the checklist: paths, labels, external target
+    /task/probe-config.json    extra oracles, external target, output names
     /task/probe.release        created by the test to let the probe exit
 
 Output::
@@ -31,6 +52,7 @@ unit runs it with ``/usr/bin/python3 /workload.py`` like the production workload
 from __future__ import annotations
 
 import errno
+import ipaddress
 import json
 import os
 import socket
@@ -40,34 +62,37 @@ import time
 from pathlib import Path
 
 __all__ = [
-    "DEFAULT_DENIED_PATHS",
+    "DEFAULT_DENIED",
+    "ORACLE_KINDS",
     "PROBE_VERSION",
     "collect_report",
-    "probe_denied_path",
+    "probe_denied",
     "probe_external",
     "probe_loopback",
     "probe_task_dir_write",
 ]
 
-PROBE_VERSION = 1
+PROBE_VERSION = 2
 
-#: Fixed host paths no task unit may reach.  Labels are generic and stable; the
-#: values exist only in the task directory configuration, never in the report.
-DEFAULT_DENIED_PATHS: dict[str, str] = {
-    "etc_shadow": "/etc/shadow",
-    "host_home": "/home",
-    "postgresql_data": "/var/lib/postgresql",
-    "host_systemd_run": "/run/systemd",
-    "host_dbus": "/run/dbus",
-    "docker_socket": "/var/run/docker.sock",
-    "containerd_socket": "/run/containerd/containerd.sock",
+#: Fixed denial oracles: label -> (host path, expected observation).  The test
+#: pre-checks each path on the host and supplies its own dynamic labels.
+DEFAULT_DENIED: dict[str, tuple[str, str]] = {
+    "etc_shadow": ("/etc/shadow", "permission"),
+    "host_home": ("/home", "hidden"),
+    "postgresql_data": ("/var/lib/postgresql", "hidden"),
+    "host_systemd_run": ("/run/systemd", "absent"),
+    "host_dbus": ("/run/dbus", "absent"),
+    "docker_socket": ("/var/run/docker.sock", "absent"),
+    "containerd_socket": ("/run/containerd/containerd.sock", "absent"),
 }
+
+ORACLE_KINDS = frozenset({"permission", "hidden", "absent"})
 
 DEFAULT_TASK_DIR = Path("/task")
 CONFIG_NAME = "probe-config.json"
 DEFAULT_OUT_NAME = "probe.json"
 DEFAULT_RELEASE_NAME = "probe.release"
-DEFAULT_EXTERNAL = ("example.com", 443)
+DEFAULT_EXTERNAL = ("203.0.113.1", 443)
 
 SOCKET_TIMEOUT_SECONDS = 5.0
 LINGER_POLL_SECONDS = 0.2
@@ -93,49 +118,94 @@ def _error_detail(error: OSError) -> str:
     return type(error).__name__
 
 
+def _is_mask(info: os.stat_result) -> bool:
+    """True for a systemd inaccessible overmount (mode 0000, owned by root)."""
+
+    return stat.S_IMODE(info.st_mode) == 0 and info.st_uid == 0
+
+
+def _hidden_by_mask(path: str) -> bool:
+    """True when an inaccessible overmount sits on the path or an ancestor."""
+
+    for candidate in (Path(path), *Path(path).parents):
+        try:
+            info = os.lstat(candidate)
+        except OSError:
+            # An unreadable or absent ancestor cannot be the mask proof itself;
+            # keep walking up (``/home/<user>`` is unreachable *because* ``/home``
+            # is an inaccessible mount).
+            continue
+        if _is_mask(info):
+            return True
+    return False
+
+
+def _denied_by_permission(path: str) -> tuple[str, str]:
+    if _hidden_by_mask(path):
+        return "hidden", "ancestor_mask"
+    return "permission", "EACCES"
+
+
 def _probe_unix_socket(path: str) -> tuple[str, str]:
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     client.settimeout(SOCKET_TIMEOUT_SECONDS)
     try:
         client.connect(path)
+    except FileNotFoundError:
+        return "absent", "ENOENT"
+    except PermissionError:
+        return _denied_by_permission(path)
     except OSError as error:
-        return "denied", _error_detail(error)
+        return "error", _error_detail(error)
     finally:
         client.close()
     return "reached", "connected"
 
 
-def probe_denied_path(path: str) -> tuple[str, str]:
+def probe_denied(path: str) -> tuple[str, str]:
     """Return ``(observed, detail)`` for a path that must not be reachable.
 
-    ``observed`` is ``denied`` when the path is absent, unreadable, an empty
-    directory or an unconnectable socket, and ``reached`` when any content or
-    connection was available.
+    ``observed`` is ``permission`` (ordinary DAC denial), ``hidden``
+    (inaccessible overmount on the path or an ancestor), ``absent`` (ENOENT),
+    ``reached`` (content or a connection was available) or ``error``.
     """
 
     try:
         info = os.lstat(path)
+    except FileNotFoundError:
+        return "absent", "ENOENT"
+    except NotADirectoryError:
+        return "absent", "ENOTDIR"
+    except PermissionError:
+        return _denied_by_permission(path)
     except OSError as error:
-        return "denied", _error_detail(error)
+        return "error", _error_detail(error)
+
+    if _is_mask(info):
+        return "hidden", "mask"
 
     if stat.S_ISDIR(info.st_mode):
         try:
             entries = os.listdir(path)
+        except PermissionError:
+            return _denied_by_permission(path)
         except OSError as error:
-            return "denied", _error_detail(error)
-        return ("denied", "empty_directory") if not entries else ("reached", "entries")
+            return "error", _error_detail(error)
+        return "reached", f"{len(entries)}_entries"
 
     if stat.S_ISSOCK(info.st_mode):
         return _probe_unix_socket(path)
 
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except PermissionError:
+        return _denied_by_permission(path)
     except OSError as error:
-        return "denied", _error_detail(error)
+        return "error", _error_detail(error)
     try:
         os.read(descriptor, 16)
     except OSError as error:
-        return "denied", _error_detail(error)
+        return "error", _error_detail(error)
     finally:
         os.close(descriptor)
     return "reached", "readable"
@@ -167,16 +237,24 @@ def probe_loopback() -> tuple[str, str]:
     return "ok", "connected"
 
 
-def probe_external(host: str, port: int) -> tuple[str, str]:
-    """Attempt one direct outbound connection; any failure is a denial."""
+def probe_external(address: str, port: int) -> tuple[str, str]:
+    """Attempt one direct outbound connection to an IP literal.
+
+    Only ``ENETUNREACH`` proves network isolation: a timeout, a permission
+    error or any other failure is reported as ``error`` (DNS cannot happen
+    because the caller must pass a literal address).
+    """
 
     try:
         with socket.create_connection(
-            (host, port), timeout=SOCKET_TIMEOUT_SECONDS
+            (address, port), timeout=SOCKET_TIMEOUT_SECONDS
         ):
             return "reached", "connected"
     except OSError as error:
-        return "denied", _error_detail(error)
+        detail = _error_detail(error)
+        if error.errno == errno.ENETUNREACH:
+            return "isolated", detail
+        return "error", detail
 
 
 def probe_task_dir_write(task_dir: Path) -> tuple[str, str]:
@@ -211,23 +289,24 @@ def _record(expected: str, observed: str, detail: str) -> dict[str, object]:
 def collect_report(
     *,
     task_dir: Path,
-    denied_paths: dict[str, str],
+    denied: dict[str, tuple[str, str]],
     external: tuple[str, int] | None,
+    oracles_absent: tuple[str, ...] = (),
 ) -> dict[str, object]:
     """Run the whole checklist and return the evidence document."""
 
     probes: dict[str, dict[str, object]] = {}
-    for label in sorted(denied_paths):
-        path = denied_paths[label]
-        observed, detail = probe_denied_path(path)
-        probes[label] = _record("denied", observed, detail)
+    for label in sorted(denied):
+        path, expected = denied[label]
+        observed, detail = probe_denied(path)
+        probes[label] = _record(expected, observed, detail)
 
     observed, detail = probe_loopback()
     probes["loopback"] = _record("ok", observed, detail)
 
     if external is not None:
         observed, detail = probe_external(*external)
-        probes["external_https"] = _record("denied", observed, detail)
+        probes["external"] = _record("isolated", observed, detail)
 
     observed, detail = probe_task_dir_write(task_dir)
     probes["task_dir_write"] = _record("ok", observed, detail)
@@ -236,6 +315,7 @@ def collect_report(
     return {
         "version": PROBE_VERSION,
         "probes": probes,
+        "oracles_absent": sorted(oracles_absent),
         "ok": not failed,
         "failed": failed,
     }
@@ -262,44 +342,68 @@ def _require_name(value: object, label: str) -> str:
     return value
 
 
+def _require_label(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{label} must be a non-empty string")
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+        raise ValueError(f"{label} contains control characters")
+    return value
+
+
+def _load_denied(raw: object) -> dict[str, tuple[str, str]]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("denied must be an object")
+    denied: dict[str, tuple[str, str]] = {}
+    for label, entry in raw.items():
+        name = _require_label(label, "denied path label")
+        if not isinstance(entry, dict):
+            raise ValueError(f"denied path {name} must be an object")
+        path = _require_absolute(entry.get("path"), f"denied path {name}")
+        expect = entry.get("expect")
+        if expect not in ORACLE_KINDS:
+            raise ValueError(f"denied path {name} has an unknown expectation")
+        denied[name] = (path, str(expect))
+    return denied
+
+
+def _load_external(raw: object) -> tuple[str, int] | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("external must be an object or absent")
+    address = raw.get("address")
+    port = raw.get("port")
+    if not isinstance(address, str):
+        raise ValueError("external address must be an IP literal")
+    try:
+        ipaddress.ip_address(address)
+    except ValueError:
+        raise ValueError("external address must be an IP literal") from None
+    if type(port) is not int or not 1 <= port <= 65_535:
+        raise ValueError("external port must be an integer port")
+    return address, port
+
+
 def _load_config(task_dir: Path) -> dict[str, object]:
     document = json.loads((task_dir / CONFIG_NAME).read_text(encoding="utf-8"))
     if not isinstance(document, dict):
         raise ValueError("probe config must be an object")
 
-    raw_paths = document.get("denied_paths", {})
-    if not isinstance(raw_paths, dict):
-        raise ValueError("denied_paths must be an object")
-    denied: dict[str, str] = {}
-    for label, path in raw_paths.items():
-        if not isinstance(label, str) or not label:
-            raise ValueError("denied path labels must be non-empty strings")
-        if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in label):
-            raise ValueError("denied path labels contain control characters")
-        denied[label] = _require_absolute(path, f"denied path {label}")
-
-    raw_external = document.get("external")
-    external: tuple[str, int] | None = None
-    if raw_external is None:
-        external = DEFAULT_EXTERNAL
-    elif isinstance(raw_external, dict):
-        host = raw_external.get("host")
-        port = raw_external.get("port")
-        if not isinstance(host, str) or not host:
-            raise ValueError("external host must be a non-empty string")
-        if type(port) is not int or not 1 <= port <= 65_535:
-            raise ValueError("external port must be an integer port")
-        external = (host, port)
-    else:
-        raise ValueError("external must be an object or absent")
+    raw_absent = document.get("oracles_absent", [])
+    if not isinstance(raw_absent, list):
+        raise ValueError("oracles_absent must be a list")
+    absent = tuple(_require_label(item, "oracle label") for item in raw_absent)
 
     linger = document.get("linger_seconds", 60)
     if type(linger) is not int or not 0 <= linger <= MAX_LINGER_SECONDS:
         raise ValueError("linger_seconds out of range")
 
     return {
-        "denied_paths": denied,
-        "external": external,
+        "denied": _load_denied(document.get("denied")),
+        "external": _load_external(document.get("external")),
+        "oracles_absent": absent,
         "out": _require_name(document.get("out", DEFAULT_OUT_NAME), "out"),
         "release": _require_name(
             document.get("release", DEFAULT_RELEASE_NAME), "release"
@@ -341,19 +445,21 @@ def main() -> int:
     task_dir = DEFAULT_TASK_DIR
     try:
         config = _load_config(task_dir)
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    except (OSError, ValueError, TypeError):
         return EXIT_CONFIG_ERROR
 
-    extra_paths = config["denied_paths"]
-    external = config["external"]
-    denied = dict(DEFAULT_DENIED_PATHS)
-    if isinstance(extra_paths, dict):
-        denied.update(extra_paths)
+    denied = dict(DEFAULT_DENIED)
+    extra = config["denied"]
+    if isinstance(extra, dict):
+        denied.update(extra)
 
+    external = config["external"]
+    absent = config["oracles_absent"]
     report = collect_report(
         task_dir=task_dir,
-        denied_paths=denied,
+        denied=denied,
         external=external if isinstance(external, tuple) else None,
+        oracles_absent=absent if isinstance(absent, tuple) else (),
     )
     document = json.dumps(report, indent=2, sort_keys=True).encode("utf-8")
     try:

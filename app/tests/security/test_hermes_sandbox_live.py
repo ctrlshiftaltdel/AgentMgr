@@ -6,24 +6,31 @@ default: :data:`live_only` skips every live body unless *both*
 adds its own skip reason when a required path, group or helper is absent.  A
 skip is never acceptance evidence; the implementer must never claim a live run.
 
-Two independent live bodies:
+Three independent live bodies:
 
 ``TestProbeUnit``
     Launches :mod:`hermes_probe_workload` (the fixed test-only probe next to this
     file) through the production helper's **pure** ``build_systemd_run_argv`` and
     asserts the negative matrix inside exactly the production sandbox property
     profile: host files, host home, database/container/systemd/D-Bus paths and a
-    sibling task directory are denied, isolated loopback works, a direct external
-    connection fails, and only the task directory is writable.
+    sibling task directory are denied, isolated loopback works, a direct
+    connection to an RFC 5737 address returns ``ENETUNREACH``, and only the task
+    directory is writable.  Every denial oracle is pre-checked on the host so a
+    bare ``EACCES`` or a path that does not exist cannot pass as evidence.
 
 ``TestManagedLifecycle``
     Drives ``HelperSandboxSupervisor`` / ``HermesManagedAdapter`` against the real
     ``agentmgr-hermes-exec`` helper with a **stub** egress broker whose loopback
     upstream returns fixed assistant text only (no tool calls).  It proves the
     unit/workload/Hermes process lifecycle, the task-file and token channel, the
-    single-unit idempotency rule, stop/cgroup-gone and the honest
-    "no artifact -> unknown/needs_human" mapping.  It proves neither business
-    success nor model quality.
+    dynamic UID (cross-checked against the helper's live task attestation), the
+    ``terminal``-only argv, the single-unit idempotency rule, a completed run
+    whose whole task directory is scanned for prompt/token leakage, stop/cgroup-
+    gone and the honest "no artifact -> unknown/needs_human" mapping.
+
+``TestStopWhileLive``
+    Stops a *running* unit (the stub still holds the model answer) and asserts
+    the adapter never reports a confirmed stop before the cgroup is gone.
 
 Environment (all paths must be absolute and on a persistent filesystem):
 
@@ -31,17 +38,22 @@ Environment (all paths must be absolute and on a persistent filesystem):
 * ``AGENTMGR_HERMES_RUNTIME_ROOT`` -- read-only Hermes runtime root.
 * ``AGENTMGR_HERMES_TASK_ROOT`` -- provisioned task root (group-shared, 0770).
 * ``AGENTMGR_HERMES_EGRESS_SOCKET`` -- dedicated *test* broker socket under the
-  control directory.  The lifecycle body owns it: it refuses to replace a live
-  or pre-existing socket.
+  control directory.  Each managed body owns it and refuses to replace a live or
+  pre-existing socket.
 * ``AGENTMGR_HERMES_GROUP`` -- sandbox group, default ``agentmgr-hermes``.
+* ``AGENTMGR_HERMES_PERSONAL_PROFILE`` -- the personal/default Hermes profile
+  whose gateway lock/socket must be invisible to the unit; defaults to
+  ``~/.hermes`` of the test user.  Never committed.
 * ``AGENTMGR_HERMES_PROBE_WORKLOAD`` -- optional installed copy of the probe
-  workload; defaults to the file next to this module (a checkout under ``/tmp``
-  cannot be a bind source because the unit has ``PrivateTmp=yes``).
+  workload; its SHA-256 must equal the committed ``hermes_probe_workload.py``.
+  The default (this file's directory) is unpinnable as a bind source when the
+  checkout lives under ``/tmp``/``/var/tmp`` because the unit has
+  ``PrivateTmp=yes``.
 * Lifecycle only: ``AGENTMGR_HERMES_HELPER``, ``AGENTMGR_HERMES_ATTESTATION_KEY``,
   ``AGENTMGR_HERMES_EGRESS_TOKEN_KEY``, ``AGENTMGR_HERMES_RUNTIME_ROOT_HASH``,
   ``AGENTMGR_HERMES_EVIDENCE_REF``, ``AGENTMGR_HERMES_MODEL``,
   ``AGENTMGR_HERMES_RUNTIME_VERSION`` and ``AGENTMGR_HERMES_PROVIDER_HOST``
-  (loopback-agnostic token claim, default ``stub-provider.invalid``), plus
+  (token claim, default ``stub-provider.invalid``), plus
   ``AGENTMGR_HERMES_RUNTIME_NAME`` (default ``hermes``) and
   ``AGENTMGR_HERMES_RUNTIME_MAX_SEC`` (default 180).
 
@@ -52,6 +64,7 @@ session; every unit and task directory it creates is removed in ``finally``.
 from __future__ import annotations
 
 import contextlib
+import errno
 import grp
 import hashlib
 import http.server
@@ -62,6 +75,7 @@ import pwd
 import secrets
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -74,6 +88,8 @@ from typing import Any, Iterator
 import pytest
 
 from app.runtime.contract import (
+    CancelOutcome,
+    CancelResult,
     ResultOutcome,
     RuntimeGrant,
     RuntimeState,
@@ -102,25 +118,41 @@ LIVE_TIMEOUT_SECONDS = 240
 UNIT_START_TIMEOUT_SECONDS = 60
 UNIT_STOP_TIMEOUT_SECONDS = 90
 STATUS_TIMEOUT_SECONDS = 240
+STUB_RELEASE_TIMEOUT_SECONDS = 120
 
 PROBE_TASK_ID = "task_hermes_live_probe"
 PROBE_GRANT_ID = "grnt_hermes_live_probe"
 PROBE_IDEMPOTENCY_KEY = "idem_hermes_live_probe"
 PROBE_RUNTIME_MAX_SEC = 120
 PROBE_LINGER_SECONDS = 90
-PROBE_EXTERNAL = ("example.com", 443)
+PROBE_EXTERNAL = ("203.0.113.1", 443)
 CANARY_DIRECTORY = "agentmgr-hermes-canary-live"
 CANARY_PROMPT = "PROMPT-CANARY-hermes-live-probe"
 CANARY_TOKEN = "egt.canary.live.probe.token"
 
 MANAGED_PROMPT_CANARY = "PROMPT-CANARY-hermes-managed-live"
 STUB_ASSISTANT_TEXT = "STUB-ASSISTANT-OK"
-STUB_RELEASE_TIMEOUT_SECONDS = 120
 STUB_PROVIDER_KEY = b"stub-provider-key-never-real"
 
-#: Hermes argv facts asserted on the live process: the prompt is a file and the
-#: toolset is exactly ``terminal``.
-HERMES_ARGV_FACTS = ("--query-file", "/task/prompt.txt", "-t", "terminal")
+#: Fixed denial oracles that must exist on the host and prove their denial kind.
+#: ``permission`` is a DAC baseline (EACCES, never isolation); ``hidden`` is an
+#: inaccessible overmount on the path or an ancestor; ``absent`` is ENOENT on a
+#: filesystem the unit replaced (private ``/run``).
+REQUIRED_ORACLES: tuple[tuple[str, str, str], ...] = (
+    ("etc_shadow", "/etc/shadow", "permission"),
+    ("host_home", "/home", "hidden"),
+    ("postgresql_data", "/var/lib/postgresql", "hidden"),
+    ("host_systemd_run", "/run/systemd", "absent"),
+    ("host_dbus", "/run/dbus", "absent"),
+)
+
+#: Container sockets only exist on hosts that run those container runtimes.
+OPTIONAL_ORACLES: tuple[tuple[str, str, str], ...] = (
+    ("docker_socket", "/var/run/docker.sock", "absent"),
+    ("containerd_socket", "/run/containerd/containerd.sock", "absent"),
+)
+
+POSTGRES_SOCKETS: tuple[str, ...] = ("/run/postgresql/.s.PGSQL.5432",)
 
 SUDO = shutil.which("sudo") or "/usr/bin/sudo"
 SYSTEMCTL = shutil.which("systemctl") or "/usr/bin/systemctl"
@@ -128,6 +160,13 @@ JOURNALCTL = shutil.which("journalctl") or "/usr/bin/journalctl"
 INSTALL = shutil.which("install") or "/usr/bin/install"
 RM = shutil.which("rm") or "/usr/bin/rm"
 CAT = shutil.which("cat") or "/usr/bin/cat"
+STAT = shutil.which("stat") or "/usr/bin/stat"
+SHA256SUM = shutil.which("sha256sum") or "/usr/bin/sha256sum"
+FIND = shutil.which("find") or "/usr/bin/find"
+
+#: systemd's DynamicUser allocation range (``systemd.exec(5)``).
+DYNAMIC_UID_MIN = 61184
+DYNAMIC_UID_MAX = 65519
 
 live_only = pytest.mark.skipif(not LIVE_ENABLED, reason=LIVE_SKIP_REASON)
 
@@ -180,6 +219,7 @@ class LiveEnvironment:
     provider_host: str
     runtime_max_sec: int
     probe_workload: Path
+    personal_profile: Path
 
     # -- readiness -----------------------------------------------------------
 
@@ -275,6 +315,22 @@ class LiveEnvironment:
             revocation_dir=revocation_dir,
         )
 
+    # -- personal Hermes paths (never committed) -----------------------------
+
+    def personal_paths(self) -> dict[str, Path]:
+        """Concrete personal Hermes paths the unit must not see.
+
+        The profile is required; its gateway lock/socket are added when present.
+        Only the labels ever reach output.
+        """
+
+        paths = {"personal_hermes_profile": self.personal_profile}
+        for name in ("gateway.lock", "gateway.sock", "gw.lock", "gw.sock"):
+            candidate = self.personal_profile / name
+            if candidate.exists():
+                paths[f"personal_{name.replace('.', '_')}"] = candidate
+        return paths
+
     # -- internal checks -----------------------------------------------------
 
     def _socket_problem(self) -> str | None:
@@ -334,6 +390,10 @@ def read_environment() -> LiveEnvironment:
         runtime_max_sec=_runtime_max_sec(),
         probe_workload=(
             _path("AGENTMGR_HERMES_PROBE_WORKLOAD") or PROBE_WORKLOAD
+        ),
+        personal_profile=(
+            _path("AGENTMGR_HERMES_PERSONAL_PROFILE")
+            or Path.home() / ".hermes"
         ),
     )
 
@@ -503,6 +563,14 @@ def _joined(dump: str, name: str) -> str:
     return " ".join(_property_values(dump, name))
 
 
+def _require_property(dump: str, name: str) -> str:
+    """A property missing from ``systemctl show`` fails; it is never empty proof."""
+
+    values = _property_values(dump, name)
+    assert values, f"systemctl show did not report {name}"
+    return values[-1]
+
+
 def _try_show(unit: str) -> str | None:
     completed = _sudo([SYSTEMCTL, "show", "--no-pager", unit])
     if completed.returncode != 0:
@@ -586,6 +654,24 @@ def _read_remote_json(path: Path) -> dict[str, object] | None:
     return document if isinstance(document, dict) else None
 
 
+def _remote_sha256(path: Path) -> str | None:
+    completed = _sudo([SHA256SUM, str(path)])
+    if completed.returncode != 0:
+        return None
+    fields = completed.stdout.split()
+    return fields[0] if fields else None
+
+
+def _remote_size(path: Path) -> int | None:
+    completed = _sudo([STAT, "-c", "%s", str(path)])
+    if completed.returncode != 0:
+        return None
+    try:
+        return int(completed.stdout.strip())
+    except ValueError:
+        return None
+
+
 def _write_remote_json(
     tmp_path: Path, directory: Path, name: str, document: object
 ) -> None:
@@ -593,17 +679,46 @@ def _write_remote_json(
     source.write_text(
         json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
-    completed = _sudo([INSTALL, "-m", "0644", str(source), str(directory / name)])
+    completed = _sudo(
+        [
+            INSTALL,
+            "-o",
+            _current_user(),
+            "-g",
+            _user_group(),
+            "-m",
+            "0644",
+            str(source),
+            str(directory / name),
+        ]
+    )
     assert completed.returncode == 0, completed.stderr
 
 
 def _write_remote_text(
-    tmp_path: Path, directory: Path, name: str, text: str, mode: str
+    tmp_path: Path,
+    directory: Path,
+    name: str,
+    text: str,
+    *,
+    owner: str,
+    group: str,
+    mode: str,
 ) -> None:
     source = tmp_path / f"upload-{name}"
     source.write_text(text, encoding="utf-8")
     completed = _sudo(
-        [INSTALL, "-m", mode, str(source), str(directory / name)]
+        [
+            INSTALL,
+            "-o",
+            owner,
+            "-g",
+            group,
+            "-m",
+            mode,
+            str(source),
+            str(directory / name),
+        ]
     )
     assert completed.returncode == 0, completed.stderr
 
@@ -621,6 +736,14 @@ def _remove_tree(path: Path, parent: Path) -> None:
     if path.parent != parent or not path.name.startswith("agentmgr-hermes-"):
         pytest.fail(f"refusing to remove a path that is not derived: {path.name}")
     _sudo([RM, "-rf", "--", str(path)])
+
+
+def _user_group() -> str:
+    entry = pwd.getpwuid(os.geteuid())
+    try:
+        return grp.getgrgid(entry.pw_gid).gr_name
+    except KeyError:
+        return str(entry.pw_gid)
 
 
 @contextlib.contextmanager
@@ -644,6 +767,255 @@ def _egress_bind_source(path: Path) -> Iterator[None]:
         listener.close()
         with contextlib.suppress(OSError):
             path.unlink()
+
+
+# ---------------------------------------------------------------------------
+# oracle model
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _Oracle:
+    label: str
+    path: Path
+    expect: str
+    required: bool
+    canary: bool = False
+
+
+def _is_mask(info: os.stat_result) -> bool:
+    return stat.S_IMODE(info.st_mode) == 0 and info.st_uid == 0
+
+
+def _oracles(environment: LiveEnvironment, canary_dir: Path) -> list[_Oracle]:
+    """Build the host pre-checked denial oracles for the probe unit."""
+
+    assert environment.task_root is not None
+    oracles: list[_Oracle] = [
+        _Oracle(label, Path(path), expect, required=True)
+        for label, path, expect in REQUIRED_ORACLES
+    ]
+    oracles.extend(
+        _Oracle(label, Path(path), expect, required=False)
+        for label, path, expect in OPTIONAL_ORACLES
+    )
+    canaries = {
+        "sibling_prompt": canary_dir / "prompt.txt",
+        "sibling_token": canary_dir / "egress.token",
+    }
+    for label, path in canaries.items():
+        oracles.append(
+            _Oracle(label, path, "hidden", required=True, canary=True)
+        )
+    oracles.append(_Oracle("host_home_dir", Path.home(), "hidden", required=True))
+    for label, path in environment.personal_paths().items():
+        oracles.append(_Oracle(label, path, "hidden", required=True))
+    if environment.attestation_key is not None:
+        oracles.append(
+            _Oracle(
+                "sandbox_attestation_key",
+                environment.attestation_key,
+                "hidden",
+                required=True,
+            )
+        )
+    for candidate in POSTGRES_SOCKETS:
+        if Path(candidate).exists():
+            oracles.append(
+                _Oracle("postgres_socket", Path(candidate), "absent", required=False)
+            )
+            break
+    return oracles
+
+
+def _precheck_oracles(
+    oracles: list[_Oracle], *, group: str
+) -> list[str]:
+    """Fail unless every oracle exists and proves its denial kind on the host.
+
+    Returns the labels that exist only optionally and are absent (they cannot be
+    evidence and are recorded as such).
+    """
+
+    gid = grp.getgrnam(group).gr_gid
+    absent_optional: list[str] = []
+    missing_required: list[str] = []
+    unreadable_baseline: list[str] = []
+    not_an_oracle: list[str] = []
+    weak_canary: list[str] = []
+
+    for oracle in oracles:
+        try:
+            info = oracle.path.lstat()
+        except FileNotFoundError:
+            if oracle.required:
+                missing_required.append(oracle.label)
+            else:
+                absent_optional.append(oracle.label)
+            continue
+        except OSError as error:
+            pytest.fail(
+                f"oracle {oracle.label} cannot be inspected on the host: "
+                f"{type(error).__name__}"
+            )
+
+        if _is_mask(info):
+            # The host path must be real content, not already a systemd mask.
+            not_an_oracle.append(oracle.label)
+            continue
+
+        if oracle.expect == "permission":
+            # The DAC baseline must hold for the unprivileged test user: the
+            # path exists and opening it raises EACCES.
+            readable = True
+            try:
+                with oracle.path.open("rb"):
+                    pass
+            except OSError:
+                readable = False
+            if readable:
+                unreadable_baseline.append(oracle.label)
+            continue
+
+        if oracle.canary:
+            mode = stat.S_IMODE(info.st_mode)
+            if mode != 0o640 or info.st_gid != gid or mode & 0o007:
+                weak_canary.append(oracle.label)
+
+    if missing_required:
+        pytest.fail(
+            "required denial oracle(s) absent on this host: "
+            + ", ".join(sorted(missing_required))
+            + " (an absent path cannot prove isolation)"
+        )
+    if not_an_oracle:
+        pytest.fail(
+            "host path(s) are already inaccessible masks, not real oracles: "
+            + ", ".join(sorted(not_an_oracle))
+        )
+    if unreadable_baseline:
+        pytest.fail(
+            "permission baseline does not hold (readable by the test user): "
+            + ", ".join(sorted(unreadable_baseline))
+        )
+    if weak_canary:
+        pytest.fail(
+            "sibling canary must be mode 0640 group-readable by the sandbox "
+            "group, or the denial proves nothing: "
+            + ", ".join(sorted(weak_canary))
+        )
+    return absent_optional
+
+
+def _oracle_config(oracles: list[_Oracle]) -> dict[str, dict[str, str]]:
+    return {
+        oracle.label: {"path": str(oracle.path), "expect": oracle.expect}
+        for oracle in oracles
+    }
+
+
+def _pinned_probe_workload(environment: LiveEnvironment) -> tuple[Path, str]:
+    """Require the configured probe workload to be the committed file byte-wise."""
+
+    committed = hashlib.sha256(PROBE_WORKLOAD.read_bytes()).hexdigest()
+    candidate = environment.probe_workload
+    try:
+        actual = hashlib.sha256(candidate.read_bytes()).hexdigest()
+    except OSError:
+        pytest.fail(f"the probe workload {candidate} is unreadable")
+    if actual != committed:
+        pytest.fail(
+            "AGENTMGR_HERMES_PROBE_WORKLOAD does not match the committed "
+            f"hermes_probe_workload.py (expected sha256:{committed}, "
+            f"got sha256:{actual})"
+        )
+    return candidate, committed
+
+
+# ---------------------------------------------------------------------------
+# sandbox profile assertions (shared by the probe and managed bodies)
+# ---------------------------------------------------------------------------
+
+
+def _assert_unit_profile(
+    dump: str,
+    environment: LiveEnvironment,
+    task_dir: Path,
+    *,
+    workload: Path | None,
+) -> None:
+    assert environment.runtime_root is not None
+    assert environment.task_root is not None
+    assert environment.egress_socket is not None
+
+    assert _property(dump, "ActiveState") == "active"
+    assert _property(dump, "DynamicUser") == "yes"
+    assert _property(dump, "Group") == environment.group
+    # Exactly one empty SupplementaryGroups line: a missing property fails.
+    assert _property_values(dump, "SupplementaryGroups") == [""]
+
+    for name in (
+        "PrivateDevices",
+        "PrivateNetwork",
+        "PrivateTmp",
+        "ProtectHome",
+        "NoNewPrivileges",
+        "ProtectClock",
+        "ProtectKernelTunables",
+        "ProtectKernelModules",
+        "ProtectKernelLogs",
+        "ProtectControlGroups",
+        "ProtectHostname",
+        "RestrictNamespaces",
+        "LockPersonality",
+        "MemoryDenyWriteExecute",
+        "RestrictRealtime",
+        "RestrictSUIDSGID",
+        "RemoveIPC",
+        "SendSIGKILL",
+    ):
+        assert _require_property(dump, name) == "yes", name
+    assert _property(dump, "ProtectSystem") == "strict"
+    assert _property(dump, "ProtectProc") == "invisible"
+    assert _property(dump, "ProcSubset") == "pid"
+    assert _property(dump, "KillMode") == "control-group"
+    assert _property(dump, "ExitType") == "cgroup"
+    assert _property(dump, "WorkingDirectory") == "/task"
+    assert int(_require_property(dump, "UMask"), 8) == 0o007
+    assert _property_values(dump, "CapabilityBoundingSet") == [""]
+    assert _property_values(dump, "AmbientCapabilities") == [""]
+    assert _property(dump, "SystemCallArchitectures") == "native"
+    assert int(_require_property(dump, "SystemCallErrorNumber")) == errno.EPERM
+    assert _property(dump, "SystemCallFilter").strip(), "SystemCallFilter is empty"
+    assert set(_property(dump, "RestrictAddressFamilies").split()) == {
+        "AF_INET",
+        "AF_INET6",
+        "AF_UNIX",
+    }
+    for limit in ("RuntimeMaxUSec", "MemoryMax", "TasksMax", "CPUQuotaPerSecUSec"):
+        assert _require_property(dump, limit) not in {"", "infinity"}, limit
+
+    inaccessible = _joined(dump, "InaccessiblePaths")
+    assert f"-{environment.task_root}" in inaccessible
+    if environment.egress_socket.parent != environment.task_root:
+        assert f"-{environment.egress_socket.parent}" in inaccessible
+    assert "-/etc/agentmgr" in inaccessible
+    assert "-/var/lib/postgresql" in inaccessible
+
+    bind = _joined(dump, "BindPaths")
+    assert f"{task_dir}:/task" in bind
+    assert f"{environment.task_root}:" not in bind
+    readonly = _joined(dump, "BindReadOnlyPaths")
+    assert f"{environment.runtime_root}:/runtime" in readonly
+    assert f"{environment.egress_socket}:/task/egress.sock" in readonly
+    if workload is None:
+        assert ":/workload.py" in readonly
+    else:
+        assert f"{workload}:/workload.py" in readonly
+    assert "/workload.py" in _joined(dump, "ExecStart")
+
+    for path in environment.personal_paths().values():
+        assert str(path) not in dump
 
 
 # ---------------------------------------------------------------------------
@@ -673,39 +1045,14 @@ def _probe_request(task_dir: Path) -> Any:
     )
 
 
-def _personal_paths() -> dict[str, Path]:
-    """Existing personal Hermes locations the unit must not see (labels only)."""
-
-    home = Path.home()
-    candidates = {
-        "personal_hermes_home": home / ".hermes",
-        "personal_hermes_config": home / ".config" / "hermes",
-    }
-    return {label: path for label, path in candidates.items() if path.exists()}
-
-
-def _probe_denied_paths(
-    environment: LiveEnvironment, canary_dir: Path
-) -> dict[str, str]:
-    assert environment.task_root is not None
-    paths = {
-        "sibling_prompt": str(canary_dir / "prompt.txt"),
-        "sibling_token": str(canary_dir / "egress.token"),
-        "host_home_dir": str(Path.home()),
-    }
-    for label, path in _personal_paths().items():
-        paths[label] = str(path)
-    if environment.attestation_key is not None:
-        paths["sandbox_attestation_key"] = str(environment.attestation_key)
-    return paths
-
-
-def _prepare_probe_tree(
+def _prepare_probe_paths(
     environment: LiveEnvironment,
     task_dir: Path,
     canary_dir: Path,
     tmp_path: Path,
 ) -> None:
+    """Create the task directory and the group-readable sibling canaries."""
+
     owner = _current_user()
     assert environment.task_root is not None
     _make_directory(task_dir, owner=owner, group=environment.group, mode="0770")
@@ -713,11 +1060,36 @@ def _prepare_probe_tree(
         task_dir / "out", owner=owner, group=environment.group, mode="0770"
     )
     _make_directory(canary_dir, owner=owner, group=environment.group, mode="0770")
-    _write_remote_text(tmp_path, canary_dir, "prompt.txt", CANARY_PROMPT, "0640")
-    _write_remote_text(tmp_path, canary_dir, "egress.token", CANARY_TOKEN, "0640")
+    _write_remote_text(
+        tmp_path,
+        canary_dir,
+        "prompt.txt",
+        CANARY_PROMPT,
+        owner=owner,
+        group=environment.group,
+        mode="0640",
+    )
+    _write_remote_text(
+        tmp_path,
+        canary_dir,
+        "egress.token",
+        CANARY_TOKEN,
+        owner=owner,
+        group=environment.group,
+        mode="0640",
+    )
+
+
+def _write_probe_config(
+    oracles: list[_Oracle],
+    absent_optional: list[str],
+    task_dir: Path,
+    tmp_path: Path,
+) -> None:
     document = {
-        "denied_paths": _probe_denied_paths(environment, canary_dir),
-        "external": {"host": PROBE_EXTERNAL[0], "port": PROBE_EXTERNAL[1]},
+        "denied": _oracle_config(oracles),
+        "external": {"address": PROBE_EXTERNAL[0], "port": PROBE_EXTERNAL[1]},
+        "oracles_absent": absent_optional,
         "out": "probe.json",
         "release": "probe.release",
         "linger_seconds": PROBE_LINGER_SECONDS,
@@ -749,7 +1121,7 @@ def _release_probe(task_dir: Path) -> None:
 
 
 def _assert_probe_argv(
-    argv: list[str], environment: LiveEnvironment, task_dir: Path
+    argv: list[str], environment: LiveEnvironment, task_dir: Path, workload: Path
 ) -> None:
     assert environment.task_root is not None
     assert environment.runtime_root is not None
@@ -758,80 +1130,35 @@ def _assert_probe_argv(
     assert f"--property=Group={environment.group}" in argv
     assert "--property=PrivateNetwork=yes" in argv
     assert "--property=PrivateDevices=yes" in argv
+    assert "--property=PrivateTmp=yes" in argv
+    assert "--property=NoNewPrivileges=yes" in argv
+    assert "--property=CapabilityBoundingSet=" in argv
+    assert "--property=AmbientCapabilities=" in argv
     assert f"--property=InaccessiblePaths=-{environment.task_root}" in argv
     assert f"--property=BindPaths={task_dir}:/task" in argv
-    workload_bind = (
-        f"--property=BindReadOnlyPaths={environment.probe_workload}:/workload.py"
-    )
-    assert workload_bind in argv
+    assert f"--property=BindReadOnlyPaths={workload}:/workload.py" in argv
     assert not any("SupplementaryGroups" in item for item in argv)
     assert not any(CANARY_PROMPT in item or CANARY_TOKEN in item for item in argv)
 
 
-def _assert_sandbox_properties(
-    dump: str, environment: LiveEnvironment, task_dir: Path
-) -> None:
-    assert environment.runtime_root is not None
-    assert environment.task_root is not None
-    assert environment.egress_socket is not None
-
-    assert _property(dump, "ActiveState") == "active"
-    assert _property(dump, "DynamicUser") == "yes"
-    assert _property(dump, "Group") == environment.group
-    assert _property_values(dump, "SupplementaryGroups") in ([], [""])
-    assert _property(dump, "PrivateDevices") == "yes"
-    assert _property(dump, "PrivateNetwork") == "yes"
-    assert _property(dump, "ProtectHome") == "yes"
-    assert _property(dump, "ProtectSystem") == "strict"
-    assert _property(dump, "KillMode") == "control-group"
-    assert _property(dump, "ExitType") == "cgroup"
-    assert _property(dump, "WorkingDirectory") == "/task"
-
-    inaccessible = _joined(dump, "InaccessiblePaths")
-    assert f"-{environment.task_root}" in inaccessible
-    if environment.egress_socket.parent != environment.task_root:
-        assert f"-{environment.egress_socket.parent}" in inaccessible
-    assert "-/etc/agentmgr" in inaccessible
-    assert "-/var/lib/postgresql" in inaccessible
-
-    bind = _joined(dump, "BindPaths")
-    assert f"{task_dir}:/task" in bind
-    assert f"{environment.task_root}:" not in bind
-    readonly = _joined(dump, "BindReadOnlyPaths")
-    assert f"{environment.runtime_root}:/runtime" in readonly
-    assert f"{environment.egress_socket}:/task/egress.sock" in readonly
-    assert f"{environment.probe_workload}:/workload.py" in readonly
-
-    assert "/workload.py" in _joined(dump, "ExecStart")
-    for path in _personal_paths().values():
-        assert str(path) not in dump
-
-
 def _assert_probe_report(
-    report: dict[str, object], environment: LiveEnvironment
+    report: dict[str, object],
+    oracles: list[_Oracle],
+    absent_optional: list[str],
 ) -> None:
-    assert environment.task_root is not None
     probes = report.get("probes")
     assert isinstance(probes, dict) and probes
     assert report.get("ok") is True, report.get("failed")
     assert report.get("failed") == []
+    assert report.get("oracles_absent") == sorted(absent_optional)
 
-    denied_labels = (
-        "etc_shadow",
-        "host_home",
-        "host_home_dir",
-        "postgresql_data",
-        "host_systemd_run",
-        "host_dbus",
-        "docker_socket",
-        "containerd_socket",
-        "sibling_prompt",
-        "sibling_token",
-    )
-    for label in denied_labels:
-        item = probes.get(label)
-        assert isinstance(item, dict), f"missing probe {label}"
-        assert item.get("observed") == "denied", item
+    absent = set(absent_optional)
+    for oracle in oracles:
+        if oracle.label in absent:
+            continue
+        item = probes.get(oracle.label)
+        assert isinstance(item, dict), f"missing probe {oracle.label}"
+        assert item.get("observed") == oracle.expect, item
         assert item.get("passed") is True, item
 
     for label in ("loopback", "task_dir_write"):
@@ -839,18 +1166,13 @@ def _assert_probe_report(
         assert isinstance(item, dict), f"missing probe {label}"
         assert item.get("observed") == "ok", item
 
-    external = probes.get("external_https")
+    external = probes.get("external")
     assert isinstance(external, dict)
-    assert external.get("observed") == "denied", external
+    assert external.get("observed") == "isolated", external
+    assert external.get("detail") == "ENETUNREACH", external
 
     raw = json.dumps(report)
-    forbidden = (
-        CANARY_PROMPT,
-        CANARY_TOKEN,
-        str(environment.task_root),
-        str(Path.home()),
-    )
-    for value in forbidden:
+    for value in (CANARY_PROMPT, CANARY_TOKEN, str(Path.home())):
         assert value not in raw
 
 
@@ -864,14 +1186,21 @@ class TestProbeUnit:
         assert environment.runtime_root is not None
         assert environment.egress_socket is not None
 
+        workload, _digest = _pinned_probe_workload(environment)
         unit = helper.unit_for_task(PROBE_TASK_ID, PROBE_IDEMPOTENCY_KEY)
         task_dir = environment.task_root / unit
         canary_dir = environment.task_root / CANARY_DIRECTORY
         if _unit_exists(unit):
             pytest.fail(f"a stale unit {unit} already exists; clean it up first")
 
+        oracles = _oracles(environment, canary_dir)
+
         try:
-            _prepare_probe_tree(environment, task_dir, canary_dir, tmp_path)
+            # The canaries must exist before they can be pre-checked as
+            # group-readable oracles.
+            _prepare_probe_paths(environment, task_dir, canary_dir, tmp_path)
+            absent_optional = _precheck_oracles(oracles, group=environment.group)
+            _write_probe_config(oracles, absent_optional, task_dir, tmp_path)
             with _egress_bind_source(environment.egress_socket):
                 request = _probe_request(task_dir)
                 argv = helper.build_systemd_run_argv(
@@ -879,17 +1208,19 @@ class TestProbeUnit:
                     task_dir=task_dir,
                     runtime_root=environment.runtime_root,
                     broker_socket=environment.egress_socket,
-                    workload=environment.probe_workload,
+                    workload=workload,
                 )
-                _assert_probe_argv(argv, environment, task_dir)
+                _assert_probe_argv(argv, environment, task_dir, workload)
 
                 launched = _sudo(argv)
                 assert launched.returncode == 0, launched.stderr.strip()
 
                 report = _wait_for_probe_report(task_dir, unit)
                 dump = _show(unit)
-                _assert_sandbox_properties(dump, environment, task_dir)
-                _assert_probe_report(report, environment)
+                _assert_unit_profile(
+                    dump, environment, task_dir, workload=workload
+                )
+                _assert_probe_report(report, oracles, absent_optional)
 
                 # The probe lingers after writing its report, so the property
                 # dump above is taken from a live unit; release it now.
@@ -940,6 +1271,17 @@ class _StubUpstream:
         if self._thread is not None:
             self._thread.join(timeout=5)
 
+    def chat_requests(self) -> list[dict[str, object]]:
+        with self._lock:
+            records = list(self.requests)
+        return [
+            record
+            for record in records
+            if record.get("method") == "POST"
+            and str(record.get("path", "")).split("?", 1)[0]
+            == "/v1/chat/completions"
+        ]
+
     def _handler(self) -> type[http.server.BaseHTTPRequestHandler]:
         state = self
 
@@ -960,7 +1302,12 @@ class _StubUpstream:
                 body = self.rfile.read(length) if length else b""
                 with state._lock:
                     state.requests.append(
-                        {"method": self.command, "path": self.path, "body": body}
+                        {
+                            "method": self.command,
+                            "path": self.path,
+                            "headers": dict(self.headers.items()),
+                            "body": body,
+                        }
                     )
                 if self.command == "POST" and self.path.startswith(
                     "/v1/chat/completions"
@@ -1070,9 +1417,38 @@ def _request_streams(body: bytes) -> bool:
     return isinstance(document, dict) and document.get("stream") is True
 
 
+def _wait_for_chat_request(
+    stub: _StubUpstream, *, timeout: float
+) -> dict[str, object]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        records = stub.chat_requests()
+        if records:
+            return records[0]
+        time.sleep(0.2)
+    pytest.fail("Hermes never sent POST /v1/chat/completions through the broker")
+
+
 # ---------------------------------------------------------------------------
-# managed lifecycle body
+# managed task harness
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _ManagedRun:
+    environment: LiveEnvironment
+    task_id: str
+    grant_id: str
+    idempotency_key: str
+    unit: str
+    task_dir: Path
+    revocation_dir: Path
+    config: HermesManagedConfig
+    supervisor: HelperSandboxSupervisor
+    adapter: HermesManagedAdapter
+    stub: _StubUpstream
+    broker: EgressBroker
+    handle: str
 
 
 def _managed_grant(
@@ -1114,9 +1490,328 @@ def _start_broker(
     return broker
 
 
+@contextlib.contextmanager
+def _managed_task(
+    environment: LiveEnvironment, *, prompt: str
+) -> Iterator[_ManagedRun]:
+    """Start the stub broker and submit one managed task; always clean up."""
+
+    assert environment.task_root is not None
+    assert environment.egress_socket is not None
+    assert environment.helper is not None
+    if environment.egress_socket.exists():
+        pytest.fail(
+            "AGENTMGR_HERMES_EGRESS_SOCKET already exists: this body must own "
+            "a dedicated test socket and never replaces a live broker socket"
+        )
+
+    suffix = secrets.token_hex(4)
+    task_id = f"task_hermes_live_{suffix}"
+    grant_id = f"grnt_hermes_live_{suffix}"
+    idempotency_key = f"idem_hermes_live_{suffix}"
+    unit = unit_name_for(task_id, idempotency_key)
+    task_dir = environment.task_root / unit
+    revocation_dir = environment.egress_socket.parent / f"{unit}-revocations"
+
+    stub = _StubUpstream(environment.model)
+    broker: EgressBroker | None = None
+    try:
+        _make_directory(
+            revocation_dir,
+            owner=_current_user(),
+            group=environment.group,
+            mode="0770",
+        )
+        stub.start()
+        broker = _start_broker(environment, stub, revocation_dir)
+        config = environment.managed_config(revocation_dir)
+        supervisor = HelperSandboxSupervisor(config)
+        adapter = HermesManagedAdapter(config, supervisor)
+        submitted = adapter.submit_task(
+            task_id,
+            prompt,
+            idempotency_key,
+            _managed_grant(task_id, grant_id),
+        )
+        assert submitted.outcome is SubmitOutcome.ACCEPTED, submitted.error
+        handle = submitted.runtime_task_id
+        assert handle is not None and handle.startswith("rtask_hermes_")
+        yield _ManagedRun(
+            environment=environment,
+            task_id=task_id,
+            grant_id=grant_id,
+            idempotency_key=idempotency_key,
+            unit=unit,
+            task_dir=task_dir,
+            revocation_dir=revocation_dir,
+            config=config,
+            supervisor=supervisor,
+            adapter=adapter,
+            stub=stub,
+            broker=broker,
+            handle=handle,
+        )
+    finally:
+        stub.stop()
+        if broker is not None:
+            broker.stop()
+        _stop_unit(unit)
+        _remove_tree(task_dir, environment.task_root)
+        _remove_tree(revocation_dir, environment.egress_socket.parent)
+
+
+# ---------------------------------------------------------------------------
+# managed assertions
+# ---------------------------------------------------------------------------
+
+
+def _assert_task_files(
+    run: _ManagedRun, token: str
+) -> None:
+    """The prompt and token are task files; neither leaks into other files."""
+
+    mode = _sudo([STAT, "-c", "%a", str(run.task_dir / "egress.token")])
+    assert mode.returncode == 0, mode.stderr
+    assert mode.stdout.strip() == "640"
+
+    prompt = _read_remote_text(run.task_dir / "prompt.txt")
+    assert prompt is not None
+    assert MANAGED_PROMPT_CANARY in prompt
+
+    manifest = _read_remote_json(run.task_dir / "manifest.json")
+    assert manifest is not None
+    assert token not in json.dumps(manifest)
+    assert MANAGED_PROMPT_CANARY not in json.dumps(manifest)
+
+
+def _read_task_token(run: _ManagedRun) -> str:
+    token = _read_remote_text(run.task_dir / "egress.token")
+    assert token is not None, "the task egress token is unreadable"
+    token = token.strip()
+    assert token.startswith("egt.")
+    return token
+
+
+def _wait_for_child_pid(run: _ManagedRun, *, timeout: float) -> tuple[int, dict]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        marker = _read_remote_json(run.task_dir / "status" / "started.json")
+        if marker is not None:
+            pid = marker.get("child_pid")
+            if type(pid) is int and pid > 0:
+                return pid, marker
+        time.sleep(0.2)
+    pytest.fail("the started marker never reported a child pid")
+
+
+def _process_uid(pid: int) -> int:
+    completed = _sudo([CAT, f"/proc/{pid}/status"])
+    assert completed.returncode == 0, f"/proc/{pid}/status is unreadable"
+    for line in completed.stdout.splitlines():
+        if line.startswith("Uid:"):
+            fields = line.split()
+            assert len(fields) >= 2, "malformed /proc status Uid line"
+            return int(fields[1])
+    pytest.fail(f"/proc/{pid}/status has no Uid line")
+
+
+def _task_attestation_uid(run: _ManagedRun) -> int:
+    """Ask the production helper for the live task attestation and read its uid.
+
+    The helper returns a task attestation only while the unit is active with a
+    readable main-process UID, which is exactly the window this runs in.  This
+    is the same fixed stdin-JSON protocol the supervisor uses; the request
+    carries hashes and sizes only.
+    """
+
+    environment = run.environment
+    assert environment.helper is not None
+    manifest = _read_remote_json(run.task_dir / "manifest.json")
+    assert manifest is not None, "the manifest is unreadable"
+    digests: dict[str, str] = {}
+    for field, name in (
+        ("prompt_sha256", "prompt.txt"),
+        ("profile_template_sha256", "profile.template.yaml"),
+        ("egress_token_sha256", "egress.token"),
+    ):
+        digest = _remote_sha256(run.task_dir / name)
+        assert digest is not None, f"{name} is unreadable"
+        digests[field] = digest
+    prompt_size = _remote_size(run.task_dir / "prompt.txt")
+    assert prompt_size is not None
+
+    request = {
+        "operation": "attest",
+        "task_id": run.task_id,
+        "grant_id": run.grant_id,
+        "unit": run.unit,
+        "runtime_handle": manifest.get("runtime_handle"),
+        "idempotency_key": run.idempotency_key,
+        "prompt_sha256": digests["prompt_sha256"],
+        "prompt_bytes": prompt_size,
+        "profile_template_sha256": digests["profile_template_sha256"],
+        "egress_token_sha256": digests["egress_token_sha256"],
+        "ttl_seconds": manifest.get("ttl_seconds"),
+        "runtime_max_sec": manifest.get("runtime_max_sec"),
+        "memory_max_mb": manifest.get("memory_max_mb"),
+        "cpu_quota_percent": manifest.get("cpu_quota_percent"),
+        "tasks_max": manifest.get("tasks_max"),
+    }
+    completed = _sudo([str(environment.helper)], stdin_text=json.dumps(request))
+    assert completed.returncode == 0, completed.stderr
+    try:
+        document = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        pytest.fail("the helper attest response is not JSON")
+    assert isinstance(document, dict)
+    attestation = document.get("task_attestation")
+    assert isinstance(attestation, dict), (
+        "the helper did not return a live task attestation"
+    )
+    uid = attestation.get("uid")
+    assert type(uid) is int and uid > 0
+    return int(uid)
+
+
+def _child_arguments(run: _ManagedRun, pid: int) -> list[str]:
+    completed = _sudo([CAT, f"/proc/{pid}/cmdline"])
+    assert completed.returncode == 0, "the Hermes child process is not alive"
+    return [item for item in completed.stdout.split("\x00") if item]
+
+
+def _assert_child_process(run: _ManagedRun, token: str) -> None:
+    """Prompt file, terminal-only toolset, no argv secret, dynamic UID."""
+
+    pid, marker = _wait_for_child_pid(run, timeout=UNIT_START_TIMEOUT_SECONDS)
+    arguments = _child_arguments(run, pid)
+
+    assert arguments.count("-t") == 1, arguments
+    toolset_index = arguments.index("-t")
+    assert arguments[toolset_index + 1] == "terminal", arguments
+    assert arguments.count("--query-file") == 1, arguments
+    query_index = arguments.index("--query-file")
+    assert arguments[query_index + 1] == "/task/prompt.txt"
+    for forbidden in ("browser", "web", "mcp", "memory", "plugin", "file"):
+        assert forbidden not in arguments, f"the {forbidden} toolset is enabled"
+    assert "--api-key" not in arguments
+    assert "--safe-mode" in arguments
+    assert "--oneshot" in arguments
+    assert "-Q" in arguments
+    assert "chat" in arguments
+    assert MANAGED_PROMPT_CANARY not in " ".join(arguments)
+    assert token not in " ".join(arguments)
+
+    environ = _sudo([CAT, f"/proc/{pid}/environ"])
+    assert environ.returncode == 0, "the Hermes child environment is unreadable"
+    assert token in environ.stdout, (
+        "the task token must reach the child only through its environment"
+    )
+    assert "HERMES_HOME=/task/profile" in environ.stdout
+    assert "HERMES_GATEWAY_LOCK_DIR=/task/locks" in environ.stdout
+    for path in run.environment.personal_paths().values():
+        assert str(path) not in environ.stdout
+        assert str(path) not in " ".join(arguments)
+
+    uid = _process_uid(pid)
+    workload_pid = marker.get("workload_pid")
+    if type(workload_pid) is int and workload_pid > 0:
+        assert _process_uid(workload_pid) == uid
+    assert uid > 0
+    assert uid != os.geteuid()
+    assert DYNAMIC_UID_MIN <= uid <= DYNAMIC_UID_MAX, (
+        f"{uid} is outside systemd's dynamic-user range"
+    )
+    assert uid == _task_attestation_uid(run)
+
+
+def _assert_chat_request(run: _ManagedRun, token: str) -> None:
+    chat = _wait_for_chat_request(
+        run.stub, timeout=STUB_RELEASE_TIMEOUT_SECONDS
+    )
+    raw_body = chat.get("body")
+    assert isinstance(raw_body, bytes)
+    decoded = raw_body.decode("utf-8", "replace")
+    assert str(chat.get("path", "")).split("?", 1)[0] == "/v1/chat/completions"
+    assert MANAGED_PROMPT_CANARY in decoded
+    assert token not in decoded
+
+    headers = chat.get("headers")
+    assert isinstance(headers, dict)
+    lowered = {str(name).lower(): str(value) for name, value in headers.items()}
+    assert "x-agentmgr-egress-token" not in lowered
+    assert token not in json.dumps(lowered)
+    assert lowered.get("authorization") == f"Bearer {STUB_PROVIDER_KEY.decode()}"
+
+
+def _task_directory_files(task_dir: Path) -> dict[str, str]:
+    """Read every regular file in the finished task directory (sudo)."""
+
+    completed = _sudo([FIND, str(task_dir), "-type", "f", "-print"])
+    assert completed.returncode == 0, completed.stderr
+    files: dict[str, str] = {}
+    for line in completed.stdout.splitlines():
+        if not line.strip():
+            continue
+        path = Path(line)
+        relative = path.relative_to(task_dir).as_posix()
+        text = _read_remote_text(path)
+        assert text is not None, f"expected task file {relative} is unreadable"
+        files[relative] = text
+    assert files, "the finished task directory has no regular files"
+    return files
+
+
+def _assert_completed_task_directory(run: _ManagedRun, token: str) -> None:
+    """Scan the whole finished task directory for prompt/token leakage.
+
+    Missing or unreadable expected log/status files fail; only ``prompt.txt``
+    may contain the prompt and only ``egress.token`` may contain the token.
+    """
+
+    files = _task_directory_files(run.task_dir)
+    expected = {
+        "manifest.json",
+        "prompt.txt",
+        "profile.template.yaml",
+        "profile/config.yaml",
+        "egress.token",
+        "status/started.json",
+        "status/heartbeat.json",
+        "status/exit.json",
+        "stdout.txt",
+        "stderr.txt",
+    }
+    missing = sorted(expected - set(files))
+    assert not missing, f"expected task files are missing after the run: {missing}"
+
+    assert token in files["egress.token"]
+    assert MANAGED_PROMPT_CANARY in files["prompt.txt"]
+    assert MANAGED_PROMPT_CANARY not in files["egress.token"]
+    assert token not in files["prompt.txt"]
+
+    for relative, text in files.items():
+        if relative == "egress.token":
+            continue
+        assert token not in text, f"the egress token leaked into {relative}"
+    for relative, text in files.items():
+        if relative == "prompt.txt":
+            continue
+        assert MANAGED_PROMPT_CANARY not in text, (
+            f"the prompt leaked into {relative}"
+        )
+
+
+def _assert_journal_is_clean(unit: str, token: str) -> None:
+    completed = _sudo([JOURNALCTL, "--no-pager", "-o", "cat", "-u", unit])
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip(), "an empty journal cannot prove absence"
+    assert MANAGED_PROMPT_CANARY not in completed.stdout
+    assert token not in completed.stdout
+
+
 def _wait_for_terminal_status(
     adapter: HermesManagedAdapter, handle: str, task_id: str
-) -> object:
+) -> Any:
     deadline = time.monotonic() + STATUS_TIMEOUT_SECONDS
     terminal = {
         RuntimeState.COMPLETED,
@@ -1133,247 +1828,187 @@ def _wait_for_terminal_status(
     pytest.fail("the managed task did not reach a terminal state in time")
 
 
-def _assert_managed_properties(
-    dump: str, environment: LiveEnvironment, task_dir: Path
-) -> None:
-    assert environment.runtime_root is not None
-    assert environment.task_root is not None
-    assert environment.egress_socket is not None
-
-    assert _property(dump, "ActiveState") == "active"
-    assert _property(dump, "DynamicUser") == "yes"
-    assert _property(dump, "Group") == environment.group
-    assert _property_values(dump, "SupplementaryGroups") in ([], [""])
-    assert _property(dump, "PrivateDevices") == "yes"
-    assert _property(dump, "PrivateNetwork") == "yes"
-    assert _property(dump, "ProtectHome") == "yes"
-    assert _property(dump, "ProtectSystem") == "strict"
-    assert _property(dump, "WorkingDirectory") == "/task"
-
-    inaccessible = _joined(dump, "InaccessiblePaths")
-    assert f"-{environment.task_root}" in inaccessible
-    if environment.egress_socket.parent != environment.task_root:
-        assert f"-{environment.egress_socket.parent}" in inaccessible
-
-    bind = _joined(dump, "BindPaths")
-    assert f"{task_dir}:/task" in bind
-    assert f"{environment.task_root}:" not in bind
-    readonly = _joined(dump, "BindReadOnlyPaths")
-    assert f"{environment.runtime_root}:/runtime" in readonly
-    assert f"{environment.egress_socket}:/task/egress.sock" in readonly
-    assert ":/workload.py" in readonly
-
-    assert MANAGED_PROMPT_CANARY not in dump
-    for path in _personal_paths().values():
-        assert str(path) not in dump
-
-
-def _assert_task_files(task_dir: Path) -> str:
-    """Check the task-file channel and return the task egress token."""
-
-    mode = _sudo(["/usr/bin/stat", "-c", "%a", str(task_dir / "egress.token")])
-    assert mode.returncode == 0, mode.stderr
-    assert mode.stdout.strip() == "640"
-
-    token = _read_remote_text(task_dir / "egress.token")
-    assert token is not None
-    token = token.strip()
-    assert token.startswith("egt.")
-
-    prompt = _read_remote_text(task_dir / "prompt.txt") or ""
-    assert MANAGED_PROMPT_CANARY in prompt
-
-    for name in (
-        "manifest.json",
-        "profile/config.yaml",
-        "status/started.json",
-        "status/exit.json",
-        "stdout.txt",
-        "stderr.txt",
-    ):
-        text = _read_remote_text(task_dir / name) or ""
-        assert token not in text, f"the egress token leaked into {name}"
-        assert MANAGED_PROMPT_CANARY not in text, f"the prompt leaked into {name}"
-    return token
-
-
-def _assert_child_process(task_dir: Path, token: str) -> None:
-    """The prompt is a file and the token is only an environment value."""
-
-    started = _read_remote_json(task_dir / "status" / "started.json")
-    assert started is not None, "the started marker is missing"
-    child_pid = started.get("child_pid")
-    assert type(child_pid) is int and child_pid > 0
-
-    cmdline = _sudo([CAT, f"/proc/{child_pid}/cmdline"])
-    assert cmdline.returncode == 0, "the Hermes child process is not alive"
-    for fact in HERMES_ARGV_FACTS:
-        assert fact in cmdline.stdout
-    assert MANAGED_PROMPT_CANARY not in cmdline.stdout
-    assert token not in cmdline.stdout
-
-    environ = _sudo([CAT, f"/proc/{child_pid}/environ"])
-    assert environ.returncode == 0, "the Hermes child environment is unreadable"
-    assert token in environ.stdout, (
-        "the task token must reach the child only through its environment"
-    )
-
-
-def _wait_for_stub_request(stub: _StubUpstream, *, timeout: float) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if stub.requests:
-            return
-        time.sleep(0.2)
-    pytest.fail("Hermes never sent a model request through the egress broker")
-
-
-def _assert_journal_is_clean(unit: str, token: str) -> None:
-    completed = _sudo([JOURNALCTL, "--no-pager", "-o", "cat", "-u", unit])
-    assert completed.returncode == 0, completed.stderr
-    assert MANAGED_PROMPT_CANARY not in completed.stdout
-    assert token not in completed.stdout
-
-
-def _started_marker(task_dir: Path) -> dict[str, object]:
-    marker = _read_remote_json(task_dir / "status" / "started.json")
-    assert marker is not None, "the started marker is missing"
-    return marker
+# ---------------------------------------------------------------------------
+# managed lifecycle body
+# ---------------------------------------------------------------------------
 
 
 @live_only
 class TestManagedLifecycle:
     def test_managed_task_lifecycle_with_stub_broker(
-        self, live_environment: LiveEnvironment, tmp_path: Path
+        self, live_environment: LiveEnvironment
     ) -> None:
         environment = live_environment
         reason = environment.lifecycle_skip_reason()
         if reason:
             pytest.skip(reason)
 
-        assert environment.task_root is not None
-        assert environment.egress_socket is not None
-        assert environment.helper is not None
-
-        if environment.egress_socket.exists():
-            pytest.fail(
-                "AGENTMGR_HERMES_EGRESS_SOCKET already exists: this body must own "
-                "a dedicated test socket and never replaces a live broker socket"
+        with _managed_task(environment, prompt=MANAGED_PROMPT_CANARY) as run:
+            dump = _wait_for_active_unit(
+                run.unit, timeout=UNIT_START_TIMEOUT_SECONDS
             )
+            dump = _show(run.unit)
+            _assert_unit_profile(dump, environment, run.task_dir, workload=None)
 
-        suffix = secrets.token_hex(4)
-        task_id = f"task_hermes_live_{suffix}"
-        grant_id = f"grnt_hermes_live_{suffix}"
-        idempotency_key = f"idem_hermes_live_{suffix}"
-        unit = unit_name_for(task_id, idempotency_key)
-        task_dir = environment.task_root / unit
-        revocation_dir = (
-            environment.egress_socket.parent / f"{unit}-revocations"
-        )
-
-        stub = _StubUpstream(environment.model)
-        broker: EgressBroker | None = None
-        supervisor: HelperSandboxSupervisor | None = None
-        try:
-            _make_directory(
-                revocation_dir,
-                owner=_current_user(),
-                group=environment.group,
-                mode="0770",
-            )
-            stub.start()
-            broker = _start_broker(environment, stub, revocation_dir)
-            config = environment.managed_config(revocation_dir)
-            supervisor = HelperSandboxSupervisor(config)
-            adapter = HermesManagedAdapter(config, supervisor)
-
-            submitted = adapter.submit_task(
-                task_id,
-                MANAGED_PROMPT_CANARY,
-                idempotency_key,
-                _managed_grant(task_id, grant_id),
-            )
-            assert submitted.outcome is SubmitOutcome.ACCEPTED, submitted.error
-            handle = submitted.runtime_task_id
-            assert handle is not None and handle.startswith("rtask_hermes_")
-
-            dump = _wait_for_active_unit(unit, timeout=UNIT_START_TIMEOUT_SECONDS)
-            _wait_for_stub_request(stub, timeout=STUB_RELEASE_TIMEOUT_SECONDS)
-            dump = _show(unit)
-            _assert_managed_properties(dump, environment, task_dir)
-
-            marker = _started_marker(task_dir)
-            assert marker.get("unit") == unit
-            assert marker.get("task_id") == task_id
-            assert marker.get("runtime_handle") == handle
+            marker = _read_remote_json(run.task_dir / "status" / "started.json")
+            assert marker is not None, "the started marker is missing"
+            assert marker.get("unit") == run.unit
+            assert marker.get("task_id") == run.task_id
+            assert marker.get("runtime_handle") == run.handle
             started_at = marker.get("started_at")
             main_start = _property(dump, "ExecMainStartTimestamp")
 
-            token = _assert_task_files(task_dir)
-            assert token not in _show(unit)
-            _assert_child_process(task_dir, token)
+            token = _read_task_token(run)
+            _assert_task_files(run, token)
+            assert token not in dump
+            _assert_chat_request(run, token)
+            _assert_child_process(run, token)
 
             # A duplicate submission reuses the same unit and never relaunches.
-            replay = adapter.submit_task(
-                task_id,
+            replay = run.adapter.submit_task(
+                run.task_id,
                 MANAGED_PROMPT_CANARY,
-                idempotency_key,
-                _managed_grant(task_id, grant_id),
+                run.idempotency_key,
+                _managed_grant(run.task_id, run.grant_id),
             )
             assert replay.outcome is SubmitOutcome.ACCEPTED, replay.error
             assert replay.replayed is True
-            assert replay.runtime_task_id == handle
-            conflict = adapter.submit_task(
-                task_id,
+            assert replay.runtime_task_id == run.handle
+            conflict = run.adapter.submit_task(
+                run.task_id,
                 MANAGED_PROMPT_CANARY + " (different payload)",
-                idempotency_key,
-                _managed_grant(task_id, grant_id),
+                run.idempotency_key,
+                _managed_grant(run.task_id, run.grant_id),
             )
             assert conflict.outcome is SubmitOutcome.CONFLICT, conflict.error
-            malformed = adapter.submit_task(
-                task_id,
+            malformed = run.adapter.submit_task(
+                run.task_id,
                 MANAGED_PROMPT_CANARY,
-                idempotency_key,
-                _managed_grant(task_id, grant_id, execution_mode="advisory"),
+                run.idempotency_key,
+                _managed_grant(
+                    run.task_id, run.grant_id, execution_mode="advisory"
+                ),
             )
             assert malformed.outcome is SubmitOutcome.REJECTED, malformed.error
-            # The one unit never restarted: same start timestamp, same marker.
-            after = _show(unit)
+            after = _show(run.unit)
             assert _property(after, "ExecMainStartTimestamp") == main_start
-            assert _started_marker(task_dir).get("started_at") == started_at
+            marker_after = _read_remote_json(
+                run.task_dir / "status" / "started.json"
+            )
+            assert marker_after is not None
+            assert marker_after.get("started_at") == started_at
 
             # The stub upstream is the only model path; release its answer.
-            stub.release.set()
+            run.stub.release.set()
 
-            status = _wait_for_terminal_status(adapter, handle, task_id)
+            status = _wait_for_terminal_status(
+                run.adapter, run.handle, run.task_id
+            )
             assert status.state is RuntimeState.COMPLETED, status
-            assert _read_remote_json(task_dir / "status" / "exit.json") is not None
+            _wait_for_unit_gone(run.unit, timeout=UNIT_STOP_TIMEOUT_SECONDS)
 
             # No artifact: the adapter must not synthesize success.
-            result = adapter.get_result(handle, task_id=task_id)
+            result = run.adapter.get_result(run.handle, task_id=run.task_id)
             assert result.outcome in {
                 ResultOutcome.UNKNOWN,
                 ResultOutcome.NEEDS_HUMAN,
             }, result
             assert result.result_ref is None
-            assert not (task_dir / "out" / "result.txt").exists()
+            assert not (run.task_dir / "out" / "result.txt").exists()
 
-            _assert_journal_is_clean(unit, token)
+            # The unit has fully exited: scan every task file and the journal.
+            _assert_completed_task_directory(run, token)
+            _assert_journal_is_clean(run.unit, token)
 
-            stopped = supervisor.stop(unit, reason="live_test")
+            stopped = run.supervisor.stop(run.unit, reason="live_test")
             assert stopped.stop_confirmed is True
             assert stopped.process_gone is True
-            _wait_for_unit_gone(unit, timeout=UNIT_STOP_TIMEOUT_SECONDS)
+            _wait_for_unit_gone(run.unit, timeout=UNIT_STOP_TIMEOUT_SECONDS)
 
-            supervisor.cleanup(unit, result_read=True)
-            assert not task_dir.exists()
-        finally:
-            stub.stop()
-            if broker is not None:
-                broker.stop()
-            _stop_unit(unit)
-            _remove_tree(task_dir, environment.task_root)
-            _remove_tree(revocation_dir, environment.egress_socket.parent)
+            run.supervisor.cleanup(run.unit, result_read=True)
+            assert not run.task_dir.exists()
+
+
+# ---------------------------------------------------------------------------
+# stop-while-live body
+# ---------------------------------------------------------------------------
+
+
+@live_only
+class TestStopWhileLive:
+    def test_stop_while_live_never_claims_before_the_cgroup_is_gone(
+        self, live_environment: LiveEnvironment
+    ) -> None:
+        environment = live_environment
+        reason = environment.lifecycle_skip_reason()
+        if reason:
+            pytest.skip(reason)
+
+        with _managed_task(environment, prompt=MANAGED_PROMPT_CANARY) as run:
+            _wait_for_chat_request(run.stub, timeout=STUB_RELEASE_TIMEOUT_SECONDS)
+            dump = _show(run.unit)
+            _assert_unit_profile(dump, environment, run.task_dir, workload=None)
+            assert not _unit_is_gone(dump), "the unit must be live before the stop"
+
+            outcome: dict[str, object] = {}
+            returned_at: list[float] = []
+
+            def _cancel() -> None:
+                try:
+                    outcome["result"] = run.adapter.cancel_task(
+                        run.handle, task_id=run.task_id, reason="live_stop"
+                    )
+                except BaseException as error:  # noqa: BLE001 - reported below
+                    outcome["error"] = error
+                finally:
+                    returned_at.append(time.monotonic())
+
+            thread = threading.Thread(target=_cancel, daemon=True)
+            thread.start()
+            gone_at: float | None = None
+            deadline = time.monotonic() + UNIT_STOP_TIMEOUT_SECONDS
+            while time.monotonic() < deadline:
+                snapshot = _try_show(run.unit)
+                if snapshot is not None and _unit_is_gone(snapshot):
+                    gone_at = time.monotonic()
+                    break
+                time.sleep(0.1)
+            thread.join(timeout=UNIT_STOP_TIMEOUT_SECONDS)
+            assert not thread.is_alive(), "the helper stop did not return"
+            assert "error" not in outcome, outcome.get("error")
+            cancel = outcome.get("result")
+            assert isinstance(cancel, CancelResult), cancel
+            assert returned_at
+
+            # A live unit is never "already terminal"; the adapter may only
+            # report a confirmed stop for a cgroup that is already gone.
+            assert cancel.outcome is not CancelOutcome.ALREADY_TERMINAL
+            assert cancel.outcome is not CancelOutcome.UNSUPPORTED
+            if cancel.outcome is CancelOutcome.REQUESTED:
+                assert cancel.stop_confirmed is False
+                assert gone_at is None or gone_at >= returned_at[0] - 0.5, (
+                    "the adapter reported a request for a unit that was gone"
+                )
+            else:
+                assert cancel.outcome is CancelOutcome.STOPPED, cancel
+                assert cancel.stop_confirmed is True
+                assert gone_at is not None, "a confirmed stop without a gone unit"
+                assert gone_at <= returned_at[0] + 1.0
+
+            _wait_for_unit_gone(run.unit, timeout=UNIT_STOP_TIMEOUT_SECONDS)
+            status = run.adapter.get_status(run.handle, task_id=run.task_id)
+            assert status.stop_confirmed is True
+            assert status.state is not RuntimeState.COMPLETED
+
+            result = run.adapter.get_result(run.handle, task_id=run.task_id)
+            assert result.outcome in {
+                ResultOutcome.UNKNOWN,
+                ResultOutcome.NEEDS_HUMAN,
+            }, result
+            assert result.result_ref is None
+
+            run.supervisor.cleanup(run.unit, result_read=True)
+            assert not run.task_dir.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -1381,7 +2016,7 @@ class TestManagedLifecycle:
 # ---------------------------------------------------------------------------
 
 
-def _probe_module() -> object:
+def _probe_module() -> Any:
     spec = importlib.util.spec_from_file_location(
         "hermes_probe_workload", PROBE_WORKLOAD
     )
@@ -1391,41 +2026,86 @@ def _probe_module() -> object:
     return module
 
 
-def test_probe_workload_reports_only_generic_labels(tmp_path: Path) -> None:
+def test_probe_classifies_denial_kinds(tmp_path: Path, monkeypatch) -> None:
     probe = _probe_module()
-    visible = tmp_path / "visible.txt"
-    visible.write_text("canary", encoding="utf-8")
-    empty = tmp_path / "empty"
-    empty.mkdir()
-    populated = tmp_path / "populated"
-    populated.mkdir()
-    (populated / "file").write_text("x", encoding="utf-8")
+    readable = tmp_path / "readable.txt"
+    readable.write_text("canary", encoding="utf-8")
+    blocked = tmp_path / "blocked.txt"
+    blocked.write_text("secret", encoding="utf-8")
+    blocked.chmod(0o000)
+    try:
+        assert probe.probe_denied(str(readable)) == ("reached", "readable")
+        # A plain permission denial is reported as a DAC baseline, never as
+        # isolation, even though the path exists on the host.
+        assert probe.probe_denied(str(blocked))[0] == "permission"
+        assert probe.probe_denied(str(tmp_path / "missing"))[0] == "absent"
+    finally:
+        blocked.chmod(0o600)
 
-    for path, expected in (
-        (str(tmp_path / "missing"), "denied"),
-        (str(visible), "reached"),
-        (str(empty), "denied"),
-        (str(populated), "reached"),
-    ):
-        observed, _detail = probe.probe_denied_path(path)
-        assert observed == expected, path
+    mask = tmp_path / "mask"
+    mask.mkdir()
+    mask.chmod(0o000)
+    try:
+        # The unit-test fixture cannot create a uid-0 inode; treat mode 0000 as
+        # the mask marker for this classification test only.
+        monkeypatch.setattr(
+            probe,
+            "_is_mask",
+            lambda info: stat.S_IMODE(info.st_mode) == 0,
+        )
+        assert probe.probe_denied(str(mask)) == ("hidden", "mask")
+        assert probe.probe_denied(str(mask / "child"))[0] == "hidden"
+    finally:
+        mask.chmod(0o700)
 
-    observed, _detail = probe.probe_loopback()
-    assert observed == "ok"
-    observed, _detail = probe.probe_task_dir_write(tmp_path)
-    assert observed == "ok"
 
+class _FakeSocketModule:
+    def __init__(self, error: BaseException) -> None:
+        self._error = error
+
+    def create_connection(self, *_args: object, **_kwargs: object) -> None:
+        raise self._error
+
+
+def test_probe_external_requires_enetunreach(monkeypatch) -> None:
+    probe = _probe_module()
+    monkeypatch.setattr(
+        probe, "socket", _FakeSocketModule(OSError(errno.ENETUNREACH, "no route"))
+    )
+    assert probe.probe_external("203.0.113.1", 443) == (
+        "isolated",
+        "ENETUNREACH",
+    )
+
+    monkeypatch.setattr(
+        probe, "socket", _FakeSocketModule(TimeoutError("timed out"))
+    )
+    assert probe.probe_external("203.0.113.1", 443)[0] == "error"
+
+
+def test_probe_report_has_only_labels_and_expectations(tmp_path: Path) -> None:
+    probe = _probe_module()
+    missing = tmp_path / "missing"
     report = probe.collect_report(
         task_dir=tmp_path,
-        denied_paths={"missing": str(tmp_path / "missing")},
+        denied={"missing": (str(missing), "absent")},
         external=None,
+        oracles_absent=("docker_socket",),
     )
     assert report["ok"] is True
     assert report["failed"] == []
-    assert report["probes"]["missing"]["observed"] == "denied"
+    assert report["oracles_absent"] == ["docker_socket"]
+    assert report["probes"]["missing"] == {
+        "expected": "absent",
+        "observed": "absent",
+        "passed": True,
+        "detail": "ENOENT",
+    }
+    assert report["probes"]["loopback"]["observed"] == "ok"
+    assert report["probes"]["task_dir_write"]["observed"] == "ok"
     raw = json.dumps(report)
     assert str(tmp_path) not in raw
-    assert "visible.txt" not in raw
+    assert "missing" in raw  # the label, never the path
 
 
 def test_probe_workload_imports_only_the_standard_library() -> None:
@@ -1434,6 +2114,45 @@ def test_probe_workload_imports_only_the_standard_library() -> None:
         stripped = line.strip()
         assert not stripped.startswith("import app."), stripped
         assert not stripped.startswith("from app."), stripped
+
+
+def test_probe_workload_pin_rejects_a_modified_copy(
+    tmp_path: Path, monkeypatch
+) -> None:
+    environment = read_environment()
+    pinned, digest = _pinned_probe_workload(environment)
+    assert pinned == environment.probe_workload
+    assert digest == hashlib.sha256(PROBE_WORKLOAD.read_bytes()).hexdigest()
+
+    copy = tmp_path / "hermes_probe_workload.py"
+    copy.write_bytes(PROBE_WORKLOAD.read_bytes() + b"\n# modified\n")
+    monkeypatch.setenv("AGENTMGR_HERMES_PROBE_WORKLOAD", str(copy))
+    modified = read_environment()
+    with pytest.raises(pytest.fail.Exception):
+        _pinned_probe_workload(modified)
+
+
+def test_oracle_precheck_rejects_absent_and_weak_oracles(tmp_path: Path) -> None:
+    readable = tmp_path / "readable.txt"
+    readable.write_text("x", encoding="utf-8")
+    group = _user_group()
+
+    with pytest.raises(pytest.fail.Exception):
+        _precheck_oracles(
+            [_Oracle("missing", tmp_path / "missing", "hidden", required=True)],
+            group=group,
+        )
+    with pytest.raises(pytest.fail.Exception):
+        _precheck_oracles(
+            [_Oracle("readable", readable, "permission", required=True)],
+            group=group,
+        )
+    # An absent optional oracle is recorded, not silently dropped.
+    absent = _precheck_oracles(
+        [_Oracle("optional", tmp_path / "missing", "absent", required=False)],
+        group=group,
+    )
+    assert absent == ["optional"]
 
 
 def test_probe_argv_reuses_the_production_sandbox_profile() -> None:
@@ -1483,7 +2202,7 @@ def test_probe_argv_reuses_the_production_sandbox_profile() -> None:
     assert not any(CANARY_PROMPT in item or CANARY_TOKEN in item for item in argv)
 
 
-def test_property_parser_reads_repeated_and_single_values() -> None:
+def test_property_reader_distinguishes_missing_from_empty() -> None:
     dump = "\n".join(
         [
             "Id=agentmgr-hermes-0123456789abcdef.service",
@@ -1502,6 +2221,8 @@ def test_property_parser_reads_repeated_and_single_values() -> None:
     ]
     assert _property(dump, "PrivateDevices") == "yes"
     assert _property(dump, "PrivateNetwork") == ""
+    with pytest.raises(AssertionError):
+        _require_property(dump, "PrivateNetwork")
 
 
 def test_live_gate_names_both_required_variables() -> None:
