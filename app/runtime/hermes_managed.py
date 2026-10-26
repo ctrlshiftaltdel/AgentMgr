@@ -2945,6 +2945,7 @@ class HermesManagedAdapter:
             return unit, manifest
 
         try:
+            unreadable_sibling = False
             with os.scandir(self._config.task_root) as entries:
                 seen = 0
                 for entry in entries:
@@ -2958,16 +2959,17 @@ class HermesManagedAdapter:
                         if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
                             continue
                     except OSError:
+                        unreadable_sibling = True
                         continue
                     try:
                         manifest = read_manifest(self._config, unit)
                     except SandboxSpecError:
-                        # A manifest exists but cannot be trusted.  Without it
-                        # this scan cannot prove the handle is absent, so fail
-                        # closed instead of answering not_found.
-                        raise _ManifestUnreadable(
-                            "task manifest is unreadable"
-                        ) from None
+                        # An unreadable sibling is skipped so one bad task
+                        # directory cannot hide every later healthy task.  If
+                        # the whole scan finds no match, the caller still gets
+                        # ``unknown`` (never ``not_found``).
+                        unreadable_sibling = True
+                        continue
                     if (
                         manifest is not None
                         and manifest.runtime_handle == handle
@@ -2976,6 +2978,10 @@ class HermesManagedAdapter:
                         with self._lock:
                             self._handles[handle] = (unit, manifest.task_id)
                         return unit, manifest
+            if unreadable_sibling:
+                raise _ManifestUnreadable(
+                    "a task manifest in the task root is unreadable"
+                )
         except (FileNotFoundError, NotADirectoryError, OSError):
             return None
         return None
@@ -3062,8 +3068,6 @@ def _map_status(status: SandboxStatus) -> tuple[RuntimeState, RuntimeErrorInfo |
         return RuntimeState.TIMED_OUT, None
     if status.cancelled and status.process_gone:
         return RuntimeState.STOPPED, None
-    if status.started and status.exit_code is not None and status.exit_code != 0:
-        return RuntimeState.FAILED, None
     if status.active_state == "failed":
         return RuntimeState.FAILED, None
     if status.process_gone:

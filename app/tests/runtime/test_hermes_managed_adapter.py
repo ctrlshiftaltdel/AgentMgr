@@ -423,6 +423,64 @@ def _alarm(seconds: int):
         signal.signal(signal.SIGALRM, previous)
 
 
+def _write_corrupt_sibling(
+    config: HermesManagedConfig,
+    name: str = "agentmgr-hermes-ffffffffffffffff",
+) -> str:
+    task_dir = config.task_root / name
+    (task_dir / "out").mkdir(parents=True, exist_ok=True)
+    manifest = task_dir / "manifest.json"
+    manifest.write_text("{not-json", encoding="utf-8")
+    manifest.chmod(0o640)
+    return name
+
+
+class _OrderedScandir:
+    def __init__(self, entries):
+        self._entries = entries
+
+    def __enter__(self):
+        return iter(self._entries)
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+class _UnstattableEntry:
+    """A task-root entry whose metadata cannot be read."""
+
+    name = "agentmgr-hermes-eeeeeeeeeeeeeeee"
+
+    def is_symlink(self) -> bool:
+        return False
+
+    def is_dir(self, *, follow_symlinks: bool = True) -> bool:
+        raise OSError(5, "input/output error")
+
+
+def _scandir_with_first(config: HermesManagedConfig, first, monkeypatch):
+    """Place ``first`` (a name of a real entry, or a fake entry) first in the scan."""
+
+    real_scandir = os.scandir
+
+    def fake_scandir(path):
+        handle = real_scandir(path)
+        try:
+            entries = list(handle)
+        finally:
+            handle.close()
+        if Path(path) == config.task_root:
+            if isinstance(first, str):
+                entries.sort(key=lambda entry: 0 if entry.name == first else 1)
+            else:
+                entries.insert(0, first)
+        return _OrderedScandir(entries)
+
+    monkeypatch.setattr(
+        "app.runtime.hermes_managed.os.scandir", fake_scandir
+    )
+
+
 # ---------------------------------------------------------------------------
 # capabilities gating
 # ---------------------------------------------------------------------------
@@ -855,6 +913,47 @@ def test_status_maps_nonzero_exit_to_failed(tmp_path):
     assert status.state is RuntimeState.FAILED
 
 
+def test_nonzero_exit_while_the_unit_is_alive_is_running(tmp_path):
+    _, supervisor, adapter, result = accepted_submission(tmp_path)
+    supervisor.active_state = "active"
+    supervisor.process_gone = False
+    supervisor.started = True
+    supervisor.exit_code = 1
+
+    status = adapter.get_status(result.runtime_task_id, task_id="task_1")
+
+    assert status.state is RuntimeState.RUNNING
+    assert status.stop_confirmed is False
+
+
+def test_unloaded_nonzero_exit_is_failed(tmp_path):
+    _, supervisor, adapter, result = accepted_submission(tmp_path)
+    supervisor.active_state = "not-found"
+    supervisor.sub_state = None
+    supervisor.process_gone = True
+    supervisor.started = True
+    supervisor.exit_code = 1
+
+    status = adapter.get_status(result.runtime_task_id, task_id="task_1")
+
+    assert status.state is RuntimeState.FAILED
+
+
+def test_unloaded_without_an_exit_marker_is_unknown(tmp_path):
+    _, supervisor, adapter, result = accepted_submission(tmp_path)
+    supervisor.active_state = "not-found"
+    supervisor.sub_state = None
+    supervisor.process_gone = True
+    supervisor.started = True
+    supervisor.exit_code = None
+    supervisor.exit_status = None
+
+    status = adapter.get_status(result.runtime_task_id, task_id="task_1")
+
+    assert status.state is RuntimeState.UNKNOWN
+    assert status.stop_confirmed is True
+
+
 def test_status_maps_timeout_and_cancelled(tmp_path):
     _, supervisor, adapter, result = accepted_submission(tmp_path)
     supervisor.active_state = "failed"
@@ -943,6 +1042,76 @@ def test_unreadable_or_tampered_manifest_is_unknown_not_not_found(tmp_path):
     assert symlinked.state is RuntimeState.UNKNOWN
 
 
+def test_cold_scan_skips_a_corrupt_sibling_and_finds_a_later_manifest(
+    tmp_path, monkeypatch
+):
+    config, supervisor, adapter, submitted = accepted_submission(tmp_path)
+    unit = unit_name_for("task_1", "idem_1")
+    _complete_with_artifact(config, supervisor, unit, b"cold-scan-success")
+    supervisor.active_state = "not-found"
+    supervisor.sub_state = None
+    supervisor.started = True
+    supervisor.exit_code = 0
+    supervisor.process_gone = True
+    corrupt = _write_corrupt_sibling(config)
+    _scandir_with_first(config, corrupt, monkeypatch)
+
+    restarted = HermesManagedAdapter(config, supervisor, now=lambda: NOW)
+    status = restarted.get_status(submitted.runtime_task_id, task_id="task_1")
+    result = restarted.get_result(submitted.runtime_task_id, task_id="task_1")
+    stop_before = supervisor.stop_calls
+    cancelled = restarted.cancel_task(submitted.runtime_task_id, task_id="task_1")
+
+    assert status.state is RuntimeState.COMPLETED
+    assert result.outcome is ResultOutcome.SUCCEEDED
+    assert cancelled.outcome is CancelOutcome.ALREADY_TERMINAL
+    assert supervisor.stop_calls == stop_before + 1
+
+
+def test_cold_scan_skips_an_unreadable_sibling_and_finds_a_later_manifest(
+    tmp_path, monkeypatch
+):
+    config, supervisor, adapter, submitted = accepted_submission(tmp_path)
+    unit = unit_name_for("task_1", "idem_1")
+    _complete_with_artifact(config, supervisor, unit, b"cold-scan-unreadable")
+    supervisor.active_state = "not-found"
+    supervisor.sub_state = None
+    supervisor.started = True
+    supervisor.exit_code = 0
+    supervisor.process_gone = True
+    _scandir_with_first(config, _UnstattableEntry(), monkeypatch)
+
+    restarted = HermesManagedAdapter(config, supervisor, now=lambda: NOW)
+    status = restarted.get_status(submitted.runtime_task_id, task_id="task_1")
+
+    assert status.state is RuntimeState.COMPLETED
+    assert status.state is not RuntimeState.UNKNOWN
+
+
+def test_cold_scan_without_a_match_and_an_unreadable_sibling_is_unknown(
+    tmp_path, monkeypatch
+):
+    config, supervisor, _, _ = accepted_submission(tmp_path)
+    _scandir_with_first(config, _UnstattableEntry(), monkeypatch)
+    restarted = HermesManagedAdapter(config, supervisor, now=lambda: NOW)
+
+    status = restarted.get_status("rtask_hermes_" + "0" * 32, task_id="task_1")
+
+    assert status.state is RuntimeState.UNKNOWN
+    assert status.state is not RuntimeState.NOT_FOUND
+
+
+def test_cold_scan_without_a_match_and_a_corrupt_sibling_is_unknown(tmp_path):
+    config, supervisor, _ = build_adapter(tmp_path)
+    _write_corrupt_sibling(config)
+    restarted = HermesManagedAdapter(config, supervisor, now=lambda: NOW)
+
+    status = restarted.get_status("rtask_hermes_" + "0" * 32, task_id="task_1")
+
+    assert status.state is RuntimeState.UNKNOWN
+    assert status.state is not RuntimeState.NOT_FOUND
+
+
 def test_cross_task_cancel_is_unknown_and_never_stops(tmp_path):
     config, supervisor, adapter, submitted = accepted_submission(tmp_path)
 
@@ -1028,6 +1197,7 @@ def test_unloaded_success_is_completed_and_verifying_evidence(tmp_path):
     assert status.stop_confirmed is True
     assert lookup.outcome is LookupOutcome.FOUND
     assert lookup.runtime_task_id == submitted.runtime_task_id
+    assert lookup.reported_state == RuntimeState.COMPLETED.value
     assert result.outcome is ResultOutcome.SUCCEEDED
     assert result.result_ref is not None
     assert result.evidence_refs[0].startswith("evidence:hermes_artifact_")
