@@ -268,23 +268,35 @@ def _json(path: Path) -> dict[str, object]:
 # ---------------------------------------------------------------------------
 
 
-def test_hermes_argv_uses_query_file_and_never_prompt_or_key():
+def test_hermes_argv_matches_the_supported_one_shot_command_exactly():
     argv = workload.build_hermes_argv(
-        RUNTIME_ROOT, model=MODEL, base_url=BASE_URL, run_budget_sec=60
+        RUNTIME_ROOT, model=MODEL, base_url=BASE_URL
     )
     assert argv[0] == str(
         RUNTIME_ROOT / "hermes-agent" / ".hermes" / "bin" / "hermes"
     )
-    assert "chat" in argv
-    assert "--query-file" in argv and "/task/prompt.txt" in argv
-    assert "--oneshot" in argv and "-Q" in argv
-    assert "-t" in argv and "terminal" in argv
-    assert "--format" in argv and "text" in argv
-    assert "--provider" in argv and "custom" in argv
-    assert "--base-url" in argv and BASE_URL in argv
-    assert "--model" in argv and MODEL in argv
-    assert "--safe-mode" in argv
-    assert "--run-budget" in argv and "60" in argv
+    # Exact flag list: the installed `chat` client rejects `--run-budget`
+    # ("Unsupported gateway CLI options", live Task 7), and neither the prompt
+    # nor a credential may ever appear in argv.
+    assert argv[1:] == [
+        "chat",
+        "--query-file",
+        "/task/prompt.txt",
+        "--oneshot",
+        "-Q",
+        "--format",
+        "text",
+        "-t",
+        "terminal",
+        "--provider",
+        "custom",
+        "--base-url",
+        BASE_URL,
+        "--model",
+        MODEL,
+        "--safe-mode",
+    ]
+    assert not any("run-budget" in item for item in argv)
     assert "--api-key" not in argv
     assert "--yolo" not in argv
     assert not any(
@@ -292,52 +304,46 @@ def test_hermes_argv_uses_query_file_and_never_prompt_or_key():
     )
 
 
+def test_hermes_argv_has_no_run_budget_flag():
+    # Regression for the live Task 7 finding: the CLI rejects the flag before
+    # any model call, so the workload deadline/systemd must be the only bound.
+    argv = workload.build_hermes_argv(
+        RUNTIME_ROOT, model=MODEL, base_url=BASE_URL
+    )
+    assert "--run-budget" not in argv
+    assert not any("run-budget" in item for item in argv)
+
+
 @pytest.mark.parametrize(
     ("kwargs", "code"),
     [
         (
-            {"model": "", "base_url": BASE_URL, "run_budget_sec": 60},
+            {"model": "", "base_url": BASE_URL},
             "model_invalid",
         ),
         (
-            {"model": "--yolo", "base_url": BASE_URL, "run_budget_sec": 60},
+            {"model": "--yolo", "base_url": BASE_URL},
             "model_invalid",
         ),
         (
-            {"model": "a\nb", "base_url": BASE_URL, "run_budget_sec": 60},
+            {"model": "a\nb", "base_url": BASE_URL},
             "model_invalid",
         ),
         (
-            {"model": "a\tb", "base_url": BASE_URL, "run_budget_sec": 60},
+            {"model": "a\tb", "base_url": BASE_URL},
             "model_invalid",
         ),
         (
-            {"model": MODEL, "base_url": "http://example.com/v1", "run_budget_sec": 60},
+            {"model": MODEL, "base_url": "http://example.com/v1"},
             "base_url_invalid",
         ),
         (
-            {
-                "model": MODEL,
-                "base_url": "https://127.0.0.1:1/v1",
-                "run_budget_sec": 60,
-            },
+            {"model": MODEL, "base_url": "https://127.0.0.1:1/v1"},
             "base_url_invalid",
         ),
         (
-            {
-                "model": MODEL,
-                "base_url": "http://127.0.0.1:1/other",
-                "run_budget_sec": 60,
-            },
+            {"model": MODEL, "base_url": "http://127.0.0.1:1/other"},
             "base_url_invalid",
-        ),
-        (
-            {"model": MODEL, "base_url": BASE_URL, "run_budget_sec": 0},
-            "budget_invalid",
-        ),
-        (
-            {"model": MODEL, "base_url": BASE_URL, "run_budget_sec": 1.5},
-            "budget_invalid",
         ),
     ],
 )
@@ -345,6 +351,20 @@ def test_hermes_argv_rejects_unsafe_input(kwargs, code):
     with pytest.raises(workload.WorkloadError) as excinfo:
         workload.build_hermes_argv(RUNTIME_ROOT, **kwargs)
     assert excinfo.value.code == code
+
+
+@pytest.mark.parametrize("budget", [0, -1, 1.5, True])
+def test_run_workload_rejects_an_invalid_internal_budget(tmp_path, budget):
+    # The budget is no longer an argv flag but still bounds the deadline.
+    with pytest.raises(workload.WorkloadError) as excinfo:
+        workload.run_workload(
+            task_dir=tmp_path,
+            runtime_root=tmp_path / "runtime",
+            model=MODEL,
+            run_budget_sec=budget,
+            proxy_socket=tmp_path / "e.sock",
+        )
+    assert excinfo.value.code == "budget_invalid"
 
 
 @pytest.mark.parametrize(
@@ -357,25 +377,21 @@ def test_hermes_argv_rejects_unsafe_input(kwargs, code):
     ],
 )
 def test_model_validation_accepts_task2_compatible_names(model):
-    argv = workload.build_hermes_argv(
-        RUNTIME_ROOT, model=model, base_url=BASE_URL, run_budget_sec=10
-    )
+    argv = workload.build_hermes_argv(RUNTIME_ROOT, model=model, base_url=BASE_URL)
     assert argv[argv.index("--model") + 1] == model
 
 
 def test_model_validation_rejects_an_overlong_name():
     model = "a" * (workload.MAX_MODEL_BYTES + 1)
     with pytest.raises(workload.WorkloadError) as excinfo:
-        workload.build_hermes_argv(
-            RUNTIME_ROOT, model=model, base_url=BASE_URL, run_budget_sec=10
-        )
+        workload.build_hermes_argv(RUNTIME_ROOT, model=model, base_url=BASE_URL)
     assert excinfo.value.code == "model_invalid"
 
 
 def test_hermes_argv_rejects_relative_runtime_root():
     with pytest.raises(workload.WorkloadError) as excinfo:
         workload.build_hermes_argv(
-            Path("runtime"), model=MODEL, base_url=BASE_URL, run_budget_sec=10
+            Path("runtime"), model=MODEL, base_url=BASE_URL
         )
     assert excinfo.value.code == "runtime_root_invalid"
 

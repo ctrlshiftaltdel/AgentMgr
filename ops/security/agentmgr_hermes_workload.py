@@ -41,16 +41,19 @@ Behaviour
          --query-file /task/prompt.txt --oneshot -Q --format text \\
          -t terminal --provider custom \\
          --base-url http://127.0.0.1:<port>/v1 --model <name> \\
-         --safe-mode --run-budget <seconds>
+         --safe-mode
 
-   The child receives a fresh allowlisted environment (no host credential, DB
-   DSN, path or profile variable).  The task egress token is exposed only as
-   ``CUSTOM_API_KEY``/``OPENAI_API_KEY``; it is never a command-line argument.
+   The installed ``chat`` client rejects ``--run-budget`` (live Task 7), so the
+   budget is enforced only by the workload deadline below and by systemd
+   ``RuntimeMaxSec``.  The child receives a fresh allowlisted environment (no
+   host credential, DB DSN, path or profile variable).  The task egress token
+   is exposed only as ``CUSTOM_API_KEY``/``OPENAI_API_KEY``; it is never a
+   command-line argument.
 5. Write ``status/started.json`` and ``status/heartbeat.json`` atomically,
-   capture stdout/stderr with the prompt and token redacted, enforce the run
-   budget/deadline, and on timeout, stop signal or any post-spawn failure send
-   SIGTERM to the whole process group, then SIGKILL after the grace period.
-   ``status/exit.json`` records exit code, signal, duration and the
+   capture stdout/stderr with the prompt and token redacted, enforce the
+   workload deadline, and on timeout, stop signal or any post-spawn failure
+   send SIGTERM to the whole process group, then SIGKILL after the grace
+   period.  ``status/exit.json`` records exit code, signal, duration and the
    timeout/cancel flags plus a stable error code when the workload itself
    failed.
 6. Never create, modify or read ``out/result.txt``: the host adapter reads and
@@ -193,8 +196,9 @@ EXIT_WRITE_RESERVE_SECONDS = 2
 
 HEARTBEAT_INTERVAL_SECONDS = 5.0
 POLL_INTERVAL_SECONDS = 0.2
-#: Extra time after ``--run-budget`` before the workload's own deadline fires;
-#: Hermes normally stops itself first, this is the backstop.
+#: Extra time after the run budget before the workload's own deadline fires.
+#: The Hermes ``chat`` CLI has no ``--run-budget`` flag (live Task 7), so this
+#: deadline and systemd ``RuntimeMaxSec`` are the only bound on the child.
 DEADLINE_MARGIN_SECONDS = 5.0
 #: Grace between SIGTERM and SIGKILL for the child process group.
 TERMINATE_GRACE_SECONDS = 5.0
@@ -767,18 +771,21 @@ def build_hermes_argv(
     *,
     model: str,
     base_url: str,
-    run_budget_sec: int,
 ) -> list[str]:
     """Return the fixed one-shot Hermes argv.
 
     The prompt is referenced only as the fixed in-unit ``/task/prompt.txt``
     path; the workload never puts prompt text or a credential in argv.
+
+    There is deliberately no ``--run-budget`` flag: the installed Hermes
+    ``chat`` client rejects it ("Unsupported gateway CLI options") before any
+    model call (live Task 7).  The workload enforces its own deadline and
+    systemd bounds the unit with ``RuntimeMaxSec``.
     """
 
     root = _require_absolute_path(runtime_root, "runtime_root")
     name = _validate_model(model)
     url = _validate_base_url(base_url)
-    budget = _validate_budget(run_budget_sec)
     executable = root / "hermes-agent" / ".hermes" / "bin" / "hermes"
     return [
         str(executable),
@@ -798,8 +805,6 @@ def build_hermes_argv(
         "--model",
         name,
         "--safe-mode",
-        "--run-budget",
-        str(budget),
     ]
 
 
@@ -1644,10 +1649,13 @@ def run_workload(
 ) -> int:
     """Run one Hermes task inside the sandbox and return its exit code.
 
-    ``runtime_max_sec`` (when given) is the unit's systemd ``RuntimeMaxSec``;
-    the internal deadline is clamped so that deadline + SIGTERM grace + the
-    exit-marker reserve always stays below it.  A limit too small to honour
-    that contract fails closed with ``runtime_too_short``.
+    ``run_budget_sec`` is the **internal deadline budget**: the installed
+    Hermes ``chat`` client rejects ``--run-budget`` (live Task 7), so the value
+    is enforced only by the workload's own deadline.  ``runtime_max_sec`` (when
+    given) is the unit's systemd ``RuntimeMaxSec``; the internal deadline is
+    clamped so that deadline + SIGTERM grace + the exit-marker reserve always
+    stays below it.  A limit too small to honour that contract fails closed
+    with ``runtime_too_short``.
     """
 
     task = _require_task_directory(task_dir)
@@ -1730,7 +1738,6 @@ def run_workload(
             root,
             model=name,
             base_url=_base_url(handle.port),
-            run_budget_sec=budget,
         )
         env = build_child_env(task, handle.port, token=token)
         return _run_child(
@@ -1760,11 +1767,13 @@ def _maximum_deadline(runtime_max_sec: int, grace_sec: float) -> float:
 
 
 def unit_run_parameters(runtime_max_sec: int) -> tuple[int, float]:
-    """Return ``(hermes --run-budget, workload deadline)`` for a unit limit.
+    """Return ``(deadline budget, workload deadline)`` for a unit limit.
 
+    The budget is the internal deadline budget only: the Hermes ``chat`` client
+    has no ``--run-budget`` flag (live Task 7), so it is never passed in argv.
     The deadline plus the default SIGTERM grace plus the exit-marker reserve is
-    strictly below ``runtime_max_sec``; the Hermes budget stops first so it can
-    exit cleanly.  A limit below the minimum contract fails closed.
+    strictly below ``runtime_max_sec``; a limit below the minimum contract fails
+    closed.
     """
 
     if (
