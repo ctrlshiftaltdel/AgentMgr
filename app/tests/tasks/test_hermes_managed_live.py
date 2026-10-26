@@ -825,19 +825,37 @@ def _wait_for_started_marker(task_dir: Path, *, timeout: float) -> dict[str, obj
     pytest.fail("the managed unit never wrote status/started.json")
 
 
-def _unit_is_gone(unit: str) -> bool:
-    completed = _sudo(
-        [SYSTEMCTL, "show", "--no-pager", f"--property=LoadState,ActiveState,MainPID", unit]
-    )
-    if completed.returncode != 0:
-        pytest.fail("systemctl show failed; the unit state cannot be proven")
-    dump = completed.stdout
+def _unit_dump_is_gone(dump: str) -> bool:
+    """Return whether a ``systemctl show`` dump proves the cgroup is gone.
+
+    A killed one-shot usually ends ``failed`` with ``MainPID=0`` and no
+    control group; that is gone just like ``inactive``.  A non-empty
+    ``ControlGroup`` is never accepted as gone here (the helper's own
+    ``stop_confirmed`` is separately asserted by the adapter status).
+    """
+
     if _property(dump, "LoadState") == "not-found":
         return True
     return (
-        _property(dump, "ActiveState") == "inactive"
+        _property(dump, "ActiveState") in {"inactive", "failed"}
         and _property(dump, "MainPID") in {"", "0"}
+        and _property(dump, "ControlGroup") == ""
     )
+
+
+def _unit_is_gone(unit: str) -> bool:
+    completed = _sudo(
+        [
+            SYSTEMCTL,
+            "show",
+            "--no-pager",
+            "--property=LoadState,ActiveState,MainPID,ControlGroup",
+            unit,
+        ]
+    )
+    if completed.returncode != 0:
+        pytest.fail("systemctl show failed; the unit state cannot be proven")
+    return _unit_dump_is_gone(completed.stdout)
 
 
 def _wait_for_unit_gone(unit: str, *, timeout: float) -> None:
@@ -2503,6 +2521,24 @@ def test_real_model_skip_reason_names_the_provider_inputs(monkeypatch) -> None:
 
 def test_artifact_goal_names_the_exact_ok_artifact() -> None:
     assert ARTIFACT_BYTES == b"OK"
+
+
+def test_unit_dump_gone_accepts_failed_empty_cgroup() -> None:
+    assert _unit_dump_is_gone("LoadState=not-found\n")
+    assert _unit_dump_is_gone(
+        "LoadState=loaded\nActiveState=inactive\nMainPID=0\nControlGroup=\n"
+    )
+    # A killed one-shot ends failed; the empty cgroup is the stop proof.
+    assert _unit_dump_is_gone(
+        "LoadState=loaded\nActiveState=failed\nMainPID=0\nControlGroup=\n"
+    )
+    assert not _unit_dump_is_gone(
+        "LoadState=loaded\nActiveState=failed\nMainPID=0\n"
+        "ControlGroup=/system.slice/agentmgr-hermes-x.service\n"
+    )
+    assert not _unit_dump_is_gone(
+        "LoadState=loaded\nActiveState=active\nMainPID=123\nControlGroup=\n"
+    )
     assert ARTIFACT_DIGEST == "sha256:" + hashlib.sha256(b"OK").hexdigest()
     assert ARTIFACT_RESULT_REF == f"result_{ARTIFACT_HEX[:32]}"
     assert ARTIFACT_EVIDENCE_REF == f"evidence:hermes_artifact_{ARTIFACT_HEX[:32]}"
