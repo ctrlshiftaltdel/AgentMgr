@@ -623,7 +623,9 @@ def _check_runtime_content(deployment: Deployment) -> None:
     pythons = [
         candidate
         for candidate in (RUNTIME_ROOT / "tools").glob("python-*/bin/python3")
-        if candidate.is_file() and not candidate.is_symlink()
+        if candidate.is_file()
+        and os.access(candidate, os.X_OK)
+        and _is_inside(candidate.resolve(), RUNTIME_ROOT.resolve())
     ]
     if not pythons:
         _fail("runtime_root_hermes_incomplete", "tools/python-*/bin/python3")

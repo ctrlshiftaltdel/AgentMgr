@@ -1025,10 +1025,11 @@ def test_verifier_requires_the_inprocess_runner_runtime_content(tmp_path, monkey
     oneshot = root / "hermes-agent" / "hermes_cli" / "oneshot.py"
     oneshot.parent.mkdir(parents=True)
     oneshot.write_text("", encoding="utf-8")
-    python = root / "tools" / "python-3.14.7" / "bin" / "python3"
+    python = root / "tools" / "python-3.14.7" / "bin" / "python3.14"
     python.parent.mkdir(parents=True)
     python.write_text("#!/bin/sh\n", encoding="utf-8")
     python.chmod(0o755)
+    (python.parent / "python3").symlink_to("python3.14")
     site_packages = (
         root
         / "installs"

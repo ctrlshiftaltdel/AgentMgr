@@ -440,10 +440,16 @@ done
 # these would install cleanly but fail every task with ModuleNotFoundError.
 [ -f "${SOURCE}/hermes-agent/hermes_cli/oneshot.py" ] || \
     fail "the runtime source is missing hermes-agent/hermes_cli/oneshot.py"
-if ! find "${SOURCE}/tools" -maxdepth 3 -type f -path '*/bin/python3' \
-    -perm -0100 -print -quit 2>/dev/null | grep -q .; then
+if ! find "${SOURCE}/tools" -maxdepth 3 -path '*/bin/python3' \
+    -print -quit 2>/dev/null | grep -q .; then
     fail "the runtime source is missing an executable tools/python-*/bin/python3"
 fi
+# The Hermes tools layout commonly links python3 -> python3.14 inside the same
+# bin directory; the source scan already rejects absolute or escaping symlinks.
+python_candidate=$(find "${SOURCE}/tools" -maxdepth 3 -path '*/bin/python3' \
+    -print -quit 2>/dev/null)
+[ -n "${python_candidate}" ] && [ -x "${python_candidate}" ] || \
+    fail "the runtime source tools/python-*/bin/python3 is not executable"
 if ! find "${SOURCE}/installs" -type d -name site-packages -print -quit \
     2>/dev/null | grep -q .; then
     fail "the runtime source is missing installs/**/site-packages"
