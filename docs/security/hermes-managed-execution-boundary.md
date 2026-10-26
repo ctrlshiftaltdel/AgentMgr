@@ -3,7 +3,7 @@
 - 状态：**沙箱隔离、in-process Managed 生命周期和 stub-broker token/cancel/timeout 已在批准测试机取得 live 证据；真实 provider key 的模型 artifact E2E 仍 pending；生产未部署。** 本文区分“已在测试机证明”和“仍未证明”。
 - 日期：2026-10-26
 - 关联：Issue #97、#96、#83；[设计](hermes-managed-execution-design.md)、[实施计划](hermes-managed-execution-plan.md)、[#96 调度器运维](../operations/runtime-dispatch.md)、[#82 受控执行边界](managed-execution-boundary.md)、[Runtime Adapter 契约](../contracts/runtime-adapter.md)。
-- 证据提交：实现分支 `feat/97-hermes-managed`，live/全量门禁运行于提交 `cc8e65b`，live 运行时的 runtime root 哈希 `sha256:96cd218efbc04d845a75e795803f1877acee48ac3df8d7a4f51610831db07239`（Hermes 0.22.1，批准测试机）。其后的文档修订不改变代码/测试；任何代码或测试 head 变化后必须重跑 live 门禁。具体 pytest 计数见 §3.0；不记录主机名、个人路径、IP 或 key。
+- 证据提交：实现分支 `feat/97-hermes-managed`，live/全量门禁运行于提交 `16e16d7`，live 运行时的 runtime root 哈希 `sha256:96cd218efbc04d845a75e795803f1877acee48ac3df8d7a4f51610831db07239`（Hermes 0.22.1，批准测试机）。其后的文档修订不改变代码/测试；任何代码或测试 head 变化后必须重跑 live 门禁。具体 pytest 计数见 §3.0；不记录主机名、个人路径、IP 或 key。
 
 ## 1 结论摘要（先读这一节）
 
@@ -53,7 +53,7 @@ pytest app/tests -q -o addopts=''
   -> 3126 passed, 20 skipped, 7 subtests passed
 ```
 
-运行环境：Hermes 0.22.1；提交 `cc8e65b`；runtime root `sha256:96cd218efbc04d845a75e795803f1877acee48ac3df8d7a4f51610831db07239`。证据只记录命令、退出码、版本与哈希；不记录主机名、个人路径、IP、key 或 token。
+运行环境：Hermes 0.22.1；提交 `16e16d7`；runtime root `sha256:96cd218efbc04d845a75e795803f1877acee48ac3df8d7a4f51610831db07239`。证据只记录命令、退出码、版本与哈希；不记录主机名、个人路径、IP、key 或 token。
 
 ### 3.1 安装与静态验证（已完成）
 
