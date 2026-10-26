@@ -2,14 +2,18 @@
 
 The workload in ``ops/security/agentmgr_hermes_workload.py`` is a production
 template that runs *inside* a transient sandbox unit.  Nothing here needs a
-unit, ``sudo``, ``systemd-run`` or a real model: the tests drive the exported
-functions directly, and the one ``run_workload`` integration test writes a
-**fake** ``hermes`` executable into a temporary runtime root.
+unit, ``sudo``, ``systemd-run``, a real model or a real Hermes install: the
+tests drive the exported functions directly, and the ``run_workload``
+integration tests write a **fake** runtime interpreter into a temporary runtime
+root (the fixed ``-c`` runner code is ignored by the fake).
 
 Properties pinned here:
 
-* the prompt is only reachable through ``--query-file /task/prompt.txt`` and the
-  task egress token only through the child environment / the proxy header;
+* the prompt is only reachable through the fixed in-unit ``/task/prompt.txt``
+  (read by the in-process runner, never argv) and the task egress token only
+  through the child environment / the proxy header;
+* no gateway-backed ``hermes chat`` command is ever launched: the runner is
+  ``python -I -c <RUNNER_CODE>`` with the terminal-only in-process engine;
 * the loopback proxy forwards an allowlisted method/path/body to the Unix
   socket, strips every client credential and injects the task token;
 * the workload writes its own status markers atomically, bounds stdout/stderr,
@@ -47,7 +51,6 @@ TOKEN_CANARY = "TOKEN-CANARY.egt.canary"
 #: A second canary that only ever appears as a client-supplied credential.
 CLIENT_CANARY = "CLIENT-AUTH-CANARY"
 
-RUNTIME_ROOT = Path("/var/lib/agentmgr-hermes/runtime")
 MODEL = "model-x"
 BASE_URL = "http://127.0.0.1:1234/v1"
 
@@ -138,8 +141,11 @@ def _make_task(
     return task
 
 
-def _fake_runtime(root: Path, script: str) -> Path:
-    executable = root / "runtime" / "hermes-agent" / ".hermes" / "bin" / "hermes"
+def _fake_runtime(
+    root: Path, script: str, *, python_dir: str | None = None
+) -> Path:
+    name = python_dir or workload.PINNED_RUNTIME_PYTHON
+    executable = root / "runtime" / "tools" / name / "bin" / "python3"
     executable.parent.mkdir(parents=True)
     executable.write_text("#!/usr/bin/env python3\n" + textwrap.dedent(script))
     executable.chmod(0o755)
@@ -268,94 +274,74 @@ def _json(path: Path) -> dict[str, object]:
 # ---------------------------------------------------------------------------
 
 
-def test_hermes_argv_matches_the_supported_one_shot_command_exactly():
-    argv = workload.build_hermes_argv(
-        RUNTIME_ROOT, model=MODEL, base_url=BASE_URL
-    )
+def test_runner_argv_is_the_fixed_in_process_one_shot_command(tmp_path):
+    runtime = _fake_runtime(tmp_path, "import sys\nsys.exit(0)\n")
+    argv = workload.build_hermes_argv(runtime)
     assert argv[0] == str(
-        RUNTIME_ROOT / "hermes-agent" / ".hermes" / "bin" / "hermes"
+        runtime / "tools" / workload.PINNED_RUNTIME_PYTHON / "bin" / "python3"
     )
-    # Exact flag list: the installed `chat` client rejects `--run-budget`
-    # ("Unsupported gateway CLI options", live Task 7), and neither the prompt
-    # nor a credential may ever appear in argv.
-    assert argv[1:] == [
-        "chat",
-        "--query-file",
-        "/task/prompt.txt",
-        "--oneshot",
-        "-Q",
-        "--format",
-        "text",
-        "-t",
-        "terminal",
-        "--provider",
-        "custom",
-        "--base-url",
-        BASE_URL,
-        "--model",
-        MODEL,
-        "--safe-mode",
-    ]
-    assert not any("run-budget" in item for item in argv)
-    assert "--api-key" not in argv
-    assert "--yolo" not in argv
-    assert not any(
-        PROMPT_CANARY in item or TOKEN_CANARY in item for item in argv
+    assert argv[1:] == ["-I", "-c", workload.RUNNER_CODE]
+    # No gateway-backed `chat` command, no CLI flags and no prompt/token: the
+    # runner reads /task/prompt.txt itself.
+    joined = "\n".join(argv)
+    assert "--query-file" not in argv
+    assert "--run-budget" not in joined
+    assert "--api-key" not in joined
+    assert "--yolo" not in joined
+    assert "gateway" not in joined
+    assert " chat" not in joined
+    assert PROMPT_CANARY not in joined
+    assert TOKEN_CANARY not in joined
+
+
+def test_runner_code_runs_oneshot_with_terminal_tools_only():
+    code = workload.RUNNER_CODE
+    assert "from hermes_cli.oneshot import run_oneshot" in code
+    assert "run_oneshot(" in code
+    assert 'provider="custom"' in code
+    assert 'toolsets="terminal"' in code
+    assert code.count("toolsets=") == 1
+    assert 'Path("/task/prompt.txt")' in code
+    assert '"/runtime/hermes-agent"' in code
+    assert '"/runtime/installs"' in code
+    assert "sys.path.insert" in code
+    assert "os.walk" in code
+    assert "gateway" not in code
+    lowered = code.lower()
+    for forbidden in ("browser", "mcp", "plugins", "memory", "connectors", "web"):
+        assert forbidden not in lowered
+
+
+def test_runner_python_is_discovered_when_unpinned(tmp_path):
+    runtime = _fake_runtime(
+        tmp_path, "import sys\nsys.exit(0)\n", python_dir="python-3.15-linux-x64"
+    )
+    argv = workload.build_hermes_argv(runtime)
+    assert argv[0] == str(
+        runtime / "tools" / "python-3.15-linux-x64" / "bin" / "python3"
     )
 
 
-def test_hermes_argv_has_no_run_budget_flag():
-    # Regression for the live Task 7 finding: the CLI rejects the flag before
-    # any model call, so the workload deadline/systemd must be the only bound.
-    argv = workload.build_hermes_argv(
-        RUNTIME_ROOT, model=MODEL, base_url=BASE_URL
-    )
-    assert "--run-budget" not in argv
-    assert not any("run-budget" in item for item in argv)
-
-
-@pytest.mark.parametrize(
-    ("kwargs", "code"),
-    [
-        (
-            {"model": "", "base_url": BASE_URL},
-            "model_invalid",
-        ),
-        (
-            {"model": "--yolo", "base_url": BASE_URL},
-            "model_invalid",
-        ),
-        (
-            {"model": "a\nb", "base_url": BASE_URL},
-            "model_invalid",
-        ),
-        (
-            {"model": "a\tb", "base_url": BASE_URL},
-            "model_invalid",
-        ),
-        (
-            {"model": MODEL, "base_url": "http://example.com/v1"},
-            "base_url_invalid",
-        ),
-        (
-            {"model": MODEL, "base_url": "https://127.0.0.1:1/v1"},
-            "base_url_invalid",
-        ),
-        (
-            {"model": MODEL, "base_url": "http://127.0.0.1:1/other"},
-            "base_url_invalid",
-        ),
-    ],
-)
-def test_hermes_argv_rejects_unsafe_input(kwargs, code):
+def test_runner_python_missing_or_ambiguous_fails_closed(tmp_path):
+    runtime = tmp_path / "runtime"
+    (runtime / "tools").mkdir(parents=True)
     with pytest.raises(workload.WorkloadError) as excinfo:
-        workload.build_hermes_argv(RUNTIME_ROOT, **kwargs)
-    assert excinfo.value.code == code
+        workload.build_hermes_argv(runtime)
+    assert excinfo.value.code == "hermes_python_unavailable"
+
+    for name in ("python-3.15-linux-x64", "python-3.16-linux-x64"):
+        executable = runtime / "tools" / name / "bin" / "python3"
+        executable.parent.mkdir(parents=True)
+        executable.write_text("#!/usr/bin/env python3\n")
+        executable.chmod(0o755)
+    with pytest.raises(workload.WorkloadError) as excinfo:
+        workload.build_hermes_argv(runtime)
+    assert excinfo.value.code == "hermes_python_ambiguous"
 
 
 @pytest.mark.parametrize("budget", [0, -1, 1.5, True])
 def test_run_workload_rejects_an_invalid_internal_budget(tmp_path, budget):
-    # The budget is no longer an argv flag but still bounds the deadline.
+    # The budget is not a CLI flag; it only bounds the workload deadline.
     with pytest.raises(workload.WorkloadError) as excinfo:
         workload.run_workload(
             task_dir=tmp_path,
@@ -367,6 +353,19 @@ def test_run_workload_rejects_an_invalid_internal_budget(tmp_path, budget):
     assert excinfo.value.code == "budget_invalid"
 
 
+@pytest.mark.parametrize("model", ["", "-model", "a\nb", "a\tb"])
+def test_run_workload_rejects_an_unsafe_or_absent_model(tmp_path, model):
+    with pytest.raises(workload.WorkloadError) as excinfo:
+        workload.run_workload(
+            task_dir=tmp_path,
+            runtime_root=tmp_path / "runtime",
+            model=model,
+            run_budget_sec=10,
+            proxy_socket=tmp_path / "e.sock",
+        )
+    assert excinfo.value.code == "model_invalid"
+
+
 @pytest.mark.parametrize(
     "model",
     [
@@ -376,34 +375,33 @@ def test_run_workload_rejects_an_invalid_internal_budget(tmp_path, budget):
         "a.b:c+d_e@f",
     ],
 )
-def test_model_validation_accepts_task2_compatible_names(model):
-    argv = workload.build_hermes_argv(RUNTIME_ROOT, model=model, base_url=BASE_URL)
-    assert argv[argv.index("--model") + 1] == model
+def test_child_env_sets_task2_compatible_models(tmp_path, model):
+    env = workload.build_child_env(tmp_path, 1234, model=model)
+    assert env["HERMES_INFERENCE_MODEL"] == model
 
 
-def test_model_validation_rejects_an_overlong_name():
+def test_child_env_rejects_an_overlong_model(tmp_path):
     model = "a" * (workload.MAX_MODEL_BYTES + 1)
     with pytest.raises(workload.WorkloadError) as excinfo:
-        workload.build_hermes_argv(RUNTIME_ROOT, model=model, base_url=BASE_URL)
+        workload.build_child_env(tmp_path, 1234, model=model)
     assert excinfo.value.code == "model_invalid"
 
 
 def test_hermes_argv_rejects_relative_runtime_root():
     with pytest.raises(workload.WorkloadError) as excinfo:
-        workload.build_hermes_argv(
-            Path("runtime"), model=MODEL, base_url=BASE_URL
-        )
+        workload.build_hermes_argv(Path("runtime"))
     assert excinfo.value.code == "runtime_root_invalid"
 
 
 def test_child_env_clears_host_secrets_and_sets_hermes_home(tmp_path):
-    env = workload.build_child_env(tmp_path, 1234)
+    env = workload.build_child_env(tmp_path, 1234, model=MODEL)
     assert env["HOME"] == str(tmp_path / "home")
     assert env["HERMES_HOME"] == str(tmp_path / "profile")
     assert env["XDG_STATE_HOME"] == str(tmp_path / "state")
     assert env["HERMES_GATEWAY_LOCK_DIR"] == str(tmp_path / "locks")
     assert env["TMPDIR"] == str(tmp_path / "tmp")
     assert env["PATH"] == workload.CHILD_PATH
+    assert env["HERMES_INFERENCE_MODEL"] == MODEL
     assert "AGENTMGR_DB_DSN" not in env
     assert "API_KEY" not in " ".join(env)
 
@@ -415,24 +413,27 @@ def test_child_env_does_not_inherit_any_host_variable(tmp_path, monkeypatch):
         "API_KEY",
         "OPENAI_API_KEY",
         "HERMES_API_KEY",
+        "HERMES_INFERENCE_MODEL",
         "AWS_SECRET_ACCESS_KEY",
         "GITHUB_TOKEN",
         "SSH_AUTH_SOCK",
         "HERMES_HOME",
     ):
         monkeypatch.setenv(name, f"HOST-CANARY-{name}")
-    env = workload.build_child_env(tmp_path, 1234)
+    env = workload.build_child_env(tmp_path, 1234, model=MODEL)
     joined = "\n".join(f"{key}={value}" for key, value in env.items())
     assert "HOST-CANARY" not in joined
     assert "OPENAI_API_KEY" not in env
     assert "CUSTOM_API_KEY" not in env
+    assert env["HERMES_INFERENCE_MODEL"] == MODEL
     assert env["OPENAI_BASE_URL"] == "http://127.0.0.1:1234/v1"
 
 
 def test_child_env_exposes_the_task_token_only_as_api_key_env(tmp_path):
-    env = workload.build_child_env(tmp_path, 4321, token=TOKEN_CANARY)
+    env = workload.build_child_env(tmp_path, 4321, model=MODEL, token=TOKEN_CANARY)
     assert env["CUSTOM_API_KEY"] == TOKEN_CANARY
     assert env["OPENAI_API_KEY"] == TOKEN_CANARY
+    assert env["HERMES_INFERENCE_MODEL"] == MODEL
     assert not any(
         TOKEN_CANARY in value for key, value in env.items()
         if key not in {"CUSTOM_API_KEY", "OPENAI_API_KEY"}
@@ -440,7 +441,7 @@ def test_child_env_exposes_the_task_token_only_as_api_key_env(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# runtime "installs" on PYTHONPATH (gateway subprocess dependencies)
+# runtime "installs" on PYTHONPATH (runner/tool subprocess dependencies)
 # ---------------------------------------------------------------------------
 
 
@@ -456,7 +457,7 @@ def test_child_env_exposes_every_runtime_site_packages_dir(tmp_path):
     second = _site_packages(installs, "tool-b")
 
     env = workload.build_child_env(
-        tmp_path / "task", 1234, runtime_installs=installs
+        tmp_path / "task", 1234, model=MODEL, runtime_installs=installs
     )
 
     assert env["PYTHONPATH"].split(":") == sorted([str(first), str(second)])
@@ -473,7 +474,7 @@ def test_child_env_leaves_pythonpath_unset_without_runtime_installs(
         installs.mkdir()
 
     env = workload.build_child_env(
-        tmp_path / "task", 1234, runtime_installs=installs
+        tmp_path / "task", 1234, model=MODEL, runtime_installs=installs
     )
 
     assert "PYTHONPATH" not in env
@@ -493,6 +494,7 @@ def test_child_env_pythonpath_carries_no_host_or_task_secret(tmp_path, monkeypat
     env = workload.build_child_env(
         tmp_path / "task",
         1234,
+        model=MODEL,
         token=TOKEN_CANARY,
         runtime_installs=installs,
     )
@@ -514,7 +516,9 @@ def test_child_env_rejects_an_oversized_pythonpath(tmp_path, monkeypatch):
         lambda _root: ["/runtime/installs/" + "x" * 9000],
     )
     with pytest.raises(workload.WorkloadError) as excinfo:
-        workload.build_child_env(tmp_path / "task", 1234, runtime_installs=installs)
+        workload.build_child_env(
+            tmp_path / "task", 1234, model=MODEL, runtime_installs=installs
+        )
     assert excinfo.value.code == "pythonpath_too_large"
 
 
@@ -541,6 +545,7 @@ def test_run_workload_passes_the_fixed_installs_path_to_the_child_env(
     )
     assert code == 0
     assert captured["runtime_installs"] == Path("/runtime/installs")
+    assert captured["model"] == MODEL
 
 
 def test_render_profile_replaces_the_port_with_the_minimal_model_block():
@@ -972,10 +977,12 @@ report = {
             "PATH",
             "CUSTOM_API_KEY",
             "OPENAI_API_KEY",
+            "HERMES_INFERENCE_MODEL",
+            "OPENAI_BASE_URL",
         )
     },
 }
-base_url = sys.argv[sys.argv.index("--base-url") + 1]
+base_url = os.environ["OPENAI_BASE_URL"]
 request = urllib.request.Request(
     base_url + "/chat/completions",
     data=b'{"model":"m","messages":[]}',
@@ -1009,16 +1016,20 @@ def test_run_workload_wires_env_argv_profile_and_proxy(tmp_path):
     report = _json(task / "fake-report.json")
     assert report["status"] == 200
     argv = report["argv"]
-    assert "--query-file" in argv
-    assert argv[argv.index("--query-file") + 1] == "/task/prompt.txt"
+    assert argv[:2] == ["-I", "-c"]
+    assert argv[2] == workload.RUNNER_CODE
+    assert "--query-file" not in argv
+    assert "chat" not in argv
+    assert not any("gateway" in item for item in argv)
     assert "--api-key" not in argv
     assert TOKEN_CANARY not in json.dumps(argv)
     assert PROMPT_CANARY not in json.dumps(argv)
 
-    base_url = argv[argv.index("--base-url") + 1]
+    base_url = report["env"]["OPENAI_BASE_URL"]
     assert re.fullmatch(r"http://127\.0\.0\.1:\d{1,5}/v1", base_url)
     assert report["env"]["CUSTOM_API_KEY"] == TOKEN_CANARY
     assert report["env"]["OPENAI_API_KEY"] == TOKEN_CANARY
+    assert report["env"]["HERMES_INFERENCE_MODEL"] == MODEL
     assert report["env"]["HOME"] == str(task / "home")
     assert report["env"]["HERMES_HOME"] == str(task / "profile")
     assert report["env"]["XDG_STATE_HOME"] == str(task / "state")
@@ -1326,7 +1337,7 @@ def test_run_workload_validates_task_files_before_starting(tmp_path, mutate, cod
     assert not (task / "status" / "started.json").exists()
 
 
-def test_run_workload_reports_a_missing_runtime_binary(tmp_path):
+def test_run_workload_reports_a_missing_runtime_python(tmp_path):
     task = _make_task(tmp_path)
     with pytest.raises(workload.WorkloadError) as excinfo:
         workload.run_workload(
@@ -1337,15 +1348,10 @@ def test_run_workload_reports_a_missing_runtime_binary(tmp_path):
             proxy_socket=tmp_path / "e.sock",
             heartbeat_interval_sec=30.0,
         )
-    assert excinfo.value.code == "hermes_unavailable"
-    started = _json(task / "status" / "started.json")
-    assert started["child_pid"] is None
-    exit_document = _json(task / "status" / "exit.json")
-    assert exit_document["exit_code"] is None
-    assert exit_document["timed_out"] is False
-    assert exit_document["cancelled"] is False
-    assert exit_document["error"] == "hermes_unavailable"
-    assert not (task / "status" / "heartbeat.json").exists()
+    assert excinfo.value.code == "hermes_python_unavailable"
+    # The runner is resolved before the spawn, so no unit marker is written.
+    for name in ("started.json", "heartbeat.json", "exit.json"):
+        assert not (task / "status" / name).exists()
 
 
 def test_run_workload_kills_the_child_when_a_status_write_fails(

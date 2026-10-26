@@ -35,22 +35,34 @@ Behaviour
    then expose the read-only runtime ``installs`` environment inside the
    profile (``HERMES_HOME``) as a symlink to the runtime-visible
    ``/runtime/installs`` so the Hermes bootstrap finds its dependencies.
-4. Spawn the fixed Hermes one-shot command in its own process group::
+4. Spawn the fixed in-process one-shot runner in its own process group::
 
-       <runtime>/hermes-agent/.hermes/bin/hermes chat \\
-         --query-file /task/prompt.txt --oneshot -Q --format text \\
-         -t terminal --provider custom \\
-         --base-url http://127.0.0.1:<port>/v1 --model <name> \\
-         --safe-mode
+       <runtime>/tools/python-3.14.7+20260901-linux-x64/bin/python3 \\
+         -I -c <RUNNER_CODE>
 
-   The installed ``chat`` client rejects ``--run-budget`` (live Task 7), so the
-   budget is enforced only by the workload deadline below and by systemd
-   ``RuntimeMaxSec``.  The child receives a fresh allowlisted environment (no
-   host credential, DB DSN, path or profile variable).  The task egress token
-   is exposed only as ``CUSTOM_API_KEY``/``OPENAI_API_KEY``; it is never a
-   command-line argument.  ``PYTHONPATH`` carries the runtime installs
-   ``site-packages`` directories so the gateway subprocess that ``hermes chat``
-   spawns can import the same dependencies as its launcher.
+   The installed ``hermes chat`` client is *gateway-backed*: it always spawns a
+   local gateway subprocess, and that subprocess cannot import the runtime
+   installs (live Task 7: ``ModuleNotFoundError: ruamel``), even after the
+   launcher's ``sys.path`` patch.  This module therefore runs Hermes's
+   in-process one-shot engine (``hermes_cli.oneshot.run_oneshot``) instead: no
+   gateway, no ``chat`` subcommand and no ``--query-file``/``--run-budget``
+   flags.  The runner reads the prompt from ``/task/prompt.txt`` itself and
+   patches ``sys.path`` with ``/runtime/hermes-agent`` plus every
+   ``/runtime/installs/**/site-packages``.  It is started with ``-I`` (isolated
+   interpreter: no user site-packages, no host ``PYTHONPATH``) and a task-local
+   ``HERMES_HOME`` whose profile is the minimal ``provider``/``base_url``/
+   ``name`` block; together with the fixed ``toolsets="terminal"`` this is the
+   in-process equivalent of the old ``--safe-mode``.  This workload never reads
+   or writes an internal Hermes database or profile; only the task-local
+   ``HERMES_HOME`` is used.
+
+   The workload deadline below and systemd ``RuntimeMaxSec`` are the only time
+   bounds.  The child receives a fresh allowlisted environment (no host
+   credential, DB DSN, path or profile variable) with
+   ``HERMES_INFERENCE_MODEL=<name>``.  The task egress token is exposed only as
+   ``CUSTOM_API_KEY``/``OPENAI_API_KEY``; it is never a command-line argument.
+   ``PYTHONPATH`` carries the runtime installs ``site-packages`` directories so
+   tool subprocesses that inherit the environment can import the same modules.
 5. Write ``status/started.json`` and ``status/heartbeat.json`` atomically,
    capture stdout/stderr with the prompt and token redacted, enforce the
    workload deadline, and on timeout, stop signal or any post-spawn failure
@@ -111,7 +123,9 @@ __all__ = [
     "MAX_REQUEST_BYTES",
     "MAX_RESPONSE_BYTES",
     "POLL_INTERVAL_SECONDS",
+    "PINNED_RUNTIME_PYTHON",
     "ProxyHandle",
+    "RUNNER_CODE",
     "TERMINATE_GRACE_SECONDS",
     "TaskManifest",
     "UNIT_EGRESS_SOCKET_PATH",
@@ -134,6 +148,7 @@ __all__ = [
     "read_manifest",
     "render_profile",
     "run_workload",
+    "runtime_python",
     "start_egress_proxy",
     "unit_run_parameters",
     "write_status_atomic",
@@ -205,9 +220,8 @@ EXIT_WRITE_RESERVE_SECONDS = 2
 
 HEARTBEAT_INTERVAL_SECONDS = 5.0
 POLL_INTERVAL_SECONDS = 0.2
-#: Extra time after the run budget before the workload's own deadline fires.
-#: The Hermes ``chat`` CLI has no ``--run-budget`` flag (live Task 7), so this
-#: deadline and systemd ``RuntimeMaxSec`` are the only bound on the child.
+#: The in-process one-shot runner has no CLI budget flag, so this deadline and
+#: systemd ``RuntimeMaxSec`` are the only bound on the child.
 DEADLINE_MARGIN_SECONDS = 5.0
 #: Grace between SIGTERM and SIGKILL for the child process group.
 TERMINATE_GRACE_SECONDS = 5.0
@@ -775,56 +789,110 @@ def _base_url(port: int) -> str:
 # ---------------------------------------------------------------------------
 
 
-def build_hermes_argv(
-    runtime_root: Path,
-    *,
-    model: str,
-    base_url: str,
-) -> list[str]:
-    """Return the fixed one-shot Hermes argv.
+#: Pinned runtime interpreter directory; when present it wins over discovery.
+PINNED_RUNTIME_PYTHON = "python-3.14.7+20260901-linux-x64"
 
-    The prompt is referenced only as the fixed in-unit ``/task/prompt.txt``
-    path; the workload never puts prompt text or a credential in argv.
+#: Fixed in-process one-shot runner.  The installed Hermes ``chat`` client is
+#: gateway-backed and spawns a local gateway subprocess that cannot import the
+#: runtime installs (live Task 7: ``ModuleNotFoundError: ruamel``).
+#: ``hermes_cli.oneshot.run_oneshot`` runs the same engine in-process, so no
+#: gateway is started and no prompt or token ever appears in argv.
+RUNNER_CODE = """\
+import os
+import sys
+from pathlib import Path
 
-    There is deliberately no ``--run-budget`` flag: the installed Hermes
-    ``chat`` client rejects it ("Unsupported gateway CLI options") before any
-    model call (live Task 7).  The workload enforces its own deadline and
-    systemd bounds the unit with ``RuntimeMaxSec``.
+_installs = Path("/runtime/installs")
+if _installs.is_dir():
+    _site_packages = []
+    for _directory, _names, _files in os.walk(_installs, followlinks=False):
+        _names[:] = [
+            _name
+            for _name in _names
+            if not os.path.islink(os.path.join(_directory, _name))
+        ]
+        if os.path.basename(_directory) == "site-packages":
+            _site_packages.append(_directory)
+            _names[:] = []
+    for _entry in sorted(_site_packages, reverse=True):
+        sys.path.insert(0, _entry)
+
+# The Hermes source wins over installed packages.
+if Path("/runtime/hermes-agent").is_dir():
+    sys.path.insert(0, "/runtime/hermes-agent")
+
+from hermes_cli.oneshot import run_oneshot
+
+prompt = Path("/task/prompt.txt").read_text(encoding="utf-8")
+raise SystemExit(
+    run_oneshot(
+        prompt,
+        model=os.environ.get("HERMES_INFERENCE_MODEL"),
+        provider="custom",
+        toolsets="terminal",
+    )
+)
+"""
+
+
+def _is_executable_file(path: Path) -> bool:
+    try:
+        return path.is_file() and os.access(path, os.X_OK)
+    except OSError:
+        return False
+
+
+def runtime_python(runtime_root: Path) -> Path:
+    """Return the runtime interpreter used for the in-process one-shot runner.
+
+    Prefers the pinned ``tools/python-3.14.7+20260901-linux-x64/bin/python3``;
+    otherwise a single executable ``tools/python-*/bin/python3`` is accepted.
+    No interpreter, or several ambiguous ones, fails closed.
     """
 
     root = _require_absolute_path(runtime_root, "runtime_root")
-    name = _validate_model(model)
-    url = _validate_base_url(base_url)
-    executable = root / "hermes-agent" / ".hermes" / "bin" / "hermes"
-    return [
-        str(executable),
-        "chat",
-        "--query-file",
-        str(UNIT_PROMPT_PATH),
-        "--oneshot",
-        "-Q",
-        "--format",
-        "text",
-        "-t",
-        "terminal",
-        "--provider",
-        "custom",
-        "--base-url",
-        url,
-        "--model",
-        name,
-        "--safe-mode",
-    ]
+    tools = root / "tools"
+    pinned = tools / PINNED_RUNTIME_PYTHON / "bin" / "python3"
+    if _is_executable_file(pinned):
+        return pinned
+    try:
+        candidates = sorted(
+            path
+            for path in tools.glob("python-*/bin/python3")
+            if _is_executable_file(path)
+        )
+    except OSError:
+        raise WorkloadError("hermes_python_unavailable") from None
+    if not candidates:
+        raise WorkloadError("hermes_python_unavailable")
+    if len(candidates) > 1:
+        raise WorkloadError("hermes_python_ambiguous")
+    return candidates[0]
+
+
+def build_hermes_argv(runtime_root: Path) -> list[str]:
+    """Return the fixed in-process one-shot runner argv.
+
+    The prompt is read by the runner from the fixed in-unit
+    ``/task/prompt.txt``; neither the prompt nor a credential is ever in argv.
+    ``-I`` isolates the interpreter (no user site, no ``PYTHONPATH``), so the
+    runner inserts the Hermes source and runtime installs ``site-packages``
+    into ``sys.path`` itself.  There is no ``chat``/gateway subprocess and no
+    ``--run-budget`` flag: the workload deadline and systemd ``RuntimeMaxSec``
+    are the only time bounds.
+    """
+
+    return [str(runtime_python(runtime_root)), "-I", "-c", RUNNER_CODE]
 
 
 def _runtime_site_packages(runtime_installs: Path) -> list[str]:
     """Return the sorted ``site-packages`` directories under ``installs``.
 
-    The runtime tree is mounted read-only at ``/runtime``; the installed Hermes
-    gateway subprocess does not inherit the parent launcher's ``sys.path``
-    patch, so its dependencies must be reachable through ``PYTHONPATH``.
-    Symlinked directories are never followed, keeping every entry inside the
-    runtime installs tree.
+    The runtime tree is mounted read-only at ``/runtime``; terminal/tool
+    subprocesses started by the in-process runner inherit the environment, so
+    the installs paths are useful there even though the isolated runner patches
+    ``sys.path`` itself.  Symlinked directories are never followed, keeping
+    every entry inside the runtime installs tree.
     """
 
     root = _require_absolute_path(runtime_installs, "runtime_installs")
@@ -852,24 +920,27 @@ def build_child_env(
     task_dir: Path,
     proxy_port: int,
     *,
+    model: str,
     token: str | None = None,
     runtime_installs: Path = UNIT_RUNTIME_INSTALLS_PATH,
 ) -> dict[str, str]:
-    """Return a fresh allowlist environment for the Hermes child.
+    """Return a fresh allowlist environment for the Hermes runner.
 
-    Nothing is inherited from the host.  The task egress token, when given, is
-    exposed only as ``CUSTOM_API_KEY``/``OPENAI_API_KEY`` for the loopback
-    proxy; it is never an argv entry.
+    Nothing is inherited from the host.  ``HERMES_INFERENCE_MODEL`` selects the
+    model for ``run_oneshot``; the task egress token, when given, is exposed
+    only as ``CUSTOM_API_KEY``/``OPENAI_API_KEY`` for the loopback proxy and is
+    never an argv entry.
 
     ``PYTHONPATH`` carries only the runtime installs ``site-packages``
-    directories (the gateway subprocess spawned by ``hermes chat`` does not
-    inherit the parent launcher's ``sys.path`` patch).  It is left unset when
+    directories, useful for tool subprocesses that inherit the environment; the
+    isolated (``-I``) runner patches ``sys.path`` itself.  It is left unset when
     no installs tree exists, and an already allowlisted ``PYTHONPATH`` value is
     extended rather than overwritten.  Host ``PYTHONPATH`` is never read.
     """
 
     directory = _require_absolute_path(task_dir, "task_dir")
     port = _validate_port(proxy_port)
+    name = _validate_model(model)
     env = {
         "PATH": CHILD_PATH,
         "LC_ALL": "C",
@@ -880,6 +951,7 @@ def build_child_env(
         "TMPDIR": str(directory / "tmp"),
         "OPENAI_BASE_URL": _base_url(port),
         "CUSTOM_API_BASE_URL": _base_url(port),
+        "HERMES_INFERENCE_MODEL": name,
     }
     site_packages = _runtime_site_packages(runtime_installs)
     if site_packages:
@@ -1710,9 +1782,9 @@ def run_workload(
 ) -> int:
     """Run one Hermes task inside the sandbox and return its exit code.
 
-    ``run_budget_sec`` is the **internal deadline budget**: the installed
-    Hermes ``chat`` client rejects ``--run-budget`` (live Task 7), so the value
-    is enforced only by the workload's own deadline.  ``runtime_max_sec`` (when
+    ``run_budget_sec`` is the **internal deadline budget**: the in-process
+    one-shot runner has no CLI budget flag (live Task 7), so the value is
+    enforced only by the workload's own deadline.  ``runtime_max_sec`` (when
     given) is the unit's systemd ``RuntimeMaxSec``; the internal deadline is
     clamped so that deadline + SIGTERM grace + the exit-marker reserve always
     stays below it.  A limit too small to honour that contract fails closed
@@ -1795,14 +1867,11 @@ def run_workload(
         # Hermes bootstraps its dependencies from the runtime ``installs``
         # environment; expose it inside HERMES_HOME before the spawn.
         link_runtime_installs(task / "profile", UNIT_RUNTIME_INSTALLS_PATH)
-        argv = build_hermes_argv(
-            root,
-            model=name,
-            base_url=_base_url(handle.port),
-        )
+        argv = build_hermes_argv(root)
         env = build_child_env(
             task,
             handle.port,
+            model=name,
             token=token,
             runtime_installs=UNIT_RUNTIME_INSTALLS_PATH,
         )
@@ -1835,8 +1904,8 @@ def _maximum_deadline(runtime_max_sec: int, grace_sec: float) -> float:
 def unit_run_parameters(runtime_max_sec: int) -> tuple[int, float]:
     """Return ``(deadline budget, workload deadline)`` for a unit limit.
 
-    The budget is the internal deadline budget only: the Hermes ``chat`` client
-    has no ``--run-budget`` flag (live Task 7), so it is never passed in argv.
+    The budget is the internal deadline budget only: the in-process one-shot
+    runner has no CLI budget flag (live Task 7), so it is never passed in argv.
     The deadline plus the default SIGTERM grace plus the exit-marker reserve is
     strictly below ``runtime_max_sec``; a limit below the minimum contract fails
     closed.
