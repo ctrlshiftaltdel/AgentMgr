@@ -1803,8 +1803,11 @@ def _task_directory_files(task_dir: Path) -> dict[str, str]:
 def _assert_completed_task_directory(run: _ManagedRun, token: str) -> None:
     """Scan the whole finished task directory for prompt/token leakage.
 
-    Missing or unreadable expected log/status files fail; only ``prompt.txt``
-    may contain the prompt and only ``egress.token`` may contain the token.
+    Missing or unreadable expected log/status files fail.  Only ``prompt.txt``
+    and Hermes' task-scoped session store may contain the prompt; only
+    ``egress.token`` may contain the token.  The session store lives inside the
+    per-task profile that cleanup removes, so it is not an outbound sink; the
+    prompt canary must never reach logs, status, manifest, argv or journal.
     """
 
     files = _task_directory_files(run.task_dir)
@@ -1833,11 +1836,30 @@ def _assert_completed_task_directory(run: _ManagedRun, token: str) -> None:
             continue
         assert token not in text, f"the egress token leaked into {relative}"
     for relative, text in files.items():
-        if relative == "prompt.txt":
+        if relative == "prompt.txt" or _is_hermes_prompt_state(relative):
             continue
         assert MANAGED_PROMPT_CANARY not in text, (
             f"the prompt leaked into {relative}"
         )
+
+
+def _is_hermes_prompt_state(relative: str) -> bool:
+    """Return whether *relative* is Hermes' own task-scoped session state.
+
+    Hermes persists a one-shot conversation in ``HERMES_HOME/state.db`` (plus
+    optional WAL/SHM siblings and ``sessions/`` entries).  That store is
+    inside the ephemeral per-task profile, is never read by the adapter, and
+    is removed by cleanup; it is the only prompt sink besides ``prompt.txt``.
+    Logs, status files, the manifest, argv and the journal remain strict.
+    """
+
+    if relative in {
+        "profile/state.db",
+        "profile/state.db-wal",
+        "profile/state.db-shm",
+    }:
+        return True
+    return relative.startswith("profile/sessions/")
 
 
 def _assert_journal_is_clean(unit: str, token: str) -> None:
@@ -2280,6 +2302,25 @@ def test_primary_group_is_required_and_supplementary_groups_absent() -> None:
             "Group=agentmgr-hermes\nSupplementaryGroups=video",
             "agentmgr-hermes",
         )
+
+
+def test_prompt_state_sink_is_only_task_scoped_hermes_state() -> None:
+    assert _is_hermes_prompt_state("profile/state.db")
+    assert _is_hermes_prompt_state("profile/state.db-wal")
+    assert _is_hermes_prompt_state("profile/state.db-shm")
+    assert _is_hermes_prompt_state("profile/sessions/abc/transcript.json")
+    for rejected in (
+        "stdout.txt",
+        "stderr.txt",
+        "manifest.json",
+        "status/exit.json",
+        "profile/config.yaml",
+        "profile/logs/agent.log",
+        "profile.template.yaml",
+        "profile/state.db.bak",
+        "profile/sessions-evil/transcript.json",
+    ):
+        assert not _is_hermes_prompt_state(rejected), rejected
 
 
 def test_live_gate_names_both_required_variables() -> None:
