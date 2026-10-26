@@ -20,6 +20,7 @@ real capability label.
 from __future__ import annotations
 
 import dataclasses
+import grp
 import hashlib
 import hmac
 import json
@@ -214,6 +215,28 @@ def managed_grant(**overrides: object) -> RuntimeGrant:
     return RuntimeGrant(**values)  # type: ignore[arg-type]
 
 
+def _share_with_sandbox_group(path: Path) -> None:
+    """Give a fake task file the production sandbox group when it exists.
+
+    ``read_manifest`` requires the sandbox gid on a provisioned host.  A test
+    user that is a member of ``agentmgr-hermes`` may change the group of a file
+    it owns without root; where the group does not exist (plain CI) nothing is
+    required.  A provisioned host without membership is a test-host setup error.
+    """
+
+    try:
+        gid = grp.getgrnam("agentmgr-hermes").gr_gid
+    except KeyError:
+        return
+    try:
+        os.chown(path, -1, gid)
+    except PermissionError as exc:  # pragma: no cover - provisioning error
+        raise AssertionError(
+            "the test user must be a member of agentmgr-hermes on a "
+            "provisioned host"
+        ) from exc
+
+
 def write_fake_manifest(
     config: HermesManagedConfig,
     spec: SandboxSpec,
@@ -257,6 +280,7 @@ def write_fake_manifest(
         json.dumps(document, sort_keys=True, separators=(",", ":")), encoding="utf-8"
     )
     path.chmod(0o640)
+    _share_with_sandbox_group(path)
     return path
 
 
@@ -436,6 +460,7 @@ def _write_corrupt_sibling(
     manifest = task_dir / "manifest.json"
     manifest.write_text("{not-json", encoding="utf-8")
     manifest.chmod(0o640)
+    _share_with_sandbox_group(manifest)
     return name
 
 

@@ -728,22 +728,32 @@ def test_upstream_timeout_is_stable(tmp_path: Path) -> None:
 def test_neither_key_nor_token_nor_prompt_reaches_the_logs(
     harness: Harness, caplog: pytest.LogCaptureFixture
 ) -> None:
-    caplog.set_level(logging.DEBUG)
-    token = token_for()
+    # Alembic's test migrations call fileConfig(disable_existing_loggers=True),
+    # which disables this module logger after import.  Re-enable it for the
+    # duration so caplog can observe the allow/deny path; otherwise an empty
+    # capture would make the absence assertions vacuous.
+    logger = logging.getLogger("agentmgr.hermes.egress")
+    previous_disabled = logger.disabled
+    logger.disabled = False
+    try:
+        caplog.set_level(logging.DEBUG, logger="agentmgr.hermes.egress")
+        token = token_for()
 
-    assert call(harness.broker, token).status == 200
-    assert call(harness.broker, "bogus-token").status == 401
+        assert call(harness.broker, token).status == 200
+        assert call(harness.broker, "bogus-token").status == 401
 
-    harness.state.status = 500
-    harness.state.body = b'{"error":"secret body"}'
-    assert call(harness.broker, token).status == 502
+        harness.state.status = 500
+        harness.state.body = b'{"error":"secret body"}'
+        assert call(harness.broker, token).status == 502
 
-    logged = caplog.text
-    assert "egress" in logged, "the denial/allow path must actually be logged"
-    assert token not in logged
-    assert REAL_KEY.decode() not in logged
-    assert "PROMPT-CANARY" not in logged
-    assert "secret body" not in logged
+        logged = caplog.text
+        assert "egress" in logged, "the denial/allow path must actually be logged"
+        assert token not in logged
+        assert REAL_KEY.decode() not in logged
+        assert "PROMPT-CANARY" not in logged
+        assert "secret body" not in logged
+    finally:
+        logger.disabled = previous_disabled
 
 
 # ---------------------------------------------------------------------------

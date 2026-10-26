@@ -24,6 +24,7 @@ labels.
 
 from __future__ import annotations
 
+import grp
 import hashlib
 import hmac
 import json
@@ -207,6 +208,21 @@ def _canonical(document: Mapping[str, object]) -> bytes:
 
 def _iso_utc(value: datetime) -> str:
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _share_with_sandbox_group(path: Path) -> None:
+    """Give the fake manifest the production sandbox group when it exists.
+
+    The real helper writes the manifest group-readable; on a provisioned host a
+    test user in ``agentmgr-hermes`` can set that group without root.  Plain CI
+    has no such group and the adapter falls back to the mode/owner checks.
+    """
+
+    try:
+        gid = grp.getgrnam("agentmgr-hermes").gr_gid
+    except KeyError:
+        return
+    os.chown(path, -1, gid)
 
 
 def _sign(document: Mapping[str, object], key: bytes) -> dict[str, object]:
@@ -483,6 +499,7 @@ class FakeHermesSupervisor:
         path = spec.task_dir / "manifest.json"
         path.write_bytes(_canonical(document))
         os.chmod(path, 0o640)
+        _share_with_sandbox_group(path)
 
     def _write_started(self, spec: SandboxSpec) -> None:
         """Write the workload-shaped ``status/started.json`` marker."""
