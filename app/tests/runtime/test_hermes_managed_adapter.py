@@ -435,6 +435,18 @@ def _write_corrupt_sibling(
     return name
 
 
+def _write_manifestless_sibling(
+    config: HermesManagedConfig,
+    name: str = "agentmgr-hermes-dddddddddddddddd",
+) -> str:
+    """A unit-shaped directory left behind before its manifest was written."""
+
+    task_dir = config.task_root / name
+    (task_dir / "out").mkdir(parents=True, exist_ok=True)
+    (task_dir / "prompt.txt").write_text("sibling", encoding="utf-8")
+    return name
+
+
 class _OrderedScandir:
     def __init__(self, entries):
         self._entries = entries
@@ -954,6 +966,36 @@ def test_unloaded_without_an_exit_marker_is_unknown(tmp_path):
     assert status.stop_confirmed is True
 
 
+def test_failed_unit_with_a_live_cgroup_is_running(tmp_path):
+    _, supervisor, adapter, result = accepted_submission(tmp_path)
+    unit = unit_name_for("task_1", "idem_1")
+    supervisor.active_state = "failed"
+    supervisor.sub_state = "failed"
+    alive = dataclasses.replace(
+        supervisor.status(unit), process_gone=False, main_pid=1234
+    )
+    assert alive.active_state == "failed"
+    assert alive.process_gone is False
+    supervisor.status_override = alive
+
+    status = adapter.get_status(result.runtime_task_id, task_id="task_1")
+
+    assert status.state is RuntimeState.RUNNING
+    assert status.state is not RuntimeState.FAILED
+    assert status.stop_confirmed is False
+
+
+def test_failed_unit_with_a_gone_cgroup_is_failed(tmp_path):
+    _, supervisor, adapter, result = accepted_submission(tmp_path)
+    supervisor.active_state = "failed"
+    supervisor.process_gone = True
+    supervisor.started = True
+
+    status = adapter.get_status(result.runtime_task_id, task_id="task_1")
+
+    assert status.state is RuntimeState.FAILED
+
+
 def test_status_maps_timeout_and_cancelled(tmp_path):
     _, supervisor, adapter, result = accepted_submission(tmp_path)
     supervisor.active_state = "failed"
@@ -1104,6 +1146,55 @@ def test_cold_scan_without_a_match_and_an_unreadable_sibling_is_unknown(
 def test_cold_scan_without_a_match_and_a_corrupt_sibling_is_unknown(tmp_path):
     config, supervisor, _ = build_adapter(tmp_path)
     _write_corrupt_sibling(config)
+    restarted = HermesManagedAdapter(config, supervisor, now=lambda: NOW)
+
+    status = restarted.get_status("rtask_hermes_" + "0" * 32, task_id="task_1")
+
+    assert status.state is RuntimeState.UNKNOWN
+    assert status.state is not RuntimeState.NOT_FOUND
+
+
+def test_cold_scan_skips_a_manifestless_sibling_and_finds_a_later_manifest(
+    tmp_path, monkeypatch
+):
+    config, supervisor, _, submitted = accepted_submission(tmp_path)
+    unit = unit_name_for("task_1", "idem_1")
+    _complete_with_artifact(config, supervisor, unit, b"cold-scan-manifestless")
+    supervisor.active_state = "not-found"
+    supervisor.sub_state = None
+    supervisor.started = True
+    supervisor.exit_code = 0
+    supervisor.process_gone = True
+    sibling = _write_manifestless_sibling(config)
+    _scandir_with_first(config, sibling, monkeypatch)
+
+    restarted = HermesManagedAdapter(config, supervisor, now=lambda: NOW)
+    status = restarted.get_status(submitted.runtime_task_id, task_id="task_1")
+
+    assert status.state is RuntimeState.COMPLETED
+    assert status.state is not RuntimeState.UNKNOWN
+
+
+def test_cold_scan_without_a_match_and_a_manifestless_directory_is_unknown(tmp_path):
+    config, supervisor, _ = build_adapter(tmp_path)
+    _write_manifestless_sibling(config)
+    restarted = HermesManagedAdapter(config, supervisor, now=lambda: NOW)
+
+    status = restarted.get_status("rtask_hermes_" + "0" * 32, task_id="task_1")
+
+    assert status.state is RuntimeState.UNKNOWN
+    assert status.state is not RuntimeState.NOT_FOUND
+
+
+def test_truncated_task_root_scan_without_a_match_is_unknown(tmp_path, monkeypatch):
+    config, supervisor, adapter = build_adapter(tmp_path)
+    first = adapter.submit_task("task_1", "PROMPT-CANARY", "idem_1", managed_grant())
+    second = adapter.submit_task(
+        "task_2", "PROMPT-CANARY", "idem_2", managed_grant(task_id="task_2")
+    )
+    assert first.outcome is SubmitOutcome.ACCEPTED
+    assert second.outcome is SubmitOutcome.ACCEPTED
+    monkeypatch.setattr("app.runtime.hermes_managed._MAX_TASK_SCAN", 1)
     restarted = HermesManagedAdapter(config, supervisor, now=lambda: NOW)
 
     status = restarted.get_status("rtask_hermes_" + "0" * 32, task_id="task_1")

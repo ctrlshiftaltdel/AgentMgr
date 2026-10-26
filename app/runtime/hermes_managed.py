@@ -2945,12 +2945,14 @@ class HermesManagedAdapter:
             return unit, manifest
 
         try:
+            truncated = False
             unreadable_sibling = False
             with os.scandir(self._config.task_root) as entries:
                 seen = 0
                 for entry in entries:
                     seen += 1
                     if seen > _MAX_TASK_SCAN:
+                        truncated = True
                         break
                     unit = entry.name
                     if not _UNIT_RE.fullmatch(unit):
@@ -2970,14 +2972,22 @@ class HermesManagedAdapter:
                         # ``unknown`` (never ``not_found``).
                         unreadable_sibling = True
                         continue
+                    if manifest is None:
+                        # A unit-shaped directory without a usable manifest
+                        # cannot prove the handle is absent either.
+                        unreadable_sibling = True
+                        continue
                     if (
-                        manifest is not None
-                        and manifest.runtime_handle == handle
+                        manifest.runtime_handle == handle
                         and (task_id is None or manifest.task_id == task_id)
                     ):
                         with self._lock:
                             self._handles[handle] = (unit, manifest.task_id)
                         return unit, manifest
+            if truncated:
+                # The scan stopped at the entry cap, so a handle in the
+                # unscanned tail cannot be ruled out.
+                raise _ManifestUnreadable("task root scan was truncated")
             if unreadable_sibling:
                 raise _ManifestUnreadable(
                     "a task manifest in the task root is unreadable"
@@ -3068,7 +3078,7 @@ def _map_status(status: SandboxStatus) -> tuple[RuntimeState, RuntimeErrorInfo |
         return RuntimeState.TIMED_OUT, None
     if status.cancelled and status.process_gone:
         return RuntimeState.STOPPED, None
-    if status.active_state == "failed":
+    if status.active_state == "failed" and status.process_gone:
         return RuntimeState.FAILED, None
     if status.process_gone:
         if not status.started:
