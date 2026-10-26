@@ -586,12 +586,26 @@ def _show(unit: str) -> str:
 
 
 def _unit_is_gone(dump: str) -> bool:
+    """Return whether the unit's process cgroup is empty.
+
+    A killed one-shot often ends as ``failed`` with ``MainPID=0`` and an empty
+    cgroup; that is gone just like ``inactive``.  If systemd still reports a
+    control group, its ``cgroup.procs`` must be readable and empty.
+    """
+
     if _property(dump, "LoadState") == "not-found":
         return True
-    return (
-        _property(dump, "ActiveState") == "inactive"
-        and int(_property(dump, "MainPID") or 0) == 0
-    )
+    if int(_property(dump, "MainPID") or 0) != 0:
+        return False
+    if _property(dump, "ActiveState") not in {"inactive", "failed"}:
+        return False
+    cgroup = _property(dump, "ControlGroup")
+    if not cgroup:
+        return True
+    completed = _sudo([CAT, f"/sys/fs/cgroup{cgroup}/cgroup.procs"])
+    if completed.returncode != 0:
+        return "No such file" in completed.stderr
+    return not completed.stdout.strip()
 
 
 def _wait_for_unit_gone(unit: str, *, timeout: float) -> None:
@@ -2321,6 +2335,25 @@ def test_prompt_state_sink_is_only_task_scoped_hermes_state() -> None:
         "profile/sessions-evil/transcript.json",
     ):
         assert not _is_hermes_prompt_state(rejected), rejected
+
+
+def test_unit_gone_accepts_failed_empty_cgroup_and_rejects_live() -> None:
+    assert _unit_is_gone("LoadState=not-found\n")
+    assert _unit_is_gone(
+        "LoadState=loaded\nActiveState=inactive\nMainPID=0\nControlGroup=\n"
+    )
+    # A killed one-shot usually ends failed with an empty cgroup: gone.
+    assert _unit_is_gone(
+        "LoadState=loaded\nActiveState=failed\nMainPID=0\nControlGroup=\n"
+    )
+    assert not _unit_is_gone(
+        "LoadState=loaded\nActiveState=active\nMainPID=123\n"
+        "ControlGroup=/system.slice/agentmgr-hermes-x.service\n"
+    )
+    assert not _unit_is_gone(
+        "LoadState=loaded\nActiveState=deactivating\nMainPID=0\n"
+        "ControlGroup=/system.slice/agentmgr-hermes-x.service\n"
+    )
 
 
 def test_live_gate_names_both_required_variables() -> None:
