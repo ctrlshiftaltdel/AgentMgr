@@ -245,7 +245,7 @@ AGENTMGR_HERMES_LIVE=1 ... \
   pytest app/tests/tasks/test_hermes_managed_live.py -q -o addopts=''
 ```
 
-证据记录：命令、退出码、Hermes 版本、runtime root 哈希、提交 SHA、pytest 计数；证据放在仓库外/Issue，不入库主机信息或秘密。**没有这些证据前，边界记录中的能力标签保持 `unverified`。**
+证据记录：命令、退出码、Hermes 版本、runtime root 哈希、提交 SHA、pytest 计数；证据放在仓库外/Issue，不入库主机信息或秘密。**边界记录区分 `live`/`partial`/`unverified`；真实 provider key 的模型 artifact 和 `runtime.managed_execution` 在真实 key E2E 通过前仍为 `unverified`。**
 
 ## 12 未包含 / 边界
 

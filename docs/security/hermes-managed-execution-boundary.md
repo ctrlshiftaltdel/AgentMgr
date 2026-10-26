@@ -110,6 +110,8 @@ stub 上游已真实验证：任务级短时令牌的签发/过期/撤销/跨任
 8. **每任务一个 unit/进程有启动开销。** 并发容量未测量；单 worker 单任务串行。
 9. **真实 key 由所有者提供。** key 轮换、配额与计费流程不在本设计内；当前测试机只有 dummy key。
 10. **live 证据只在批准测试机产生。** 测试机安装/验证不等于生产部署；生产 service principal、CLI、真实 provider key 与容量仍未验证。
+11. **完成 artifact 与 cancel 竞态仍在 dispatcher 层未闭环。** `cancel_task` 在 artifact 已存在时返回 `already_terminal`，但 #96 `RuntimeDispatcher` 当前只按 `get_status` 决定是否进入 `verifying`；若 cancel 先让 workload 记录 `cancelled`，任务会转 `needs_human`，而不是利用已存在的 artifact。该路径不会 auto-`succeeded`、auto-`cancelled` 或写 `side_effects_reconciled`，但会丢失设计的 `verifying` 路径。修复涉及 #96 dispatcher，需单独任务/所有者决策。
+12. **`capabilities()` 与文档标签口径不同。** 只要 helper 返回有效 runtime attestation 且 `evidence_ref` 匹配，`capabilities()` 会把已实现的 Managed 标签标为 verified，包括 `runtime.managed_execution`；它不知道真实 provider key E2E 是否运行。本文档标签更保守；不得把 `capabilities()` 的 `verified` 快照当作真实 key/生产证据。
 
 ## 6 不得作出的声明
 

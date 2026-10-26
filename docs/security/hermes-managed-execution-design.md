@@ -1,6 +1,6 @@
 # Hermes-in-sandbox Managed Execution 设计（#97）
 
-- 状态：**Draft — 待所有者审阅**；本文只定义 #97 设计，不代表已实现、已部署或已通过真实证据验证。
+- 状态：**Implemented — sandbox/lifecycle/stub-broker live evidence recorded; real-key model artifact E2E pending.** 本文定义 #97 设计与实际实现边界，不代表生产部署或真实模型端到端已验证；证据见[边界记录](hermes-managed-execution-boundary.md)。
 - 日期：2026-10-25
 - 关联：Issue #97、#96、#82、#83、#81；[Runtime Adapter 契约](../contracts/runtime-adapter.md)、[任务状态机](../architecture/task-state-machine.md)、[#96 调度器](../architecture/runtime-dispatch.md)、[#82 隔离设计](managed-execution-isolation-design.md)、[#82 边界记录](managed-execution-boundary.md)。
 - 依赖：`RuntimeAdapter` v1.0.0、#96 的 `RuntimeDispatcher`、#82 的 transient systemd 基座与 PEP 设计。
