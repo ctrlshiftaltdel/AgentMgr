@@ -937,6 +937,27 @@ def _pinned_probe_workload(environment: LiveEnvironment) -> tuple[Path, str]:
 # ---------------------------------------------------------------------------
 
 
+def _assert_primary_group(dump: str, group: str) -> None:
+    """Assert the intended group mechanism: one static primary group, no extras.
+
+    The helper deliberately passes ``Group=<sandbox group>`` as the unit's
+    *static primary* group (design §6.2) instead of ``SupplementaryGroups=``, so
+    files the unit writes inherit the sandbox group and the trusted adapter can
+    read them.  A full ``systemctl show`` therefore reports
+    ``Group=<group>`` and **no** ``SupplementaryGroups`` property at all
+    (``systemctl show`` omits empty values outside an explicit ``-p`` request);
+    that absence is the intended profile, not a gap.  A missing or different
+    primary group fails, and so does any supplementary group.
+    """
+
+    assert _property_values(dump, "Group") == [group], (
+        f"the unit primary group must be exactly {group}"
+    )
+    assert _property_values(dump, "SupplementaryGroups") == [], (
+        "the unit must not carry supplementary groups"
+    )
+
+
 def _assert_unit_profile(
     dump: str,
     environment: LiveEnvironment,
@@ -950,9 +971,7 @@ def _assert_unit_profile(
 
     assert _property(dump, "ActiveState") == "active"
     assert _property(dump, "DynamicUser") == "yes"
-    assert _property(dump, "Group") == environment.group
-    # Exactly one empty SupplementaryGroups line: a missing property fails.
-    assert _property_values(dump, "SupplementaryGroups") == [""]
+    _assert_primary_group(dump, environment.group)
 
     for name in (
         "PrivateDevices",
@@ -982,8 +1001,12 @@ def _assert_unit_profile(
     assert _property(dump, "ExitType") == "cgroup"
     assert _property(dump, "WorkingDirectory") == "/task"
     assert int(_require_property(dump, "UMask"), 8) == 0o007
-    assert _property_values(dump, "CapabilityBoundingSet") == [""]
-    assert _property_values(dump, "AmbientCapabilities") == [""]
+    # An empty capability set is rendered either as one empty value (explicit
+    # ``-p`` request) or omitted from the full ``systemctl show`` dump; both
+    # encode "no capabilities".  A non-empty set always prints its names here
+    # and fails.
+    assert _property_values(dump, "CapabilityBoundingSet") in ([], [""])
+    assert _property_values(dump, "AmbientCapabilities") in ([], [""])
     assert _property(dump, "SystemCallArchitectures") == "native"
     assert int(_require_property(dump, "SystemCallErrorNumber")) == errno.EPERM
     assert _property(dump, "SystemCallFilter").strip(), "SystemCallFilter is empty"
@@ -2223,6 +2246,24 @@ def test_property_reader_distinguishes_missing_from_empty() -> None:
     assert _property(dump, "PrivateNetwork") == ""
     with pytest.raises(AssertionError):
         _require_property(dump, "PrivateNetwork")
+
+
+def test_primary_group_is_required_and_supplementary_groups_absent() -> None:
+    _assert_primary_group("Group=agentmgr-hermes", "agentmgr-hermes")
+
+    # A missing primary group: systemctl show omits empty values, so an absent
+    # Group line must fail (it is not "no group of interest").
+    with pytest.raises(AssertionError):
+        _assert_primary_group("PrivateDevices=yes", "agentmgr-hermes")
+    # A different primary group must fail.
+    with pytest.raises(AssertionError):
+        _assert_primary_group("Group=agentmgr-exec", "agentmgr-hermes")
+    # Supplementary groups are never part of the intended profile.
+    with pytest.raises(AssertionError):
+        _assert_primary_group(
+            "Group=agentmgr-hermes\nSupplementaryGroups=video",
+            "agentmgr-hermes",
+        )
 
 
 def test_live_gate_names_both_required_variables() -> None:
