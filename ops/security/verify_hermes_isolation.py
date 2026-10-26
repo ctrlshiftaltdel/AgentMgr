@@ -614,6 +614,37 @@ def _check_runtime_content(deployment: Deployment) -> None:
     # original mode; the read-only remount is then the enforcement.
     if _mode(info) & 0o222 and not _runtime_root_mount_is_read_only():
         _fail("runtime_root_writable", oct(_mode(info)))
+    # The managed workload runs Hermes in-process: it needs the source, a
+    # runtime Python and the provisioned dependency environment.  A runtime
+    # root missing any of these would install cleanly but fail every task.
+    oneshot = RUNTIME_ROOT / "hermes-agent" / "hermes_cli" / "oneshot.py"
+    if not oneshot.is_file() or oneshot.is_symlink():
+        _fail("runtime_root_hermes_incomplete", "oneshot.py")
+    pythons = [
+        candidate
+        for candidate in (RUNTIME_ROOT / "tools").glob("python-*/bin/python3")
+        if candidate.is_file() and not candidate.is_symlink()
+    ]
+    if not pythons:
+        _fail("runtime_root_hermes_incomplete", "tools/python-*/bin/python3")
+    installs = RUNTIME_ROOT / "installs"
+    if not installs.is_dir() or installs.is_symlink():
+        _fail("runtime_root_hermes_incomplete", "installs")
+    found = False
+    try:
+        for dirpath, dirnames, _filenames in os.walk(installs, followlinks=False):
+            dirnames[:] = [
+                name
+                for name in dirnames
+                if not os.path.islink(os.path.join(dirpath, name))
+            ]
+            if os.path.basename(dirpath) == "site-packages":
+                found = True
+                break
+    except OSError:
+        _fail("runtime_root_hermes_incomplete", "installs")
+    if not found:
+        _fail("runtime_root_hermes_incomplete", "installs/**/site-packages")
 
 
 def _unescape_mountinfo(value: str) -> str:

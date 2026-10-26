@@ -435,6 +435,20 @@ for marker in profiles auth.json .env sessions gateway.lock locks; do
     fi
 done
 
+# The managed workload runs hermes_cli.oneshot in-process with the runtime
+# Python and the provisioned dependency environment.  A source missing any of
+# these would install cleanly but fail every task with ModuleNotFoundError.
+[ -f "${SOURCE}/hermes-agent/hermes_cli/oneshot.py" ] || \
+    fail "the runtime source is missing hermes-agent/hermes_cli/oneshot.py"
+if ! find "${SOURCE}/tools" -maxdepth 3 -type f -path '*/bin/python3' \
+    -perm -0100 -print -quit 2>/dev/null | grep -q .; then
+    fail "the runtime source is missing an executable tools/python-*/bin/python3"
+fi
+if ! find "${SOURCE}/installs" -type d -name site-packages -print -quit \
+    2>/dev/null | grep -q .; then
+    fail "the runtime source is missing installs/**/site-packages"
+fi
+
 if ! [[ "${ADAPTER_USER}" =~ ^[A-Za-z_][A-Za-z0-9_-]{0,31}$ ]]; then
     fail "--adapter-user is not a valid account name"
 fi

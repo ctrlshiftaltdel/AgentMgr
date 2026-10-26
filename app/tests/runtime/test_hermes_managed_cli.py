@@ -997,6 +997,10 @@ def test_provisioning_fails_closed_and_logs_key_rotation():
     assert "rotation is an explicit operator action" in source
     assert "existing provider key differs" in source
 
+    # A source without the in-process runner inputs must fail before install.
+    assert "hermes-agent/hermes_cli/oneshot.py" in source
+    assert "installs/**/site-packages" in source
+
 
 def test_verifier_registers_each_check_once():
     verifier = _load_verifier()
@@ -1013,6 +1017,37 @@ def test_verifier_registers_each_check_once():
         "sandbox-argv",
     } <= set(names)
     assert dict(verifier.CHECKS)["sandbox-argv"].__name__ == "_check_sandbox_argv"
+
+
+def test_verifier_requires_the_inprocess_runner_runtime_content(tmp_path, monkeypatch):
+    verifier = _load_verifier()
+    root = tmp_path / "runtime"
+    oneshot = root / "hermes-agent" / "hermes_cli" / "oneshot.py"
+    oneshot.parent.mkdir(parents=True)
+    oneshot.write_text("", encoding="utf-8")
+    python = root / "tools" / "python-3.14.7" / "bin" / "python3"
+    python.parent.mkdir(parents=True)
+    python.write_text("#!/bin/sh\n", encoding="utf-8")
+    python.chmod(0o755)
+    site_packages = (
+        root
+        / "installs"
+        / "env"
+        / "venv"
+        / "lib"
+        / "python3.14"
+        / "site-packages"
+    )
+    site_packages.mkdir(parents=True)
+    monkeypatch.setattr(verifier, "RUNTIME_ROOT", root)
+    monkeypatch.setattr(verifier, "_runtime_root_mount_is_read_only", lambda: True)
+
+    verifier._check_runtime_content(None)  # complete runtime: no failure
+
+    site_packages.rmdir()
+    with pytest.raises(verifier.VerificationError) as error:
+        verifier._check_runtime_content(None)
+    assert error.value.code == "runtime_root_hermes_incomplete"
 
 
 def test_provisioner_renderer_accepts_staging_arguments(tmp_path, monkeypatch):
