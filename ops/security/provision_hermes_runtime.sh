@@ -420,6 +420,8 @@ require_install_path "${VENV}" "--venv"
 
 require_state_path "${SOURCE}" "--source"
 require_present_directory "${SOURCE}" "--source"
+SOURCE=$(readlink -f -- "${SOURCE}" 2>/dev/null) || \
+    fail "--source must resolve to a real directory"
 [ "${SOURCE}" != "${RUNTIME_ROOT}" ] || fail "--source must differ from the runtime root"
 case "${RUNTIME_ROOT}/" in
     "${SOURCE}/"*) fail "the runtime root must not be inside --source" ;;

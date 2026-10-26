@@ -1000,6 +1000,8 @@ def test_provisioning_fails_closed_and_logs_key_rotation():
     # A source without the in-process runner inputs must fail before install.
     assert "hermes-agent/hermes_cli/oneshot.py" in source
     assert "installs/**/site-packages" in source
+    # A trailing slash / symlinked source is normalized before prefix checks.
+    assert 'SOURCE=$(readlink -f -- "${SOURCE}"' in source
 
 
 def test_provisioner_runtime_source_gate_executes(tmp_path):
