@@ -248,24 +248,32 @@ _DEFINITE_LAUNCH_PREFIXES = (
     "task_dir_",
     "task_file_",
     "prompt_",
-    "profile_template_",
+    "profile_",
+    "token_",
+    "out_dir_",
     "egress_token_",
     "attestation_key_",
 )
 _DEFINITE_LAUNCH_CODES = frozenset(
     {
+        "adapter_sandbox_group_missing",
         "arguments_not_accepted",
         "forbidden_field",
+        "group_unavailable",
         "invalid_digest",
         "invalid_limit",
         "invalid_operation",
         "invalid_request",
         "invalid_unit",
+        "masked_source",
         "missing_field",
+        "path_unavailable",
         "payload_too_large",
+        "private_tmp_source",
         "runtime_handle_mismatch",
         "unit_name_mismatch",
         "unknown_field",
+        "user_unavailable",
     }
 )
 
@@ -1334,6 +1342,13 @@ def read_manifest(config: HermesManagedConfig, unit: str) -> SandboxManifest | N
             info = os.fstat(descriptor)
             if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= _MANIFEST_MAX_BYTES:
                 raise SandboxSpecError("task manifest is not a bounded regular file")
+            if info.st_uid != os.geteuid():
+                raise SandboxSpecError("task manifest owner is invalid")
+            sandbox_gid = _sandbox_gid()
+            if sandbox_gid is not None and info.st_gid != sandbox_gid:
+                raise SandboxSpecError("task manifest group is invalid")
+            if stat.S_IMODE(info.st_mode) != 0o640:
+                raise SandboxSpecError("task manifest mode is invalid")
             raw = _read_bounded_fd(descriptor, _MANIFEST_MAX_BYTES)
         finally:
             os.close(descriptor)
@@ -1918,6 +1933,14 @@ class _Intent:
     accepted_at: datetime | None = None
 
 
+class _ManifestUnreadable(HermesManagedError):
+    """A manifest exists for a known unit but fails validation.
+
+    Distinguished from an absent manifest so status/result/cancel can report
+    ``unknown`` instead of the definite ``not_found`` answer.
+    """
+
+
 class HermesManagedAdapter:
     """``RuntimeAdapter`` for Hermes in a transient systemd sandbox.
 
@@ -2099,12 +2122,28 @@ class HermesManagedAdapter:
                     "idempotency_key_payload_conflict",
                     ErrorCode.CONFLICT,
                 )
+            if prior is not None and prior.state != "rejected":
+                # A prepared/launched or ambiguous intent already owns this
+                # key.  Without the durable manifest we cannot prove whether a
+                # unit exists, and a second prepare/launch is forbidden.
+                return _submit_error(
+                    SubmitOutcome.UNKNOWN,
+                    "submission_intent_unresolved",
+                    ErrorCode.UNKNOWN,
+                )
             if _path_exists(_task_dir(self._config, unit)):
                 self._remember_intent(task_id, idempotency_key, digest, "unknown")
                 return _submit_error(
                     SubmitOutcome.UNKNOWN,
                     "task_directory_exists_without_manifest",
                     ErrorCode.UNKNOWN,
+                )
+
+            if not self._runtime_attestation_verified(current):
+                return _submit_error(
+                    SubmitOutcome.UNSUPPORTED,
+                    "runtime_attestation_unverified",
+                    ErrorCode.UNSUPPORTED,
                 )
 
             try:
@@ -2291,13 +2330,12 @@ class HermesManagedAdapter:
             intent = self._intents.get((task_id, idempotency_key))
         if intent is not None and intent.state == "rejected":
             return LookupResult(outcome=LookupOutcome.NOT_FOUND, observed_at=current)
-        if intent is not None and intent.state == "accepted" and intent.handle:
-            self._handles[intent.handle] = (unit, task_id)
-            return LookupResult(
-                outcome=LookupOutcome.FOUND,
-                runtime_task_id=intent.handle,
-                reported_state=RuntimeState.UNKNOWN.value,
-                observed_at=current,
+        if intent is not None:
+            # An accepted/ambiguous intent without its durable manifest cannot
+            # prove the handle or the absence of side effects.  Never claim
+            # found (or not_found) and never suggest a relaunch.
+            return _lookup_error(
+                LookupOutcome.UNKNOWN, "submission_intent_unresolved", current
             )
         return _lookup_error(LookupOutcome.UNKNOWN, "submission_intent_unproven", current)
 
@@ -2312,7 +2350,22 @@ class HermesManagedAdapter:
         """Return the mapped unit state, verifying the handle/task binding."""
 
         current = self._clock()
-        resolved = self._resolve_handle(runtime_task_id, task_id)
+        try:
+            resolved = self._resolve_handle(runtime_task_id, task_id)
+        except _ManifestUnreadable:
+            return StatusResult(
+                runtime_task_id=runtime_task_id,
+                state=RuntimeState.UNKNOWN,
+                external_state=None,
+                observed_at=current,
+                stop_confirmed=False,
+                runtime="hermes",
+                error=RuntimeErrorInfo(
+                    code=ErrorCode.UNKNOWN,
+                    message="task manifest is unreadable",
+                    context={"reason": "task_manifest_unreadable"},
+                ),
+            )
         if resolved is None:
             return StatusResult(
                 runtime_task_id=runtime_task_id,
@@ -2380,7 +2433,15 @@ class HermesManagedAdapter:
         """Hash ``out/result.txt`` and return verifying evidence, never success."""
 
         current = self._clock()
-        resolved = self._resolve_handle(runtime_task_id, task_id)
+        try:
+            resolved = self._resolve_handle(runtime_task_id, task_id)
+        except _ManifestUnreadable:
+            return _result_error(
+                ResultOutcome.UNKNOWN,
+                stop_confirmed=False,
+                code=ErrorCode.UNKNOWN,
+                reason="task_manifest_unreadable",
+            )
         if resolved is None:
             return _result_error(
                 ResultOutcome.UNKNOWN,
@@ -2472,7 +2533,19 @@ class HermesManagedAdapter:
 
         del idempotency_key, poll_timeout, poll_interval
         current = self._clock()
-        resolved = self._resolve_handle(runtime_task_id, task_id)
+        try:
+            resolved = self._resolve_handle(runtime_task_id, task_id)
+        except _ManifestUnreadable:
+            return CancelResult(
+                outcome=CancelOutcome.UNKNOWN,
+                stop_confirmed=False,
+                observed_at=current,
+                error=RuntimeErrorInfo(
+                    code=ErrorCode.UNKNOWN,
+                    message="task manifest is unreadable",
+                    context={"reason": "task_manifest_unreadable"},
+                ),
+            )
         if resolved is None:
             return CancelResult(
                 outcome=CancelOutcome.UNKNOWN,
@@ -2528,6 +2601,7 @@ class HermesManagedAdapter:
             stop = self._supervisor.stop(unit, reason=stop_reason)
         except SupervisorError as exc:
             if prior_status is not None and prior_status.process_gone:
+                self._revoke(manifest)
                 return CancelResult(
                     outcome=CancelOutcome.ALREADY_TERMINAL,
                     stop_confirmed=True,
@@ -2669,6 +2743,19 @@ class HermesManagedAdapter:
             return "runtime_token_ttl_invalid", ErrorCode.INVALID_REQUEST
         return None
 
+    def _runtime_attestation_verified(self, now: datetime) -> bool:
+        """Verify the runtime attestation before creating any task directory."""
+
+        try:
+            attestation = self._supervisor.runtime_attestation()
+            key = _read_key_file(self._config.attestation_key_path, "attestation key")
+            verify_runtime_attestation(
+                attestation, key=key, config=self._config, now=now
+            )
+        except Exception:  # noqa: BLE001 - an unverified runtime fails closed
+            return False
+        return True
+
     def _profile_template(self) -> str:
         template = self._config.local_proxy_base_url_template
         if (
@@ -2777,7 +2864,7 @@ class HermesManagedAdapter:
             return _submit_error(
                 SubmitOutcome.UNKNOWN, exc.code, ErrorCode.UNKNOWN
             )
-        if status.active_state != "not-found" or status.started:
+        if status.started:
             self._handles[manifest.runtime_handle] = (manifest.unit, manifest.task_id)
             return SubmitResult(
                 outcome=SubmitOutcome.ACCEPTED,
@@ -2789,7 +2876,7 @@ class HermesManagedAdapter:
         self._remember_intent(task_id, idempotency_key, digest, "unknown")
         return _submit_error(
             SubmitOutcome.UNKNOWN,
-            "task_prepared_without_unit",
+            "task_prepared_without_started",
             ErrorCode.UNKNOWN,
         )
 
@@ -2846,14 +2933,15 @@ class HermesManagedAdapter:
             try:
                 manifest = read_manifest(self._config, unit)
             except SandboxSpecError:
+                raise _ManifestUnreadable("task manifest is unreadable") from None
+            if manifest is None:
                 return None
             if (
-                manifest is None
-                or manifest.unit != unit
+                manifest.unit != unit
                 or manifest.runtime_handle != handle
                 or manifest.task_id != bound_task
             ):
-                return None
+                raise _ManifestUnreadable("task manifest is not bound to this handle")
             return unit, manifest
 
         try:
@@ -2961,7 +3049,7 @@ def _submission_digest(
 
 
 def _map_status(status: SandboxStatus) -> tuple[RuntimeState, RuntimeErrorInfo | None]:
-    if status.active_state == "not-found":
+    if status.active_state == "not-found" and not status.started:
         return RuntimeState.NOT_FOUND, RuntimeErrorInfo(
             code=ErrorCode.NOT_FOUND, message="runtime unit was not found"
         )
@@ -2969,6 +3057,8 @@ def _map_status(status: SandboxStatus) -> tuple[RuntimeState, RuntimeErrorInfo |
         return RuntimeState.TIMED_OUT, None
     if status.cancelled and status.process_gone:
         return RuntimeState.STOPPED, None
+    if status.started and status.exit_code is not None and status.exit_code != 0:
+        return RuntimeState.FAILED, None
     if status.active_state == "failed":
         return RuntimeState.FAILED, None
     if status.process_gone:
@@ -2982,7 +3072,9 @@ def _map_status(status: SandboxStatus) -> tuple[RuntimeState, RuntimeErrorInfo |
             # systemd observed a non-zero exit but the workload never wrote its
             # exit marker: never report success.
             return RuntimeState.FAILED, None
-        # A missing exit marker is not proof that the run completed.
+        # A missing exit marker is not proof that the run completed.  A
+        # transient unit is unloaded after success, so ``not-found`` with
+        # ``started=True`` and no exit marker is still unknown, not success.
         return RuntimeState.UNKNOWN, RuntimeErrorInfo(
             code=ErrorCode.UNKNOWN,
             message="runtime exited without a workload exit marker",
@@ -3089,6 +3181,9 @@ _SUBMIT_ERROR_MESSAGES = {
     "task_files_unwritable": "managed task files could not be written",
     "task_attestation_invalid": "task attestation could not be verified",
     "task_prepared_without_unit": "task was prepared but no unit/started marker exists",
+    "task_prepared_without_started": "task was prepared but the started marker is missing",
+    "submission_intent_unresolved": "an earlier submission intent is unresolved",
+    "runtime_attestation_unverified": "runtime attestation is not verified",
     "idempotency_key_payload_conflict": "idempotency key was used with a different payload",
 }
 _LOOKUP_ERROR_MESSAGES = {
@@ -3098,6 +3193,7 @@ _LOOKUP_ERROR_MESSAGES = {
     "runtime_status_unreadable": "runtime status is unreadable",
     "task_prepared_without_unit": "task was prepared but no unit/started marker exists",
     "submission_intent_unproven": "submission intent cannot be proven",
+    "submission_intent_unresolved": "an earlier submission intent is unresolved",
     "idempotency_key_payload_conflict": "idempotency key was used with a different payload",
 }
 

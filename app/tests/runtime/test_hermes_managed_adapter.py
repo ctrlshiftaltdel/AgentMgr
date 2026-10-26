@@ -567,6 +567,30 @@ def test_manifest_missing_after_prepare_is_unknown_and_does_not_launch(tmp_path)
     assert supervisor.launch_calls == 0
 
 
+def test_submit_requires_a_verified_runtime_attestation_before_prepare(tmp_path):
+    config, supervisor, adapter = build_adapter(tmp_path)
+    supervisor.attestation_value = RuntimeAttestation.from_document(
+        {**runtime_document(config), "hmac": "f" * 64}
+    )
+
+    result = adapter.submit_task("task_1", "PROMPT-CANARY", "idem_1", managed_grant())
+
+    assert result.outcome is SubmitOutcome.UNSUPPORTED
+    assert result.error is not None
+    assert result.error.code is ErrorCode.UNSUPPORTED
+    assert supervisor.prepare_calls == 0
+    assert supervisor.launch_calls == 0
+
+    supervisor.attestation_value = runtime_attestation(config)
+    supervisor.attestation_error = SupervisorError("helper_unavailable")
+    unavailable = adapter.submit_task(
+        "task_1", "PROMPT-CANARY", "idem_1", managed_grant()
+    )
+    assert unavailable.outcome is SubmitOutcome.UNSUPPORTED
+    assert supervisor.prepare_calls == 0
+    assert supervisor.launch_calls == 0
+
+
 # ---------------------------------------------------------------------------
 # idempotency
 # ---------------------------------------------------------------------------
@@ -606,6 +630,53 @@ def test_idempotent_replay_after_adapter_restart_uses_the_manifest(tmp_path):
     assert second.replayed is True
     assert second.runtime_task_id == first.runtime_task_id
     assert supervisor.launch_calls == 1
+
+
+def test_replay_is_unknown_before_the_started_marker(tmp_path):
+    _, supervisor, adapter, first = accepted_submission(tmp_path)
+    supervisor.started = False
+    supervisor.active_state = "active"
+
+    second = adapter.submit_task(
+        "task_1", "PROMPT-CANARY", "idem_1", managed_grant()
+    )
+
+    assert first.outcome is SubmitOutcome.ACCEPTED
+    assert second.outcome is SubmitOutcome.UNKNOWN
+    assert supervisor.launch_calls == 1
+    assert supervisor.prepare_calls == 1
+
+
+def test_ambiguous_submission_is_never_relaunched(tmp_path):
+    _, supervisor, adapter = build_adapter(tmp_path)
+    supervisor.launch_error = SupervisorError(
+        "started_marker_timeout", ambiguous=True
+    )
+    first = adapter.submit_task("task_1", "PROMPT-CANARY", "idem_1", managed_grant())
+    supervisor.launch_error = None
+
+    second = adapter.submit_task("task_1", "PROMPT-CANARY", "idem_1", managed_grant())
+
+    assert first.outcome is SubmitOutcome.UNKNOWN
+    assert second.outcome is SubmitOutcome.UNKNOWN
+    assert supervisor.launch_calls == 1
+    assert supervisor.prepare_calls == 1
+
+
+def test_accepted_intent_without_manifest_is_never_relaunched(tmp_path):
+    config, supervisor, adapter, first = accepted_submission(tmp_path)
+    shutil.rmtree(config.task_root / unit_name_for("task_1", "idem_1"))
+
+    lookup = adapter.find_by_idempotency_key("task_1", "grnt_1", "idem_1")
+    second = adapter.submit_task(
+        "task_1", "PROMPT-CANARY", "idem_1", managed_grant()
+    )
+
+    assert first.outcome is SubmitOutcome.ACCEPTED
+    assert lookup.outcome is LookupOutcome.UNKNOWN
+    assert second.outcome is SubmitOutcome.UNKNOWN
+    assert supervisor.launch_calls == 1
+    assert supervisor.prepare_calls == 1
 
 
 def test_find_by_idempotency_key_reports_durable_facts(tmp_path):
@@ -832,6 +903,52 @@ def test_status_unreadable_is_unknown_without_guessing(tmp_path):
     assert status.stop_confirmed is False
 
 
+def test_unreadable_or_tampered_manifest_is_unknown_not_not_found(tmp_path):
+    config, supervisor, adapter, submitted = accepted_submission(tmp_path)
+    unit = unit_name_for("task_1", "idem_1")
+    manifest = config.task_root / unit / "manifest.json"
+    good = manifest.read_bytes()
+
+    manifest.write_text("{not-json", encoding="utf-8")
+    corrupted = adapter.get_status(submitted.runtime_task_id, task_id="task_1")
+    corrupted_result = adapter.get_result(
+        submitted.runtime_task_id, task_id="task_1"
+    )
+    corrupted_cancel = adapter.cancel_task(
+        submitted.runtime_task_id, task_id="task_1"
+    )
+
+    assert corrupted.state is RuntimeState.UNKNOWN
+    assert corrupted.state is not RuntimeState.NOT_FOUND
+    assert corrupted_result.outcome is ResultOutcome.UNKNOWN
+    assert corrupted_cancel.outcome is CancelOutcome.UNKNOWN
+    assert supervisor.stop_calls == 0
+
+    manifest.write_bytes(good)
+    manifest.chmod(0o644)
+    wrong_mode = adapter.get_status(submitted.runtime_task_id, task_id="task_1")
+    assert wrong_mode.state is RuntimeState.UNKNOWN
+
+    manifest.chmod(0o640)
+    outside = tmp_path / "outside-manifest.json"
+    outside.write_bytes(good)
+    manifest.unlink()
+    manifest.symlink_to(outside)
+    symlinked = adapter.get_status(submitted.runtime_task_id, task_id="task_1")
+    assert symlinked.state is RuntimeState.UNKNOWN
+
+
+def test_cross_task_cancel_is_unknown_and_never_stops(tmp_path):
+    config, supervisor, adapter, submitted = accepted_submission(tmp_path)
+
+    cancelled = adapter.cancel_task(submitted.runtime_task_id, task_id="task_2")
+
+    assert cancelled.outcome is CancelOutcome.UNKNOWN
+    assert cancelled.stop_confirmed is False
+    assert supervisor.stop_calls == 0
+    assert list(config.revocation_dir.iterdir()) == []  # type: ignore[union-attr]
+
+
 # ---------------------------------------------------------------------------
 # results
 # ---------------------------------------------------------------------------
@@ -884,6 +1001,31 @@ def test_completed_artifact_becomes_verifying_evidence_not_success(tmp_path):
     assert f"unit.{unit}" in names
     assert f"task.task_1" in names
     assert f"grant.grnt_1" in names
+
+
+def test_unloaded_success_is_completed_and_verifying_evidence(tmp_path):
+    config, supervisor, adapter, submitted = accepted_submission(tmp_path)
+    unit = unit_name_for("task_1", "idem_1")
+    _complete_with_artifact(config, supervisor, unit, b"unloaded-success")
+    # Normal systemd behaviour: a successful transient unit is unloaded, so the
+    # unit is gone even though the task markers/artifact remain.
+    supervisor.active_state = "not-found"
+    supervisor.sub_state = None
+    supervisor.started = True
+    supervisor.exit_code = 0
+    supervisor.process_gone = True
+
+    status = adapter.get_status(submitted.runtime_task_id, task_id="task_1")
+    lookup = adapter.find_by_idempotency_key("task_1", "grnt_1", "idem_1")
+    result = adapter.get_result(submitted.runtime_task_id, task_id="task_1")
+
+    assert status.state is RuntimeState.COMPLETED
+    assert status.stop_confirmed is True
+    assert lookup.outcome is LookupOutcome.FOUND
+    assert lookup.runtime_task_id == submitted.runtime_task_id
+    assert result.outcome is ResultOutcome.SUCCEEDED
+    assert result.result_ref is not None
+    assert result.evidence_refs[0].startswith("evidence:hermes_artifact_")
 
 
 def test_missing_artifact_needs_human_and_never_synthesizes(tmp_path):
@@ -1261,6 +1403,85 @@ def test_helper_launch_requires_started_evidence(tmp_path):
     assert excinfo.value.ambiguous is True
 
 
+@pytest.mark.parametrize(
+    "code",
+    [
+        "prompt_missing",
+        "prompt_invalid",
+        "prompt_owner_invalid",
+        "prompt_group_invalid",
+        "prompt_mode_invalid",
+        "prompt_size_mismatch",
+        "prompt_hash_mismatch",
+        "profile_missing",
+        "profile_invalid",
+        "profile_owner_invalid",
+        "profile_group_invalid",
+        "profile_mode_invalid",
+        "profile_size_mismatch",
+        "profile_hash_mismatch",
+        "token_missing",
+        "token_invalid",
+        "token_owner_invalid",
+        "token_group_invalid",
+        "token_mode_invalid",
+        "token_size_mismatch",
+        "token_hash_mismatch",
+        "out_dir_owner_invalid",
+        "masked_source",
+        "private_tmp_source",
+        "user_unavailable",
+        "group_unavailable",
+        "adapter_sandbox_group_missing",
+        "path_unavailable",
+        "runtime_root_mode_invalid",
+        "broker_socket_invalid",
+        "workload_invalid",
+    ],
+)
+def test_launch_pre_start_helper_codes_are_definite(tmp_path, code):
+    config = helper_config(tmp_path)
+    spec = helper_spec(config)
+    runner = Runner(
+        [{"returncode": 1, "stdout": "", "stderr": json.dumps({"error": code})}]
+    )
+
+    with pytest.raises(SupervisorError) as excinfo:
+        HelperSandboxSupervisor(config, runner=runner).launch(spec)
+
+    assert excinfo.value.code == code
+    assert excinfo.value.ambiguous is False
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "unit_already_exists",
+        "unit_not_found",
+        "unit_failed",
+        "unit_not_active",
+        "unit_start_timeout",
+        "started_marker_timeout",
+        "started_marker_invalid",
+        "process_uid_unavailable",
+        "io_error",
+        "internal_error",
+    ],
+)
+def test_launch_post_start_helper_codes_are_ambiguous(tmp_path, code):
+    config = helper_config(tmp_path)
+    spec = helper_spec(config)
+    runner = Runner(
+        [{"returncode": 1, "stdout": "", "stderr": json.dumps({"error": code})}]
+    )
+
+    with pytest.raises(SupervisorError) as excinfo:
+        HelperSandboxSupervisor(config, runner=runner).launch(spec)
+
+    assert excinfo.value.code == code
+    assert excinfo.value.ambiguous is True
+
+
 def test_helper_errors_are_stable_and_do_not_leak_output(tmp_path):
     config = helper_config(tmp_path)
     spec = helper_spec(config)
@@ -1419,6 +1640,78 @@ def test_helper_stop_and_cleanup_map_process_gone(tmp_path):
     cleanup_request = json.loads(str(runner.calls[1][1]["input"]))
     assert cleanup_request["operation"] == "cleanup"
     assert cleanup_request["result_read"] is True
+
+
+@pytest.mark.parametrize("removed", [True, False])
+def test_helper_cleanup_accepts_both_idempotent_removed_values(tmp_path, removed):
+    config = helper_config(tmp_path)
+    spec = helper_spec(config)
+    write_fake_manifest(config, spec)
+    runner = Runner(
+        [
+            {
+                "returncode": 0,
+                "stdout": json.dumps(
+                    {
+                        "ok": True,
+                        "operation": "cleanup",
+                        "unit": spec.unit,
+                        "removed": removed,
+                        "process_gone": True,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            }
+        ]
+    )
+
+    HelperSandboxSupervisor(config, runner=runner).cleanup(spec.unit, result_read=True)
+
+
+def test_helper_cleanup_unconfirmed_or_malformed_fails_closed(tmp_path):
+    config = helper_config(tmp_path)
+    spec = helper_spec(config)
+    write_fake_manifest(config, spec)
+    unconfirmed = {
+        "returncode": 0,
+        "stdout": json.dumps(
+            {
+                "ok": True,
+                "operation": "cleanup",
+                "unit": spec.unit,
+                "removed": True,
+                "process_gone": False,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    }
+    with pytest.raises(SupervisorError) as excinfo:
+        HelperSandboxSupervisor(config, runner=Runner([unconfirmed])).cleanup(
+            spec.unit, result_read=True
+        )
+    assert excinfo.value.code == "cleanup_unconfirmed"
+
+    malformed = {
+        "returncode": 0,
+        "stdout": json.dumps(
+            {
+                "ok": True,
+                "operation": "cleanup",
+                "unit": spec.unit,
+                "removed": "yes",
+                "process_gone": True,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    }
+    with pytest.raises(SupervisorError) as excinfo:
+        HelperSandboxSupervisor(config, runner=Runner([malformed])).cleanup(
+            spec.unit, result_read=True
+        )
+    assert excinfo.value.code == "helper_response_invalid"
 
 
 def test_helper_runtime_attestation_uses_a_task_free_sentinel(tmp_path):
