@@ -9,6 +9,12 @@ or exercised with root privileges in Issue #82.
 > install this helper, add a sudoers rule, or create a persistent user. The
 > helper in this directory is the production path and is unit-tested locally
 > without root.
+>
+> **Two families.** This README documents #82's `agentmgr-exec` family below.
+> Issue #97 adds a separate Hermes sandbox family (`agentmgr_hermes_*`,
+> `agentmgr-hermes-*`) with its own installer and verifier; see
+> [Hermes managed execution (#97)](#hermes-managed-execution-97) at the end.
+> The two families share no helper, sudoers rule, runtime root or unit names.
 
 ## Files
 
@@ -214,3 +220,84 @@ are retained under the deployment's normal retention policy.
 - No live or root-privileged validation was performed while writing these
   templates. Do not treat them as verified until a deployment records real
   command output and exit codes.
+
+## Hermes managed execution (#97)
+
+Issue #97 adds a **separate** Hermes-in-sandbox family. It does not share the
+#82 helper, sudoers rule, runtime root or unit names, and it never starts or
+mounts a personal/default Hermes gateway or profile. Like the #82 templates,
+nothing here was installed or exercised with root privileges while the changes
+were written; the installer and verifier were syntax/static checked only.
+
+| File | Installed as | Purpose |
+| --- | --- | --- |
+| `agentmgr_hermes_exec.py` | `/usr/local/libexec/agentmgr_hermes_exec.py` | Root helper: fixed `systemd-run` argv, stdin-JSON request, launch/status/stop/cleanup/attest. |
+| `agentmgr-hermes-exec` | `/usr/local/libexec/agentmgr-hermes-exec` | Fixed `#!/bin/sh` wrapper with no arguments. |
+| `agentmgr_hermes_workload.py` | `/usr/local/libexec/agentmgr_hermes_workload.py` | Unit workload: local loopback model proxy + one `hermes` one-shot process. |
+| `agentmgr-hermes.sudoers` | `/etc/sudoers.d/agentmgr-hermes` | One argument-less wrapper command for the adapter account. |
+| `agentmgr-hermes-egress.service` | `/etc/systemd/system/agentmgr-hermes-egress.service` | Host egress broker (the only holder of the provider key). |
+| `provision_hermes_runtime.sh` | (not installed) | Idempotent root installer: groups/users, read-only runtime root + manifest hash, configs, keys, sudoers, unit. |
+| `verify_hermes_isolation.sh` / `.py` | (not installed) | Read-only post-install verification; no task unit required. |
+
+### Install
+
+```sh
+sudo ops/security/provision_hermes_runtime.sh --dry-run \
+  --adapter-user <adapter-user> --install-root <install-root> \
+  --venv <venv-bin-dir> --service-identity-id svc_<id> \
+  --source <runtime-source> --runtime-version <version> \
+  --model <model-name> --provider-host <provider-host> \
+  --provider-base-url https://<provider-host> \
+  --provider-key-file <root-only-provider-key> \
+  --evidence-ref evidence:hermes:managed:<id>
+# review the dry-run output, then rerun without --dry-run
+```
+
+The script:
+
+- creates the `agentmgr-hermes` sandbox group, the `agentmgr-hermes-adapter`
+  private group and the dedicated broker user; the adapter user must already
+  exist and is added to both groups;
+- creates the task/control/revocation directories with the exact group and mode
+  the helper and broker expect;
+- prepares `/var/lib/agentmgr-hermes-runtime` from `--source` (`copy` default or
+  a read-only `bind`) and records a deterministic `sha256:` manifest hash; it
+  refuses a source with `profiles`, `auth.json`, `.env`, `sessions`,
+  `gateway.lock` or `locks`, and refuses home/repository/personal-profile paths;
+- installs the helper, wrapper, workload, sudoers rule, broker unit, helper
+  install config, launcher config, broker config and deployment record;
+- generates the attestation and egress-token HMAC keys (root:adapter-private
+  `0440`, never sandbox-group readable), copies the operator-supplied provider
+  key as root-only `0400` and writes the provisioning runtime-attestation
+  record; no secret is printed;
+- **does not start any unit** and never touches a personal/default Hermes
+  gateway or profile.
+
+After install:
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now agentmgr-hermes-egress.service
+sudo ops/security/verify_hermes_isolation.sh
+```
+
+`verify_hermes_isolation.sh` (root, read-only) checks installed hashes and
+modes, the exact sudoers rule, group memberships, the runtime manifest hash
+against the install/launcher/broker configs, the task/control/revocation
+directories, the broker socket, key permissions, the absence of personal
+profiles/bind mounts, and the installed helper's fixed `systemd-run` argv. It
+exits non-zero on any mismatch and starts no task unit.
+
+### Rollback
+
+```sh
+sudo ops/security/provision_hermes_runtime.sh --rollback
+# optional, after confirming the accounts are no longer used:
+sudo ops/security/provision_hermes_runtime.sh --rollback --purge-groups
+```
+
+This stops every `agentmgr-hermes-*` transient unit, disables the broker,
+removes the unit/sudoers/helper/wrapper/workload and `/etc/agentmgr/hermes/**`,
+unmounts a bind runtime root and removes the runtime/task/control/revocation
+directories. There is no database migration and no persistent task state to
+roll back. The personal/default Hermes gateway and profiles are not touched.

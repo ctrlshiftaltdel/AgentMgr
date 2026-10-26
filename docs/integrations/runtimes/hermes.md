@@ -11,8 +11,9 @@
 
 > **Scope.** This adapter is the internal B3 runtime boundary for Hermes. It
 > maps the Hermes `/v1/runs` API onto the neutral Runtime Adapter contract and
-> serves `advisory` execution only; managed execution is refused until Issue #82.
-> It does not write task state, issue or accept Grants, expose Hermes
+> serves `advisory` execution only. Managed execution is a **different** path
+> (#97: `app/runtime/hermes_managed.py`); this adapter always refuses a managed
+> grant. It does not write task state, issue or accept Grants, expose Hermes
 > profile/database/session internals, or claim OS-level isolation.
 >
 > **Evidence split.** Mock tests prove the adapter/contract mapping and the
@@ -24,6 +25,36 @@
 > paths remain mock-only, every supported capability stays
 > `partially_verified`; none is upgraded to `verified`, and mock tests are never
 > presented as runtime compatibility.
+
+## 0. Two execution paths (do not conflate)
+
+Hermes has **two separate integrations** in this repository. They share the
+neutral Runtime Adapter contract but not a transport, a configuration or an
+evidence record:
+
+| Path | Implementation | Managed (`managed_execution`)? | Toolset / isolation | Current labels |
+|---|---|---|---|---|
+| **Advisory `/v1/runs`** | `app/runtime/hermes.py`, `HermesConfig` (`HERMES_API_URL`/`HERMES_API_KEY`) | No. A managed grant is always `unsupported`; there is no opt-in. | Runtime's full configured toolset; no OS boundary. | `partially_verified` (0.22.1 spike + mock contract tests). |
+| **Managed one-shot supervisor** | `app/runtime/hermes_managed.py`, `app/runtime/hermes_managed_cli.py`, `ops/security/agentmgr_*` | Yes, but only with a valid runtime attestation and the #96 dispatcher. | Target: exactly `terminal`; one transient systemd unit per task, `DynamicUser`, read-only runtime root, private `/run`/`/tmp`, isolated loopback, task-scoped egress token. | **`unverified` pending #97 live evidence.** |
+
+Do not use advisory runs as evidence for managed execution, and do not route a
+managed task to the advisory adapter. The two paths have separate deployment,
+configuration, credentials and evidence:
+
+- The advisory path never selects, imports or falls back to the managed
+  supervisor (and vice versa). `HermesConfig` has no managed switch.
+- The managed path never starts or mounts a personal/default Hermes gateway,
+  profile, authentication file or `.env`; it runs one `hermes` one-shot CLI per
+  transient unit with a generated minimal profile.
+- The managed launcher has no default configuration. Without the trusted
+  `/etc/agentmgr/hermes/managed-cli.json`, a provisioned runtime attestation,
+  key files, the installed helper and an active service principal, it exits
+  non-zero instead of falling back.
+- See the [managed execution design](../../security/hermes-managed-execution-design.md),
+  [operations manual](../../operations/hermes-managed-execution.md) and
+  [boundary record](../../security/hermes-managed-execution-boundary.md) for the
+  fixed paths, install/rollback/verification, and the live evidence still
+  required before any managed label leaves `unverified`.
 
 ## 1. Setup
 
@@ -52,14 +83,18 @@ the key is stripped; embedded whitespace is rejected.
 For TLS deployments, terminate TLS at the API server or a trusted local proxy
 and keep the key out of command history, repository files and logs.
 
-### Managed execution is always refused
+### Managed execution on this adapter is always refused
 
-`managed_execution` is **unverified** because Hermes cannot enforce per-tool
-capability/scope, task-scoped credentials or OS isolation. A managed grant is
-therefore **always** rejected with `SubmitOutcome.UNSUPPORTED`, and nothing is
-sent to the runtime. There is no environment variable, configuration field or
-test-only bypass: the adapter serves only `advisory` execution until Issue #82
-provides a controlled execution environment.
+**For this advisory adapter** `managed_execution` is **unverified**: the
+`/v1/runs` transport cannot enforce per-tool capability/scope, task-scoped
+credentials or OS isolation. A managed grant is therefore **always** rejected
+with `SubmitOutcome.UNSUPPORTED`, and nothing is sent to the runtime. There is
+no environment variable, configuration field or test-only bypass in
+`HermesConfig`: the advisory adapter serves only `advisory` execution. The
+supported managed path is the separate one-shot supervisor described in §0; it
+uses its own adapter, launcher and attestation gate and is still `unverified`
+pending #97 live evidence. A managed task must never be routed here to obtain a
+different answer.
 
 ## 2. Endpoints and authentication
 
@@ -161,7 +196,7 @@ client payload, and never widens scope. It enforces what it locally can:
 - `grant.task_id` must equal `task_id` (otherwise `forbidden`);
 - `task_revision` must be a positive integer;
 - `execution_mode` must be `advisory` (the only mode this adapter serves until
-  Issue #82; `managed_execution` is always `unsupported`, and
+  this advisory path; `managed_execution` is always `unsupported`, and
   `governed_resource_access` is refused as a mode mismatch);
 - `expires_at` must be present and in the future;
 - `capabilities` must be non-empty, well-formed, duplicate-free, and must not
@@ -354,16 +389,19 @@ new tasks when health is `unavailable`.
 1. **Full host toolset.** The runtime exposes its configured tools, including
    terminal access. There is no per-run tool permission or allowlist.
 2. **Hermes tools bypass the AgentMgr PEP.** Tool calls executed inside Hermes do
-   **not** pass through the AgentMgr policy enforcement point. Until Issue #82
-   provides controlled execution, the adapter cannot claim that tool scope is
-   enforced. Managed execution and `runtime.tool_permissions` stay `unverified`.
+   **not** pass through the AgentMgr policy enforcement point. Until the #97
+   managed supervisor passes live evidence and #83 governs business tools, this
+   adapter cannot claim that tool scope is enforced. Managed execution and
+   `runtime.tool_permissions` stay `unverified`.
 3. **No per-task credentials.** The adapter cannot inject short-lived,
    task-scoped credentials; Hermes uses its own configured credentials.
 4. **Logical session binding only.** `session_id` associates a run with the
    AgentMgr task id; it is not an OS user, filesystem, process or network
    boundary.
-5. **Managed Execution is unverified.** Managed-execution submissions are always
-   rejected as `unsupported` until Issue #82; there is no test-only opt-in.
+5. **Managed Execution is unverified.** This advisory adapter always rejects
+   managed submissions as `unsupported`; there is no test-only opt-in. The
+   separate managed supervisor (§0) exists, but every managed capability stays
+   `unverified` until the #97 live gates pass.
 6. **Structured results are absent.** Only text + usage are available;
    completion is `partial_success`.
 7. **Approval/unknown controls are unverified.** The endpoints exist, but their
