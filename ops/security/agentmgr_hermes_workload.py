@@ -31,7 +31,10 @@ Behaviour
    (``Authorization``, ``X-Api-Key`` and any client-supplied egress token),
    adds ``X-AgentMgr-Egress-Token`` from the task token file and streams the
    response from the Unix-socket broker ``/task/egress.sock``.
-3. Render ``profile/config.yaml`` with the actual port and write it atomically.
+3. Render ``profile/config.yaml`` with the actual port and write it atomically,
+   then expose the read-only runtime ``installs`` environment inside the
+   profile (``HERMES_HOME``) as a symlink to the runtime-visible
+   ``/runtime/installs`` so the Hermes bootstrap finds its dependencies.
 4. Spawn the fixed Hermes one-shot command in its own process group::
 
        <runtime>/hermes-agent/.hermes/bin/hermes chat \\
@@ -114,12 +117,14 @@ __all__ = [
     "UNIT_PROFILE_CONFIG_PATH",
     "UNIT_PROFILE_TEMPLATE_PATH",
     "UNIT_PROMPT_PATH",
+    "UNIT_RUNTIME_INSTALLS_PATH",
     "UNIT_RUNTIME_ROOT",
     "UNIT_STARTED_PATH",
     "UNIT_TASK_DIR",
     "WorkloadError",
     "build_child_env",
     "build_hermes_argv",
+    "link_runtime_installs",
     "main",
     "read_manifest",
     "render_profile",
@@ -135,6 +140,7 @@ __all__ = [
 
 UNIT_TASK_DIR = Path("/task")
 UNIT_RUNTIME_ROOT = Path("/runtime")
+UNIT_RUNTIME_INSTALLS_PATH = Path("/runtime/installs")
 UNIT_PROMPT_PATH = Path("/task/prompt.txt")
 UNIT_PROFILE_TEMPLATE_PATH = Path("/task/profile.template.yaml")
 UNIT_PROFILE_CONFIG_PATH = Path("/task/profile/config.yaml")
@@ -537,6 +543,53 @@ def _write_profile(path: Path, text: str) -> None:
     info = _lstat(path)
     if info is None or not stat.S_ISREG(info.st_mode):
         raise WorkloadError("profile_write_failed")
+
+
+def link_runtime_installs(profile_dir: Path, runtime_installs: Path) -> None:
+    """Expose the runtime's ``installs`` environment inside ``HERMES_HOME``.
+
+    Hermes bootstraps its Python dependencies (for example ``ruamel``) from
+    ``<runtime>/installs`` and expects to find that environment relative to its
+    home.  With ``HERMES_HOME=/task/profile`` the read-only runtime installs
+    directory must therefore appear as ``/task/profile/installs``.
+
+    ``runtime_installs`` must be the **runtime-visible** path (inside the unit
+    that is ``/runtime/installs``), never the host path: the symlink is created
+    verbatim so it resolves in the unit's mount namespace.  An existing symlink
+    to the same target is left alone; a regular file, directory or symlink to a
+    different target fails closed.  When ``runtime_installs`` does not exist
+    (unit tests, or a runtime without installs) nothing is created.
+    """
+
+    profile = _require_absolute_path(profile_dir, "profile_dir")
+    target = _require_absolute_path(runtime_installs, "runtime_installs")
+    info = _lstat(profile)
+    if info is None or stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise WorkloadError("profile_dir_invalid")
+    try:
+        target_is_directory = target.is_dir()
+    except OSError:
+        target_is_directory = False
+    if not target_is_directory:
+        # Nothing to expose: leave ``profile/installs`` absent (mock/unit tests).
+        return
+
+    link = profile / "installs"
+    existing = _lstat(link)
+    if existing is None:
+        try:
+            os.symlink(str(target), link)
+        except OSError:
+            raise WorkloadError("profile_installs_unavailable") from None
+        return
+    if not stat.S_ISLNK(existing.st_mode):
+        raise WorkloadError("profile_installs_invalid")
+    try:
+        current = os.readlink(link)
+    except OSError:
+        raise WorkloadError("profile_installs_invalid") from None
+    if current != str(target):
+        raise WorkloadError("profile_installs_mismatch")
 
 
 # ---------------------------------------------------------------------------
@@ -1670,6 +1723,9 @@ def run_workload(
     try:
         profile = render_profile(template, proxy_port=handle.port, model=name)
         _write_profile(task / "profile" / "config.yaml", profile)
+        # Hermes bootstraps its dependencies from the runtime ``installs``
+        # environment; expose it inside HERMES_HOME before the spawn.
+        link_runtime_installs(task / "profile", UNIT_RUNTIME_INSTALLS_PATH)
         argv = build_hermes_argv(
             root,
             model=name,

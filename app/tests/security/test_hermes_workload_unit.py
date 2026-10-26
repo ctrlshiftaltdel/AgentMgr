@@ -468,6 +468,108 @@ def test_render_profile_rejects_an_invalid_port(port):
 
 
 # ---------------------------------------------------------------------------
+# runtime "installs" exposure in HERMES_HOME
+# ---------------------------------------------------------------------------
+
+
+def test_link_runtime_installs_creates_a_symlink_to_the_given_target(tmp_path):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    runtime_installs = tmp_path / "runtime" / "installs"
+    runtime_installs.mkdir(parents=True)
+
+    workload.link_runtime_installs(profile, runtime_installs)
+
+    link = profile / "installs"
+    assert link.is_symlink()
+    assert os.readlink(link) == str(runtime_installs)
+
+
+def test_link_runtime_installs_is_idempotent_for_the_same_target(tmp_path):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    runtime_installs = tmp_path / "runtime" / "installs"
+    runtime_installs.mkdir(parents=True)
+
+    workload.link_runtime_installs(profile, runtime_installs)
+    workload.link_runtime_installs(profile, runtime_installs)
+
+    link = profile / "installs"
+    assert link.is_symlink()
+    assert os.readlink(link) == str(runtime_installs)
+    assert sorted(item.name for item in profile.iterdir()) == ["installs"]
+
+
+@pytest.mark.parametrize(
+    ("kind", "code"),
+    [
+        ("file", "profile_installs_invalid"),
+        ("directory", "profile_installs_invalid"),
+        ("foreign-symlink", "profile_installs_mismatch"),
+    ],
+)
+def test_link_runtime_installs_rejects_an_existing_unsafe_entry(
+    tmp_path, kind, code
+):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    runtime_installs = tmp_path / "runtime" / "installs"
+    runtime_installs.mkdir(parents=True)
+    entry = profile / "installs"
+    if kind == "file":
+        entry.write_text("not-a-link")
+    elif kind == "directory":
+        entry.mkdir()
+    else:
+        other = tmp_path / "other-installs"
+        other.mkdir()
+        entry.symlink_to(other, target_is_directory=True)
+
+    with pytest.raises(workload.WorkloadError) as excinfo:
+        workload.link_runtime_installs(profile, runtime_installs)
+    assert excinfo.value.code == code
+    # The unsafe entry is never silently replaced or removed.
+    if kind == "file":
+        assert entry.read_text() == "not-a-link"
+    elif kind == "directory":
+        assert entry.is_dir() and not entry.is_symlink()
+    else:
+        assert entry.is_symlink()
+        assert os.readlink(entry) != str(runtime_installs)
+
+
+@pytest.mark.parametrize("target", ["missing", "file"])
+def test_link_runtime_installs_leaves_an_absent_target_absent(tmp_path, target):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    if target == "missing":
+        runtime_installs = tmp_path / "runtime" / "installs"
+    else:
+        runtime_installs = tmp_path / "runtime" / "installs"
+        runtime_installs.parent.mkdir(parents=True)
+        runtime_installs.write_text("not-a-directory")
+
+    workload.link_runtime_installs(profile, runtime_installs)
+
+    assert not (profile / "installs").exists()
+    assert not (profile / "installs").is_symlink()
+    assert list(profile.iterdir()) == []
+
+
+def test_link_runtime_installs_rejects_a_symlinked_profile_dir(tmp_path):
+    real = tmp_path / "real-profile"
+    real.mkdir()
+    profile = tmp_path / "profile"
+    profile.symlink_to(real, target_is_directory=True)
+    runtime_installs = tmp_path / "runtime" / "installs"
+    runtime_installs.mkdir(parents=True)
+
+    with pytest.raises(workload.WorkloadError) as excinfo:
+        workload.link_runtime_installs(profile, runtime_installs)
+    assert excinfo.value.code == "profile_dir_invalid"
+
+
+# ---------------------------------------------------------------------------
 # local model proxy
 # ---------------------------------------------------------------------------
 
@@ -841,6 +943,33 @@ def test_run_workload_wires_env_argv_profile_and_proxy(tmp_path):
         text = (task / name).read_text(encoding="utf-8", errors="replace")
         assert PROMPT_CANARY not in text
         assert TOKEN_CANARY not in text
+
+
+def test_run_workload_exposes_runtime_installs_before_spawning(tmp_path, monkeypatch):
+    runtime = _fake_runtime(tmp_path, "import sys\nsys.exit(0)\n")
+    task = _make_task(tmp_path)
+    captured: dict[str, object] = {}
+
+    def fake_link(profile_dir, runtime_installs):
+        captured["profile"] = profile_dir
+        captured["installs"] = runtime_installs
+        captured["config_exists"] = (profile_dir / "config.yaml").is_file()
+
+    monkeypatch.setattr(workload, "link_runtime_installs", fake_link)
+    code = workload.run_workload(
+        task_dir=task,
+        runtime_root=runtime,
+        model=MODEL,
+        run_budget_sec=30,
+        proxy_socket=tmp_path / "e.sock",
+        heartbeat_interval_sec=30.0,
+    )
+    assert code == 0
+    assert captured["profile"] == task / "profile"
+    # The unit sees the runtime root mounted at "/runtime", so the target must
+    # be the runtime-visible path, not the host path passed as runtime_root.
+    assert captured["installs"] == Path("/runtime/installs")
+    assert captured["config_exists"] is True
 
 
 def test_run_workload_preserves_an_existing_result_artifact(tmp_path):
