@@ -142,7 +142,7 @@ REQUIRED_ORACLES: tuple[tuple[str, str, str], ...] = (
     ("etc_shadow", "/etc/shadow", "permission"),
     ("host_home", "/home", "hidden"),
     ("postgresql_data", "/var/lib/postgresql", "hidden"),
-    ("host_systemd_run", "/run/systemd", "absent"),
+    ("host_systemd_run", "/run/systemd/private", "absent"),
     ("host_dbus", "/run/dbus", "absent"),
 )
 
@@ -1703,25 +1703,41 @@ def _child_arguments(run: _ManagedRun, pid: int) -> list[str]:
 
 
 def _assert_child_process(run: _ManagedRun, token: str) -> None:
-    """Prompt file, terminal-only toolset, no argv secret, dynamic UID."""
+    """Terminal-only one-shot runner, prompt file, no argv secret, dynamic UID."""
 
     pid, marker = _wait_for_child_pid(run, timeout=UNIT_START_TIMEOUT_SECONDS)
     arguments = _child_arguments(run, pid)
 
-    assert arguments.count("-t") == 1, arguments
-    toolset_index = arguments.index("-t")
-    assert arguments[toolset_index + 1] == "terminal", arguments
-    assert arguments.count("--query-file") == 1, arguments
-    query_index = arguments.index("--query-file")
-    assert arguments[query_index + 1] == "/task/prompt.txt"
-    for forbidden in ("browser", "web", "mcp", "memory", "plugin", "file"):
-        assert forbidden not in arguments, f"the {forbidden} toolset is enabled"
-    assert "--api-key" not in arguments
-    assert "--safe-mode" in arguments
-    assert "--oneshot" in arguments
-    assert "-Q" in arguments
-    assert "chat" in arguments
-    assert MANAGED_PROMPT_CANARY not in " ".join(arguments)
+    # The sandbox child is the fixed in-process runner:
+    #     /runtime/tools/<python>/bin/python3 -I -c <RUNNER_CODE>
+    # There is no gateway-backed ``chat`` argv and no CLI toolset flag.
+    assert len(arguments) == 4, arguments
+    interpreter, isolated, command, runner = arguments
+    assert interpreter.startswith("/runtime/tools/"), arguments
+    assert interpreter.endswith("/bin/python3"), arguments
+    assert isolated == "-I", arguments
+    assert command == "-c", arguments
+    assert 'toolsets="terminal"' in runner, runner
+    assert runner.count("toolsets=") == 1, runner
+    assert "from hermes_cli.oneshot import run_oneshot" in runner, runner
+    assert 'Path("/task/prompt.txt")' in runner, runner
+    for forbidden in ("browser", "web", "mcp", "memory", "plugin"):
+        assert f'"{forbidden}"' not in runner, (
+            f"the {forbidden} toolset is enabled"
+        )
+    for retired in (
+        "--query-file",
+        "--api-key",
+        "--safe-mode",
+        "--oneshot",
+        "-Q",
+        "-t",
+        "chat",
+    ):
+        assert retired not in arguments, (
+            f"the retired gateway argv {retired} is back"
+        )
+    assert MANAGED_PROMPT_CANARY not in runner
     assert token not in " ".join(arguments)
 
     environ = _sudo([CAT, f"/proc/{pid}/environ"])

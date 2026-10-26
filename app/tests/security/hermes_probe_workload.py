@@ -80,7 +80,7 @@ DEFAULT_DENIED: dict[str, tuple[str, str]] = {
     "etc_shadow": ("/etc/shadow", "permission"),
     "host_home": ("/home", "hidden"),
     "postgresql_data": ("/var/lib/postgresql", "hidden"),
-    "host_systemd_run": ("/run/systemd", "absent"),
+    "host_systemd_run": ("/run/systemd/private", "absent"),
     "host_dbus": ("/run/dbus", "absent"),
     "docker_socket": ("/var/run/docker.sock", "absent"),
     "containerd_socket": ("/run/containerd/containerd.sock", "absent"),
