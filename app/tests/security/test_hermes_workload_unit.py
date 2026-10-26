@@ -26,6 +26,7 @@ from __future__ import annotations
 import http.client
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -1218,6 +1219,60 @@ def test_run_workload_forwards_sigterm_and_records_cancellation(tmp_path):
     assert code == 128 + signal.SIGTERM
     pids = _json(task / "pids.json")
     assert _wait_gone(pids["child"])
+
+
+class _AlreadyExitedProcess:
+    """Minimal Popen stand-in: the child died before the wait loop ran."""
+
+    def __init__(self, code: int = -signal.SIGTERM) -> None:
+        self.pid = 424242
+        self.returncode = code
+        self.stdout = io.BytesIO(b"")
+        self.stderr = io.BytesIO(b"")
+
+    def poll(self) -> int:
+        return self.returncode
+
+    def wait(self) -> int:
+        return self.returncode
+
+
+def test_run_child_records_cancel_when_child_dies_before_the_loop(
+    tmp_path, monkeypatch
+):
+    """systemd kills the whole cgroup: the child can die before poll() sees us.
+
+    The workload's own SIGTERM is still cancellation evidence; the exit marker
+    must not degrade a confirmed stop to a plain signal failure.
+    """
+
+    task = _make_task(tmp_path)
+    process = _AlreadyExitedProcess()
+    monkeypatch.setattr(workload, "_spawn", lambda *_a, **_k: process)
+
+    def _handlers():
+        workload._stop_signal = signal.SIGTERM
+        return {}
+
+    monkeypatch.setattr(workload, "_install_signal_handlers", _handlers)
+    code = workload._run_child(
+        ["/runtime/tools/fake/bin/python3", "-I", "-c", "x"],
+        task_dir=task,
+        env={},
+        manifest=workload.read_manifest(task),
+        deadline_sec=10.0,
+        heartbeat_interval_sec=0.2,
+        poll_interval_sec=0.05,
+        terminate_grace_sec=0.1,
+        stdout_limit=1024,
+        stderr_limit=1024,
+    )
+
+    exit_document = _json(task / "status" / "exit.json")
+    assert exit_document["cancelled"] is True
+    assert exit_document["timed_out"] is False
+    assert exit_document["exit_code"] == -signal.SIGTERM
+    assert code == 128 + signal.SIGTERM
 
 
 BOUNDED_SCRIPT = """\

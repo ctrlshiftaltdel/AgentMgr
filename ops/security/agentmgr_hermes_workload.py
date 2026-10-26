@@ -1725,6 +1725,12 @@ def _run_child(
         process.wait()
         for reader in readers:
             reader.join(5.0)
+        # systemd sends the stop signal to every process in the unit cgroup.
+        # The child can therefore die before this loop observes ``_stop_signal``;
+        # that must still be recorded as a cancellation, not a plain SIGTERM
+        # failure.  A workload-initiated timeout keeps its own flag.
+        if forced is None and _stop_signal is not None:
+            forced = "cancelled"
         returncode = process.returncode
         # The normal path must not report success without a durable exit marker:
         # a write failure raises ``status_write_failed`` and is handled by the
