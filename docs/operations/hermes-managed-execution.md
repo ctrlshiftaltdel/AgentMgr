@@ -1,6 +1,6 @@
 # Hermes Managed Execution 运维手册（#97）
 
-- 状态：**实现完成；已在批准的测试机安装并完成沙箱/生命周期与 stub-broker live 证据；真实 key 的模型 artifact E2E 仍 pending；生产未部署。** 本手册描述 #97 提供的生产启动器、安装脚本、验证脚本与回滚步骤；实际安装/运行必须由所有者在批准的测试机执行，并按[边界记录](../security/hermes-managed-execution-boundary.md)记录证据。
+- 状态：**实现完成；已在批准的测试机安装并完成沙箱/生命周期/stub-broker 与真实 provider key artifact E2E live 证据；生产未部署；容量未测量。** 本手册描述 #97 提供的生产启动器、安装脚本、验证脚本与回滚步骤；实际安装/运行必须由所有者在批准的测试机执行，并按[边界记录](../security/hermes-managed-execution-boundary.md)记录证据。
 - 日期：2026-10-26
 - 关联：Issue #97、#96、#83；[设计](../security/hermes-managed-execution-design.md)、[实施计划](../security/hermes-managed-execution-plan.md)、[边界记录](../security/hermes-managed-execution-boundary.md)、[Runtime Dispatch 运维](runtime-dispatch.md)、[Runtime Adapter 契约](../contracts/runtime-adapter.md)。
 
@@ -245,7 +245,7 @@ AGENTMGR_HERMES_LIVE=1 ... \
   pytest app/tests/tasks/test_hermes_managed_live.py -q -o addopts=''
 ```
 
-证据记录：命令、退出码、Hermes 版本、runtime root 哈希、提交 SHA、pytest 计数；证据放在仓库外/Issue，不入库主机信息或秘密。**边界记录区分 `live`/`partial`/`unverified`；真实 provider key 的模型 artifact 和 `runtime.managed_execution` 在真实 key E2E 通过前仍为 `unverified`。**
+证据记录：命令、退出码、Hermes 版本、runtime root 哈希、提交 SHA、pytest 计数；证据放在仓库外/Issue，不入库主机信息或秘密。**边界记录区分 `live`/`partial`/`unverified`；真实 provider key artifact 与 `runtime.managed_execution` 已在测试机 live，生产/capacity 仍未验证。**
 
 ## 12 未包含 / 边界
 

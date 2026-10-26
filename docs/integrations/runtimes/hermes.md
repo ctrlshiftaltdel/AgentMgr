@@ -35,7 +35,7 @@ evidence record:
 | Path | Implementation | Managed (`managed_execution`)? | Toolset / isolation | Current labels |
 |---|---|---|---|---|
 | **Advisory `/v1/runs`** | `app/runtime/hermes.py`, `HermesConfig` (`HERMES_API_URL`/`HERMES_API_KEY`) | No. A managed grant is always `unsupported`; there is no opt-in. | Runtime's full configured toolset; no OS boundary. | `partially_verified` (0.22.1 spike + mock contract tests). |
-| **Managed one-shot supervisor** | `app/runtime/hermes_managed.py`, `app/runtime/hermes_managed_cli.py`, `ops/security/agentmgr_*` | Yes, but only with a valid runtime attestation and the #96 dispatcher. | Target: exactly `terminal`; one transient systemd unit per task, `DynamicUser`, read-only runtime root, private `/run`/`/tmp`, isolated loopback, task-scoped egress token. | **`unverified` pending real-key artifact E2E;** sandbox isolation, in-process lifecycle and stub-broker token/cancel/timeout live bodies passed on the approved test host. |
+| **Managed one-shot supervisor** | `app/runtime/hermes_managed.py`, `app/runtime/hermes_managed_cli.py`, `ops/security/agentmgr_*` | Yes, but only with a valid runtime attestation and the #96 dispatcher. | Target: exactly `terminal`; one transient systemd unit per task, `DynamicUser`, read-only runtime root, private `/run`/`/tmp`, isolated loopback, task-scoped egress token. | **live on the approved test host;** sandbox isolation, in-process lifecycle, stub-broker token/cancel/timeout and real-key artifact E2E passed. Production/capacity remain unverified. |
 
 Do not use advisory runs as evidence for managed execution, and do not route a
 managed task to the advisory adapter. The two paths have separate deployment,
@@ -54,10 +54,10 @@ configuration, credentials and evidence:
 - See the [managed execution design](../../security/hermes-managed-execution-design.md),
   [operations manual](../../operations/hermes-managed-execution.md) and
   [boundary record](../../security/hermes-managed-execution-boundary.md) for the
-  fixed paths, install/rollback/verification, and the live evidence still
-  required before any managed label is treated as production-verified (the
-  boundary record currently marks sandbox isolation and the stub-broker
-  lifecycle live, and the real-key artifact E2E pending).
+  fixed paths, install/rollback/verification, and the evidence boundaries. The
+  boundary record marks sandbox isolation, in-process lifecycle, stub-broker
+  token/cancel/timeout and the real-key artifact E2E live on the approved test
+  host; production deployment and capacity remain unverified.
 
 ## 1. Setup
 
@@ -95,9 +95,10 @@ with `SubmitOutcome.UNSUPPORTED`, and nothing is sent to the runtime. There is
 no environment variable, configuration field or test-only bypass in
 `HermesConfig`: the advisory adapter serves only `advisory` execution. The
 supported managed path is the separate one-shot supervisor described in §0; it
-uses its own adapter, launcher and attestation gate; it remains `unverified`
-until the real-key artifact E2E passes (sandbox/lifecycle live evidence is
-recorded in the boundary document). A managed task must never be routed here to obtain a
+uses its own adapter, launcher and attestation gate; its live gates (sandbox,
+in-process lifecycle, stub-broker token/cancel/timeout, real-key artifact E2E)
+passed on the approved test host, while production/capacity remain unverified
+(see the boundary document). A managed task must never be routed here to obtain a
 different answer.
 
 ## 2. Endpoints and authentication
@@ -393,23 +394,22 @@ new tasks when health is `unavailable`.
 1. **Full host toolset.** The runtime exposes its configured tools, including
    terminal access. There is no per-run tool permission or allowlist.
 2. **Hermes tools bypass the AgentMgr PEP.** Tool calls executed inside Hermes do
-   **not** pass through the AgentMgr policy enforcement point. Until the real-key
-   managed artifact E2E passes and #83 governs business tools, this advisory
-   adapter cannot claim tool scope is enforced. The separate managed supervisor
-   uses `toolsets="terminal"` and has live sandbox evidence, but
-   `runtime.managed_execution` remains `unverified` until the real-key artifact
-   E2E and production configuration are verified.
+   **not** pass through the AgentMgr policy enforcement point. This advisory
+   adapter cannot claim tool scope is enforced; #83 must govern business tools.
+   The separate managed supervisor uses `toolsets="terminal"`, its sandbox and
+   real-key artifact E2E passed on the approved test host, but production and
+   capacity remain unverified.
 3. **No per-task credentials.** The adapter cannot inject short-lived,
    task-scoped credentials; Hermes uses its own configured credentials.
 4. **Logical session binding only.** `session_id` associates a run with the
    AgentMgr task id; it is not an OS user, filesystem, process or network
    boundary.
-5. **Managed Execution is unverified for production.** This advisory adapter
-   always rejects managed submissions as `unsupported`; there is no test-only
-   opt-in. The separate managed supervisor (§0) has sandbox/lifecycle and
-   stub-broker live evidence on the approved test host, but
-   `runtime.managed_execution` remains `unverified` until the real-key artifact
-   E2E and production configuration pass.
+5. **Managed Execution is live on the test host, not production.** This advisory
+   adapter always rejects managed submissions as `unsupported`; there is no
+   test-only opt-in. The separate managed supervisor (§0) passed sandbox,
+   in-process lifecycle, stub-broker token/cancel/timeout and real-key artifact
+   E2E on the approved test host. Production configuration, scale and capacity
+   remain unverified.
 6. **Structured results are absent.** Only text + usage are available;
    completion is `partial_success`.
 7. **Approval/unknown controls are unverified.** The endpoints exist, but their
