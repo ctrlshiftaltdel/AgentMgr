@@ -1002,6 +1002,75 @@ def test_provisioning_fails_closed_and_logs_key_rotation():
     assert "installs/**/site-packages" in source
 
 
+def test_provisioner_runtime_source_gate_executes(tmp_path):
+    """Execute the real source gate, not just grep its text."""
+
+    import subprocess
+
+    source = _operations_script("provision_hermes_runtime.sh").read_text(
+        encoding="utf-8"
+    )
+    begin_marker = "# BEGIN RUNTIME SOURCE CONTENT CHECK"
+    end_marker = "# END RUNTIME SOURCE CONTENT CHECK"
+    begin = source.index(begin_marker)
+    end = source.index(end_marker) + len(end_marker)
+    gate = source[begin:end]
+    script = tmp_path / "gate.sh"
+    script.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        'fail() { echo "$1" >&2; exit 1; }\n'
+        'SOURCE="$1"\n'
+        + gate
+        + "\n",
+        encoding="utf-8",
+    )
+
+    def run(root: Path):
+        return subprocess.run(
+            ["bash", str(script), str(root)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    valid = tmp_path / "valid"
+    _make_runtime_tree(valid)
+    assert run(valid).returncode == 0
+
+    unversioned = tmp_path / "unversioned"
+    _make_runtime_tree(unversioned)
+    (unversioned / "tools" / "python-3.14.7").rename(
+        unversioned / "tools" / "python"
+    )
+    assert run(unversioned).returncode != 0
+
+    directory = tmp_path / "python-dir"
+    _, link, _ = _make_runtime_tree(directory)
+    link.unlink()
+    link.mkdir()
+    assert run(directory).returncode != 0
+
+    outside = tmp_path / "outside"
+    _, link, _ = _make_runtime_tree(outside)
+    outside_python = tmp_path / "outside-python"
+    outside_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    outside_python.chmod(0o755)
+    link.unlink()
+    link.symlink_to(outside_python)
+    assert run(outside).returncode != 0
+
+    empty = tmp_path / "empty"
+    _, _, site_packages = _make_runtime_tree(empty)
+    (site_packages / "dependency.py").unlink()
+    assert run(empty).returncode != 0
+
+    missing = tmp_path / "missing-oneshot"
+    oneshot, _, _ = _make_runtime_tree(missing)
+    oneshot.unlink()
+    assert run(missing).returncode != 0
+
+
 def test_verifier_registers_each_check_once():
     verifier = _load_verifier()
     names = [name for name, _ in verifier.CHECKS]
@@ -1019,9 +1088,9 @@ def test_verifier_registers_each_check_once():
     assert dict(verifier.CHECKS)["sandbox-argv"].__name__ == "_check_sandbox_argv"
 
 
-def test_verifier_requires_the_inprocess_runner_runtime_content(tmp_path, monkeypatch):
-    verifier = _load_verifier()
-    root = tmp_path / "runtime"
+def _make_runtime_tree(root: Path) -> tuple[Path, Path, Path]:
+    """Create a minimal managed runtime: oneshot source, python, deps."""
+
     oneshot = root / "hermes-agent" / "hermes_cli" / "oneshot.py"
     oneshot.parent.mkdir(parents=True)
     oneshot.write_text("", encoding="utf-8")
@@ -1029,7 +1098,8 @@ def test_verifier_requires_the_inprocess_runner_runtime_content(tmp_path, monkey
     python.parent.mkdir(parents=True)
     python.write_text("#!/bin/sh\n", encoding="utf-8")
     python.chmod(0o755)
-    (python.parent / "python3").symlink_to("python3.14")
+    link = python.parent / "python3"
+    link.symlink_to("python3.14")
     site_packages = (
         root
         / "installs"
@@ -1040,15 +1110,58 @@ def test_verifier_requires_the_inprocess_runner_runtime_content(tmp_path, monkey
         / "site-packages"
     )
     site_packages.mkdir(parents=True)
-    monkeypatch.setattr(verifier, "RUNTIME_ROOT", root)
+    (site_packages / "dependency.py").write_text("", encoding="utf-8")
+    return oneshot, link, site_packages
+
+
+def test_verifier_requires_the_inprocess_runner_runtime_content(tmp_path, monkeypatch):
+    verifier = _load_verifier()
     monkeypatch.setattr(verifier, "_runtime_root_mount_is_read_only", lambda: True)
 
-    verifier._check_runtime_content(None)  # complete runtime: no failure
-
-    site_packages.rmdir()
-    with pytest.raises(verifier.VerificationError) as error:
+    def check(root: Path) -> None:
+        monkeypatch.setattr(verifier, "RUNTIME_ROOT", root)
         verifier._check_runtime_content(None)
+
+    valid = tmp_path / "valid"
+    _make_runtime_tree(valid)
+    check(valid)  # complete runtime, including a relative python symlink
+
+    empty = tmp_path / "empty"
+    _, _, site_packages = _make_runtime_tree(empty)
+    (site_packages / "dependency.py").unlink()
+    with pytest.raises(verifier.VerificationError) as error:
+        check(empty)
     assert error.value.code == "runtime_root_hermes_incomplete"
+
+    missing = tmp_path / "missing-oneshot"
+    oneshot, _, _ = _make_runtime_tree(missing)
+    oneshot.unlink()
+    with pytest.raises(verifier.VerificationError):
+        check(missing)
+
+    outside = tmp_path / "outside"
+    _, link, _ = _make_runtime_tree(outside)
+    outside_python = tmp_path / "outside-python"
+    outside_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    outside_python.chmod(0o755)
+    link.unlink()
+    link.symlink_to(outside_python)
+    with pytest.raises(verifier.VerificationError):
+        check(outside)
+
+    noexec = tmp_path / "noexec"
+    _, link, _ = _make_runtime_tree(noexec)
+    (link.parent / "python3.14").chmod(0o644)
+    with pytest.raises(verifier.VerificationError):
+        check(noexec)
+
+    unversioned = tmp_path / "unversioned"
+    _make_runtime_tree(unversioned)
+    (unversioned / "tools" / "python-3.14.7").rename(
+        unversioned / "tools" / "python"
+    )
+    with pytest.raises(verifier.VerificationError):
+        check(unversioned)
 
 
 def test_provisioner_renderer_accepts_staging_arguments(tmp_path, monkeypatch):

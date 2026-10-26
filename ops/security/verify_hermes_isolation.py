@@ -618,7 +618,9 @@ def _check_runtime_content(deployment: Deployment) -> None:
     # runtime Python and the provisioned dependency environment.  A runtime
     # root missing any of these would install cleanly but fail every task.
     oneshot = RUNTIME_ROOT / "hermes-agent" / "hermes_cli" / "oneshot.py"
-    if not oneshot.is_file() or oneshot.is_symlink():
+    if not oneshot.is_file() or not _is_inside(
+        oneshot.resolve(), RUNTIME_ROOT.resolve()
+    ):
         _fail("runtime_root_hermes_incomplete", "oneshot.py")
     pythons = [
         candidate
@@ -640,13 +642,23 @@ def _check_runtime_content(deployment: Deployment) -> None:
                 for name in dirnames
                 if not os.path.islink(os.path.join(dirpath, name))
             ]
-            if os.path.basename(dirpath) == "site-packages":
+            if os.path.basename(dirpath) != "site-packages":
+                continue
+            try:
+                with os.scandir(dirpath) as entries:
+                    non_empty = any(entries)
+            except OSError:
+                continue
+            if non_empty:
                 found = True
                 break
     except OSError:
         _fail("runtime_root_hermes_incomplete", "installs")
     if not found:
-        _fail("runtime_root_hermes_incomplete", "installs/**/site-packages")
+        _fail(
+            "runtime_root_hermes_incomplete",
+            "installs/**/site-packages (non-empty)",
+        )
 
 
 def _unescape_mountinfo(value: str) -> str:

@@ -435,25 +435,41 @@ for marker in profiles auth.json .env sessions gateway.lock locks; do
     fi
 done
 
+# BEGIN RUNTIME SOURCE CONTENT CHECK
 # The managed workload runs hermes_cli.oneshot in-process with the runtime
 # Python and the provisioned dependency environment.  A source missing any of
 # these would install cleanly but fail every task with ModuleNotFoundError.
-[ -f "${SOURCE}/hermes-agent/hermes_cli/oneshot.py" ] || \
+oneshot_candidate="${SOURCE}/hermes-agent/hermes_cli/oneshot.py"
+[ -f "${oneshot_candidate}" ] || \
     fail "the runtime source is missing hermes-agent/hermes_cli/oneshot.py"
-if ! find "${SOURCE}/tools" -maxdepth 3 -path '*/bin/python3' \
-    -print -quit 2>/dev/null | grep -q .; then
+oneshot_resolved=$(readlink -f -- "${oneshot_candidate}" 2>/dev/null || true)
+case "${oneshot_resolved}" in
+    "${SOURCE}"/*) ;;
+    *) fail "the runtime source hermes-agent symlink escapes the source" ;;
+esac
+
+python_candidates=$(find "${SOURCE}/tools" -maxdepth 3 \
+    -path '*/python-*/bin/python3' -print 2>/dev/null || true)
+[ -n "${python_candidates}" ] || \
     fail "the runtime source is missing an executable tools/python-*/bin/python3"
+while IFS= read -r python_candidate; do
+    [ -n "${python_candidate}" ] || continue
+    [ -f "${python_candidate}" ] || \
+        fail "the runtime source python3 is not a regular file: ${python_candidate}"
+    [ -x "${python_candidate}" ] || \
+        fail "the runtime source python3 is not executable: ${python_candidate}"
+    python_resolved=$(readlink -f -- "${python_candidate}" 2>/dev/null || true)
+    case "${python_resolved}" in
+        "${SOURCE}"/*) ;;
+        *) fail "the runtime source python3 symlink escapes the source" ;;
+    esac
+done <<< "${python_candidates}"
+
+if ! find "${SOURCE}/installs" -type d -name site-packages -not -empty \
+    -print -quit 2>/dev/null | grep -q .; then
+    fail "the runtime source is missing non-empty installs/**/site-packages"
 fi
-# The Hermes tools layout commonly links python3 -> python3.14 inside the same
-# bin directory; the source scan already rejects absolute or escaping symlinks.
-python_candidate=$(find "${SOURCE}/tools" -maxdepth 3 -path '*/bin/python3' \
-    -print -quit 2>/dev/null)
-[ -n "${python_candidate}" ] && [ -x "${python_candidate}" ] || \
-    fail "the runtime source tools/python-*/bin/python3 is not executable"
-if ! find "${SOURCE}/installs" -type d -name site-packages -print -quit \
-    2>/dev/null | grep -q .; then
-    fail "the runtime source is missing installs/**/site-packages"
-fi
+# END RUNTIME SOURCE CONTENT CHECK
 
 if ! [[ "${ADAPTER_USER}" =~ ^[A-Za-z_][A-Za-z0-9_-]{0,31}$ ]]; then
     fail "--adapter-user is not a valid account name"
