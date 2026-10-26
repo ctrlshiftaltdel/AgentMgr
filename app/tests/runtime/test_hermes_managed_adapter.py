@@ -911,6 +911,10 @@ def test_unreadable_or_tampered_manifest_is_unknown_not_not_found(tmp_path):
 
     manifest.write_text("{not-json", encoding="utf-8")
     corrupted = adapter.get_status(submitted.runtime_task_id, task_id="task_1")
+    restarted = HermesManagedAdapter(config, supervisor, now=lambda: NOW)
+    restarted_corrupted = restarted.get_status(
+        submitted.runtime_task_id, task_id="task_1"
+    )
     corrupted_result = adapter.get_result(
         submitted.runtime_task_id, task_id="task_1"
     )
@@ -919,6 +923,7 @@ def test_unreadable_or_tampered_manifest_is_unknown_not_not_found(tmp_path):
     )
 
     assert corrupted.state is RuntimeState.UNKNOWN
+    assert restarted_corrupted.state is RuntimeState.UNKNOWN
     assert corrupted.state is not RuntimeState.NOT_FOUND
     assert corrupted_result.outcome is ResultOutcome.UNKNOWN
     assert corrupted_cancel.outcome is CancelOutcome.UNKNOWN

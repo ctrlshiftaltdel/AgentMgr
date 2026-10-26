@@ -2962,7 +2962,12 @@ class HermesManagedAdapter:
                     try:
                         manifest = read_manifest(self._config, unit)
                     except SandboxSpecError:
-                        continue
+                        # A manifest exists but cannot be trusted.  Without it
+                        # this scan cannot prove the handle is absent, so fail
+                        # closed instead of answering not_found.
+                        raise _ManifestUnreadable(
+                            "task manifest is unreadable"
+                        ) from None
                     if (
                         manifest is not None
                         and manifest.runtime_handle == handle
