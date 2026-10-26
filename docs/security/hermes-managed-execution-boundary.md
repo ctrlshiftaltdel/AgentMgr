@@ -3,13 +3,13 @@
 - 状态：**沙箱隔离、in-process Managed 生命周期和 stub-broker token/cancel/timeout 已在批准测试机取得 live 证据；真实 provider key 的模型 artifact E2E 仍 pending；生产未部署。** 本文区分“已在测试机证明”和“仍未证明”。
 - 日期：2026-10-26
 - 关联：Issue #97、#96、#83；[设计](hermes-managed-execution-design.md)、[实施计划](hermes-managed-execution-plan.md)、[#96 调度器运维](../operations/runtime-dispatch.md)、[#82 受控执行边界](managed-execution-boundary.md)、[Runtime Adapter 契约](../contracts/runtime-adapter.md)。
-- 证据提交：实现分支 `feat/97-hermes-managed`，live 运行时的 runtime root 哈希 `sha256:96cd218efbc04d845a75e795803f1877acee48ac3df8d7a4f51610831db07239`（Hermes 0.22.1，批准测试机）。具体提交 SHA 与 pytest 计数见 §3.0；不记录主机名、个人路径、IP 或 key。
+- 证据提交：实现分支 `feat/97-hermes-managed`，提交 `23ef41e`，live 运行时的 runtime root 哈希 `sha256:96cd218efbc04d845a75e795803f1877acee48ac3df8d7a4f51610831db07239`（Hermes 0.22.1，批准测试机）。具体 pytest 计数见 §3.0；不记录主机名、个人路径、IP 或 key。任何 head 变化后必须重跑 live 门禁。
 
 ## 1 结论摘要（先读这一节）
 
 - **已在批准测试机安装。** 固定 helper/wrapper/workload/sudoers/broker unit/launcher 配置已安装；`verify_hermes_isolation.sh` 18/18 检查通过。个人/默认 Hermes gateway、Profile、认证、`.env`、会话和 lock 未被读取、挂载、启动、停止或替换。
-- **沙箱负向矩阵已真实通过。** 15 个 live 测试覆盖 `DynamicUser`、只读宿主、私有 `/run`/`/tmp`、`ENETUNREACH` 外部隔离、loopback、跨任务目录/token、宿主 systemd/dbus/容器 socket、`terminal`-only runner、动态 UID、unit 属性、干净日志/journal。
-- **真实 Managed 生命周期已用 stub 模型上游通过。** `submit` 在 unit active + started 后 accepted；重复提交不重新 launch；cancel 确认 -> 停止证据；无 artifact 不产生 success；stop-while-live 只在 cgroup 为空后确认。
+- **沙箱负向矩阵已真实通过。** live 命令 `test_hermes_sandbox_live.py` 15 passed；其中 3 个是 live-gated 真实单元体（probe 负向矩阵、in-process Managed 生命周期、stop-while-live），其余 12 个是 DB-free 的属性/oracle/argv 断言。覆盖 `DynamicUser`、只读宿主、私有 `/run`/`/tmp`、`ENETUNREACH` 外部隔离、loopback、跨任务目录/token、宿主 systemd/dbus/容器 socket、`terminal`-only runner、动态 UID、unit 属性、干净日志/journal。
+- **真实 Managed 生命周期已用 stub 模型上游通过。** `test_hermes_managed_live.py` 的 3 个 live body（token/cancel/timeout）使用真实 PostgreSQL、真实 helper/adapter/broker；同文件另有 7 个 DB-free 断言，2 个 real-key body skipped。`submit` 在 unit active + started 后 accepted；重复提交不重新 launch 与无 artifact 不产生 success 的 live 断言位于 Task 7 managed lifecycle；stop-while-live 只在 cgroup 为空后确认。
 - **真实 provider key 的模型调用仍未运行。** 当前只有 dummy key；真实 key 的 artifact E2E（`OK` 写入 `out/result.txt`、宿主哈希、dispatcher -> `verifying`、独立 `complete_task` -> `succeeded`）仍 pending。没有真实 key 前不得声称模型出口或 artifact 信任已端到端验证。
 - **生产未部署。** 测试机安装不是生产安装；CLI 未在真实 service principal/生产配置下运行；容量未测量。
 - **调度器只到 `verifying`。** 任何运行时事实都不会让 #96 调度器写入 `succeeded`；`stop_confirmed` 只是停止证据，不是业务副作用对账。
@@ -49,7 +49,7 @@ pytest app/tests/tasks/test_hermes_managed_live.py -q -o addopts=''
   -> 10 passed, 2 skipped (real-key bodies)
 ```
 
-运行环境：Hermes 0.22.1；runtime root `sha256:96cd218efbc04d845a75e795803f1877acee48ac3df8d7a4f51610831db07239`。证据只记录命令、退出码、版本与哈希；不记录主机名、个人路径、IP、key 或 token。
+运行环境：Hermes 0.22.1；提交 `23ef41e`；runtime root `sha256:96cd218efbc04d845a75e795803f1877acee48ac3df8d7a4f51610831db07239`。证据只记录命令、退出码、版本与哈希；不记录主机名、个人路径、IP、key 或 token。
 
 ### 3.1 安装与静态验证（已完成）
 
@@ -57,7 +57,7 @@ pytest app/tests/tasks/test_hermes_managed_live.py -q -o addopts=''
 
 ### 3.2 真实沙箱负向矩阵（已完成）
 
-`app/tests/security/test_hermes_sandbox_live.py` 已真实通过 15 项：独立 `DynamicUser`、只读宿主、私有 `/run`/`/tmp`、无外部 IP（`ENETUNREACH`）、broker 以外的 loopback 不可达、跨任务目录/令牌/单元不可读、仅 `terminal` 工具集的 in-process runner、artifact symlink 拒绝、环境变量不含真实 key/DB DSN/宿主路径。
+`app/tests/security/test_hermes_sandbox_live.py` 的 live 命令通过 15 项；其中 3 个 live-gated 体真实启动 transient unit（probe 矩阵、managed 生命周期、stop-while-live），12 个是不需要 host 的属性/oracle/argv 断言。真实体覆盖独立 `DynamicUser`、只读宿主、私有 `/run`/`/tmp`、无外部 IP（`ENETUNREACH`）、broker 以外的 loopback 不可达、跨任务目录/令牌/单元不可读、仅 `terminal` 工具集的 in-process runner、artifact symlink 拒绝、环境变量不含真实 key/DB DSN/宿主路径。
 
 ### 3.3 真实模型出口与 broker（部分完成）
 
@@ -65,7 +65,7 @@ stub 上游已真实验证：任务级短时令牌的签发/过期/撤销/跨任
 
 ### 3.4 真实 Managed 生命周期与调度器 E2E（部分完成）
 
-`app/tests/tasks/test_hermes_managed_live.py` 已用真实 PostgreSQL、真实 helper/adapter/broker 和 stub 模型上游通过 10 项：`submit` 只在 unit active + started 后返回 `accepted`；`status`/`cancel`/超时/未知映射；重复提交不产生第二个 unit；取消确认后进入 `needs_human` 而非自动 `cancelled`；无 artifact 不产生 success。adapter 重启/lookup 由 fake supervisor + 真实 PostgreSQL E2E 覆盖，未在真实 helper 上重跑。**真实 key 的 artifact + dispatcher -> `verifying` + 独立 `complete_task` -> `succeeded` 仍 pending。**
+`app/tests/tasks/test_hermes_managed_live.py` 的 live 命令通过 10 项、跳过 2 项（real-key bodies）。10 项中 3 个是 live body（token 边界、cancel confirmed、timeout），使用真实 PostgreSQL、真实 helper/adapter/broker 与 stub 模型上游；7 个是 DB-free 断言。live body 证明：cancel 确认后进入 `needs_human` 而非自动 `cancelled`；超时停止并保留 partial artifact 证据；token 过期/撤销/跨任务拒绝。`submit` accepted、重复提交不产生第二个 unit、无 artifact 不产生 success、stop-while-live 的断言在 Task 7 managed lifecycle 中。adapter 重启/lookup 由 fake supervisor + 真实 PostgreSQL E2E 覆盖，未在真实 helper 上重跑。**真实 key 的 artifact + dispatcher -> `verifying` + 独立 `complete_task` -> `succeeded` 仍 pending。**
 
 ### 3.5 证据记录格式
 
@@ -81,7 +81,7 @@ stub 上游已真实验证：任务级短时令牌的签发/过期/撤销/跨任
 | `task.result` | **partial** | 无 artifact/失败路径 live；真实 artifact 哈希/`verifying` 待验 |
 | `task.lookup` | **partial** | fake supervisor + 真实 PostgreSQL E2E；真实 helper 重启用未重跑 |
 | `runtime.health` | **live** | helper/broker/root/attestation 真实检查 |
-| `runtime.isolation` | **live** | 15 项负向矩阵真实通过 |
+| `runtime.isolation` | **live** | 3 个 live 单元体 + 12 个 DB-free oracle 真实通过 |
 | `runtime.task_scoped_credentials` | **live（stub 上游）** | 真实令牌/撤销/跨任务；真实 provider key 隔离待验 |
 | `runtime.tool_permissions` | **live（runner 断言）** | runner 代码固定 `toolsets="terminal"`；实际工具执行面仍属 #83 |
 | `runtime.managed_execution` | **unverified** | 真实 key artifact/生产配置/容量未完成 |

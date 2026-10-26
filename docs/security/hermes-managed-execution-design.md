@@ -47,7 +47,7 @@
 以下事实来自 #97 设计阶段的只读/一次性探测，写入设计以避免重复踩坑；不是运行时能力证据。
 
 1. 测试机上已有个人/默认 Hermes gateway 在运行。Hermes 0.22.1 对同一 OS 用户实施 **one gateway per host**；第二个 gateway 会被拒绝，`--replace` 会替换现有 gateway。**#97 绝不复用、替换或停止该 gateway。**
-2. 一次性 CLI `hermes -z` 不经过 gateway，不参与 host lock；适合每任务进程模型。
+2. 一次性 CLI `hermes chat` 会启动本地 gateway 子进程，且该子进程在只读运行时根中无法可靠导入 `installs` 依赖（live #97 观察到 `ModuleNotFoundError: ruamel`）。Managed 路径改用 in-process `hermes_cli.oneshot.run_oneshot`，不启动 gateway，也不参与 host lock；因此适合每任务进程模型。
 3. `PrivateNetwork=yes` 的 transient unit 具有可用的隔离 loopback；外部 IP（如 `<external-ipv4>:<port>`）返回 `ENETUNREACH`。这允许单元内运行 Hermes 与本地模型代理，同时保持无直接外网。
 4. `ProtectHome=yes` 下，使用 `BindReadOnlyPaths` 把宿主路径挂到单元内仍然可读；因此可以把 Hermes 运行时只读挂入，而不复制 2.6 GB 安装。
 5. 独立的 `HERMES_HOME` 首次启动会尝试安装依赖；每任务重新安装不可接受。设计使用 **一次 provision 的只读运行时根 + 每任务轻量 profile**。
@@ -64,7 +64,7 @@
 | 模型出口 | 单元内 localhost 代理 -> 宿主 Unix socket broker；broker 校验令牌和目标 | 令牌/目标/撤销测试 |
 | 停止/取消 | systemd cgroup 停止；只有 unit/cgroup gone 才 `stop_confirmed` | 取消/超时/崩溃测试 |
 | 完成验证 | 宿主读取 `out/result.txt` 并哈希；独立验证器提交证据 | dispatcher E2E + 验证器测试 |
-| 误接个人 gateway | 不启动 gateway；CLI one-shot；不挂载个人 profile；attestation 绑定 helper/unit | 负向配置测试 + 人工检查 |
+| 误接个人 gateway | 不启动 gateway；in-process one-shot；不挂载个人 profile；attestation 绑定 helper/unit | 负向配置测试 + 人工检查 |
 
 ## 5. 架构
 
@@ -242,9 +242,9 @@ task attestation 示例：
 
 `RUNNER_CODE` 只做三件事：
 
-1. 将 `/runtime/hermes-agent` 与 `/runtime/installs/**/site-packages` 插入 `sys.path`（不跟随 symlink）；
+1. 将 `/runtime/hermes-agent` 与 `/runtime/installs/**/site-packages` 插入 `sys.path`（`installs` walk 不跟随 symlink；`hermes-agent` 必须位于只读运行时根内）；
 2. 从固定文件 `/task/prompt.txt` 读取 prompt；
-3. 调用 `hermes_cli.oneshot.run_oneshot(prompt, model=os.environ["HERMES_INFERENCE_MODEL"], provider="custom", toolsets="terminal")`。
+3. 调用 `hermes_cli.oneshot.run_oneshot(prompt, model=os.environ.get("HERMES_INFERENCE_MODEL"), provider="custom", toolsets="terminal")`。
 
 `-I` 隔离宿主 site-packages/`PYTHONPATH`；依赖只来自只读运行时根。`HERMES_HOME=/task/profile`，workload 在 spawn 前创建 `profile/installs -> /runtime/installs` 并传入 `HERMES_INFERENCE_MODEL`；终端工具的子进程通过允许列表环境继承同一 `site-packages`。
 
@@ -268,7 +268,7 @@ model:
 ```
 
 - 本地代理的 API key 使用任务级 `egress.token`；Hermes 只看到该 token，不看到真实 key。
-- 使用 `--safe-mode` 时 profile 只提供空的隔离 home；模型 endpoint/model 以显式 `--provider custom --base-url --model` 为准。若实现退回生成 profile 路线，profile 只含这三项，不含 key。
+- Managed 运行器不调用 CLI 的 `--safe-mode`；它使用生成的最小 profile，只含 `model.provider=custom`、`base_url` 和 `name`，并通过 `run_oneshot(..., provider="custom", toolsets="terminal")` 与 `HERMES_INFERENCE_MODEL` 选择模型。profile 不含 key、平台、插件、MCP 或用户配置。
 - `model-name` / provider 上游由受信部署配置提供；任务 payload 不能选择 provider/base URL 或密钥。
 - workload 不把 profile 内容、token 或 prompt 写入 stdout/stderr。
 

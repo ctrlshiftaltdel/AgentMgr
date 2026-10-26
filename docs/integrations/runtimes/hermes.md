@@ -55,7 +55,9 @@ configuration, credentials and evidence:
   [operations manual](../../operations/hermes-managed-execution.md) and
   [boundary record](../../security/hermes-managed-execution-boundary.md) for the
   fixed paths, install/rollback/verification, and the live evidence still
-  required before any managed label leaves `unverified`.
+  required before any managed label is treated as production-verified (the
+  boundary record currently marks sandbox isolation and the stub-broker
+  lifecycle live, and the real-key artifact E2E pending).
 
 ## 1. Setup
 
@@ -391,19 +393,23 @@ new tasks when health is `unavailable`.
 1. **Full host toolset.** The runtime exposes its configured tools, including
    terminal access. There is no per-run tool permission or allowlist.
 2. **Hermes tools bypass the AgentMgr PEP.** Tool calls executed inside Hermes do
-   **not** pass through the AgentMgr policy enforcement point. Until the #97
-   managed supervisor passes live evidence and #83 governs business tools, this
-   adapter cannot claim that tool scope is enforced. Managed execution and
-   `runtime.tool_permissions` stay `unverified`.
+   **not** pass through the AgentMgr policy enforcement point. Until the real-key
+   managed artifact E2E passes and #83 governs business tools, this advisory
+   adapter cannot claim tool scope is enforced. The separate managed supervisor
+   uses `toolsets="terminal"` and has live sandbox evidence, but
+   `runtime.managed_execution` remains `unverified` until the real-key artifact
+   E2E and production configuration are verified.
 3. **No per-task credentials.** The adapter cannot inject short-lived,
    task-scoped credentials; Hermes uses its own configured credentials.
 4. **Logical session binding only.** `session_id` associates a run with the
    AgentMgr task id; it is not an OS user, filesystem, process or network
    boundary.
-5. **Managed Execution is unverified.** This advisory adapter always rejects
-   managed submissions as `unsupported`; there is no test-only opt-in. The
-   separate managed supervisor (§0) exists, but every managed capability stays
-   `unverified` until the #97 live gates pass.
+5. **Managed Execution is unverified for production.** This advisory adapter
+   always rejects managed submissions as `unsupported`; there is no test-only
+   opt-in. The separate managed supervisor (§0) has sandbox/lifecycle and
+   stub-broker live evidence on the approved test host, but
+   `runtime.managed_execution` remains `unverified` until the real-key artifact
+   E2E and production configuration pass.
 6. **Structured results are absent.** Only text + usage are available;
    completion is `partial_success`.
 7. **Approval/unknown controls are unverified.** The endpoints exist, but their
