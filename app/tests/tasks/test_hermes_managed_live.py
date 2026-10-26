@@ -27,6 +27,9 @@ retry)
     ``artifact_store`` evidence record moves the task to ``succeeded``.  The
     second test scans every captured unit file, journal line, child argv and
     child environment for the provider key and asserts only the broker holds it.
+    A file listed by ``find`` must be readable (directly or with ``sudo -n``),
+    and a launched run must expose the full finished-run file set; an empty,
+    partial or unreadable set fails instead of proving absence.
 
 ``TestEgressTokenBoundaries``
     Uses a loopback stub upstream (no real key) and a real managed unit whose
@@ -117,6 +120,7 @@ from app.governance.principal import (
     resolve_employee_principal,
     resolve_service_principal,
 )
+from app.identity.seed import seed_permission_catalog
 from app.runtime.contract import (
     CapabilityStatus,
     HealthStatus,
@@ -251,6 +255,16 @@ REAL_TASK_MAX_RUNTIME_SECONDS = 300
 TIMEOUT_TASK_MAX_RUNTIME_SECONDS = 120
 TIMEOUT_UNIT_RUNTIME_SEC = 20
 STUB_UNIT_RUNTIME_SEC = 120
+
+#: Files a finished managed run must leave before key absence can be proven.
+FINISHED_TASK_FILES: tuple[str, ...] = (
+    "manifest.json",
+    "prompt.txt",
+    "egress.token",
+    "stdout.txt",
+    "stderr.txt",
+    "status/exit.json",
+)
 
 SUDO = shutil.which("sudo") or "/usr/bin/sudo"
 SYSTEMCTL = shutil.which("systemctl") or "/usr/bin/systemctl"
@@ -645,10 +659,12 @@ def _upstream_base_problem(value: str) -> str | None:
     host = parsed.hostname
     if not host:
         return "AGENTMGR_HERMES_PROVIDER_BASE_URL has no host"
-    if scheme == "http" and host not in {"127.0.0.1", "::1", "localhost"}:
+    if scheme == "http" and host not in {"127.0.0.1", "localhost"}:
+        # The broker's upstream parser accepts a DNS name or IPv4 only; IPv6
+        # loopback (``::1``) cannot be an embedded test upstream.
         return (
             "AGENTMGR_HERMES_PROVIDER_BASE_URL may use plain http only for a "
-            "loopback upstream"
+            "loopback IPv4/localhost upstream"
         )
     if not _HOST_PATTERN.fullmatch(host):
         return "AGENTMGR_HERMES_PROVIDER_BASE_URL host is not a DNS name or IPv4"
@@ -814,7 +830,7 @@ def _unit_is_gone(unit: str) -> bool:
         [SYSTEMCTL, "show", "--no-pager", f"--property=LoadState,ActiveState,MainPID", unit]
     )
     if completed.returncode != 0:
-        return True
+        pytest.fail("systemctl show failed; the unit state cannot be proven")
     dump = completed.stdout
     if _property(dump, "LoadState") == "not-found":
         return True
@@ -841,12 +857,20 @@ def _journal(unit: str) -> tuple[str, bool]:
 
 
 def _task_files(task_dir: Path) -> dict[str, str]:
-    """Read every regular file in a finished task directory (sudo)."""
+    """Read **every** regular file in a finished task directory, or fail.
 
-    if not task_dir.exists():
+    A file listed by ``find`` that cannot be read directly or through
+    ``sudo -n cat`` is a hard failure: omitting it would let the key-isolation
+    proof pass over an unreadable (for example ``0600``) file.  An empty or
+    partial listing is never accepted as evidence; callers must also require
+    :data:`FINISHED_TASK_FILES`.
+    """
+
+    if not task_dir.is_dir():
         return {}
     completed = _sudo([FIND, str(task_dir), "-type", "f", "-print"])
-    assert completed.returncode == 0, completed.stderr
+    if completed.returncode != 0:
+        pytest.fail("the task directory file listing failed")
     files: dict[str, str] = {}
     for line in completed.stdout.splitlines():
         if not line.strip():
@@ -855,11 +879,26 @@ def _task_files(task_dir: Path) -> dict[str, str]:
         try:
             relative = path.relative_to(task_dir).as_posix()
         except ValueError:
-            continue
+            pytest.fail("the task file listing escaped the task directory")
         text = _read_text(path)
-        if text is not None:
-            files[relative] = text
+        if text is None:
+            pytest.fail(
+                f"the task file {relative} is unreadable; key isolation "
+                "cannot be proven"
+            )
+        files[relative] = text
     return files
+
+
+def _require_finished_files(files: Mapping[str, str]) -> None:
+    """Fail unless every file a finished managed run must leave was read."""
+
+    missing = [name for name in FINISHED_TASK_FILES if name not in files]
+    if missing:
+        pytest.fail(
+            "the finished task directory is missing required files: "
+            + ", ".join(missing)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1565,7 +1604,6 @@ class _Attempt:
 @dataclass(frozen=True, repr=False)
 class _RealArtifactRun:
     environment: LiveEnvironment
-    engine: Engine
     backend: _Backend
     provider_key: bytes = field(repr=False)
     task_id: str
@@ -1578,6 +1616,9 @@ class _RealArtifactRun:
     artifact_bytes: bytes
     owner_employee_id: int
     attempts: tuple[_Attempt, ...]
+    final_state: str = ""
+    final_outcome: str | None = None
+    all_criteria_passed: bool = False
 
 
 def _snapshot_attempt(
@@ -1591,7 +1632,14 @@ def _snapshot_attempt(
     files = _task_files(task_dir)
     journal, journal_ok = _journal(unit)
     data, digest = _artifact_payload(task_dir)
-    launched = bool(files) or capture.captured
+    task_dir_present = task_dir.exists()
+    started = (task_dir / "status" / "started.json").exists()
+    launched = task_dir_present or started or bool(files) or capture.captured
+    if launched:
+        # A partial/unreadable finished-run set cannot prove the key's absence.
+        # ``status/exit.json`` is the workload's own end-of-run marker; a
+        # launched unit without it has not finished (fail closed, no retry).
+        _require_finished_files(files)
     handle = task.runtime_task_id
     return _Attempt(
         task_id=task.task_id,
@@ -1615,6 +1663,24 @@ def _snapshot_attempt(
     )
 
 
+def _false_success(attempt: _Attempt) -> str | None:
+    """Return why an attempt already looks successful, or ``None``.
+
+    The dispatcher may only reach ``verifying``; a task/runtime that already
+    reports ``succeeded`` or a passed result before the independent
+    ``complete_task`` is a false success and must fail immediately (never be
+    retried).
+    """
+
+    if attempt.task_state == "succeeded":
+        return "task_state=succeeded"
+    if attempt.dispatcher_outcome == "succeeded":
+        return "dispatcher_outcome=succeeded"
+    if attempt.result_document.get("outcome") == "passed":
+        return "result_outcome=passed"
+    return None
+
+
 def _cleanup_unit(
     backend: _Backend,
     *,
@@ -1633,6 +1699,72 @@ def _cleanup_unit(
     if not removed and task_dir.exists():
         with contextlib.suppress(Exception):
             _remove_tree(task_dir, task_root)
+
+
+def _complete_artifact_run(
+    engine: Engine, run: _RealArtifactRun
+) -> _RealArtifactRun:
+    """Independently verify the captured artifact and record completion.
+
+    Runs inside the module-scoped fixture so the ``succeeded`` snapshot is
+    available without depending on test ordering.  The evidence record hashes
+    the **actual captured bytes**, not a constant.
+    """
+
+    assert run.artifact_bytes == ARTIFACT_BYTES
+    actual_hex = hashlib.sha256(run.artifact_bytes).hexdigest()
+    actual_digest = f"sha256:{actual_hex}"
+    assert actual_digest == ARTIFACT_DIGEST
+    actual_result_ref = f"result_{actual_hex[:32]}"
+    actual_evidence_ref = f"evidence:hermes_artifact_{actual_hex[:32]}"
+    assert run.result_document.get("result_ref") == actual_result_ref
+    assert list(run.result_document.get("evidence_refs") or []) == [
+        actual_evidence_ref
+    ]
+    with Session(engine) as session:
+        task = session.scalar(
+            select(Task).where(Task.task_id == run.task_id)
+        )
+        assert task is not None
+        assert task.state == "verifying", (
+            "the independent verifier must only run on a verifying task"
+        )
+        actor = resolve_employee_principal(
+            session, employee_id=run.owner_employee_id
+        )
+        task_service.complete_task(
+            session,
+            task_id=run.task_id,
+            actor=actor,
+            result_ref=actual_result_ref,
+            evidence_refs=[actual_evidence_ref],
+            evidence=[
+                EvidenceRecord(
+                    criterion_id=CRITERION_ID,
+                    verifier_id=VERIFIER_ID,
+                    verifier_version=VERIFIER_VERSION,
+                    evidence_ref=actual_evidence_ref,
+                    observed=actual_digest,
+                    evidence_hash=actual_digest,
+                    source="artifact_store",
+                )
+            ],
+        )
+        session.commit()
+        session.refresh(task)
+        final_state = task.state
+        document = dict(task.result or {})
+        outcome = document.get("outcome")
+        final_outcome = str(outcome) if outcome is not None else None
+        all_criteria_passed = document.get("all_criteria_passed") is True
+
+    return dataclasses.replace(
+        run,
+        artifact_digest=actual_digest,
+        final_state=final_state,
+        final_outcome=final_outcome,
+        all_criteria_passed=all_criteria_passed,
+    )
 
 
 @pytest.fixture(scope="module")
@@ -1659,6 +1791,10 @@ def real_artifact_run(
     engine = create_engine(test_db_url)
     session = Session(engine)
     reset_task_state(engine)
+    # The hand-built world must not depend on whatever fixture residue the last
+    # test left: seed the catalog explicitly after the truncate.
+    seed_permission_catalog(session)
+    session.commit()
     world = _build_world(session)
     service = _service_principal(session, world)
 
@@ -1709,6 +1845,12 @@ def real_artifact_run(
                         capture=capture,
                     )
                     attempts.append(attempt)
+                    false_success = _false_success(attempt)
+                    if false_success is not None:
+                        pytest.fail(
+                            "an attempt reported success before independent "
+                            f"verification ({false_success}); refusing to retry"
+                        )
                     if (
                         result.outcome == "verifying"
                         and task.state == "verifying"
@@ -1718,7 +1860,6 @@ def real_artifact_run(
                     ):
                         run = _RealArtifactRun(
                             environment=environment,
-                            engine=engine,
                             backend=backend,
                             provider_key=backend.provider_key,
                             task_id=task.task_id,
@@ -1727,12 +1868,22 @@ def real_artifact_run(
                             handle=task.runtime_task_id,
                             task_state=task.state,
                             result_document=dict(task.result or {}),
-                            artifact_digest=ARTIFACT_DIGEST,
-                            artifact_bytes=ARTIFACT_BYTES,
+                            artifact_digest=attempt.artifact_digest,
+                            artifact_bytes=attempt.artifact_bytes,
                             owner_employee_id=world.org.manager.id,
                             attempts=tuple(attempts),
                         )
                         break
+                    artifact_miss = not (
+                        attempt.artifact_bytes == ARTIFACT_BYTES
+                        and attempt.artifact_digest == ARTIFACT_DIGEST
+                    )
+                    if not artifact_miss:
+                        pytest.fail(
+                            "the artifact is exactly OK but the managed attempt "
+                            "did not reach verifying; refusing to retry "
+                            f"({result.outcome}/{task.state})"
+                        )
                     _cleanup_unit(
                         backend,
                         unit=unit,
@@ -1746,6 +1897,9 @@ def real_artifact_run(
                         "recorded (check the dispatcher outcome and artifact "
                         "digest in the attempt snapshots)"
                     )
+                # Independent verification runs here, before yield, so the
+                # completed snapshot is available regardless of test order.
+                run = _complete_artifact_run(engine, run)
             finally:
                 for unit, task_dir in tracked:
                     _cleanup_unit(
@@ -1763,11 +1917,9 @@ def real_artifact_run(
         raise
 
     session.close()
+    engine.dispose()
     assert run is not None
-    try:
-        yield run
-    finally:
-        engine.dispose()
+    yield run
 
 
 @live_only
@@ -1784,50 +1936,25 @@ class TestRealModelArtifact:
 
         document = dict(run.result_document)
         assert document["outcome"] == "completed"
-        assert document["result_ref"] == ARTIFACT_RESULT_REF
+        actual_hex = hashlib.sha256(run.artifact_bytes).hexdigest()
+        actual_digest = f"sha256:{actual_hex}"
+        assert actual_digest == ARTIFACT_DIGEST
+        assert document["result_ref"] == f"result_{actual_hex[:32]}"
         assert list(document.get("evidence_refs") or []) == [
-            ARTIFACT_EVIDENCE_REF
+            f"evidence:hermes_artifact_{actual_hex[:32]}"
         ]
         assert (document.get("verification") or {}).get("result") == "pending"
 
         # The artifact really is the exact two-byte file the goal names.
         # The fixture captured it before cleaning the task directory.
         assert run.artifact_bytes == ARTIFACT_BYTES
-        assert hashlib.sha256(run.artifact_bytes).hexdigest() == ARTIFACT_HEX
+        assert run.artifact_digest == actual_digest
 
-        # An independent verifier -- not runtime/model self-report -- completes.
-        with Session(run.engine) as session:
-            task = session.scalar(
-                select(Task).where(Task.task_id == run.task_id)
-            )
-            assert task is not None
-            actor = resolve_employee_principal(
-                session, employee_id=run.owner_employee_id
-            )
-            task_service.complete_task(
-                session,
-                task_id=run.task_id,
-                actor=actor,
-                result_ref=document["result_ref"],
-                evidence_refs=list(document["evidence_refs"]),
-                evidence=[
-                    EvidenceRecord(
-                        criterion_id=CRITERION_ID,
-                        verifier_id=VERIFIER_ID,
-                        verifier_version=VERIFIER_VERSION,
-                        evidence_ref=ARTIFACT_EVIDENCE_REF,
-                        observed=ARTIFACT_DIGEST,
-                        evidence_hash=ARTIFACT_DIGEST,
-                        source="artifact_store",
-                    )
-                ],
-            )
-            session.commit()
-            session.refresh(task)
-
-            assert task.state == "succeeded"
-            assert task.result["outcome"] == "passed"
-            assert task.result["all_criteria_passed"] is True
+        # The module fixture already ran the independent verifier before yield;
+        # assert that snapshot instead of completing here (order-independent).
+        assert run.final_state == "succeeded"
+        assert run.final_outcome == "passed"
+        assert run.all_criteria_passed is True
 
     def test_real_key_never_enters_unit_or_task_dir(
         self, real_artifact_run: _RealArtifactRun
@@ -1865,6 +1992,10 @@ class TestRealModelArtifact:
 
         assert run.attempts, "the real run captured no attempts"
         for attempt in run.attempts:
+            false_success = _false_success(attempt)
+            assert false_success is None, (
+                f"an attempt reported a false success ({false_success})"
+            )
             for relative, text in attempt.files.items():
                 leaked = _mentions(text, key)
                 assert not leaked, (
@@ -1878,6 +2009,7 @@ class TestRealModelArtifact:
             if not attempt.launched:
                 continue
             assert attempt.files, "a launched attempt left no task files"
+            _require_finished_files(attempt.files)
             assert attempt.journal_ok, "the unit journal is unreadable"
             assert attempt.journal.strip(), "an empty journal cannot prove absence"
             journal_leaked = _mentions(attempt.journal, key)
@@ -2243,7 +2375,7 @@ class TestCancelConfirmed:
                     handle, task_id=task.task_id
                 )
                 assert status.stop_confirmed is True
-                assert status.state is not RuntimeState.COMPLETED
+                assert status.state is RuntimeState.STOPPED
                 _wait_for_unit_gone(unit, timeout=UNIT_STOP_TIMEOUT_SECONDS)
 
                 cancelled_result = backend.adapter.get_result(
