@@ -439,6 +439,110 @@ def test_child_env_exposes_the_task_token_only_as_api_key_env(tmp_path):
     )
 
 
+# ---------------------------------------------------------------------------
+# runtime "installs" on PYTHONPATH (gateway subprocess dependencies)
+# ---------------------------------------------------------------------------
+
+
+def _site_packages(root: Path, *parts: str) -> Path:
+    path = root.joinpath(*parts, "lib", "python3.13", "site-packages")
+    path.mkdir(parents=True)
+    return path
+
+
+def test_child_env_exposes_every_runtime_site_packages_dir(tmp_path):
+    installs = tmp_path / "installs"
+    first = _site_packages(installs, "tool-a")
+    second = _site_packages(installs, "tool-b")
+
+    env = workload.build_child_env(
+        tmp_path / "task", 1234, runtime_installs=installs
+    )
+
+    assert env["PYTHONPATH"].split(":") == sorted([str(first), str(second)])
+    for entry in env["PYTHONPATH"].split(":"):
+        assert Path(entry).is_relative_to(installs)
+
+
+@pytest.mark.parametrize("kind", ["missing", "empty"])
+def test_child_env_leaves_pythonpath_unset_without_runtime_installs(
+    tmp_path, kind
+):
+    installs = tmp_path / "installs"
+    if kind == "empty":
+        installs.mkdir()
+
+    env = workload.build_child_env(
+        tmp_path / "task", 1234, runtime_installs=installs
+    )
+
+    assert "PYTHONPATH" not in env
+
+
+def test_child_env_pythonpath_carries_no_host_or_task_secret(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYTHONPATH", "/host-canary-pythonpath")
+    installs = tmp_path / "installs"
+    site_packages = _site_packages(installs, "tool-a")
+    outside = tmp_path / "outside" / "site-packages"
+    outside.mkdir(parents=True)
+    (installs / "linked").mkdir()
+    (installs / "linked" / "site-packages").symlink_to(
+        outside, target_is_directory=True
+    )
+
+    env = workload.build_child_env(
+        tmp_path / "task",
+        1234,
+        token=TOKEN_CANARY,
+        runtime_installs=installs,
+    )
+
+    pythonpath = env["PYTHONPATH"]
+    assert pythonpath == str(site_packages)
+    assert "host-canary" not in pythonpath
+    assert str(outside) not in pythonpath
+    assert PROMPT_CANARY not in pythonpath
+    assert TOKEN_CANARY not in pythonpath
+
+
+def test_child_env_rejects_an_oversized_pythonpath(tmp_path, monkeypatch):
+    installs = tmp_path / "installs"
+    installs.mkdir()
+    monkeypatch.setattr(
+        workload,
+        "_runtime_site_packages",
+        lambda _root: ["/runtime/installs/" + "x" * 9000],
+    )
+    with pytest.raises(workload.WorkloadError) as excinfo:
+        workload.build_child_env(tmp_path / "task", 1234, runtime_installs=installs)
+    assert excinfo.value.code == "pythonpath_too_large"
+
+
+def test_run_workload_passes_the_fixed_installs_path_to_the_child_env(
+    tmp_path, monkeypatch
+):
+    runtime = _fake_runtime(tmp_path, "import sys\nsys.exit(0)\n")
+    task = _make_task(tmp_path)
+    captured: dict[str, object] = {}
+    real_build = workload.build_child_env
+
+    def spy(task_dir, proxy_port, **kwargs):
+        captured.update(kwargs)
+        return real_build(task_dir, proxy_port, **kwargs)
+
+    monkeypatch.setattr(workload, "build_child_env", spy)
+    code = workload.run_workload(
+        task_dir=task,
+        runtime_root=runtime,
+        model=MODEL,
+        run_budget_sec=30,
+        proxy_socket=tmp_path / "e.sock",
+        heartbeat_interval_sec=30.0,
+    )
+    assert code == 0
+    assert captured["runtime_installs"] == Path("/runtime/installs")
+
+
 def test_render_profile_replaces_the_port_with_the_minimal_model_block():
     rendered = workload.render_profile(
         PROFILE_TEMPLATE, proxy_port=23456, model=MODEL

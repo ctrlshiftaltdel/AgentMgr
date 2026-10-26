@@ -48,7 +48,9 @@ Behaviour
    ``RuntimeMaxSec``.  The child receives a fresh allowlisted environment (no
    host credential, DB DSN, path or profile variable).  The task egress token
    is exposed only as ``CUSTOM_API_KEY``/``OPENAI_API_KEY``; it is never a
-   command-line argument.
+   command-line argument.  ``PYTHONPATH`` carries the runtime installs
+   ``site-packages`` directories so the gateway subprocess that ``hermes chat``
+   spawns can import the same dependencies as its launcher.
 5. Write ``status/started.json`` and ``status/heartbeat.json`` atomically,
    capture stdout/stderr with the prompt and token redacted, enforce the
    workload deadline, and on timeout, stop signal or any post-spawn failure
@@ -187,6 +189,13 @@ MAX_STDOUT_BYTES = 1_048_576
 MAX_STDERR_BYTES = 262_144
 #: Replacement written where a prompt or token occurrence was redacted.
 REDACTED = b"[redacted]"
+
+#: Largest ``PYTHONPATH`` handed to the child; a runtime with more/bigger
+#: installs environments than this fails closed instead of hitting exec limits.
+MAX_PYTHONPATH_BYTES = 8_192
+#: Maximum directory depth searched under ``/runtime/installs`` for
+#: ``site-packages`` directories (the provisioning layout is ~4 levels).
+MAX_INSTALLS_DEPTH = 8
 
 MIN_RUN_BUDGET_SECONDS = 1
 MAX_RUN_BUDGET_SECONDS = 86_400
@@ -808,14 +817,55 @@ def build_hermes_argv(
     ]
 
 
+def _runtime_site_packages(runtime_installs: Path) -> list[str]:
+    """Return the sorted ``site-packages`` directories under ``installs``.
+
+    The runtime tree is mounted read-only at ``/runtime``; the installed Hermes
+    gateway subprocess does not inherit the parent launcher's ``sys.path``
+    patch, so its dependencies must be reachable through ``PYTHONPATH``.
+    Symlinked directories are never followed, keeping every entry inside the
+    runtime installs tree.
+    """
+
+    root = _require_absolute_path(runtime_installs, "runtime_installs")
+    if not root.is_dir():
+        return []
+    found: list[str] = []
+    base_depth = len(root.parts)
+    for current, dirnames, _files in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        if len(current_path.parts) - base_depth >= MAX_INSTALLS_DEPTH:
+            dirnames[:] = []
+            continue
+        dirnames[:] = sorted(
+            name
+            for name in dirnames
+            if not (current_path / name).is_symlink()
+        )
+        if current_path.name == "site-packages":
+            found.append(str(current_path))
+            dirnames[:] = []
+    return sorted(dict.fromkeys(found))
+
+
 def build_child_env(
-    task_dir: Path, proxy_port: int, *, token: str | None = None
+    task_dir: Path,
+    proxy_port: int,
+    *,
+    token: str | None = None,
+    runtime_installs: Path = UNIT_RUNTIME_INSTALLS_PATH,
 ) -> dict[str, str]:
     """Return a fresh allowlist environment for the Hermes child.
 
     Nothing is inherited from the host.  The task egress token, when given, is
     exposed only as ``CUSTOM_API_KEY``/``OPENAI_API_KEY`` for the loopback
     proxy; it is never an argv entry.
+
+    ``PYTHONPATH`` carries only the runtime installs ``site-packages``
+    directories (the gateway subprocess spawned by ``hermes chat`` does not
+    inherit the parent launcher's ``sys.path`` patch).  It is left unset when
+    no installs tree exists, and an already allowlisted ``PYTHONPATH`` value is
+    extended rather than overwritten.  Host ``PYTHONPATH`` is never read.
     """
 
     directory = _require_absolute_path(task_dir, "task_dir")
@@ -831,6 +881,17 @@ def build_child_env(
         "OPENAI_BASE_URL": _base_url(port),
         "CUSTOM_API_BASE_URL": _base_url(port),
     }
+    site_packages = _runtime_site_packages(runtime_installs)
+    if site_packages:
+        entries = list(site_packages)
+        existing = env.get("PYTHONPATH", "")
+        if existing:
+            current = [item for item in existing.split(":") if item]
+            entries = current + [item for item in entries if item not in current]
+        value = ":".join(entries)
+        if len(value.encode("utf-8")) > MAX_PYTHONPATH_BYTES:
+            raise WorkloadError("pythonpath_too_large")
+        env["PYTHONPATH"] = value
     if token is not None:
         value = _validate_egress_token(token)
         env["CUSTOM_API_KEY"] = value
@@ -1739,7 +1800,12 @@ def run_workload(
             model=name,
             base_url=_base_url(handle.port),
         )
-        env = build_child_env(task, handle.port, token=token)
+        env = build_child_env(
+            task,
+            handle.port,
+            token=token,
+            runtime_installs=UNIT_RUNTIME_INSTALLS_PATH,
+        )
         return _run_child(
             argv,
             task_dir=task,
