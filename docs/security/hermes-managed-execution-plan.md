@@ -54,7 +54,7 @@
 - Create `app/tests/runtime/test_hermes_egress.py` — token/broker tests.
 - Create `app/tests/runtime/test_hermes_managed_contract.py` — config/attestation/artifact/capability tests.
 - Create `app/tests/runtime/test_hermes_managed_adapter.py` — adapter with fake supervisor.
-- Create `app/tests/runtime/test_hermes_managed_live.py` — real broker/adapter/dispatcher, env-gated.
+- Create `app/tests/tasks/test_hermes_managed_live.py` — real broker/adapter/dispatcher, env-gated.
 - Create `app/tests/tasks/test_hermes_managed_dispatch.py` — real PostgreSQL dispatcher E2E with fake supervisor.
 - Create `app/tests/security/test_hermes_managed_unit.py` — helper argv/spec/attestation unit tests.
 - Create `app/tests/security/test_hermes_workload_unit.py` — workload/proxy tests.
@@ -658,8 +658,8 @@ git commit -m "test(security): add hermes sandbox live matrix"
 ### Task 8: Real Model Egress, Real Adapter and Dispatcher E2E (Live)
 
 **Files:**
-- Create: `app/tests/runtime/test_hermes_managed_live.py`
-- Consumes: Task 4 broker, Task 5 adapter/helper, Task 6 DB fixtures, dedicated provider key/base URL/model supplied at test time.
+- Create: `app/tests/tasks/test_hermes_managed_live.py`
+- Consumes: Task 4 broker, Task 5 adapter/helper, Task 6 real PostgreSQL `TaskWorld` fixtures, dedicated provider key/base URL/model supplied at test time.
 - Env gate: `AGENTMGR_HERMES_LIVE=1`, `AGENTMGR_HERMES_SUDO=1`, `AGENTMGR_HERMES_PROVIDER_KEY_FILE`, `AGENTMGR_HERMES_PROVIDER_BASE_URL`, `AGENTMGR_HERMES_MODEL`, runtime root/task root/helper paths.
 
 **Interfaces:**
@@ -681,7 +681,7 @@ Skip clearly if the dedicated key/config is absent.
 
 - [ ] **Step 2: Run collection / RED**
 
-Run: `UV_PROJECT_ENVIRONMENT=<test-host-venv> uv run --no-sync pytest app/tests/runtime/test_hermes_managed_live.py -q -o addopts='' --collect-only`
+Run: `UV_PROJECT_ENVIRONMENT=<test-host-venv> uv run --no-sync pytest app/tests/tasks/test_hermes_managed_live.py -q -o addopts='' --collect-only`
 Expected: collection succeeds; tests skip locally.
 
 - [ ] **Step 3: Implement the live harness**
@@ -697,7 +697,7 @@ AGENTMGR_HERMES_LIVE=1 AGENTMGR_HERMES_SUDO=1 \
 AGENTMGR_HERMES_PROVIDER_KEY_FILE=<root-only-file> \
 AGENTMGR_HERMES_PROVIDER_BASE_URL=<provider-base-url> \
 AGENTMGR_HERMES_MODEL=<model> ... \
-UV_PROJECT_ENVIRONMENT=<test-host-venv> uv run --no-sync pytest app/tests/runtime/test_hermes_managed_live.py -q -o addopts=''
+UV_PROJECT_ENVIRONMENT=<test-host-venv> uv run --no-sync pytest app/tests/tasks/test_hermes_managed_live.py -q -o addopts=''
 ```
 
 Record evidence; implementer must not claim it.
@@ -705,7 +705,7 @@ Record evidence; implementer must not claim it.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add app/tests/runtime/test_hermes_managed_live.py
+git add app/tests/tasks/test_hermes_managed_live.py
 git commit -m "test(runtime): add hermes managed live e2e"
 ```
 
@@ -791,7 +791,7 @@ git commit -m "feat(runtime): add hermes managed cli and operations"
 Run:
 - `pytest app/tests/tasks/test_hermes_managed_dispatch.py -q -o addopts=''`
 - `pytest app/tests/security/test_hermes_sandbox_live.py -q -o addopts=''` (live env)
-- `pytest app/tests/runtime/test_hermes_managed_live.py -q -o addopts=''` (live env)
+- `pytest app/tests/tasks/test_hermes_managed_live.py -q -o addopts=''` (live env)
 - `pytest app/tests -q -o addopts=''`
 
 Record exact counts/exit codes. No live claim without the env-gated run.
