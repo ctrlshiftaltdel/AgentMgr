@@ -130,4 +130,4 @@ stub 上游已验证：任务级短时令牌的签发/过期/撤销/跨任务拒
 
 #97 只提供 Hermes 的受控运行时与调度器接入。业务工具、PEP 连接器、真实业务资源授权、真实客户端 E2E、商业化就绪与对抗性声明验证仍属于 #83；Hermes 内执行的工具调用不经过 AgentMgr PEP，除非 #83 建立相应连接器与验证器。#97 的 live 门禁完成后，#83 不再被 #97 阻塞，但仍受自身范围约束。
 
-真实 MCP 客户端 + 活 uvicorn + 真实 Managed runtime 的 E2E 就绪/证据口径见 [real-client-managed-e2e-readiness.md](real-client-managed-e2e-readiness.md)；该记录不声称 live 已通过，也不声称商用就绪。
+真实 MCP 客户端 + 活 uvicorn + 真实 Managed runtime 的 E2E 已在批准测试机通过（4 passed）；证据、版本与剩余生产/容量缺口见 [real-client-managed-e2e-readiness.md](real-client-managed-e2e-readiness.md)。该记录不声称生产部署或商用就绪。

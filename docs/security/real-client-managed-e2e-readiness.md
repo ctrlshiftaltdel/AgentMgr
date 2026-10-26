@@ -1,13 +1,31 @@
 # 真实 MCP 客户端 + 活 uvicorn + 真实 Managed runtime E2E 就绪记录（#83 增量 A）
 
-- 状态：**测试已实现，尚未由实现者运行。** live 运行必须由 Master 在批准测试机执行；实现者只做 `--collect-only`、`py_compile`、privacy 与 diff-check，不运行 DB/live/sudo/systemd。本文不记录通过计数，也不声称已通过。
+- 状态：**已在批准测试机 live 通过（4 passed in 16.02s）；生产/容量/备份/商用就绪仍未验证。** 实现者只做 `--collect-only`、`py_compile`、privacy 与 diff-check；实际 DB/live/sudo/systemd 运行由 Master 在测试机执行。本文记录测试机证据，不声称生产部署或商业化完成。
 - 日期：2026-10-27
 - 关联：Issue #83、#97、#96、#80、#82、#100；[#97 边界记录](hermes-managed-execution-boundary.md)、[#96 调度器运维](../operations/runtime-dispatch.md)、[Managed Execution 边界](managed-execution-boundary.md)。
 - 测试文件：`app/tests/e2e/test_real_client_managed_e2e.py`。
 
+## 0 测试机 live 证据
+
+```text
+提交: fe94bc5eaaa2439533938c71c8e445d3e67ed474
+命令:
+  AGENTMGR_E2E_LIVE=1 + #97 live env \
+  pytest app/tests/e2e/test_real_client_managed_e2e.py -q -s -o addopts=''
+结果: 4 passed in 16.02s（live body 未 skip）
+Hermes: 0.22.1
+runtime root: sha256:96cd218efbc04d845a75e795803f1877acee48ac3df8d7a4f51610831db07239
+provider: inference.systalyze.com；专用测试 key 仅在宿主 broker，未记录/打印
+链路: managed artifact -> dispatcher verifying -> 独立 complete_task -> succeeded
+       -> real MCP client get_task/get_result -> outsider denied
+清理: unit/task dir/broker socket/uvicorn listener 均消失
+```
+
+不记录主机名、个人路径、IP、key、token 或真实凭据。
+
 ## 1 这个测试证明什么
 
-在批准测试机上通过后，测试证明以下事实（全部为真实组件，不使用 `TestClient`/ASGI transport）：
+在批准测试机上，测试已证明以下事实（全部为真实组件，不使用 `TestClient`/ASGI transport）：
 
 1. **真实服务器。** 测试在 `127.0.0.1:<free port>` 上绑定 socket，用真实 `uvicorn.Server` 在独立线程/事件循环中启动 `create_app()`；MCP 端点挂在 `/mcp/`。
 2. **真实客户端。** 官方 MCP SDK `mcp==2.3.0` 的 `streamable_http_client` 配真实 `httpx2.AsyncClient` 经 TCP 完成 `initialize`、`tools/list`，并调用 `governance.get_task`/`governance.get_result`；请求头为 `Authorization: Bearer <internal-token>` 与 `X-Employee-Id: <requester-id>`。
@@ -119,7 +137,7 @@ Master 在批准测试机运行后，至少记录：
 
 ## 5 不得作出的声明
 
-- 不得声称本测试已在实现者环境通过；实现者未运行 DB/live/sudo。
+- 不得把 skip 当作通过证据；本次测试机 live 结果是 4 passed、无 skip。
 - 不得声称生产已部署、已上线或已完成商业化验证。
 - 不得声称容量、并发、启动开销、备份恢复或生产 key 轮换已验证。
-- 不得把 skip 当作通过证据。
+- 不得把本测试机的单进程 uvicorn + 单 dispatcher 结果外推为生产容量证据。
