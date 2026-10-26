@@ -35,7 +35,7 @@ evidence record:
 | Path | Implementation | Managed (`managed_execution`)? | Toolset / isolation | Current labels |
 |---|---|---|---|---|
 | **Advisory `/v1/runs`** | `app/runtime/hermes.py`, `HermesConfig` (`HERMES_API_URL`/`HERMES_API_KEY`) | No. A managed grant is always `unsupported`; there is no opt-in. | Runtime's full configured toolset; no OS boundary. | `partially_verified` (0.22.1 spike + mock contract tests). |
-| **Managed one-shot supervisor** | `app/runtime/hermes_managed.py`, `app/runtime/hermes_managed_cli.py`, `ops/security/agentmgr_*` | Yes, but only with a valid runtime attestation and the #96 dispatcher. | Target: exactly `terminal`; one transient systemd unit per task, `DynamicUser`, read-only runtime root, private `/run`/`/tmp`, isolated loopback, task-scoped egress token. | **`unverified` pending #97 live evidence.** |
+| **Managed one-shot supervisor** | `app/runtime/hermes_managed.py`, `app/runtime/hermes_managed_cli.py`, `ops/security/agentmgr_*` | Yes, but only with a valid runtime attestation and the #96 dispatcher. | Target: exactly `terminal`; one transient systemd unit per task, `DynamicUser`, read-only runtime root, private `/run`/`/tmp`, isolated loopback, task-scoped egress token. | **`unverified` pending real-key artifact E2E;** sandbox isolation, in-process lifecycle and stub-broker token/cancel/timeout live bodies passed on the approved test host. |
 
 Do not use advisory runs as evidence for managed execution, and do not route a
 managed task to the advisory adapter. The two paths have separate deployment,
@@ -44,8 +44,9 @@ configuration, credentials and evidence:
 - The advisory path never selects, imports or falls back to the managed
   supervisor (and vice versa). `HermesConfig` has no managed switch.
 - The managed path never starts or mounts a personal/default Hermes gateway,
-  profile, authentication file or `.env`; it runs one `hermes` one-shot CLI per
-  transient unit with a generated minimal profile.
+  profile, authentication file or `.env`; it runs one in-process
+  `hermes_cli.oneshot.run_oneshot` per transient unit with a generated minimal
+  profile. It never invokes the gateway-backed `hermes chat` CLI.
 - The managed launcher has no default configuration. Without the trusted
   `/etc/agentmgr/hermes/managed-cli.json`, a provisioned runtime attestation,
   key files, the installed helper and an active service principal, it exits
@@ -92,8 +93,9 @@ with `SubmitOutcome.UNSUPPORTED`, and nothing is sent to the runtime. There is
 no environment variable, configuration field or test-only bypass in
 `HermesConfig`: the advisory adapter serves only `advisory` execution. The
 supported managed path is the separate one-shot supervisor described in §0; it
-uses its own adapter, launcher and attestation gate and is still `unverified`
-pending #97 live evidence. A managed task must never be routed here to obtain a
+uses its own adapter, launcher and attestation gate; it remains `unverified`
+until the real-key artifact E2E passes (sandbox/lifecycle live evidence is
+recorded in the boundary document). A managed task must never be routed here to obtain a
 different answer.
 
 ## 2. Endpoints and authentication

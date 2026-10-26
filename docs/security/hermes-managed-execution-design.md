@@ -34,8 +34,8 @@
 | 决策 | 选择 | 说明 |
 |---|---|---|
 | 隔离拓扑 | **每任务 ephemeral systemd 沙箱** | 独立 `DynamicUser`、独立任务目录、独立单元；不是长驻共享 host。 |
-| Hermes 传输 | **一次性 CLI supervisor** | 每个任务一个 `hermes -z` 进程；systemd 是进程/停止事实来源；不使用 per-task gateway。 |
-| 工具边界 | **仅 `terminal`** | `-t terminal`；其余工具集关闭。业务工具/PEP 留给 #83。 |
+| Hermes 传输 | **一次性 in-process one-shot** | 每任务一个 workload 进程，内部调用 `hermes_cli.oneshot.run_oneshot`；不启动 gateway，不使用 per-task gateway；systemd 是进程/停止事实来源。 |
+| 工具边界 | **仅 `terminal`** | `toolsets="terminal"`；其余工具集关闭。业务工具/PEP 留给 #83。 |
 | 模型凭据 | **专用测试 key + 宿主出口代理** | key 只在宿主 broker；任务只拿短时任务级令牌；由所有者提供测试 key。 |
 | Managed API | **不使用** | 临时 Hermes Profile/API server 只用于 advisory 兼容回归，不进入 Managed 链。 |
 | 停止语义 | **证据，不是对账** | 确认停止 -> 保存证据 -> `needs_human`；不自动 `cancelled`，不伪造 `side_effects_reconciled`。 |
@@ -75,7 +75,7 @@
         -> transient agentmgr-hermes-<id>.service
            -> hermes_workload.py
               -> local model proxy (127.0.0.1, unit netns)
-              -> hermes -z ... -t terminal
+              -> runtime python -I -c run_oneshot(toolsets="terminal")
      -> task dir (host-visible, group-shared)
         prompt.txt / profile / egress.token / status / stdout / out/result.txt
 
@@ -227,28 +227,34 @@ task attestation 示例：
 2. 设置最小环境：`HOME=/task/home`、`HERMES_HOME=/task/profile`、`XDG_STATE_HOME=/task/state`、`HERMES_GATEWAY_LOCK_DIR=/task/locks`、`TMPDIR=/task/tmp`、`PATH` 固定最小集合；清除所有宿主凭据环境变量。
 3. 启动 localhost 模型代理（127.0.0.1，随机端口），只转发到 `/task/egress.sock`（宿主 broker socket 的只读 bind mount）；等待监听成功；把 `profile.template.yaml` 的 `__PORT__` 替换为实际端口并原子写入 `profile/config.yaml`。
 4. 写 `status/started.json`（unit、task、handle、时间、child pid/无 secret）。
-5. 启动 Hermes one-shot CLI；周期写 `heartbeat.json`；捕获有界 stdout/stderr。
+5. 用运行时根内的固定 Python 启动 **in-process one-shot 运行器**（不启动 gateway，见 8.2）；周期写 `heartbeat.json`；捕获有界 stdout/stderr。
 6. 子进程退出后写 `status/exit.json`（exit code、signal、duration、timed_out/cancelled 标志）。
 7. 若 `out/result.txt` 存在，保留给宿主读取；不自行生成/覆盖 artifact。
 8. 退出；systemd 以 cgroup 为空作为进程停止事实。
 
-### 8.2 Hermes 调用
+### 8.2 Hermes 调用（in-process one-shot）
 
-基准命令（实现时用 argv 数组，不经过 shell；使用运行时根内的 launcher，不调用宿主个人 wrapper）：
+运行时根内的 `hermes chat` 会启动本地 gateway 子进程；live #97 在真实 transient unit 中观察到该子进程无法可靠继承运行时依赖（`ModuleNotFoundError: ruamel`），因此 **managed 路径不使用 CLI/launcher，也不启动 gateway**。固定命令是运行时根内的 Python + 固定 runner 代码：
 
 ```text
-<runtime-root>/hermes-agent/.hermes/bin/hermes chat \
-  --query-file /task/prompt.txt --oneshot -Q --format text \
-  -t terminal --provider custom --base-url http://127.0.0.1:<local-proxy-port>/v1 \
-  --model <model-name> --safe-mode --run-budget <seconds>
+<runtime-root>/tools/<pinned-python>/bin/python3 -I -c <RUNNER_CODE>
 ```
 
-- 必须使用生成的**最小 profile**（只含模型 provider/base_url/model 和明确关闭的平台/工具），不读取宿主 profile；`--safe-mode` 关闭用户配置、AGENTS.md/记忆、插件和 MCP，显式 `--provider custom --base-url` 保证本地代理仍可解析。
-- **prompt 只能通过 `--query-file /task/prompt.txt` 读取，绝不出现在 argv/宿主 `ps`。** 任务出口 token 通过子进程环境变量（如 `CUSTOM_API_KEY`/`OPENAI_API_KEY`）传入，**禁止** `--api-key` argv；token 是任务级、短时、可撤销的。
-- `-t terminal` 是唯一启用的工具集；不启用 `web`、`browser`、`file`、`code_execution`、MCP、插件、memory、connectors。
-- 不使用 `--yolo`；one-shot 自身会绕过交互审批，但沙箱是边界。
+`RUNNER_CODE` 只做三件事：
+
+1. 将 `/runtime/hermes-agent` 与 `/runtime/installs/**/site-packages` 插入 `sys.path`（不跟随 symlink）；
+2. 从固定文件 `/task/prompt.txt` 读取 prompt；
+3. 调用 `hermes_cli.oneshot.run_oneshot(prompt, model=os.environ["HERMES_INFERENCE_MODEL"], provider="custom", toolsets="terminal")`。
+
+`-I` 隔离宿主 site-packages/`PYTHONPATH`；依赖只来自只读运行时根。`HERMES_HOME=/task/profile`，workload 在 spawn 前创建 `profile/installs -> /runtime/installs` 并传入 `HERMES_INFERENCE_MODEL`；终端工具的子进程通过允许列表环境继承同一 `site-packages`。
+
+- **不调用** `hermes chat`、`--query-file`、`--oneshot`、`-Q`、`-t`、`--safe-mode`、`--run-budget`、`--api-key`；这些 CLI 参数不再属于 managed 契约。
+- **prompt 只从 `/task/prompt.txt` 读取，绝不出现在 argv/宿主 `ps`。** 任务出口 token 只通过子进程环境变量和本地代理头传递；**禁止** argv token；token 是任务级、短时、可撤销的。
+- `toolsets="terminal"` 是唯一启用的工具集；不启用 `web`、`browser`、`file`、`code_execution`、MCP、插件、memory、connectors。
+- 不启动 gateway、不读取宿主 profile/AGENTS.md/记忆/插件/MCP；不写宿主 Hermes 状态。
 - 子进程不继承宿主环境；真实 key、adapter token、DB DSN、宿主路径不进入环境（任务 token 除外，且只以环境变量形式存在）。
-- `--safe-mode` 与显式 endpoint 的组合必须在实现中先做一次真实兼容性测试；若该 Hermes 版本不接受，退回生成 profile + `--ignore-user-config --ignore-rules`，但不得退回 argv prompt 或 argv token。
+- 运行时根必须自包含 `hermes-agent`、`tools` Python 和 `installs` 依赖环境；不得依赖个人 `~/.hermes`。live 证据见[边界记录](hermes-managed-execution-boundary.md)。
+- `runtime_max_sec >= 9` 是 workload deadline + SIGTERM grace + exit marker 的最小空间；systemd `RuntimeMaxSec` 是最后兜底。
 
 ### 8.3 模型 provider 配置
 
@@ -482,7 +488,7 @@ class HermesManagedAdapter:
 
 1. 创建 `agentmgr-hermes` 组/服务用户；把受信 AgentMgr 服务用户加入组。
 2. 安装 root-owned helper/wrapper/workload/broker unit；sudoers 只允许固定 helper 路径、无参数。
-3. 准备只读运行时根（根所有；Hermes 安装 + Python tools；不含 Profile/auth/.env/session）；计算并记录 runtime root manifest 哈希。
+3. 准备只读运行时根（根所有；Hermes 安装 + Python `tools` + `installs` 依赖环境；不含 Profile/auth/.env/session）；计算并记录 runtime root manifest 哈希。运行时根必须能直接运行 in-process `run_oneshot`，不得依赖个人 `~/.hermes` 或 gateway。
 4. 创建任务根/状态根，group `agentmgr-hermes`，mode 0770；unit 以 `InaccessiblePaths=-<task-root>` 隐藏兄弟目录；broker socket 放在不落入 unit 私有 `/run`/`/tmp`/`/var/tmp` 的固定控制目录。
 5. 写入 root-only provider key/credential 和 attestation HMAC key；provider key 只对 broker 可读；attestation key 为 root:adapter-private-group 0440（或 root-only 0400），helper/adapter 可读，`agentmgr-hermes` 沙箱组不可读；路径在 `/etc/agentmgr` 等 unit 不可见位置。
 6. 启动 broker；配置只允许 provider host/path；验证 broker 健康。

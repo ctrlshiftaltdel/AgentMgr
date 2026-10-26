@@ -1,6 +1,6 @@
 # Hermes Managed Execution 运维手册（#97）
 
-- 状态：**实现完成，未安装、未运行、无 live 证据**。本手册描述 #97 提供的生产启动器、安装脚本、验证脚本与回滚步骤；实际安装/运行必须由所有者在批准的测试机执行，并按[边界记录](../security/hermes-managed-execution-boundary.md)记录证据。
+- 状态：**实现完成；已在批准的测试机安装并完成沙箱/生命周期与 stub-broker live 证据；真实 key 的模型 artifact E2E 仍 pending；生产未部署。** 本手册描述 #97 提供的生产启动器、安装脚本、验证脚本与回滚步骤；实际安装/运行必须由所有者在批准的测试机执行，并按[边界记录](../security/hermes-managed-execution-boundary.md)记录证据。
 - 日期：2026-10-26
 - 关联：Issue #97、#96、#83；[设计](../security/hermes-managed-execution-design.md)、[实施计划](../security/hermes-managed-execution-plan.md)、[边界记录](../security/hermes-managed-execution-boundary.md)、[Runtime Dispatch 运维](runtime-dispatch.md)、[Runtime Adapter 契约](../contracts/runtime-adapter.md)。
 
@@ -22,7 +22,7 @@
         -> /usr/local/libexec/agentmgr_hermes_exec.py（root helper，stdin JSON）
            -> transient agentmgr-hermes-<16hex>.service
               -> DynamicUser + agentmgr-hermes 组
-              -> /workload.py -> 本地 loopback 模型代理 + hermes one-shot（仅 terminal）
+              -> /workload.py -> 本地 loopback 模型代理 + runtime python 的 in-process one-shot（仅 terminal，无 gateway）
               -> /runtime（只读运行时根）、/task（唯一可写任务目录）
      -> 宿主侧读取 /task/out/result.txt 并计算哈希
 
@@ -63,7 +63,7 @@ agentmgr-hermes-egress.service（宿主 broker）
 - 专用模型 provider key 文件（root-only，单行）；
 - provider base URL（生产必须 `https://`）与 provider host；
 - 模型名（只能来自受信部署配置，任务 payload 不能选择）；
-- 只读 Hermes 运行时根的来源目录（不含个人 Profile/auth/.env/session）；
+- 只读 Hermes 运行时根的来源目录（不含个人 Profile/auth/.env/session；必须自包含 `hermes-agent` 源码、`tools` Python 和 `installs` 依赖环境）；
 - 受信 service identity（`svc_<id>`，需先在数据库中创建/确认 active）；
 - 运行时名称/版本、evidence ref、worker id、adapter 服务账号。
 
@@ -91,6 +91,7 @@ sudo ops/security/provision_hermes_runtime.sh ...
 - `--install-root`/`--venv` 不能位于个人 home、`/root` 或 `.hermes` 下：broker 单元有 `ProtectHome=yes`，装在 home 下会在运行时不可访问。`--source` 与所有部署目录也不能位于仓库或个人 profile 内。
 - `--adapter-user` 必须已存在；脚本**不会创建**受信适配器账号。脚本会创建 `agentmgr-hermes` sandbox 组、`agentmgr-hermes-adapter` 私有组和专用 broker 用户，并把 adapter 用户加入前两个组。
 - `--runtime-mode copy`（默认）把 `--source` 复制为 root-owned 只读运行时根；`--runtime-mode bind` 立即做只读 bind mount（**不跨重启持久化**，需要部署层自行配置 fstab/systemd mount unit；验证脚本会要求 bind source 与安装记录一致）。
+- 运行时根必须自包含 `<source>/hermes-agent`、`<source>/tools/python-*` 和 `<source>/installs/**/site-packages`。workload 用 runtime Python 的 `-I -c` runner 调用 `hermes_cli.oneshot.run_oneshot`，**不执行** `.hermes/bin/hermes`，也不启动 gateway；缺少 `installs` 或 Python tools 会 fail closed。运行时根不得依赖个人 `~/.hermes`。
 - 脚本拒绝：非 root 运行、仓库/个人 home/`.hermes` 路径、source **任意深度**包含 `profiles`/`auth.json`/`.env`/`sessions`/`gateway.lock`/`locks`、source 中的绝对 symlink 或逃逸 root 的相对 symlink、非 https 的 provider URL、URL host/port 与 `--provider-host` 不一致、空/多行 provider key、已存在但 manifest 不匹配的 runtime root（除非 `--refresh-runtime`）、以及固定目录/安装目标是 symlink 或非目录/非常规文件。
 - 固定部署目录（`/etc/agentmgr`、`/var/lib/agentmgr-hermes-*`、`/usr/local/libexec`）会被 lstat 检查；owner/group/mode 不符时会记录并修复，symlink 直接失败。
 - 已存在的 attestation/egress key 会保留并记录“rotation is an explicit operator action”；已存在的 provider key 若与 `--provider-key-file` 不同则失败，必须显式删除后才能轮换。
@@ -191,7 +192,7 @@ sudo ops/security/provision_hermes_runtime.sh --rollback --purge-groups
 
 ## 9 容量与并发
 
-- 单 worker 单任务串行；每次提交一个 transient unit 与一个 `hermes` one-shot 进程。
+- 单 worker 单任务串行；每次提交一个 transient unit 与一个 workload 进程（内部为 in-process `run_oneshot`，无 gateway）。
 - 多 worker 只能并行处理**不同**任务；同一任务的重复提交由 idempotency key/unit 唯一性阻止。
 - 每任务资源上限由配置的 `memory_max_mb`/`cpu_quota_percent`/`tasks_max`/`runtime_max_sec` 约束；broker 并发由 `max_connections`（默认 32）约束。
 - **并发容量、启动开销和吞吐未测量**；不得把单 worker 串行当作生产容量证明。

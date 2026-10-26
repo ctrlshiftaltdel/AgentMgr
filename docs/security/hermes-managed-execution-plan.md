@@ -4,7 +4,7 @@
 
 **Goal:** Connect #96's Managed Execution dispatcher to a real Hermes runtime that runs one task per ephemeral systemd sandbox, with terminal-only tools, task-scoped model egress, host-verified artifact evidence, and fail-closed isolation claims.
 
-**Architecture:** A host `HermesManagedAdapter` calls a root-owned narrow helper to launch a transient `agentmgr-hermes-<id>.service` with `DynamicUser`, private `/run`/`/tmp`, isolated loopback only, and a read-only Hermes runtime. The unit runs a stdlib workload that starts a local model proxy, invokes `hermes chat --query-file ... --oneshot -t terminal --safe-mode`, and writes heartbeat/status/artifact files. A host egress broker injects the real model key after validating a short-lived task token. The adapter returns `result_ref` + `evidence:*` from a host-computed artifact hash; the dispatcher stops at `verifying`.
+**Architecture:** A host `HermesManagedAdapter` calls a root-owned narrow helper to launch a transient `agentmgr-hermes-<id>.service` with `DynamicUser`, private `/run`/`/tmp`, isolated loopback only, and a read-only Hermes runtime. The unit runs a stdlib workload that starts a local model proxy, invokes the runtime Python with the fixed in-process `run_oneshot` runner (`toolsets="terminal"`, no gateway), and writes heartbeat/status/artifact files. A host egress broker injects the real model key after validating a short-lived task token. The adapter returns `result_ref` + `evidence:*` from a host-computed artifact hash; the dispatcher stops at `verifying`.
 
 **Tech Stack:** Python 3.13, SQLAlchemy/PostgreSQL, pytest, systemd transient units, stdlib `http.server`/`http.client`/`ssl`/`hmac`, existing `app.runtime.contract`, #96 `RuntimeDispatcher`, #82 systemd patterns.
 
@@ -16,7 +16,7 @@
 - One task per transient systemd unit; `DynamicUser=yes`; no per-task API server; no shared Hermes gateway.
 - Never start, stop, replace or mount the personal/default Hermes gateway, Profile, auth, `.env` or sessions.
 - Hermes toolset is exactly `terminal`; browser/web/file/code-execution/MCP/plugins/memory/connectors are disabled.
-- Prompt is passed only via `--query-file`; the task egress token only via child environment. Neither appears in argv, host `ps`, logs, audit or errors.
+- Prompt is read by the in-process runner only from the fixed `/task/prompt.txt`; the task egress token is passed only via child environment. Neither appears in argv, host `ps`, logs, audit or errors.
 - Real provider key lives only in the host egress broker; the unit/task dir/logs never contain it.
 - `stop_confirmed=true` only when the unit/cgroup has no processes. Runtime stop is evidence, not business reconciliation; confirmed stops route to `needs_human`, never auto-`cancelled` or `side_effects_reconciled=true`.
 - `completed` only reaches `verifying`; the dispatcher never calls `complete_task` and never writes `succeeded`.
@@ -317,11 +317,11 @@ git commit -m "feat(security): add hermes sandbox helper"
 
 **Interfaces:**
 - Produces: `build_child_env(task_dir: Path, proxy_port: int) -> dict[str, str]`
-- Produces: `build_hermes_argv(runtime_root: Path, *, model: str, base_url: str, run_budget_sec: int) -> list[str]`
+- Produces: `build_hermes_argv(runtime_root: Path) -> list[str]` (fixed in-process runner: `tools/<pinned-python>/bin/python3 -I -c <RUNNER_CODE>`)
 - Produces: `render_profile(template: str, *, proxy_port: int, model: str) -> str` (replaces the `__PORT__` placeholder with the actual loopback port; the rendered profile contains no real key)
 - Produces: `class EgressProxy` / `start_egress_proxy(socket_path: Path) -> ProxyHandle` (port, thread, close)
 - Produces: `write_status_atomic(path: Path, payload: Mapping[str, object]) -> None`
-- Produces: `run_workload(*, task_dir: Path, runtime_root: Path, model: str, run_budget_sec: int, proxy_socket: Path) -> int`
+- Produces: `run_workload(*, task_dir: Path, runtime_root: Path, model: str, run_budget_sec: int, proxy_socket: Path) -> int` (`run_budget_sec` is an internal deadline, not a CLI flag)
 - Consumes: stdlib only; no `app.*` import; no host secrets.
 
 - [ ] **Step 1: Write failing workload tests**
@@ -329,23 +329,27 @@ git commit -m "feat(security): add hermes sandbox helper"
 In `app/tests/security/test_hermes_workload_unit.py`, test:
 
 ```python
-def test_hermes_argv_uses_query_file_and_never_prompt_or_key(tmp_path):
-    argv = build_hermes_argv(RUNTIME_ROOT, model="model-x",
-        base_url="http://127.0.0.1:1234/v1", run_budget_sec=60)
-    assert "chat" in argv
-    assert "--query-file" in argv and "/task/prompt.txt" in argv
-    assert "--oneshot" in argv and "-Q" in argv
-    assert "-t" in argv and "terminal" in argv
-    assert "--safe-mode" in argv
-    assert "--api-key" not in argv
+def test_hermes_runner_is_in_process_and_never_prompt_or_key(tmp_path):
+    argv = build_hermes_argv(RUNTIME_ROOT)
+    assert argv[0].endswith("/tools/<pinned-python>/bin/python3")
+    assert argv[1:3] == ["-I", "-c"]
+    runner = argv[3]
+    assert 'toolsets="terminal"' in runner
+    assert "from hermes_cli.oneshot import run_oneshot" in runner
+    assert 'Path("/task/prompt.txt")' in runner
+    assert "chat" not in argv and "--query-file" not in argv
+    assert "--run-budget" not in argv and "--api-key" not in argv
     assert not any("PROMPT-CANARY" in item or "TOKEN-CANARY" in item for item in argv)
 
 def test_child_env_clears_host_secrets_and_sets_hermes_home(tmp_path):
-    env = build_child_env(tmp_path, 1234)
+    env = build_child_env(tmp_path, 1234, model="model-x",
+                          token="task-token", runtime_installs=INSTALLS)
     assert env["HOME"] == str(tmp_path / "home")
     assert env["HERMES_HOME"] == str(tmp_path / "profile")
     assert env["XDG_STATE_HOME"] == str(tmp_path / "state")
     assert env["HERMES_GATEWAY_LOCK_DIR"] == str(tmp_path / "locks")
+    assert env["HERMES_INFERENCE_MODEL"] == "model-x"
+    assert "/runtime/installs" in env.get("PYTHONPATH", "")
     assert "AGENTMGR_DB_DSN" not in env
     assert "API_KEY" not in " ".join(env)
 ```
@@ -359,7 +363,7 @@ Expected: FAIL with missing module/names.
 
 - [ ] **Step 3: Implement the workload**
 
-Implement fixed paths (`/task`, `/task/prompt.txt`, `/task/profile.template.yaml`, `/task/profile/config.yaml`, `/task/egress.token`, `/task/out/result.txt`), environment construction with an allowlist, template rendering, local `ThreadingHTTPServer` proxy on `127.0.0.1:0` that forwards to the Unix socket and streams responses, Hermes argv exactly as in the spec, child process group management, heartbeat every configured interval, atomic status/exit files, bounded stdout/stderr capture, and `--run-budget`. The prompt is read from the file, never argv. The token is read from the file and passed only in the child env / proxy header.
+Implement fixed paths (`/task`, `/task/prompt.txt`, `/task/profile.template.yaml`, `/task/profile/config.yaml`, `/task/profile/installs -> /runtime/installs`, `/task/egress.token`, `/task/out/result.txt`), environment construction with an allowlist, template rendering, local `ThreadingHTTPServer` proxy on `127.0.0.1:0` that forwards to the Unix socket and streams responses, the fixed in-process `run_oneshot` runner (no `hermes chat`, no gateway, no `--run-budget`), child process group management, heartbeat every configured interval, atomic status/exit files, and bounded stdout/stderr capture. The prompt is read from the file by the runner, never argv. The token is read from the file and passed only in the child env / proxy header. If the whole cgroup is stopped and the child dies before the workload's poll loop observes the signal, the exit marker still records `cancelled=true`; this is stop evidence, not business reconciliation.
 
 - [ ] **Step 4: Run to verify GREEN**
 
