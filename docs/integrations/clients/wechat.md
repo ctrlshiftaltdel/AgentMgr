@@ -37,6 +37,8 @@
   3. 提交时直接写最终 mode；策略规则只允许该 mode（`allowed_execution_modes=[final_mode]`）。不依赖 PDP 自动升级。
   4. managed 任务只有在真实 adapter capabilities verified 后才入队；否则拒绝/转人工。
 - 自由文本不能由模型选模式。B1 的自由文本只做 advisory 读取；涉及写/审批/关键数据时必须让用户选择显式动作模板/按钮/命令；无法确定则要求澄清。
+- 微信绑定只能由现有 admin bind 创建（设置 `verified_at`）；Bridge 不能自建绑定。`from_user_id` 跨重新登录的稳定性尚未验证；变化时 fail closed，试点应预期重新绑定。
+- B1 只允许消息/身份/去重/通知；在 B2 完成前不得把 `policy_lookup` 入队，避免产生无人执行的 advisory 任务。
 - 不新增公开 Managed API；Intake 只监听内部网络/loopback + token。
 
 ### 增量 B2：只读 advisory 执行器
@@ -59,7 +61,7 @@
 - 独立 verifier 检查 schema/范围/重复键/业务规则；通过后由受信 applier 写**副本**数据库。
 - applier：
   - 幂等键由 **task_id + artifact_sha256** 派生，不由模型/消息文本决定。
-  - 副本 DB 有唯一约束；验证通过不等于约束。
+  - 副本 DB 有**业务自然键**唯一约束（例如 tenant + SKU + 仓库 + 期间），不能只约束 `task_id + artifact_sha256`；验证通过不等于约束。
   - 写后读回校验，微信成功文案只能来自 applier 的读写结果。
   - 独立副本 DSN/凭据，不在 Hermes egress allowlist；启动时拒绝生产 DSN。
   - 写时重新读取 Grant；失败/未知不自动重试；已提交写入不因 cancel 回滚。
@@ -76,7 +78,7 @@
 
 - 客户端不能传 capability；只能传 action_id。未知 action_id -> 拒绝/澄清。
 - 策略规则必须只允许 final_mode；不能依赖“自动升级”。
-- 关键数据/审批下发固定 managed；不确定 -> 升级/澄清，不降级。
+- 表是唯一规则来源；`inventory_entry` 固定 managed，`document_forward` 固定 governed + `required_approval`；审批/下发不是 runtime capability，只由 B4 人类页面记录。未知/不确定 -> 拒绝/澄清，不能让客户端/模型升级或降级。
 
 ## 5 WeChat Bridge 约束
 
@@ -85,7 +87,7 @@
 - 消息去重：SDK 没有 message_id，必须从 `raw` 中提取稳定事件 ID；提取不到就 fail closed，不能拿消息文本哈希当幂等键。
 - poll 先 cursor 后 handler：失败不重投；Bridge 必须自己持久化处理状态/重试，不能声称 at-least-once。
 - `-14` 会强制重新扫码：运维必须能通知所有者扫码；不能声称无人值守自动恢复。
-- 冷用户 `send()` 可能 `NoContextError`：审批通知必须有 Workbuddy/其他通道或主动建立 context；不能假设微信随时可推送。
+- 冷用户 `send()` 可能 `NoContextError`：Python SDK 不能主动创建 context；审批通知必须有 Workbuddy/其他通道，或等用户先发消息建立 context；不能假设微信随时可推送。
 - 群消息不支持；只支持单聊。
 - 附件：大小/类型/病毒扫描（扫描器需单独选型）；消息正文/附件不写审计。
 - 日志：不记录 token、key、QR、消息正文、员工明文；只记任务号/渠道哈希/稳定码。
@@ -115,7 +117,9 @@
 
 - `app/integrations/wechat/**`：仅消息 Bridge、SDK 适配、去重、通知；**不含审批授权回调**。
 - `app/tasks/intake.py`（或 `app/intake/task_router.py`）：受信 Task Intake + 动作注册表。
+- `app/governance/policies.py` / policy seed/config：动作注册表对应的 singleton `allowed_execution_modes` 策略发布与测试。
 - `app/security/approval/**` 或现有 admin/B4 页面：受信审批页面/回调（需单独设计）。
+- `app/integrations/documents/**` 或 `app/tasks/connectors/**`：B3 文件转发 connector（需单独设计）。
 - `app/inventory/**` + `app/tasks/appliers/**`：B4 applier（需 schema/副本）。
 - `app/runtime/advisory/**`：B2 只读执行器（需单独设计）。
 - `ops/wechat/**`：部署单元、root-only credential、日志/告警。
