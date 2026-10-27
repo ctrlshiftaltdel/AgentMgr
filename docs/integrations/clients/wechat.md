@@ -2,7 +2,7 @@
 
 - 状态：**设计修订稿；不可据此授权生产路径。** v1 评审发现模式判定、advisory 执行、审批信任边界和 Python SDK 能力存在关键缺口；本稿修正这些问题，并明确增量依赖。
 - 日期：2026-10-27
-- 关联：#83、#80、#79、#82、#97、#100、#102、Epic #74；[#97 边界](../security/hermes-managed-execution-boundary.md)、[商用就绪审查](../security/commercial-readiness-review.md)。
+- 关联：#83、#80、#79、#82、#97、#100、#102、Epic #74；[#97 边界](../../security/hermes-managed-execution-boundary.md)、[商用就绪审查](../../security/commercial-readiness-review.md)。
 - 参考客户端：`corespeed-io/wechatbot`（Python SDK）。本稿不声称该 SDK 的生产能力；需按固定版本/提交审计后再引入。
 
 ## 1 所有者已确认
