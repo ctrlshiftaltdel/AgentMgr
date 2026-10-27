@@ -4,8 +4,9 @@
 
 * SDK 只在**运行时**导入；未安装 SDK 时不污染应用其它模块的导入；
 * Bridge 依赖 :class:`WeChatSdk` 协议，测试可用假实现驱动，无需网络/真实账号；
-* SDK 的 ``reply`` 在冷用户上可能抛 ``NoContextError``，其它发送失败也可能发生：
-  一律翻译成**稳定失败码**，不把 SDK 异常文本暴露给用户或写进日志；
+* SDK 的 ``send`` 在冷用户上会抛 ``NoContextError``；``reply`` 对入站消息通常带有
+  context。适配器仍对 ``reply`` 的 ``NoContextError`` 做防御性映射，其它发送失败
+  也可能发生：一律翻译成**稳定失败码**，不把 SDK 异常文本暴露给用户或写进日志；
 * SDK v0.3.0 的 ``_log`` 会把 ``user_id`` 与错误文本直接写到 stderr。本适配器
   覆盖该私有方法并丢弃消息（固定版本 0.3.0），避免 journal 记录渠道用户明文；
 * QR URL 默认由 SDK 写 stderr。适配器**只**通过调用方提供的回调展示 QR，且
@@ -15,10 +16,13 @@
 from __future__ import annotations
 
 import inspect
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
+
+logger = logging.getLogger("app.integrations.wechat.sdk")
 
 __all__ = [
     "REPLY_NO_CONTEXT",
@@ -153,7 +157,12 @@ class WeChatBotAdapter:
             if inspect.isawaitable(result):
                 result = await result
             if result is not None:
-                await self.reply(message, result)
+                reply = await self.reply(message, result)
+                if not reply.ok:
+                    # Stable code only: never log message text or channel ids.
+                    logger.warning(
+                        "wechat_bridge reply_failed code=%s", reply.code
+                    )
 
         bot.on_message(_wrapped)
 

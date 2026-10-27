@@ -202,9 +202,10 @@
   输出，非 TTY 直接失败关闭，避免 journal 记录 QR。
 - SDK 私有 `_log` 会把 `user_id` 与错误文本写 stderr；适配器固定版本下覆盖并丢弃，
   不绕过适配器直接调用 SDK。
-- 冷用户 `reply` 的 `NoContextError` 与其它发送失败分别映射为稳定码
-  `reply_no_context` / `reply_send_failed`；不假装可主动推送。
+- 冷用户 `send()` 会 `NoContextError`；B1 只回复入站消息，不主动 `send()`。入站
+  `reply` 失败（网络/API）映射为 `reply_send_failed` 并记录稳定码；不假装可主动推送。
 - `-14` 会清空凭据并要求重新扫码；入口会记录 `qr_required`，不做无人值守自动恢复。
+  systemd 模板给凭据目录 `ReadWritePaths`，避免 SDK 清理/重写凭据时被只读挂载挡住。
 - poll 先 cursor 后 handler：B1 不声称 at-least-once；失败不重投，需运维重新扫码/
   重发。
 - 群消息不支持；只支持单聊。
@@ -212,8 +213,8 @@
 ### 10.5 验证状态（实现者）
 
 - DB-free 测试：`app/tests/integrations/wechat/test_action_registry.py`、
-  `test_bridge.py`、`test_config.py` 共 86 项通过（`--noconftest`）。
-- 真实 PostgreSQL 测试：`test_intake_db.py` 仅 `--collect-only`；由 Master 在测试机
-  运行，未在此环境声称通过。
+  `test_bridge.py`、`test_config.py` 共 88 项通过（`--noconftest`）。
+- 真实 PostgreSQL 测试：`test_intake_db.py` 在测试机由 Master 运行；B1 全目录
+  **97 passed**。
 - 真实微信扫码/收发 E2E：未执行；B1 只用假 SDK 验证消息/身份/去重/日志隐私。
 - 未声称：生产部署、容量、跨主机恢复、真实账号验证、B2–B4 能力。

@@ -25,8 +25,9 @@ RestartSec=10
 TimeoutStopSec=30
 KillSignal=SIGTERM
 
-# Hardening. The credential file is read-only to the service and lives outside
-# the repository. No public port is opened by B1.
+# Hardening. The credential directory is writable only so the SDK can clear and
+# rewrite credentials after a forced re-login; the file itself is mode 0600 and
+# never in the repository. No public port is opened by B1.
 UMask=0077
 NoNewPrivileges=yes
 PrivateTmp=yes
@@ -39,7 +40,7 @@ ProtectControlGroups=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
-ReadOnlyPaths=<wechat-credential-path>
+ReadWritePaths=<wechat-credential-dir>
 Environment=PYTHONDONTWRITEBYTECODE=1
 # The service does not need the Docker/KVM/raw device surface.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

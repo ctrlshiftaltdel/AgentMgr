@@ -371,6 +371,22 @@ def test_other_send_errors_map_to_stable_failure(monkeypatch: pytest.MonkeyPatch
     assert result == ReplyResult(False, REPLY_SEND_FAILED)
 
 
+def test_reply_failure_is_logged_with_a_stable_code(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    class Bot(FakeBot):
+        def on_message(self, handler: Any) -> None:
+            self.handler = handler
+
+    bot = Bot(error=FakeSdkError())
+    adapter = _adapter_with_bot(monkeypatch, bot)
+    adapter.on_message(lambda _message: "reply")
+    caplog.set_level(logging.WARNING, logger=sdk_module.logger.name)
+    asyncio.run(bot.handler(FakeMessage()))  # type: ignore[attr-defined]
+    assert "reply_failed" in caplog.text
+    assert "reply_send_failed" in caplog.text
+
+
 def test_qr_without_callback_fails_closed() -> None:
     adapter = WeChatBotAdapter(credential_path=TEST_CREDENTIAL_PATH)
     with pytest.raises(WeChatSdkError) as excinfo:

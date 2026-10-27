@@ -26,7 +26,13 @@
 - 专用测试微信账号 / 租户；所有者已接受 iLink 条款与账号风险。
 - 测试机已具备仓库、Python 环境与测试数据库；Bridge 只连**测试/试点**库。
 - 凭据文件路径不在仓库内，例如 `/var/lib/ajaimgr-wechat/credentials.json`；
-  目录 0700、文件 0600（或 0400），属主为运行 Bridge 的用户。
+  目录 0700、文件 0600（或 0400），属主为运行 Bridge 的用户。systemd 单元只给
+  **凭据目录** `ReadWritePaths`（SDK 在 `-14` 时需要清理并重写凭据），不把整个
+  `/var/lib` 或仓库设为可写。
+- `AJAIMGR_ENV` 必须是 `pilot` / `test` / `development`；Bridge 启动时拒绝
+  未标注或 production 环境。数据库必须是副本/测试库。
+- 该本地受信服务**不需要** `AJAIMGR_INTERNAL_TOKEN`；不要把管理 API token 放进
+  Bridge 进程。身份哈希使用独立的 `AJAIMGR_IDENTITY_HASH_SALT`。
 - 单账号只跑一个 Bridge 进程；systemd 模板用 `flock -n` 做进程级 lease。
 - 不要把 token、QR、`context_token`、消息正文写入仓库、Issue、PR 或日志。
 
@@ -99,7 +105,8 @@ sudo journalctl -u ajaimgr-wechat-bridge.service -n 50 --no-pager
 | 日志出现 `qr_required` / `qr_login_requires_interactive_terminal` | 需要重新扫码，且当前不是交互式终端 | 停止服务，按第 3 节在真实终端扫码；不要期待无人值守自动恢复 |
 | 日志出现 `sdk_failure code=sdk_error` | 网络/API/发送失败 | 检查网络与账号状态；必要时重启服务 |
 | 收到 `-14`（session expired） | SDK 已清空凭据并要求重新登录 | 同 `qr_required`：所有者重新扫码；重新登录后 `from_user_id` 可能变化，需要重新绑定 |
-| 冷用户发送失败 `reply_no_context` | SDK 不能主动为冷用户创建 context | 等用户先发一条消息建立 context；审批通知必须有 Workbuddy/其它通道兜底 |
+| 冷用户 `NoContextError` | SDK 的 `send()` 不能主动为冷用户创建 context；B1 只回复入站消息，不主动 `send()` | 未来审批/通知需要 Workbuddy 或其它通道；不要假设微信随时可推送 |
+| 日志出现 `reply_failed code=reply_send_failed` | 入站回复发送失败（网络/API） | 检查网络/账号；Bridge 不重试、不把失败当成功；用户可能未收到回复 |
 
 `-14` 与冷用户限制都是 SDK v0.3.0 的已知行为，B1 不声称 at-least-once 或随时可推送。
 

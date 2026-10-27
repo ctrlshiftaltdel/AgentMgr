@@ -53,6 +53,13 @@ def _build_config() -> WeChatBridgeConfig:
 def _serve(config: WeChatBridgeConfig) -> int:
     from app.db.session import SessionLocal
 
+    # B1 is a test/pilot-only bridge. Refuse to start against an unlabelled or
+    # production environment; the operator must point it at a copy/test DB.
+    environment = os.environ.get("AJAIMGR_ENV", "").strip().lower()
+    if environment not in {"pilot", "test", "development"}:
+        logger.error("wechat_bridge environment_not_allowed env=%s", environment or "unset")
+        return 2
+
     credential_path = str(config.credential_path)
     if not os.path.isfile(credential_path):
         logger.error("wechat_bridge credential_missing")
