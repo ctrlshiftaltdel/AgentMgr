@@ -73,6 +73,7 @@ from app.tasks.verification import EvidenceRecord
 from app.tests.governance.helpers import make_service_identity
 from app.tests.tasks.conftest import TaskWorld
 from app.tests.tasks.fake_hermes_supervisor import (
+    FAILED,
     NEVER_STARTED,
     RUNNING,
     STOPPED,
@@ -431,6 +432,168 @@ def test_dispatcher_cancel_confirmed_routes_to_needs_human(
     assert supervisor.stop_calls == 1
     assert supervisor.stop_reasons == ["runtime_cancel_requested"]
     # The unit was stopped exactly once and never re-launched.
+    assert supervisor.launch_calls == 1
+
+
+def test_dispatcher_cancel_race_keeps_a_completed_artifact_verifying(
+    session: Session,
+    world: TaskWorld,
+    engine: Engine,
+    tmp_path: Path,
+    broker_socket: Path,
+) -> None:
+    """A valid artifact wins a cancel race: verifying, not needs_human."""
+
+    task = submit_managed(session, world, goal=artifact_goal())
+    session.commit()
+    config = managed_config(tmp_path)
+    supervisor = FakeHermesSupervisor(
+        config,
+        result_bytes=ARTIFACT_BYTES,
+        status_script=[RUNNING, RUNNING, STOPPED],
+    )
+    cancelled: dict[str, bool] = {"requested": False}
+
+    def _hook(unit: str, call: int) -> None:
+        if call == 1 and not cancelled["requested"]:
+            cancelled["requested"] = True
+            request_cancel_on_another_connection(
+                engine, task_id=task.task_id, actor=world.actors.requester
+            )
+
+    supervisor.status_hook = _hook
+    adapter = HermesManagedAdapter(config, supervisor)
+
+    result = dispatcher_for(session, world, adapter).run_once()
+    session.refresh(task)
+
+    assert cancelled["requested"] is True
+    # The artifact the workload already wrote is a completion, not a stop: the
+    # cancel is not swallowed and the task does not stop at ``needs_human``.
+    assert result.outcome == "verifying", result.detail
+    assert task.state == "verifying"
+    assert task.state != "succeeded"
+    assert task.state != "cancelled"
+    assert task.state != "needs_human"
+    assert task.needs_human_origin is None
+    assert task.stop_confirmed is False
+    document = dict(task.result or {})
+    assert document.get("outcome") == "completed"
+    assert document.get("result_ref") == ARTIFACT_RESULT_REF
+    assert document.get("evidence_refs") == [ARTIFACT_EVIDENCE_REF]
+    # Nothing is reconciled and nothing is certified: an independent verifier
+    # still owns the ``verifying -> succeeded`` decision.
+    assert document.get("verification", {}).get("result") == "pending"
+    assert document.get("side_effects_reconciled") is not True
+    # The unit was stopped exactly once by the core cancel and never relaunched.
+    assert supervisor.stop_calls == 1
+    assert supervisor.stop_reasons == ["runtime_cancel_requested"]
+    assert supervisor.launch_calls == 1
+
+
+def test_dispatcher_cancel_already_terminal_without_artifact_is_not_promoted(
+    session: Session,
+    world: TaskWorld,
+    engine: Engine,
+    tmp_path: Path,
+    broker_socket: Path,
+) -> None:
+    """``already_terminal`` alone is not a completed artifact.
+
+    The adapter answers ``already_terminal`` for any terminal run, including
+    one that never wrote a readable ``out/result.txt``.  Only a validated
+    result may promote the run, so the confirmed stop keeps the cancel policy.
+    """
+
+    task = submit_managed(session, world)
+    session.commit()
+    config = managed_config(tmp_path)
+    # No artifact.  The second fact is already terminal, so the cancel is
+    # answered ``already_terminal`` rather than ``stopped``.
+    supervisor = FakeHermesSupervisor(config, status_script=[RUNNING, FAILED])
+    cancelled: dict[str, bool] = {"requested": False}
+
+    def _hook(unit: str, call: int) -> None:
+        if call == 1 and not cancelled["requested"]:
+            cancelled["requested"] = True
+            request_cancel_on_another_connection(
+                engine, task_id=task.task_id, actor=world.actors.requester
+            )
+
+    supervisor.status_hook = _hook
+    adapter = HermesManagedAdapter(config, supervisor)
+
+    result = dispatcher_for(session, world, adapter).run_once()
+    session.refresh(task)
+
+    assert result.outcome == "needs_human", result.detail
+    assert result.detail == RUNTIME_STOP_CONFIRMED
+    assert task.state == "needs_human"
+    assert task.state != "verifying"
+    assert task.needs_human_origin == "cancel_requested"
+    assert task.stop_confirmed is False
+    document = dict(task.result or {})
+    assert document.get("outcome") != "completed"
+    assert document.get("result_ref") is None
+    assert document.get("side_effects_reconciled") is not True
+    reconciliation = document["runtime_reconciliation"]
+    assert reconciliation["cancel_outcome"] == "already_terminal"
+    assert reconciliation["runtime_outcome"] == "failed"
+    assert reconciliation["stop_confirmed"] is True
+    assert supervisor.stop_calls == 1
+    assert supervisor.stop_reasons == ["runtime_cancel_requested"]
+    assert supervisor.launch_calls == 1
+
+
+def test_dispatcher_cancel_race_never_verifies_a_timed_out_partial_artifact(
+    session: Session,
+    world: TaskWorld,
+    engine: Engine,
+    tmp_path: Path,
+    broker_socket: Path,
+) -> None:
+    """A partial artifact never turns a timed-out run into verification."""
+
+    task = submit_managed(session, world, goal=artifact_goal())
+    session.commit()
+    config = managed_config(tmp_path)
+    # The workload wrote a partial artifact and then declared its own timeout.
+    supervisor = FakeHermesSupervisor(
+        config,
+        result_bytes=b"partial",
+        status_script=[RUNNING, TIMED_OUT_GONE],
+    )
+    cancelled: dict[str, bool] = {"requested": False}
+
+    def _hook(unit: str, call: int) -> None:
+        if call == 1 and not cancelled["requested"]:
+            cancelled["requested"] = True
+            request_cancel_on_another_connection(
+                engine, task_id=task.task_id, actor=world.actors.requester
+            )
+
+    supervisor.status_hook = _hook
+    adapter = HermesManagedAdapter(config, supervisor)
+
+    result = dispatcher_for(session, world, adapter).run_once()
+    session.refresh(task)
+
+    # The timeout keeps its own outcome: the cancel policy applies (evidence +
+    # ``needs_human``) and the hashed partial artifact is never read as a
+    # completion.
+    assert result.outcome == "needs_human", result.detail
+    assert result.detail == RUNTIME_STOP_CONFIRMED
+    assert task.state != "verifying"
+    assert task.state != "succeeded"
+    assert task.stop_confirmed is False
+    document = dict(task.result or {})
+    assert document.get("result_ref") is None
+    assert document.get("outcome") != "completed"
+    reconciliation = document["runtime_reconciliation"]
+    assert reconciliation["runtime_outcome"] == "timed_out"
+    assert reconciliation["stop_confirmed"] is True
+    assert supervisor.stop_calls == 1
+    assert supervisor.stop_reasons == ["runtime_cancel_requested"]
     assert supervisor.launch_calls == 1
 
 

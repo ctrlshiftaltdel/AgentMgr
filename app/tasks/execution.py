@@ -181,6 +181,7 @@ from app.governance.models import ExecutionGrant, GovernanceDecisionRecord
 from app.governance.policies import canonical_json
 from app.governance.principal import GovernancePrincipal
 from app.runtime.contract import (
+    CancelOutcome,
     CapabilityStatus,
     HealthStatus,
     LookupOutcome,
@@ -1320,6 +1321,21 @@ class RuntimeDispatcher:
                     observed_at=status.observed_at,
                     now=now,
                 )
+            cancel_outcome = (cancel or {}).get("outcome")
+            if status.state is not RuntimeState.TIMED_OUT and (
+                cancel_outcome == CancelOutcome.ALREADY_TERMINAL.value
+                or status.state in (RuntimeState.STOPPED, RuntimeState.FAILED)
+            ):
+                completed_result = self._verifiable_result(task, handle)
+                if completed_result is not None:
+                    return self._observe_completed(
+                        task,
+                        lease,
+                        runtime_task_id=handle,
+                        observed_at=status.observed_at,
+                        now=now,
+                        result=completed_result,
+                    )
             if status.state in (RuntimeState.UNKNOWN, RuntimeState.NOT_FOUND):
                 return self._record_lost(
                     task,
@@ -2457,6 +2473,7 @@ class RuntimeDispatcher:
         observed_at: datetime,
         now: datetime,
         expected_revision: int | None = None,
+        result: RuntimeResult | None = None,
     ) -> DispatcherResult:
         """Persist a completed run as ``verifying``, or fail closed.
 
@@ -2466,7 +2483,8 @@ class RuntimeDispatcher:
         no reference is ever synthesized to make it fit.
         """
 
-        result = self._fetch_result(task, runtime_task_id)
+        if result is None:
+            result = self._fetch_result(task, runtime_task_id)
         if result is None:
             return self._record_lost(
                 task,
@@ -2687,14 +2705,41 @@ class RuntimeDispatcher:
 
         A completion that raced the cancel wins: the result is fetched and the
         task enters ``verifying`` exactly as on the un-cancelled path -- a
-        cancel must never swallow a finished result.  A confirmed
-        ``stopped``/``failed``/``timed_out`` is **evidence, not business
-        reconciliation**: the hashed stop evidence is saved and the task is
-        escalated to ``needs_human`` (T52).  The dispatcher never calls
-        ``confirm_stop`` and never writes ``cancelled`` from runtime facts.
+        cancel must never swallow a finished result.  The adapter also answers
+        ``already_terminal`` for a terminal run that never produced a readable
+        artifact, so that outcome alone is not a completion: only a result the
+        core verifier accepts (a ``result_*`` plus at least one ``evidence:*``
+        reference) is promoted through T50.  A ``timed_out`` observation never
+        promotes, even when a partial artifact exists.
+
+        Otherwise a confirmed ``stopped``/``failed``/``timed_out`` is
+        **evidence, not business reconciliation**: the hashed stop evidence is
+        saved and the task is escalated to ``needs_human`` (T52).  The
+        dispatcher never calls ``confirm_stop`` and never writes ``cancelled``
+        from runtime facts.
         """
 
         state = status.state
+        cancel_outcome = (cancel or {}).get("outcome")
+        # A completed artifact wins a cancel race.  ``already_terminal`` alone
+        # is ambiguous: the adapter also returns it for a run that was already
+        # failed/timed out.  Only a core-verifiable result promotes the run to
+        # ``verifying``; otherwise the normal cancel/failure policy applies.
+        # A timeout keeps its own outcome even if a partial artifact exists.
+        if state is not RuntimeState.TIMED_OUT and (
+            cancel_outcome == CancelOutcome.ALREADY_TERMINAL.value
+            or state in (RuntimeState.STOPPED, RuntimeState.FAILED)
+        ):
+            completed_result = self._verifiable_result(task, runtime_task_id)
+            if completed_result is not None:
+                return self._observe_completed(
+                    task,
+                    lease,
+                    runtime_task_id=runtime_task_id,
+                    observed_at=status.observed_at,
+                    now=now,
+                    result=completed_result,
+                )
         if state is RuntimeState.COMPLETED:
             return self._observe_completed(
                 task,
@@ -2907,6 +2952,31 @@ class RuntimeDispatcher:
             )
         except Exception:  # noqa: BLE001 - cannot prove the result
             return None
+
+    def _verifiable_result(
+        self, task: Task, runtime_task_id: str
+    ) -> RuntimeResult | None:
+        """Return a result the core verifier can accept, or ``None``.
+
+        A cancel response may be ``already_terminal`` because the runtime had
+        already reached a terminal state, not necessarily because a valid
+        artifact exists.  Only a host-compatible ``result_*`` plus at least one
+        ``evidence:*`` reference justifies the completed/verifying path; the
+        caller otherwise applies the cancel/failure policy unchanged.
+        """
+
+        result = self._fetch_result(task, runtime_task_id)
+        if result is None:
+            return None
+        try:
+            verification.validate_result_refs(
+                result.result_ref,
+                tuple(result.evidence_refs or ()),
+                require_result=True,
+            )
+        except TaskError:
+            return None
+        return result
 
     def _cancel_after_accept(
         self,
