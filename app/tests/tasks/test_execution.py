@@ -2935,6 +2935,39 @@ def test_cancel_requested_crash_pass_escalates_without_live_lease(
     _assert_lease_released(session, task)
 
 
+def test_cancel_requested_crash_pass_verifies_a_completed_artifact(
+    session: Session, world: TaskWorld
+) -> None:
+    started = utcnow()
+    task, _principal = _prepare_cancel_requested_task(
+        session, world, started=started
+    )
+    expired = started + timedelta(seconds=6)
+    adapter = FakeRuntimeAdapter(
+        status=_status(RuntimeState.STOPPED, stop_confirmed=True),
+        result=_result(),
+        cancel=CancelResult(
+            outcome=CancelOutcome.ALREADY_TERMINAL,
+            stop_confirmed=True,
+            observed_at=utcnow(),
+        ),
+    )
+    dispatcher = _dispatcher(session, world, adapter=adapter)
+
+    results = dispatcher.reconcile_cancel_requests(now=expired)
+
+    # A stranded cancel with a core-verifiable artifact is a completion race:
+    # it goes to verifying, never to a fabricated success or cancellation.
+    assert [item.outcome for item in results] == ["verifying"]
+    assert task.state == "verifying"
+    assert task.state != "succeeded"
+    assert task.result["result_ref"] == FAKE_RESULT_REF
+    assert task.result["evidence_refs"] == [FAKE_EVIDENCE_REF]
+    assert (task.result or {}).get("side_effects_reconciled") is not True
+    assert len(adapter.cancel_calls) == 1
+    assert adapter.submit_calls == []
+
+
 def test_cancel_requested_crash_pass_live_runtime_escalates(
     session: Session, world: TaskWorld
 ) -> None:

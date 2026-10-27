@@ -1321,6 +1321,21 @@ class RuntimeDispatcher:
                     observed_at=status.observed_at,
                     now=now,
                 )
+            cancel_outcome = (cancel or {}).get("outcome")
+            if status.state is not RuntimeState.TIMED_OUT and (
+                cancel_outcome == CancelOutcome.ALREADY_TERMINAL.value
+                or status.state in (RuntimeState.STOPPED, RuntimeState.FAILED)
+            ):
+                completed_result = self._verifiable_result(task, handle)
+                if completed_result is not None:
+                    return self._observe_completed(
+                        task,
+                        lease,
+                        runtime_task_id=handle,
+                        observed_at=status.observed_at,
+                        now=now,
+                        result=completed_result,
+                    )
             if status.state in (RuntimeState.UNKNOWN, RuntimeState.NOT_FOUND):
                 return self._record_lost(
                     task,
