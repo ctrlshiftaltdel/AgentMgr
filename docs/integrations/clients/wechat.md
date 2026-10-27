@@ -36,7 +36,7 @@
   2. 查**闭集动作注册表**：`action_id -> capability, final_mode, policy_set, approval_required, allowed_scope`。
   3. 提交时直接写最终 mode；策略规则只允许该 mode（`allowed_execution_modes=[final_mode]`）。不依赖 PDP 自动升级。
   4. managed 任务只有在真实 adapter capabilities verified 后才入队；否则拒绝/转人工。
-- 自由文本不能由模型选模式。B1 的自由文本只做 advisory 读取；涉及写/审批/关键数据时必须让用户选择显式动作模板/按钮/命令；无法确定则要求澄清。
+- 自由文本不能由模型选模式。B1 的自由文本只做意图澄清和显式动作引导；在 B2 完成前不执行 advisory 回答，也不入队 `policy_lookup`。涉及写/审批/关键数据时必须让用户选择显式动作模板/按钮/命令；无法确定则要求澄清。
 - 微信绑定只能由现有 admin bind 创建（设置 `verified_at`）；Bridge 不能自建绑定。`from_user_id` 跨重新登录的稳定性尚未验证；变化时 fail closed，试点应预期重新绑定。
 - B1 只允许消息/身份/去重/通知；在 B2 完成前不得把 `policy_lookup` 入队，避免产生无人执行的 advisory 任务。
 - 不新增公开 Managed API；Intake 只监听内部网络/loopback + token。
