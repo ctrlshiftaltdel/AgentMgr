@@ -146,8 +146,11 @@ cd <repo-root>
 ## 9 B1 验证（Master / 所有者在测试机）
 
 ```bash
-# DB-free 契约测试
-<test-host-venv>/bin/python -m pytest app/tests/integrations/wechat \
+# DB-free 契约测试（不要把 test_intake_db.py 放进 --noconftest 运行）
+<test-host-venv>/bin/python -m pytest \
+  app/tests/integrations/wechat/test_action_registry.py \
+  app/tests/integrations/wechat/test_bridge.py \
+  app/tests/integrations/wechat/test_wechat_config.py \
   -q -o addopts='' --noconftest
 
 # 真实 PostgreSQL 测试（需要 AJAIMGR_TEST_DB_URL）

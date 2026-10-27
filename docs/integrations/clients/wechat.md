@@ -213,7 +213,7 @@
 ### 10.5 验证状态（实现者）
 
 - DB-free 测试：`app/tests/integrations/wechat/test_action_registry.py`、
-  `test_bridge.py`、`test_config.py` 共 88 项通过（`--noconftest`）。
+  `test_bridge.py`、`test_wechat_config.py` 共 89 项通过（`--noconftest`）。
 - 真实 PostgreSQL 测试：`test_intake_db.py` 在测试机由 Master 运行；B1 全目录
   **97 passed**。
 - 真实微信扫码/收发 E2E：未执行；B1 只用假 SDK 验证消息/身份/去重/日志隐私。
