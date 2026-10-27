@@ -82,7 +82,7 @@
 
 ## 5 WeChat Bridge 约束
 
-- Python SDK 版本/提交固定；新增依赖 `wechatbot-sdk` 需单独批准（`pyproject.toml`/`uv.lock`），当前未加。
+- Python SDK 版本/提交固定；`wechatbot-sdk==0.3.0` 已按 Issue #104 B1 授权加入 `pyproject.toml` / `uv.lock`（B1 实现状态见 §10）。
 - 单账号单实例；独立 root-only credential 路径；多机 lease/advisory lock；QR URL 不写日志。
 - 消息去重：SDK 没有 message_id，必须从 `raw` 中提取稳定事件 ID；提取不到就 fail closed，不能拿消息文本哈希当幂等键。
 - poll 先 cursor 后 handler：失败不重投；Bridge 必须自己持久化处理状态/重试，不能声称 at-least-once。
@@ -139,3 +139,82 @@
 - 证据：命令、计数、SDK 版本/提交、任务号、artifact 哈希；不含 key/token/QR/个人路径。
 
 不证明：生产部署、容量、跨主机恢复、生产 key 轮换、业务工具 PEP 完整治理、微信群聊。
+
+## 10 B1 实现状态（2026-10-27）
+
+本节只记录 B1 已落地的事实与边界；设计正文（§1–§9）仍是权威约束。
+
+### 10.1 已实现路径
+
+- `app/tasks/intake.py`：选择此路径（而非 `app/intake/task_router.py`），因为它是
+  任务域的受信提交入口，避免与既有 `app/intake/inbound.py`（入站受理作业）混淆。
+  - `ActionSpec` / `ActionRegistry`：闭集查找；未知 -> `unknown_action`，已登记但
+    停用 -> `action_not_available`。
+  - `submit_action(...)`：只接受渠道键 + 显式 `action_id` + 业务 payload；身份经
+    `resolve_principal` -> `resolve_employee_principal` 服务端解析；`final_mode`
+    只来自 `ActionSpec`；requester/owner/executor 都是解析出的同一名员工；不接受
+    客户端 mode/owner/approver/employee id；不自动执行、不调用 dispatcher。
+  - 幂等键由 `(channel_type, external_user_id, external_message_id)` 的 SHA-256
+    派生，前缀 `idem_wechat_`，不使用消息正文；同一事件 + 同一 canonical
+    request 返回同一任务，同一事件 + 不同 payload 返回
+    `task_idempotency_conflict` 拒绝。
+  - 不新增表/迁移：复用 `tasks (requester_principal_id, idempotency_key)` 既有
+    唯一约束。
+- `app/integrations/wechat/**`：`config.py`、`sdk.py`（懒加载 SDK + 稳定回复码）、
+  `bridge.py`（`/help` / `/whoami`、事件键 fail-closed、可选测试用
+  `handle_action`）、`run.py` / `__main__.py`（本地入口）。
+- `ops/wechat/**`：systemd 模板（`flock -n` 单实例）、无秘密 env 示例、ops README。
+- `docs/operations/wechat-bridge.md`：所有者 QR 登录、root-only 凭据、`-14` 重新
+  扫码、冷用户 `NoContextError`、单实例与日志隐私的运行手册。
+- 依赖：`wechatbot-sdk==0.3.0`（仅此一个新增直接依赖；`aiohttp` / `cryptography`
+  为其传递依赖）。
+
+### 10.2 B1 生产注册表
+
+`B1_ACTION_REGISTRY` **没有启用的建任务动作**。设计表中的三个动作以停用条目
+登记，便于区分“完全未知”和“已登记但本增量不可用”：
+
+| action_id | capability | final_mode | 状态 |
+|---|---|---|---|
+| `policy_lookup` | `policy.read@1.0.0` | `advisory` | 停用（B2） |
+| `document_forward` | `document.forward@1.0.0` | `governed_resource_access` | 停用（B3） |
+| `inventory_entry` | `inventory.write@1.0.0` | `managed_execution` | 停用（B4） |
+
+注意：代码中的 governed 模式字符串是 `governed_resource_access`，不是设计正文
+简写的 `governed`；`ActionSpec` 只接受治理层的实际枚举值。
+
+### 10.3 Bridge 行为
+
+- 稳定事件键：`raw["from_user_id"]` + `raw["create_time_ms"]`（正整数）；缺失/零/
+  非法 -> 回复并记录 `event_key_missing`，不解析身份、不建任务。**不**用消息正文
+  哈希。
+- `/help`、`/whoami` 由 Bridge 自身处理；`/whoami` 只回答“已绑定/未绑定”，不返回
+  员工 ID、姓名、角色或公司。
+- 其它文本只回复“B1 未开放”；不调用模型、不回答 advisory、不创建任务。
+- 没有审批回调、没有公开 HTTP API、没有内网 token 校验；B1 是测试机上的受信本地
+  服务。若后续网络化，token/loopback 限制必须在单独增量中实现并失败关闭。
+- 日志只含稳定码、渠道事件哈希（SHA-256 前缀）、任务号、动作 ID 与内部原因；不
+  记录 token/key/QR/`context_token`/消息正文/渠道用户或员工明文。
+
+### 10.4 SDK v0.3.0 限制的落地处理
+
+- QR：SDK 默认把 URL 写 stderr；适配器只通过调用方回调展示，入口仅在交互式 TTY
+  输出，非 TTY 直接失败关闭，避免 journal 记录 QR。
+- SDK 私有 `_log` 会把 `user_id` 与错误文本写 stderr；适配器固定版本下覆盖并丢弃，
+  不绕过适配器直接调用 SDK。
+- 冷用户 `send()` 会 `NoContextError`；B1 只回复入站消息，不主动 `send()`。入站
+  `reply` 失败（网络/API）映射为 `reply_send_failed` 并记录稳定码；不假装可主动推送。
+- `-14` 会清空凭据并要求重新扫码；入口会记录 `qr_required`，不做无人值守自动恢复。
+  systemd 模板给凭据目录 `ReadWritePaths`，避免 SDK 清理/重写凭据时被只读挂载挡住。
+- poll 先 cursor 后 handler：B1 不声称 at-least-once；失败不重投，需运维重新扫码/
+  重发。
+- 群消息不支持；只支持单聊。
+
+### 10.5 验证状态（实现者）
+
+- DB-free 测试：`app/tests/integrations/wechat/test_action_registry.py`、
+  `test_bridge.py`、`test_wechat_config.py` 共 89 项通过（`--noconftest`）。
+- 真实 PostgreSQL 测试：`test_intake_db.py` 在测试机由 Master 运行；B1 全目录
+  **97 passed**。
+- 真实微信扫码/收发 E2E：未执行；B1 只用假 SDK 验证消息/身份/去重/日志隐私。
+- 未声称：生产部署、容量、跨主机恢复、真实账号验证、B2–B4 能力。

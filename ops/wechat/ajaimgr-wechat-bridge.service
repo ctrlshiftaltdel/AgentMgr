@@ -1,0 +1,50 @@
+# AgentMgr WeChat B1 Bridge
+#
+# Template only. The implementer does not install or start this unit.
+# Replace every <placeholder> before deployment; never commit the real env file,
+# credential file or QR.
+
+[Unit]
+Description=AgentMgr WeChat B1 message bridge (messages/identity/dedupe only)
+Documentation=file://<repo-root>/docs/operations/wechat-bridge.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=<bridge-user>
+Group=<bridge-group>
+WorkingDirectory=<repo-root>
+EnvironmentFile=<wechat-env-file>
+# Single instance: -n fails immediately if another bridge holds the lock.
+RuntimeDirectory=ajaimgr-wechat
+RuntimeDirectoryMode=0700
+ExecStart=/usr/bin/flock -n /run/ajaimgr-wechat/bridge.lock <test-host-venv>/bin/python -m app.integrations.wechat serve
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+KillSignal=SIGTERM
+
+# Hardening. The credential directory is writable only so the SDK can clear and
+# rewrite credentials after a forced re-login; the file itself is mode 0600 and
+# never in the repository. No public port is opened by B1.
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ReadWritePaths=<wechat-credential-dir>
+Environment=PYTHONDONTWRITEBYTECODE=1
+# The service does not need the Docker/KVM/raw device surface.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
