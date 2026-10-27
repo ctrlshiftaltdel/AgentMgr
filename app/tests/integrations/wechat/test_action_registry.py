@@ -98,6 +98,22 @@ def _principal() -> GovernancePrincipal:
 # --- registry ------------------------------------------------------------------
 
 
+def test_enabled_action_requires_a_server_side_allowed_scope() -> None:
+    with pytest.raises(ValueError):
+        ActionRegistry(
+            (
+                ActionSpec(
+                    action_id="test_read",
+                    capability=TEST_CAPABILITY,
+                    final_mode="advisory",
+                    policy_set=TEST_POLICY_SET,
+                    allowed_scope=None,
+                    enabled=True,
+                ),
+            )
+        )
+
+
 def test_unknown_action_is_a_stable_rejection() -> None:
     with pytest.raises(ActionRegistryError) as excinfo:
         _registry().lookup("nope")

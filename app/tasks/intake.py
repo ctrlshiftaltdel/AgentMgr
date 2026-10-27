@@ -142,6 +142,7 @@ CLIENT_AUTHORITY_FIELDS: frozenset[str] = frozenset(
         "requester_employee_id",
         "requester_principal_id",
         "requested_capabilities",
+        "resource_scope",
         "service_identity_id",
     }
 )
@@ -221,6 +222,11 @@ class ActionRegistry:
             raise ValueError("approval_required must be a boolean")
         if not isinstance(spec.enabled, bool):
             raise ValueError("enabled must be a boolean")
+        if spec.enabled:
+            if not isinstance(spec.allowed_scope, Mapping):
+                raise ValueError(
+                    "an enabled action must declare its server-side allowed_scope"
+                )
 
     def lookup(self, action_id: object) -> ActionSpec:
         """返回启用中的规格；未知 / 停用均抛出 :class:`ActionRegistryError`。"""
@@ -343,12 +349,12 @@ def _goal_request(
     payload: Mapping[str, Any] | None,
     *,
     spec: ActionSpec,
-) -> tuple[dict[str, Any], Mapping[str, Any] | None, Mapping[str, Any] | None, str | None] | None:
-    """从客户端 payload 中取出 goal / scope / execution payload / summary。
+) -> tuple[dict[str, Any], Mapping[str, Any] | None, str | None] | None:
+    """从客户端 payload 中取出 goal / execution payload / summary。
 
-    payload 只承载**业务描述**，权威字段一律拒绝。``goal`` 是任务核心
-    ``validate_goal`` 要求的结构化对象；``resource_scope`` 缺省时使用规格里的
-    ``allowed_scope``（动作固定的可访问范围）。
+    ``payload`` 只承载**业务描述**，权威字段一律拒绝。资源范围由
+    :attr:`ActionSpec.allowed_scope` 固定，客户端不能提供 ``resource_scope``；
+    客户端尝试提供会被 :data:`CLIENT_AUTHORITY_FIELDS` 拒绝，而不是静默覆盖。
     """
     if payload is None:
         return None
@@ -360,18 +366,13 @@ def _goal_request(
     goal = payload.get("goal")
     if not isinstance(goal, Mapping):
         return None
-    resource_scope = payload.get("resource_scope")
-    if resource_scope is not None and not isinstance(resource_scope, Mapping):
-        return None
-    if resource_scope is None:
-        resource_scope = spec.allowed_scope
     execution_payload = payload.get("execution_payload")
     if execution_payload is not None and not isinstance(execution_payload, Mapping):
         return None
     summary = payload.get("summary")
     if summary is not None and not isinstance(summary, str):
         return None
-    return dict(goal), resource_scope, execution_payload, summary
+    return dict(goal), execution_payload, summary
 
 
 class _ClientAuthorityError(Exception):
@@ -401,8 +402,8 @@ def submit_action(
     * ``channel_type``：B1 只接受 ``weixin``；
     * ``external_user_id`` / ``external_message_id``：渠道身份与稳定事件键；
     * ``action_id``：闭集动作 ID；
-    * ``payload``：可选的业务描述（``goal`` / ``resource_scope`` /
-      ``execution_payload`` / ``summary``）。**不得**包含任何权威字段；
+    * ``payload``：可选的业务描述（``goal`` / ``execution_payload`` /
+      ``summary``）。**不得**包含任何权威字段，包括 ``resource_scope``；
     * ``expected_company_id``：调用方已确定目标公司时传给身份解析，防跨公司；
     * ``registry``：默认使用 :data:`B1_ACTION_REGISTRY`；测试可注入自己的闭集。
 
@@ -455,7 +456,7 @@ def submit_action(
     except GovernanceError as exc:  # pragma: no cover - defensive
         return _reject(exc.reason_code)
 
-    goal, resource_scope, execution_payload, summary = request
+    goal, execution_payload, summary = request
 
     idempotency_key = channel_idempotency_key(
         channel_type=channel_type,
@@ -479,7 +480,7 @@ def submit_action(
             goal=goal,
             summary=summary,
             execution_mode=spec.final_mode,
-            resource_scope=resource_scope,
+            resource_scope=spec.allowed_scope,
             requested_capabilities=(spec.capability,),
             policy_set_id=spec.policy_set,
             payload=execution_payload,
