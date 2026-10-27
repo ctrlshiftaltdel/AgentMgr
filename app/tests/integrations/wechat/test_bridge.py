@@ -381,10 +381,16 @@ def test_reply_failure_is_logged_with_a_stable_code(
     bot = Bot(error=FakeSdkError())
     adapter = _adapter_with_bot(monkeypatch, bot)
     adapter.on_message(lambda _message: "reply")
-    caplog.set_level(logging.WARNING, logger=sdk_module.logger.name)
-    asyncio.run(bot.handler(FakeMessage()))  # type: ignore[attr-defined]
-    assert "reply_failed" in caplog.text
-    assert "reply_send_failed" in caplog.text
+    logger = sdk_module.logger
+    previous_disabled = logger.disabled
+    logger.disabled = False
+    try:
+        caplog.set_level(logging.WARNING, logger=logger.name)
+        asyncio.run(bot.handler(FakeMessage()))  # type: ignore[attr-defined]
+        assert "reply_failed" in caplog.text
+        assert "reply_send_failed" in caplog.text
+    finally:
+        logger.disabled = previous_disabled
 
 
 def test_qr_without_callback_fails_closed() -> None:
