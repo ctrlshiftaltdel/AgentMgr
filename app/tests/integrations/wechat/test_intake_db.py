@@ -206,8 +206,8 @@ def test_identity_rejections_create_no_task(
         )
         session.add(inactive)
         session.flush()
-        _bind(engine, employee_id=inactive.id)
         session.commit()
+        _bind(engine, employee_id=inactive.id)
     elif setup == "company_mismatch":
         _bind(engine, employee_id=org.employee.id)
         expected_company_id = org.company.id + 10_000

@@ -254,25 +254,33 @@ def test_unknown_slash_command_is_not_open() -> None:
 
 
 def test_logs_do_not_contain_text_user_or_secrets(caplog: pytest.LogCaptureFixture) -> None:
-    caplog.set_level(logging.INFO, logger=bridge_module.logger.name)
-    bridge, _ = _bridge()
-    secret_text = "my-token-is-SECRET-AND-MESSAGE-TEXT"
-    message = FakeMessage(
-        text=secret_text,
-        raw={
-            "from_user_id": "wx-sensitive-user",
-            "create_time_ms": 1_700_000_000_000,
-            "context_token": "context-token-secret",
-        },
-    )
+    # Alembic's test migrations call fileConfig(disable_existing_loggers=True);
+    # re-enable this module logger so the absence assertions are not vacuous.
+    logger = bridge_module.logger
+    previous_disabled = logger.disabled
+    logger.disabled = False
+    try:
+        caplog.set_level(logging.INFO, logger=logger.name)
+        bridge, _ = _bridge()
+        secret_text = "my-token-is-SECRET-AND-MESSAGE-TEXT"
+        message = FakeMessage(
+            text=secret_text,
+            raw={
+                "from_user_id": "wx-sensitive-user",
+                "create_time_ms": 1_700_000_000_000,
+                "context_token": "context-token-secret",
+            },
+        )
 
-    asyncio.run(bridge.handle_message(message))
+        asyncio.run(bridge.handle_message(message))
 
-    logged = caplog.text
-    assert secret_text not in logged
-    assert "wx-sensitive-user" not in logged
-    assert "context-token-secret" not in logged
-    assert "event_hash" in logged
+        logged = caplog.text
+        assert secret_text not in logged
+        assert "wx-sensitive-user" not in logged
+        assert "context-token-secret" not in logged
+        assert "event_hash" in logged
+    finally:
+        logger.disabled = previous_disabled
 
 
 # --- action path (production registry) ----------------------------------------

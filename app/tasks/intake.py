@@ -315,7 +315,9 @@ def channel_idempotency_key(
         (channel_type, external_user_id, external_message_id)
     ).encode("utf-8")
     digest = hashlib.sha256(material).hexdigest()
-    return f"{IDEMPOTENCY_KEY_PREFIX}{digest}"
+    # task.idempotency_key has a DB CHECK of ``idem_`` + 1..? (max 69 chars):
+    # keep the channel component short while retaining 192 bits of the digest.
+    return f"{IDEMPOTENCY_KEY_PREFIX}{digest[:48]}"
 
 
 # --- 内部工具 ------------------------------------------------------------------

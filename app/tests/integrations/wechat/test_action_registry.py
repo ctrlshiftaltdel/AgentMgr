@@ -401,6 +401,7 @@ def test_idempotency_key_is_deterministic_and_event_scoped() -> None:
     )
     assert first == second
     assert first.startswith(IDEMPOTENCY_KEY_PREFIX)
+    assert len(first) <= 69  # tasks.idempotency_key CHECK format
     assert first != other_user
     assert first != other_event
     assert "wx-user" not in first
